@@ -1,0 +1,38 @@
+# ---- build output ----
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.log
+
+# keep the OpenXR loader out - it is vendored at build time from the SDK
+openxr_loader*.dll
+
+# ---- run artefacts ----
+last_run.log
+run*.log
+
+# ---- NEVER COMMIT ----
+# Game-derived data. Ghidra projects contain a full analysis of the game binary, and
+# save files are the user's own game data. Both live outside this tree by design; these
+# entries exist so an accidental copy cannot slip in.
+*.gpr
+*.rep/
+ghidra_projects/
+save_backups/
+*.ue3profile*
+
+# extracted or decompiled game content of any kind
+uscript/
+*.upk
+*.xxx
+
+# ---- editor / OS ----
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
