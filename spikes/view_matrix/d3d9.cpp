@@ -359,6 +359,7 @@ int   g_lockedConv = CONV_ROW;
 bool  g_haveLock   = false;
 float g_projTanX = 0.0f, g_projTanY = 0.0f;   // tan of half FOV, as OBSERVED (diagnostic)
 float g_targetTanX = 0.0f, g_targetTanY = 0.0f;   // what we FORCE into the matrix, and submit
+float g_forcedTanX = 0.0f, g_forcedTanY = 0.0f;   // read back AFTER the edit, to prove it landed
 
 // Ask the engine for more FOV than we actually render with. Its value now only governs CPU
 // culling, and culling wider than we draw costs a little geometry and guarantees no bare edges
@@ -637,10 +638,32 @@ void PumpXR() {
 }
 
 // ---------------------------------------------------------------- VR frame submission
-XrSwapchain g_swapchain = XR_NULL_HANDLE;
+// One swapchain per eye. In mono only [0] is ever filled and both eyes reference it; stereo
+// fills them alternately. See the ALTERNATE-EYE note by g_stereo.
+XrSwapchain g_swapchain[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 uint32_t g_scWidth = 0, g_scHeight = 0;
-ID3D11Texture2D** g_scImages = nullptr;
-uint32_t g_scImageCount = 0;
+ID3D11Texture2D** g_scImages[2] = { nullptr, nullptr };
+uint32_t g_scImageCount[2] = { 0, 0 };
+
+// ---- ALTERNATE-EYE STEREO (F12) ----
+//
+// The game renders once per frame and there is no way to make it render twice from a D3D9
+// shim, so the cheap route to two images is to alternate: this frame is drawn from the left
+// eye, the next from the right, and each eye's swapchain holds the last image drawn for it.
+// Both are submitted every frame, so one eye is always showing an image one frame old.
+//
+// The cost is real - each eye effectively updates at half the game's frame rate, and during
+// fast head motion the two eyes disagree - which is why this is a toggle and not the default.
+// The gain is that it is genuinely stereo, with correct occlusion, because each image really
+// was rendered from that eye's position rather than reprojected.
+//
+// Almost no new maths: an eye offset IS a head position offset, so each eye's pose is fed
+// through exactly the same XR->game mapping 6-DOF already uses. Interpupillary distance never
+// appears as its own quantity.
+volatile LONG g_stereo = 0;
+int     g_renderEye = 0;             // which eye the frame now being drawn belongs to
+XrPosef g_renderPose[2]{};           // the pose each eye's stored image was rendered from
+bool    g_eyeFilled[2] = { false, false };
 
 IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
@@ -655,9 +678,12 @@ int     g_framesSubmitted = 0;
 // Create the XR swapchain lazily, sized to the game's backbuffer - we are pasting the game's
 // own image, so matching its dimensions avoids any rescale on the way in.
 bool EnsureSwapchain(UINT w, UINT h) {
-    if (g_swapchain != XR_NULL_HANDLE && w == g_scWidth && h == g_scHeight) return true;
-    if (g_swapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g_swapchain); g_swapchain = XR_NULL_HANDLE; }
-    if (g_scImages) { delete[] g_scImages; g_scImages = nullptr; }
+    if (g_swapchain[0] != XR_NULL_HANDLE && w == g_scWidth && h == g_scHeight) return true;
+    for (int e = 0; e < 2; ++e) {
+        if (g_swapchain[e] != XR_NULL_HANDLE) { xrDestroySwapchain(g_swapchain[e]); g_swapchain[e] = XR_NULL_HANDLE; }
+        if (g_scImages[e]) { delete[] g_scImages[e]; g_scImages[e] = nullptr; }
+        g_eyeFilled[e] = false;
+    }
 
     uint32_t fmtCount = 0;
     xrEnumerateSwapchainFormats(g_xrSession, 0, &fmtCount, nullptr);
@@ -686,25 +712,28 @@ bool EnsureSwapchain(UINT w, UINT h) {
             ? "(sRGB - correct for the game's output)" : "(LINEAR - expect washed out colours)");
     delete[] fmts;
 
-    XrSwapchainCreateInfo sci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
-    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-    sci.format = chosen;
-    sci.sampleCount = 1;
-    sci.width = w; sci.height = h;
-    sci.faceCount = 1; sci.arraySize = 1; sci.mipCount = 1;
-    if (XR_FAILED(xrCreateSwapchain(g_xrSession, &sci, &g_swapchain))) { Log("xrCreateSwapchain failed"); return false; }
-
-    xrEnumerateSwapchainImages(g_swapchain, 0, &g_scImageCount, nullptr);
-    XrSwapchainImageD3D11KHR* imgs = new XrSwapchainImageD3D11KHR[g_scImageCount];
-    for (uint32_t i = 0; i < g_scImageCount; ++i) imgs[i] = { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR };
-    xrEnumerateSwapchainImages(g_swapchain, g_scImageCount, &g_scImageCount,
-                               reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs));
-    g_scImages = new ID3D11Texture2D*[g_scImageCount];
-    for (uint32_t i = 0; i < g_scImageCount; ++i) g_scImages[i] = imgs[i].texture;
-    delete[] imgs;
+    for (int e = 0; e < 2; ++e) {
+        XrSwapchainCreateInfo sci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+        sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        sci.format = chosen;
+        sci.sampleCount = 1;
+        sci.width = w; sci.height = h;
+        sci.faceCount = 1; sci.arraySize = 1; sci.mipCount = 1;
+        if (XR_FAILED(xrCreateSwapchain(g_xrSession, &sci, &g_swapchain[e]))) {
+            Log("xrCreateSwapchain failed for eye %d", e); return false;
+        }
+        xrEnumerateSwapchainImages(g_swapchain[e], 0, &g_scImageCount[e], nullptr);
+        XrSwapchainImageD3D11KHR* imgs = new XrSwapchainImageD3D11KHR[g_scImageCount[e]];
+        for (uint32_t i = 0; i < g_scImageCount[e]; ++i) imgs[i] = { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR };
+        xrEnumerateSwapchainImages(g_swapchain[e], g_scImageCount[e], &g_scImageCount[e],
+                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs));
+        g_scImages[e] = new ID3D11Texture2D*[g_scImageCount[e]];
+        for (uint32_t i = 0; i < g_scImageCount[e]; ++i) g_scImages[e][i] = imgs[i].texture;
+        delete[] imgs;
+    }
 
     g_scWidth = w; g_scHeight = h;
-    Log("XR swapchain %ux%u fmt=%lld images=%u", w, h, (long long)chosen, g_scImageCount);
+    Log("XR swapchains (2) %ux%u fmt=%lld images=%u each", w, h, (long long)chosen, g_scImageCount[0]);
     return true;
 }
 
@@ -868,9 +897,14 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             uintptr_t ctl = FindController();
             g_baseYaw = (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12))
                         ? reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1] : 0;
-            g_centrePos[0] = views[0].pose.position.x;
-            g_centrePos[1] = views[0].pose.position.y;
-            g_centrePos[2] = views[0].pose.position.z;
+            // Midpoint of the eyes, so neither stereo eye starts biased against the centre.
+            const bool haveBoth = (n >= 2);
+            g_centrePos[0] = haveBoth ? (views[0].pose.position.x + views[1].pose.position.x) * 0.5f
+                                      : views[0].pose.position.x;
+            g_centrePos[1] = haveBoth ? (views[0].pose.position.y + views[1].pose.position.y) * 0.5f
+                                      : views[0].pose.position.y;
+            g_centrePos[2] = haveBoth ? (views[0].pose.position.z + views[1].pose.position.z) * 0.5f
+                                      : views[0].pose.position.z;
             g_haveCentrePos = (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
             g_haveCentre = true;
             Log("recentred: head yaw %.1f, game yaw %d, head pos (%.3f, %.3f, %.3f)%s",
@@ -906,9 +940,26 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             for (int i = 0; i < 3; ++i) g_hmdOffset[i] *= 0.94f;
         }
         else if (g_haveCentrePos) {
-            float ox = views[0].pose.position.x - g_centrePos[0];
-            float oy = views[0].pose.position.y - g_centrePos[1];
-            float oz = views[0].pose.position.z - g_centrePos[2];
+            // An eye offset IS a head position offset, so stereo needs no separate
+            // interpupillary maths: map the position of whichever eye the NEXT frame will be
+            // drawn for, and the separation falls out of the same transform 6-DOF uses. In
+            // mono, use the midpoint of the two eyes so the view is not biased half an IPD to
+            // the left.
+            const bool stereoNow = InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
+            const int nextEye = stereoNow ? (1 - g_renderEye) : 0;
+            XrVector3f hp = views[nextEye].pose.position;
+            if (!stereoNow && n >= 2) {
+                hp.x = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
+                hp.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+                hp.z = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
+            }
+            // Remember where this eye's upcoming image will have been rendered from, so it can
+            // be submitted with its true pose next frame even though by then it is stale.
+            g_renderPose[nextEye] = views[nextEye].pose;
+
+            float ox = hp.x - g_centrePos[0];
+            float oy = hp.y - g_centrePos[1];
+            float oz = hp.z - g_centrePos[2];
 
             const float sc = sinf(g_centreYaw), cc = cosf(g_centreYaw);
             float fwdAmt   = -(ox * sc) - (oz * cc);   // along the head's centre forward
@@ -945,15 +996,23 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
 
     if (fs.shouldRender && g_haveEyes && gameDev && CopyBackbufferToD3D11(gameDev)
         && EnsureSwapchain(g_srcW, g_srcH)) {
+        const bool stereo = InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
+        // The backbuffer we are about to copy was drawn with the offset chosen at the END of
+        // the previous frame, so it belongs to g_renderEye - not to whichever eye we are about
+        // to switch to.
+        const int filled = stereo ? g_renderEye : 0;
+
         uint32_t idx = 0;
         XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_swapchain, &ai, &idx))) {
+        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_swapchain[filled], &ai, &idx))) {
             XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
             wi.timeout = XR_INFINITE_DURATION;
-            if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain, &wi))) {
-                g_ctx11->CopyResource(g_scImages[idx], g_uploadTex);
+            if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain[filled], &wi))) {
+                g_ctx11->CopyResource(g_scImages[filled][idx], g_uploadTex);
                 XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-                xrReleaseSwapchainImage(g_swapchain, &ri);
+                xrReleaseSwapchainImage(g_swapchain[filled], &ri);
+                g_eyeFilled[filled] = true;
+                if (!stereo) { g_renderPose[0] = g_eyePose[0]; g_renderPose[1] = g_eyePose[1]; }
 
                 // Both eyes reference the SAME image - this is the MonoTracked rung, not
                 // stereo. It reads as depth-free but correctly oriented, because the game
@@ -974,26 +1033,40 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                     derived.angleUp    =  atanf(g_targetTanY);
                     derived.angleDown  = -atanf(g_targetTanY);
                 }
+                // In mono both eyes reference the one filled swapchain, as before. In stereo
+                // each eye gets its own, submitted with the pose its image was actually
+                // rendered from - which for the eye not drawn this frame is a frame old. That
+                // stale pose is the honest one: telling the compositor where the image really
+                // came from lets it reproject correctly instead of mismatching the two eyes.
                 for (int i = 0; i < 2; ++i) {
+                    const int src = stereo ? i : 0;
                     projViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-                    projViews[i].pose = g_eyePose[i];
+                    projViews[i].pose = stereo ? g_renderPose[i] : g_eyePose[i];
                     projViews[i].fov  = useDerived ? derived : g_eyeFov[i];
-                    projViews[i].subImage.swapchain = g_swapchain;
+                    projViews[i].subImage.swapchain = g_swapchain[src];
                     projViews[i].subImage.imageRect.offset = { 0, 0 };
                     projViews[i].subImage.imageRect.extent = { (int32_t)g_scWidth, (int32_t)g_scHeight };
                 }
-                layer.space = g_xrSpace;
-                layer.viewCount = 2;
-                layer.views = projViews;
-                layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
-                layerCount = 1;
-                if (++g_framesSubmitted == 1) Log("*** FIRST FRAME SUBMITTED TO THE HEADSET ***");
+                // Nothing is submitted until BOTH eyes hold an image, otherwise the first
+                // stereo frame would show one eye a swapchain that has never been written.
+                if (!stereo || (g_eyeFilled[0] && g_eyeFilled[1])) {
+                    layer.space = g_xrSpace;
+                    layer.viewCount = 2;
+                    layer.views = projViews;
+                    layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
+                    layerCount = 1;
+                    if (++g_framesSubmitted == 1) Log("*** FIRST FRAME SUBMITTED TO THE HEADSET ***");
+                }
             } else {
                 XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-                xrReleaseSwapchainImage(g_swapchain, &ri);
+                xrReleaseSwapchainImage(g_swapchain[filled], &ri);
             }
         }
     }
+
+    // Hand the next frame to the other eye. Done after submission so the block above still
+    // refers to the eye the just-finished frame was drawn for.
+    if (InterlockedCompareExchange(&g_stereo, 0, 0)) g_renderEye = 1 - g_renderEye;
 
     XrFrameEndInfo fei{ XR_TYPE_FRAME_END_INFO };
     fei.displayTime = fs.predictedDisplayTime;
@@ -1023,8 +1096,13 @@ const UINT kScratchVecs    = 256;   // vs_3_0's full float-constant file
 HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                                            const float* data, UINT vec4Count) {
     const bool scan   = InterlockedCompareExchange(&g_scanArmed, 0, 0) != 0;
-    const bool sixDof = InterlockedCompareExchange(&g_sixDof, 0, 0) != 0;
-    const bool inject = sixDof || InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
+    // Stereo and 6-DOF share one path: g_hmdOffset is the mapped position of the eye this
+    // frame belongs to, which already contains both the head's movement and the eye's own
+    // displacement. They cannot be separated here, so stereo necessarily brings positional
+    // head tracking with it - which is the behaviour we want anyway.
+    const bool posOffset = InterlockedCompareExchange(&g_sixDof, 0, 0) != 0 ||
+                           InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
+    const bool inject = posOffset || InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
 
     // Cheap always-on capture of the projection the game is really using. Once the matrix has
     // been located we know exactly which register to look at, so this is a bounds check on
@@ -1089,10 +1167,10 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         // happens to be facing.
         float o[3] = {0,0,0};
         if (inject) {
-            if (sixDof) { o[0] = g_hmdOffset[0]; o[1] = g_hmdOffset[1]; o[2] = g_hmdOffset[2]; }
-            else        { o[0] = g_camRight[0] * g_offsetUU;
-                          o[1] = g_camRight[1] * g_offsetUU;
-                          o[2] = g_camRight[2] * g_offsetUU; }
+            if (posOffset) { o[0] = g_hmdOffset[0]; o[1] = g_hmdOffset[1]; o[2] = g_hmdOffset[2]; }
+            else           { o[0] = g_camRight[0] * g_offsetUU;
+                             o[1] = g_camRight[1] * g_offsetUU;
+                             o[2] = g_camRight[2] * g_offsetUU; }
         }
 
         // Once the matrix is located, only its window needs testing. That matters now that
@@ -1121,6 +1199,11 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                     float tx = 0, ty = 0;
                     ProjTangents(r, c, &tx, &ty);
                     ApplyProjection(m, c, tx, ty, g_targetTanX, g_targetTanY);
+                    // Measure the RESULT, not just the input. The observed-FOV capture at the
+                    // top of this function reads the engine's matrix before we touch it, so it
+                    // reports the engine's drift and says nothing about whether our forcing
+                    // arithmetic is right. Reading it back after the edit closes that loop.
+                    ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
                 }
                 break;      // one convention per window; both cannot be true of one matrix
             }
@@ -1235,8 +1318,16 @@ void ApplyVrFov() {
         Log("    engine FOV read back before write: mCurrentPOV %.1f (range %.1f-%.1f over the"
             " last 60), mDesiredPOV %.1f, mCurrentFOV %.1f",
             povBefore, povMin, povMax, desBefore, curBefore);
-        Log("    matrix reports %.1f x %.1f deg (spread within the frame %.1f-%.1f deg horiz,"
-            " %d window(s) injected)",
+        Log("    after forcing, the matrix measures %.1f x %.1f deg (want %.1f x %.1f)",
+            g_forcedTanX > 0 ? 2.0f * atanf(g_forcedTanX) * 57.2957795f : 0.0f,
+            g_forcedTanY > 0 ? 2.0f * atanf(g_forcedTanY) * 57.2957795f : 0.0f,
+            2.0f * atanf(g_targetTanX) * 57.2957795f,
+            2.0f * atanf(g_targetTanY) * 57.2957795f);
+        // NB the figure below is the ENGINE's matrix as it arrived, before our edit - it is a
+        // measure of the engine's drift, not of our output. The count is per DRAW CALL using
+        // the camera matrix, not per distinct matrix; ~50-60 a frame is normal.
+        Log("    engine's own matrix on arrival: %.1f x %.1f deg (spread within the frame"
+            " %.1f-%.1f deg horiz, %d draw call(s) modified)",
             g_projTanX > 0 ? 2.0f * atanf(g_projTanX) * 57.2957795f : 0.0f,
             g_projTanY > 0 ? 2.0f * atanf(g_projTanY) * 57.2957795f : 0.0f,
             g_capTanMin < 1e8f ? 2.0f * atanf(g_capTanMin) * 57.2957795f : 0.0f,
@@ -1333,6 +1424,18 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      InterlockedExchange(&g_vrProjection, was?0:1);
                      Log("F6: VR-correct projection %s", was?"OFF (headset FOV claimed, as before)":"ON"); }
     p6 = k6;
+    static bool p12 = false;
+    bool k12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+    if (k12 && !p12) { LONG was = InterlockedCompareExchange(&g_stereo,0,0);
+                       InterlockedExchange(&g_stereo, was?0:1);
+                       g_eyeFilled[0] = g_eyeFilled[1] = false;
+                       g_renderEye = 0;
+                       Log("F12: alternate-eye STEREO %s%s", was?"OFF":"ON",
+                           was?"":" - each eye now updates at half the frame rate");
+                       if (!was) Log("    stereo shares the position path, so it brings"
+                                     " positional head tracking with it whether F10 is on or not");
+                     }
+    p12 = k12;
     static bool p10 = false;
     bool k10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (k10 && !p10) { LONG was = InterlockedCompareExchange(&g_sixDof,0,0);

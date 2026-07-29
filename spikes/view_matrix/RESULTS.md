@@ -148,7 +148,8 @@ Connect Virtual Desktop first, launch the dev copy, reach gameplay.
 |---|---|
 | **F7** | Scan one frame for the view matrix, then report |
 | **F10** | **6-DOF** — drive the offset from the headset's real position |
-| **F6** | **VR-correct projection** (on by default) — submit the real frustum, widen the game FOV |
+| **F12** | **Alternate-eye stereo** — left/right on successive frames |
+| **F6** | **VR-correct projection** (on by default) — force the frustum, widen the game FOV |
 | **F3** | Constant offset along the camera's right axis (the probe, not the product) |
 | **F11** | Cycle that constant: 300 / 100 / 30 / 10 / 3 UU |
 | F2 | Constant-pitch test (proves the rotation detour still works) |
@@ -201,11 +202,39 @@ dropped while orientation kept working (IMU carries rotation, position needs cam
 update was skipped and the last value persisted forever. Skipping looked like the safe choice
 and was the worst one; the offset now decays to neutral instead and recovers by itself.
 
+## Runs 4–5 — the projection, and why asking the engine was not enough
+
+The wider field read as far more natural, but the image pulsed. The log diagnosed it without a
+second run: against a steady **127.9°** requested, the matrix reported `125.3, 127.2, 125.1,
+123.8, 128.7, … 80.7`. The write **works** and is not clamped — but the engine's camera update
+interpolates back toward its own default between our Present-time writes, each step sized by
+frame duration, hence the 80.7° outlier on a long frame. A rendered FOV swinging 128° → 80° is
+the monitor's zoom flash; submitting that narrow frustum leaves the vertical short, which is the
+bars in the headset.
+
+Asking more politely could not fix it — the engine gets the last word before rendering, the same
+seam problem that defeated seven attempts at rotation. So the frustum is now **forced in the
+matrix** (rescaling the x/y columns is exactly a clip-space scale, hence exactly an FOV change),
+and the engine's FOV is demoted to a culling-only hint with 15% headroom. Run 5 confirms the
+flicker is gone.
+
+Two clarifications for reading the log:
+
+- `engine's own matrix on arrival` measures the matrix **before** our edit — it reports the
+  engine's ongoing drift (80°–141°), not our output. The `after forcing` line verifies ours.
+- The modification count is per **draw call** using the camera matrix, not per distinct matrix.
+  50–60 a frame is normal and expected.
+
+Also measured: rendering wider than the engine culled for produced **0 px** of culling band
+throughout gameplay, so UE3's per-object culling carries real slack. The headroom stays as
+insurance rather than a demonstrated necessity.
+
 ## Next
 
-1. **Two images per frame** — the last piece for real stereo, and the only hard one left
-2. **Tune `kMetresToUU`** (52.5, from UE3's 16 units per foot) once the projection is correct
-   enough to judge scale against
+1. **Test alternate-eye stereo (F12)** — does it read as depth, and is the half-rate judder
+   tolerable?
+2. **Tune `kMetresToUU`** (52.5, from UE3's 16 units per foot) — the projection is finally
+   correct enough to judge scale against
 
 ## What this build drops
 

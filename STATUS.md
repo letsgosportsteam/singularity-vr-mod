@@ -28,9 +28,9 @@ crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
 
-In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F6** VR-correct projection ·
-**F8** recentre · **F5/F4** flip yaw/pitch sign · **F7** scan for the view matrix ·
-**F3** constant offset probe · **F11** offset amount.
+In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F12** alternate-eye stereo ·
+**F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
+**F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount.
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
@@ -73,7 +73,23 @@ Findings from the same runs, all in `ENGINE_NOTES.md`:
 
 The headset's real position drives the view (F10). Leaning and ducking move the camera.
 
-## VR-correct projection — flicker diagnosed and fixed (not yet re-run)
+## Alternate-eye stereo — built, not yet run (F12)
+
+The game renders once per frame and a D3D9 shim cannot make it render twice, so the cheap route
+to two images is to alternate: this frame is drawn from the left eye, the next from the right,
+each eye's swapchain holding the last image drawn for it, both submitted every frame.
+
+Almost no new maths was needed — **an eye offset is a head position offset**, so each eye's pose
+goes through exactly the same XR→game mapping 6-DOF already uses, and interpupillary distance
+never appears as its own quantity. Consequence worth knowing: stereo shares that path, so it
+brings positional head tracking with it whether or not F10 is on.
+
+The cost is real and is why it is a toggle, not the default: **each eye updates at half the
+frame rate**, and during fast head motion the two eyes disagree. The gain is that it is
+genuinely stereo with correct occlusion — each image really was rendered from that eye's
+position, not reprojected.
+
+## VR-correct projection — flicker FIXED (confirmed run 5)
 
 Run 4: the wider field read as far more natural, but the image pulsed — a zoom flash on the
 monitor, black bars flicking top and bottom in the headset.
@@ -85,10 +101,23 @@ step sized by frame duration — hence the 80.7° outlier on a long frame. A ren
 128° → 80° is a visible zoom, and submitting that narrow frustum leaves the vertical short,
 which is the bars.
 
-**Fix:** force the frustum in the matrix (rescaling the x/y columns is exactly an FOV change),
-and demote the engine's FOV to a **culling-only** hint asked for at 15% headroom. The submitted
-OpenXR frustum is now the same forced constant rather than the observed value, so the two
+**Fix, confirmed:** force the frustum in the matrix (rescaling the x/y columns is exactly an FOV
+change), and demote the engine's FOV to a **culling-only** hint asked for at 15% headroom. The
+submitted OpenXR frustum is the same forced constant rather than the observed value, so the two
 cannot disagree.
+
+Run 5 confirms the flicker is gone. Two things the log clarified:
+
+- The engine's drift **continues** (its FOV read back anywhere from 65° to 133.9°, its matrix
+  arriving between 80° and 141°) and no longer matters, which is the point of forcing.
+- Despite rendering wider than the engine culled for on many frames, the measured culling band
+  stayed **0 px** throughout gameplay. UE3's per-object culling evidently carries enough slack.
+  The 15% headroom stays as insurance rather than a proven necessity.
+
+Read the log carefully on one point: the `engine's own matrix on arrival` figure measures the
+matrix **before** our edit, so it reports the engine's drift, not our output. The separate
+`after forcing` line is the one that verifies our own arithmetic. And the modification count is
+per **draw call** using the camera matrix (~50–60 a frame is normal), not per distinct matrix.
 
 ## VR-correct projection — what it does
 
@@ -101,18 +130,18 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Re-run with the forced projection** and confirm the flicker is gone.
-2. **Explain the brightness change** (run 4): the image is brighter and less blue than during
-   3-DOF testing, though not broken the way the sRGB double-encode was. Two candidates, and
-   they are distinguishable by turning matrix injection off while leaving the projection on:
-   UE3 auto-exposure adapting to a much wider field (benign), or our injection touching a
-   post-processing pass that uses the camera matrix (a real bug). The per-frame injected-window
-   count in the log tests the second directly.
-3. **Get two images per frame** — the last piece for real stereo, and the only hard one left.
-   The architecture renders once per frame, so this needs alternate-eye submission (one frame
-   stale per eye, cheap), engine re-entry (proper, hard), or depth reprojection.
-4. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) once the projection is
+1. **Test alternate-eye stereo (F12)** — does it read as depth, and is the half-rate judder
+   tolerable? If it is not, the alternatives are engine re-entry (proper, hard) or depth
+   reprojection.
+2. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) — the projection is now
    correct enough to judge scale against.
+3. **Explain the brightness change** (run 4, deferred): the image is brighter and less blue than
+   during 3-DOF testing, though not broken the way the sRGB double-encode was. Most likely UE3
+   auto-exposure adapting to a much wider field, which is benign; the alternative is our
+   injection touching a post-processing pass. Distinguishable by pressing F6 (projection off,
+   injection still on) and seeing whether the colour returns.
+4. **Performance** — the frame copy is still a full CPU round-trip, and the wide FOV now draws
+   considerably more geometry. Unmeasured.
 
 ## Other known work, roughly by value
 
