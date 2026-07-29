@@ -357,7 +357,13 @@ volatile LONG g_vrProjection = 1;      // on by default: it is the correct behav
 UINT  g_lockedReg  = 0;
 int   g_lockedConv = CONV_ROW;
 bool  g_haveLock   = false;
-float g_projTanX = 0.0f, g_projTanY = 0.0f;   // tan of half FOV, horizontal and vertical
+float g_projTanX = 0.0f, g_projTanY = 0.0f;   // tan of half FOV, as OBSERVED (diagnostic)
+float g_targetTanX = 0.0f, g_targetTanY = 0.0f;   // what we FORCE into the matrix, and submit
+
+// Ask the engine for more FOV than we actually render with. Its value now only governs CPU
+// culling, and culling wider than we draw costs a little geometry and guarantees no bare edges
+// even on the frames where its interpolation dips well below what we asked for.
+const float kFovHeadroom = 1.15f;
 
 // Per-frame diagnostics, reset each Present. The spread catches a case the single captured
 // value cannot: c0 is written ~50 times a frame by different passes, and if two of them carry
@@ -506,6 +512,33 @@ inline bool IsViewMatrix(float w, float dot, int pt) {
 //   ROW: row3 -= o.x*row0 + o.y*row1 + o.z*row2
 //   COL: the same identity written against the transpose - each register's .w component is
 //        the row3 entry for that column.
+// Force the frustum to an exact target by rescaling the matrix's x and y columns.
+//
+// Run 4 proved the engine will accept a wide FOV but will not HOLD it: the value the matrix
+// reported wobbled 123.8-128.7 degrees frame to frame and once fell to 80.7, against a steady
+// 127.9 requested. That is the engine's own camera update interpolating back toward its
+// default between our Present-time writes, with the size of each step set by frame duration.
+// Asking more politely cannot fix it - the engine gets the last word before rendering.
+//
+// So stop relying on the request and set the projection where nothing can argue: in the
+// matrix, on its way to the GPU, every single upload. The engine's FOV then matters only for
+// CULLING, where being roughly right (and deliberately too wide) is entirely good enough.
+//
+// Scaling the x/y columns is exactly a clip-space x/y scale, which is exactly an FOV change,
+// and it composes correctly after the positional offset.
+void ApplyProjection(Reg4* r, int conv, float curTanX, float curTanY,
+                     float wantTanX, float wantTanY) {
+    if (!(curTanX > 0 && curTanY > 0 && wantTanX > 0 && wantTanY > 0)) return;
+    const float sx = curTanX / wantTanX;
+    const float sy = curTanY / wantTanY;
+    if (conv == CONV_ROW) {
+        for (int i = 0; i < 4; ++i) { r[i].x *= sx; r[i].y *= sy; }
+    } else {
+        r[0].x *= sx; r[0].y *= sx; r[0].z *= sx; r[0].w *= sx;
+        r[1].x *= sy; r[1].y *= sy; r[1].z *= sy; r[1].w *= sy;
+    }
+}
+
 void ApplyOffset(Reg4* r, int conv, const float* o) {
     if (conv == CONV_ROW) {
         float* r3 = &r[3].x;
@@ -928,14 +961,18 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 // Submit the frustum the game ACTUALLY rendered, not the headset's. Claiming
                 // the headset's FOV for an image drawn with a different one stretches
                 // everything uniformly, which is precisely what made scale unjudgeable.
+                // Submit the frustum we FORCED, not the one we observed. Following the
+                // observation was the flicker: the engine's FOV drifts between our writes, so
+                // a submitted frustum that tracked it inherited every wobble. Forcing the
+                // matrix and submitting the same constant means the two agree by construction.
                 bool useDerived = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
-                                  g_projTanX > 0.0f && g_projTanY > 0.0f;
+                                  g_targetTanX > 0.0f && g_targetTanY > 0.0f;
                 XrFovf derived{};
                 if (useDerived) {
-                    derived.angleLeft  = -atanf(g_projTanX);
-                    derived.angleRight =  atanf(g_projTanX);
-                    derived.angleUp    =  atanf(g_projTanY);
-                    derived.angleDown  = -atanf(g_projTanY);
+                    derived.angleLeft  = -atanf(g_targetTanX);
+                    derived.angleRight =  atanf(g_targetTanX);
+                    derived.angleUp    =  atanf(g_targetTanY);
+                    derived.angleDown  = -atanf(g_targetTanY);
                 }
                 for (int i = 0; i < 2; ++i) {
                     projViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
@@ -1007,7 +1044,11 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
             }
         }
     }
-    if ((!scan && !inject) || !data || vec4Count < 4 ||
+    const bool forceProj = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
+                           g_targetTanX > 0.0f && g_targetTanY > 0.0f;
+    const bool modify = inject || forceProj;
+
+    if ((!scan && !modify) || !data || vec4Count < 4 ||
         !InterlockedCompareExchange(&g_camPosValid, 0, 0))
         return g_origSetVSConstF(dev, startReg, data, vec4Count);
 
@@ -1028,7 +1069,7 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         }
     }
 
-    if (inject) {
+    if (modify) {
         // Copy-on-match: the same register slot is reused by shadow and post passes with
         // completely different matrices, so trusting a register number would corrupt those.
         // Re-testing each call scopes the edit to the block the camera actually sits on.
@@ -1046,20 +1087,41 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         // Otherwise offset along the camera's RIGHT axis, not a world axis - that is the
         // actual stereo primitive, and it keeps the effect the same whichever way the player
         // happens to be facing.
-        float o[3];
-        if (sixDof) { o[0] = g_hmdOffset[0]; o[1] = g_hmdOffset[1]; o[2] = g_hmdOffset[2]; }
-        else        { o[0] = g_camRight[0] * g_offsetUU;
-                      o[1] = g_camRight[1] * g_offsetUU;
-                      o[2] = g_camRight[2] * g_offsetUU; }
-        for (UINT j = 0; j <= windows && j + 4 <= copyVecs; ++j) {
+        float o[3] = {0,0,0};
+        if (inject) {
+            if (sixDof) { o[0] = g_hmdOffset[0]; o[1] = g_hmdOffset[1]; o[2] = g_hmdOffset[2]; }
+            else        { o[0] = g_camRight[0] * g_offsetUU;
+                          o[1] = g_camRight[1] * g_offsetUU;
+                          o[2] = g_camRight[2] * g_offsetUU; }
+        }
+
+        // Once the matrix is located, only its window needs testing. That matters now that
+        // the projection is forced on every frame rather than only while 6-DOF is on: the
+        // full sliding scan across thousands of calls per frame would be far too expensive to
+        // leave running permanently, while a bounds check plus one window test is not.
+        UINT first = 0, last = windows;
+        if (g_haveLock) {
+            if (startReg > g_lockedReg || g_lockedReg + 4 > startReg + vec4Count)
+                return g_origSetVSConstF(dev, startReg, data, vec4Count);
+            first = last = g_lockedReg - startReg;
+        }
+
+        for (UINT j = first; j <= last && j + 4 <= copyVecs; ++j) {
             const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
             for (int c = 0; c < 2; ++c) {
+                if (g_haveLock && c != g_lockedConv) continue;
                 float w = 0, len = 0, dot = 0; int pt = 0;
                 if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot, pt)) continue;
                 if (!g_haveLock) { g_lockedReg = startReg + j; g_lockedConv = c; g_haveLock = true; }
                 ++g_injCount;
                 if (!edited) { memcpy(scratch, data, copyVecs * 4 * sizeof(float)); edited = true; }
-                ApplyOffset(reinterpret_cast<Reg4*>(scratch + j * 4), c, o);
+                Reg4* m = reinterpret_cast<Reg4*>(scratch + j * 4);
+                if (inject) ApplyOffset(m, c, o);
+                if (forceProj) {
+                    float tx = 0, ty = 0;
+                    ProjTangents(r, c, &tx, &ty);
+                    ApplyProjection(m, c, tx, ty, g_targetTanX, g_targetTanY);
+                }
                 break;      // one convention per window; both cannot be true of one matrix
             }
         }
@@ -1128,6 +1190,18 @@ void ApplyVrFov() {
     float hFovDeg = 2.0f * atanf(tanf(vHalf) * aspect) * 57.2957795f;
     if (!(hFovDeg > 30.0f && hFovDeg < 170.0f)) return;      // never write nonsense
 
+    // What we FORCE into the matrix and submit to OpenXR - one value, so the two cannot
+    // disagree and nothing can wobble. Vertical is the headset's own, horizontal follows from
+    // the backbuffer's aspect, which keeps the forced frustum consistent with the 16:9 image
+    // we are actually pasting into the eye.
+    g_targetTanY = tanf(vHalf);
+    g_targetTanX = g_targetTanY * aspect;
+
+    // The request to the engine is deliberately wider: it now governs only culling.
+    float askDeg = 2.0f * atanf(tanf(vHalf) * aspect * kFovHeadroom) * 57.2957795f;
+    if (askDeg > 170.0f) askDeg = 170.0f;
+    hFovDeg = askDeg;
+
     // ---- read BEFORE writing: does our value survive the engine's own camera update? ----
     //
     // Run 4 showed the rendered image pulsing between two fields of view - a flash on the
@@ -1154,9 +1228,13 @@ void ApplyVrFov() {
 
     static int n = 0;
     if (++n % 60 == 1) {
-        Log("VR FOV: asked %.1f deg | read back before write: mCurrentPOV %.1f (range %.1f-%.1f"
-            " over the last 60), mDesiredPOV %.1f, mCurrentFOV %.1f",
-            hFovDeg, povBefore, povMin, povMax, desBefore, curBefore);
+        Log("VR FOV: forcing %.1f x %.1f deg into the matrix; asked the engine for %.1f deg"
+            " (culling headroom x%.2f)",
+            2.0f * atanf(g_targetTanX) * 57.2957795f,
+            2.0f * atanf(g_targetTanY) * 57.2957795f, hFovDeg, kFovHeadroom);
+        Log("    engine FOV read back before write: mCurrentPOV %.1f (range %.1f-%.1f over the"
+            " last 60), mDesiredPOV %.1f, mCurrentFOV %.1f",
+            povBefore, povMin, povMax, desBefore, curBefore);
         Log("    matrix reports %.1f x %.1f deg (spread within the frame %.1f-%.1f deg horiz,"
             " %d window(s) injected)",
             g_projTanX > 0 ? 2.0f * atanf(g_projTanX) * 57.2957795f : 0.0f,

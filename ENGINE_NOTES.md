@@ -513,12 +513,46 @@ comfortably wider than needed — full coverage on both axes, surplus falling ou
 Matching horizontally would leave top and bottom short, which is the visible half of the
 aspect mismatch.
 
-This is **self-diagnosing**: the log prints both the FOV asked for and the FOV the matrix
-reports. If UE3 clamps the request, the submitted frustum still matches reality — coverage
-suffers, correctness does not.
-
 Note this does **not** resurrect the culling problem. Widening the FOV widens the engine's own
 culling frustum, since the request goes through the engine rather than round it.
+
+#### ⚠️ The engine ACCEPTS a wide FOV but will not HOLD it
+
+Run 4: the wider field read as far more natural, but the image pulsed — a zoom flash on the
+monitor, black bars flicking in and out top and bottom in the headset. The self-diagnosis paid
+off immediately. Against a steady **127.9°** requested, the matrix reported:
+
+```
+125.3  127.2  125.1  123.8  128.7  124.4  126.1  125.4  124.0  124.0  ...  80.7
+```
+
+So the write **works** — the engine honours it, and this is not a clamp. But the value drifts
+between our Present-time writes: the camera update interpolates back toward its own default
+each tick, with the size of each step set by frame duration, and one long frame produced the
+80.7° outlier. Both symptoms follow: a rendered FOV swinging 128° → 80° is a visible zoom on
+the monitor, and submitting that narrower frustum leaves the vertical badly short, which is the
+top-and-bottom bars.
+
+**Asking more politely cannot fix this** — the engine gets the last word before rendering,
+which is the same seam problem that defeated seven attempts at rotation.
+
+#### The fix: force the projection in the matrix, and demote the engine FOV to culling
+
+Set the frustum where nothing can argue — in the matrix, on its way to the GPU, on every
+upload. Rescaling the x and y columns is exactly a clip-space x/y scale, which is exactly an
+FOV change, and it composes correctly after the positional offset.
+
+The engine's FOV then matters **only for CPU culling**, where being roughly right is fine — so
+it is now asked for **15% more** than we render with, and its drift becomes harmless as long as
+it stays above what we draw.
+
+The submitted OpenXR frustum is the same forced constant rather than the observed value.
+Following the observation was the flicker: a submitted frustum that tracked the engine
+inherited every wobble. Forced and submitted from one number, the two agree by construction.
+
+Performance note: forcing runs every frame, not just while 6-DOF is on, so the full sliding
+scan could not stay in the hot path. Once the matrix is located the hook checks only its
+window — a bounds test plus one window test per covering call.
 
 #### Failure modes should decay, not freeze
 

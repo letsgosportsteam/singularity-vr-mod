@@ -73,27 +73,22 @@ Findings from the same runs, all in `ENGINE_NOTES.md`:
 
 The headset's real position drives the view (F10). Leaning and ducking move the camera.
 
-## ⚠️ VR-correct projection — works, but FLICKERS (run 4)
+## VR-correct projection — flicker diagnosed and fixed (not yet re-run)
 
-The wider field of view reads as far more natural in the headset, but the image pulses: a zoom
-flash on the monitor, black bars flicking in and out top and bottom in the headset. Stops when
-F6 turns it off.
+Run 4: the wider field read as far more natural, but the image pulsed — a zoom flash on the
+monitor, black bars flicking top and bottom in the headset.
 
-The monitor symptom is the important one — that is the game's own backbuffer, so the **rendered**
-FOV is oscillating, not just the metadata we submit. Leading hypothesis: the engine recomputes
-FOV each tick and interpolates toward its own default, so our Present-time write survives some
-frames and not others. A narrow 65°/16:9 frame submitted with its true (narrow) frustum would
-show exactly the reported top-and-bottom bars, since the vertical deficit is far larger than the
-horizontal one.
+The log settled it. Against a steady **127.9°** requested, the matrix reported `125.3, 127.2,
+125.1, 123.8, 128.7, … 80.7`. The write **works** and is not clamped, but the engine's camera
+update interpolates back toward its own default between our Present-time writes, with each
+step sized by frame duration — hence the 80.7° outlier on a long frame. A rendered FOV swinging
+128° → 80° is a visible zoom, and submitting that narrow frustum leaves the vertical short,
+which is the bars.
 
-Second candidate, independent of the first: `c0` is written ~50 times a frame by different
-passes, so if two carry genuinely different projections, the captured FOV depends on which
-wrote last.
-
-**Instrumented, not yet diagnosed.** The build now reads the FOV fields back *before*
-overwriting them (min/max over 60 frames shows the shape of any fight) and reports the spread
-of captured projections within a single frame plus the number of injected windows. That
-separates the two hypotheses.
+**Fix:** force the frustum in the matrix (rescaling the x/y columns is exactly an FOV change),
+and demote the engine's FOV to a **culling-only** hint asked for at 15% headroom. The submitted
+OpenXR frustum is now the same forced constant rather than the observed value, so the two
+cannot disagree.
 
 ## VR-correct projection — what it does
 
@@ -106,7 +101,7 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Diagnose the FOV flicker** from the instrumented log — see the two hypotheses above.
+1. **Re-run with the forced projection** and confirm the flicker is gone.
 2. **Explain the brightness change** (run 4): the image is brighter and less blue than during
    3-DOF testing, though not broken the way the sRGB double-encode was. Two candidates, and
    they are distinguishable by turning matrix injection off while leaving the projection on:
