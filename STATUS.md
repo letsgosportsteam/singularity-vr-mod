@@ -120,7 +120,36 @@ shortfall as the head tilts down is exactly the reported ammo/gun behaviour.
 **Fix:** `kFovHeadroom` 1.15 → **2.5** (asks ~160°, holds ≥130° through the observed dips,
 comfortably past the ~128° needed for 98° vertical). Not yet re-run.
 
-### ✅ Run 10: the eye mapping is CORRECT, and the real culprit is offscreen targets
+### ❌ Run 11: the shadow-map theory is FALSIFIED — and the wall is now clear
+
+The offscreen gate skipped only **11 draws of ~1,640**. Shadow rendering would be hundreds, so
+shadow maps are not being separated by size — either this build allocates them at scene
+resolution (UE3 does exactly that for whole-scene dominant shadows) or they do not pass through
+`SetRenderTarget(0)` as assumed. Behaviour was unchanged, as the numbers predict.
+
+**The reported signature is what matters:** it is not geometry going missing but *textures*,
+worst **on the ground**, flickering while walking, and present in one eye only.
+
+That is the signature of **screen-space UV sampling**. UE3 shaders that derive texture
+coordinates from screen position — deferred decals (a manhole is a decal), projected ground
+effects, SSAO, anything using `ScreenPositionScaleBias` — get that transform from a shader
+constant computed for the **full** render target. Halving the viewport invalidates it, and the
+error differs per half: the left half maps screen x∈[0,1280] as if the target were 2560 wide, the
+right half maps x∈[1280,2560] into UV [0.5,1]. Different wrongness per eye is exactly "renders in
+one eye only", and decal-heavy ground surfaces are the worst affected.
+
+**This is the wall predicted at the outset, and it is broader than "post-processing".** It is
+every shader that reasons in screen space, including ordinary ground decals. Viewport-splitting
+cannot fix it without also finding and rewriting those constants per half — a second
+matrix-hunt-scale investigation with no guarantee of a single interceptable constant.
+
+Note the double-wide render target does **not** rescue this: the constants would then be
+computed for a 5120-wide target and still be wrong for each 2560 half.
+
+**Diagnostic added:** a render-target census logging every distinct target (size, format, draw
+count) once a second, so what is actually being split is known rather than assumed.
+
+### Run 10: the eye mapping is CORRECT (this part stands)
 
 The INSERT test settled the mapping: left-half-only blanked the **right** eye, right-half-only
 blanked the **left**. That is correct, so the swap theory is dead and DELETE is not needed.
@@ -283,12 +312,20 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Re-test F1** with two fixes stacked: the culling headroom (both-eyes disappearances) and the
-   offscreen-target gate (distant textures dropping out). Watch the new `offscreen left alone`
-   count — if it is 0, the shadow-map theory is wrong and the size test is not catching them.
-2. **Decide on the double-wide render target** — now understood as required for correctness, not
-   an optimisation (see the structural finding above). It is the biggest remaining piece of work
-   on this path and worth weighing against depth reprojection before committing.
+**A decision point has been reached — see the run-11 wall above.**
+
+1. **Recommended: pivot to depth reprojection.** It sidesteps this entire class of problem because
+   the game renders **one ordinary full-screen frame** — no viewport games, so every screen-space
+   constant the engine computes stays correct, and every shader behaves exactly as shipped. Both
+   eyes still come from one instant, so the run-6 alternate-eye flicker does not return. The known
+   cost is disocclusion slivers at silhouettes, and the culling-band measurement already showed
+   IPD-scale offsets are tiny. Needs INTZ depth access.
+2. **Or continue duplication** by hunting the screen-space constants (`ScreenPositionScaleBias`
+   and relatives) and rewriting them per half. The same read-it-from-the-data technique that
+   found the view matrix would apply, but it is an open-ended investigation and there may be
+   several such constants rather than one.
+3. **Run the census either way** — one more F1 run reports exactly which targets take the draws,
+   which is worth having on record before abandoning this path.
 3. **Depth reprojection** as the alternative approach, worth building regardless so there's a
    real comparison — and a shipped mode either way.
 4. **The ini** for mode selection, plus a fallback to mono.

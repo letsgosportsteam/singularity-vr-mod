@@ -1358,6 +1358,33 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWOR
 PFN_SetRenderTarget g_origSetRenderTarget = nullptr;
 volatile LONG g_rtIsScene = 1;
 
+// ---- render-target census (run 11) ----
+//
+// The size test above caught only 11 draws of ~1640, so shadow maps are NOT being separated by
+// size - either this build allocates them at scene resolution (UE3 does that for whole-scene
+// dominant shadows) or they never pass through SetRenderTarget(0) the way assumed. Either way
+// the theory was wrong, and rather than guess a fourth time, enumerate: every distinct target,
+// its size and format, and how many draws land on it. That says exactly what is being split.
+struct RtInfo { UINT w, h; D3DFORMAT fmt; int draws; };
+RtInfo g_rtSeen[16]{};
+int    g_rtSeenCount = 0;
+int    g_rtCurrent = -1;
+
+const char* FmtName(D3DFORMAT f) {
+    switch (f) {
+        case D3DFMT_A8R8G8B8:   return "A8R8G8B8";
+        case D3DFMT_X8R8G8B8:   return "X8R8G8B8";
+        case D3DFMT_A16B16G16R16F: return "A16B16G16R16F";
+        case D3DFMT_R32F:       return "R32F";
+        case D3DFMT_G16R16F:    return "G16R16F";
+        case D3DFMT_A2B10G10R10: return "A2B10G10R10";
+        case D3DFMT_D24S8:      return "D24S8";
+        case D3DFMT_D16:        return "D16";
+        case D3DFMT_L8:         return "L8";
+        default:                return "other";
+    }
+}
+
 HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
                                               IDirect3DSurface9* surf) {
     HRESULT hr = g_origSetRenderTarget(dev, idx, surf);
@@ -1366,13 +1393,35 @@ HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
         // backbuffer, and refusing to split would silently disable stereo instead of failing
         // in a way anyone would notice.
         bool scene = true;
-        if (surf && g_srcW && g_srcH) {
+        g_rtCurrent = -1;
+        if (surf) {
             D3DSURFACE_DESC d{};
-            if (SUCCEEDED(surf->GetDesc(&d))) scene = (d.Width == g_srcW && d.Height == g_srcH);
+            if (SUCCEEDED(surf->GetDesc(&d))) {
+                if (g_srcW && g_srcH) scene = (d.Width == g_srcW && d.Height == g_srcH);
+                for (int i = 0; i < g_rtSeenCount; ++i) {
+                    if (g_rtSeen[i].w == d.Width && g_rtSeen[i].h == d.Height &&
+                        g_rtSeen[i].fmt == d.Format) { g_rtCurrent = i; break; }
+                }
+                if (g_rtCurrent < 0 && g_rtSeenCount < 16) {
+                    g_rtSeen[g_rtSeenCount] = { d.Width, d.Height, d.Format, 0 };
+                    g_rtCurrent = g_rtSeenCount++;
+                }
+            }
         }
         InterlockedExchange(&g_rtIsScene, scene ? 1 : 0);
     }
     return hr;
+}
+
+void ReportRenderTargets() {
+    Log("render-target census (draws this second, scene is %ux%u):", g_srcW, g_srcH);
+    for (int i = 0; i < g_rtSeenCount; ++i) {
+        if (!g_rtSeen[i].draws) continue;
+        bool isScene = (g_rtSeen[i].w == g_srcW && g_rtSeen[i].h == g_srcH);
+        Log("    %5ux%-5u %-14s %6d draws  %s", g_rtSeen[i].w, g_rtSeen[i].h,
+            FmtName(g_rtSeen[i].fmt), g_rtSeen[i].draws, isScene ? "<- SPLIT" : "left alone");
+        g_rtSeen[i].draws = 0;
+    }
 }
 
 // Issue one scene draw twice: left half of the viewport, then right. When the draw's matrix
@@ -1396,6 +1445,7 @@ HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
 template <typename DrawFn>
 HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     ++g_drawsTotal;
+    if (g_rtCurrent >= 0 && g_rtCurrent < 16) ++g_rtSeen[g_rtCurrent].draws;
     if (!InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
     // Never split a draw aimed at a shadow map or other offscreen target - see the note on
     // Hook_SetRenderTarget for what that corrupts.
@@ -1753,6 +1803,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
                 offsetPeak, dupPeak - offsetPeak, offscreenPeak,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
+            if (InterlockedCompareExchange(&g_dupDraws, 0, 0)) ReportRenderTargets();
             frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0;
         }
     }
