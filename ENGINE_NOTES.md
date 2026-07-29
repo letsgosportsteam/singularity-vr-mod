@@ -413,6 +413,17 @@ call site did `CALL FUN_0104e390` then stored the returned `FRotator` directly. 
 flows through generic actor plumbing shared with every actor in the game, reached from a dozen
 call sites. Detouring that would affect everything that moves, not just the camera.
 
+**3. `FUN_0104e420` — ruled out.** It sits 48 bytes past the rotation source and is called from
+the same function, so it looked like a position equivalent. Detoured and logged: first arg is
+`0.008` (a delta time), it **returns void**, and the pointer arg reads `(0,0,0)` before *and*
+after — it only reads that struct. Injecting `300.0f` into it caused wild spinning, which
+confirms the struct is an **`FRotator`** (three `int32`s reading as `0.0` when misinterpreted as
+floats) rather than a vector. Signature is `(float deltaTime, FRotator* in, ...)`. Rotation
+again, not position.
+
+Lesson: two functions of near-identical size, adjacent in memory, called from the same site can
+still do unrelated things. Adjacency was not evidence.
+
 **Better approach, not yet attempted:** intercept the **view matrix on its way to the GPU**
 (`SetVertexShaderConstantF`) and apply the per-eye / positional offset there. UE3 is
 shader-based, so the view transform passes through as vertex shader constants. This bypasses the

@@ -106,6 +106,59 @@ typedef FRotator* (__fastcall* PFN_CalcViewRotation)(
 const uintptr_t kCalcViewRotationAddr = 0x0104e390;   // no ASLR: file address == runtime
 PFN_CalcViewRotation g_origCalcViewRotation = nullptr;
 
+// ---------------------------------------------------------------- candidate position source
+// FUN_0104e420 sits 48 bytes past the rotation source and is called from the same function.
+// Same shape (127 vs 129 bytes, __thiscall), but its args differ: a FLOAT first, then a
+// pointer whose first three dwords it reads - the signature of a vector / POV out-parameter.
+// Both reference FName globals, so these look like wrappers that invoke a script function by
+// name; this one may be the camera update that produces the view position.
+//
+// This build only OBSERVES it: log the arguments and what the pointed-to vector contains
+// before and after. Establish what it is before trying to steer it.
+struct FVec3 { float x, y, z; };
+
+typedef void* (__fastcall* PFN_CalcViewPos)(
+    void* self, void* edx_unused,
+    float a1, FVec3* vec, uint32_t a3, uint32_t a4, uint32_t a5);
+
+const uintptr_t kCalcViewPosAddr = 0x0104e420;
+PFN_CalcViewPos g_origCalcViewPos = nullptr;
+
+volatile LONG g_posProbe = 0;     // F7: log what this function sees
+volatile LONG g_posInject = 0;    // F3: offset the vector and see if the view moves
+float g_injectY = 300.0f;
+int g_posHits = 0;
+
+void* __fastcall Hook_CalcViewPos(void* self, void* edx,
+        float a1, FVec3* vec, uint32_t a3, uint32_t a4, uint32_t a5) {
+    FVec3 before{};
+    bool haveBefore = false;
+    if (vec && !IsBadReadPtr(vec, sizeof(FVec3))) { before = *vec; haveBefore = true; }
+
+    void* r = g_origCalcViewPos(self, edx, a1, vec, a3, a4, a5);
+
+    if (InterlockedCompareExchange(&g_posProbe, 0, 0) && g_posHits < 6) {
+        ++g_posHits;
+        FVec3 after{};
+        if (vec && !IsBadReadPtr(vec, sizeof(FVec3))) after = *vec;
+        Log("CalcViewPos #%d: a1=%.3f vec=%p before(%.1f, %.1f, %.1f) after(%.1f, %.1f, %.1f) ret=%p",
+            g_posHits, a1, vec,
+            haveBefore ? before.x : 0.f, haveBefore ? before.y : 0.f, haveBefore ? before.z : 0.f,
+            after.x, after.y, after.z, r);
+        // the return value may itself be a vector pointer, as the rotation one was
+        if (r && !IsBadReadPtr(r, sizeof(FVec3))) {
+            FVec3* rv = static_cast<FVec3*>(r);
+            Log("    returned vector: (%.1f, %.1f, %.1f)", rv->x, rv->y, rv->z);
+        }
+    }
+
+    if (InterlockedCompareExchange(&g_posInject, 0, 0)) {
+        if (r && !IsBadReadPtr(r, sizeof(FVec3))) static_cast<FVec3*>(r)->y += g_injectY;
+        if (vec && !IsBadReadPtr(vec, sizeof(FVec3))) vec->y += g_injectY;
+    }
+    return r;
+}
+
 volatile LONG g_enabled = 0;      // head tracking
 volatile LONG g_constTest = 0;    // constant-pitch proof
 const int32_t kConstPitch = 8000; // ~44 degrees up - unmissable
@@ -709,6 +762,15 @@ void InstallViewHook() {
     }
     if (MH_EnableHook(target) != MH_OK) { Log("MH_EnableHook failed"); return; }
     Log("view rotation detour installed at 0x%08X", kCalcViewRotationAddr);
+
+    void* posTarget = reinterpret_cast<void*>(kCalcViewPosAddr);
+    if (MH_CreateHook(posTarget, reinterpret_cast<void*>(&Hook_CalcViewPos),
+                      reinterpret_cast<void**>(&g_origCalcViewPos)) == MH_OK &&
+        MH_EnableHook(posTarget) == MH_OK) {
+        Log("candidate position detour installed at 0x%08X (F7 = log, F3 = inject)", kCalcViewPosAddr);
+    } else {
+        Log("position detour FAILED at 0x%08X", kCalcViewPosAddr);
+    }
 }
 
 HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
@@ -729,10 +791,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     if (k4&&!p4) { g_pitchSign=-g_pitchSign; Log("F4: pitch sign %+d", g_pitchSign); }
     static bool p3 = false;
     bool k3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
-    if (k3 && !p3) { LONG was = InterlockedCompareExchange(&g_posTest,0,0);
-                     InterlockedExchange(&g_posTest, was?0:1);
-                     Log("F3: camera position test %s (%.0f UU sideways, ALL candidates)",
-                         was?"OFF":"ON", kPosTestUU); }
+    if (k3 && !p3) { LONG was = InterlockedCompareExchange(&g_posInject,0,0);
+                     InterlockedExchange(&g_posInject, was?0:1);
+                     Log("F3: position INJECT %s (%.0f UU on Y via CalcViewPos)",
+                         was?"OFF":"ON", g_injectY); }
+    static bool p7 = false;
+    bool k7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    if (k7 && !p7) { g_posHits = 0;
+                     LONG was = InterlockedCompareExchange(&g_posProbe,0,0);
+                     InterlockedExchange(&g_posProbe, was?0:1);
+                     Log("F7: CalcViewPos logging %s", was?"OFF":"ON"); }
+    p7 = k7;
     static bool p6 = false;
     bool k6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
     if (k6 && !p6) TogglePositionBreakpoint();

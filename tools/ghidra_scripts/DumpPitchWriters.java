@@ -26,10 +26,11 @@ public class DumpPitchWriters extends GhidraScript {
     // AActor::Location while walking. 0x00A0FD0B sits inside FUN_00a0f6e0 - the same generic
     // actor-move plumbing already seen writing rotation - so the interesting ones are the
     // other two.
+    // FUN_0104e420 is called 48 bytes after the view-rotation source FUN_0104e390, from the
+    // same function. If there is a view-POSITION equivalent, this is where it lives.
     private static final String[] EIPS = {
-        "00a15845",   // fired first
-        "00b75dab",
-        "00a0fd0b",   // the known generic SetLocation/SetRotation path
+        "0104e420",
+        "01034168",   // the call site, for surrounding context
     };
 
     @Override
