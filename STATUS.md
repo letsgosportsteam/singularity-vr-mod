@@ -73,7 +73,29 @@ Findings from the same runs, all in `ENGINE_NOTES.md`:
 
 The headset's real position drives the view (F10). Leaning and ducking move the camera.
 
-## VR-correct projection — built, not yet run
+## ⚠️ VR-correct projection — works, but FLICKERS (run 4)
+
+The wider field of view reads as far more natural in the headset, but the image pulses: a zoom
+flash on the monitor, black bars flicking in and out top and bottom in the headset. Stops when
+F6 turns it off.
+
+The monitor symptom is the important one — that is the game's own backbuffer, so the **rendered**
+FOV is oscillating, not just the metadata we submit. Leading hypothesis: the engine recomputes
+FOV each tick and interpolates toward its own default, so our Present-time write survives some
+frames and not others. A narrow 65°/16:9 frame submitted with its true (narrow) frustum would
+show exactly the reported top-and-bottom bars, since the vertical deficit is far larger than the
+horizontal one.
+
+Second candidate, independent of the first: `c0` is written ~50 times a frame by different
+passes, so if two carry genuinely different projections, the captured FOV depends on which
+wrote last.
+
+**Instrumented, not yet diagnosed.** The build now reads the FOV fields back *before*
+overwriting them (min/max over 60 frames shows the shape of any fight) and reports the spread
+of captured projections within a single frame plus the number of injected windows. That
+separates the two hypotheses.
+
+## VR-correct projection — what it does
 
 Scale could not be judged in the headset because the projection layer was claiming the
 **headset's** FOV for an image the game rendered at a different one — a uniform stretch that
@@ -84,12 +106,17 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Test the VR projection (F6, on by default)** — the log prints both the FOV asked for and
-   the FOV the matrix reports, so a clamp by UE3 shows up immediately.
-2. **Get two images per frame** — the last piece for real stereo, and the only hard one left.
+1. **Diagnose the FOV flicker** from the instrumented log — see the two hypotheses above.
+2. **Explain the brightness change** (run 4): the image is brighter and less blue than during
+   3-DOF testing, though not broken the way the sRGB double-encode was. Two candidates, and
+   they are distinguishable by turning matrix injection off while leaving the projection on:
+   UE3 auto-exposure adapting to a much wider field (benign), or our injection touching a
+   post-processing pass that uses the camera matrix (a real bug). The per-frame injected-window
+   count in the log tests the second directly.
+3. **Get two images per frame** — the last piece for real stereo, and the only hard one left.
    The architecture renders once per frame, so this needs alternate-eye submission (one frame
    stale per eye, cheap), engine re-entry (proper, hard), or depth reprojection.
-3. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) once the projection is
+4. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) once the projection is
    correct enough to judge scale against.
 
 ## Other known work, roughly by value

@@ -359,6 +359,13 @@ int   g_lockedConv = CONV_ROW;
 bool  g_haveLock   = false;
 float g_projTanX = 0.0f, g_projTanY = 0.0f;   // tan of half FOV, horizontal and vertical
 
+// Per-frame diagnostics, reset each Present. The spread catches a case the single captured
+// value cannot: c0 is written ~50 times a frame by different passes, and if two of them carry
+// genuinely different projections then "the" FOV depends on which one happened to write last -
+// a second, independent way to produce exactly the flicker seen in run 4.
+float g_capTanMin = 1e9f, g_capTanMax = -1e9f;
+int   g_injCount = 0;
+
 // The projection scales, from the x and y columns. See ClipW for how the conventions differ.
 inline void ProjTangents(const Reg4* r, int conv, float* tanX, float* tanY) {
     float xc[3], yc[3];
@@ -993,7 +1000,11 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         float len = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
         if (len > 0.3f && len < 3.0f && fabsf(r[3].w) <= kHitTolOriginUU) {
             float dot = (f[0]*g_camFwd[0] + f[1]*g_camFwd[1] + f[2]*g_camFwd[2]) / len;
-            if (dot >= kMinDotFwd) ProjTangents(r, g_lockedConv, &g_projTanX, &g_projTanY);
+            if (dot >= kMinDotFwd) {
+                ProjTangents(r, g_lockedConv, &g_projTanX, &g_projTanY);
+                if (g_projTanX < g_capTanMin) g_capTanMin = g_projTanX;
+                if (g_projTanX > g_capTanMax) g_capTanMax = g_projTanX;
+            }
         }
     }
     if ((!scan && !inject) || !data || vec4Count < 4 ||
@@ -1046,6 +1057,7 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                 float w = 0, len = 0, dot = 0; int pt = 0;
                 if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot, pt)) continue;
                 if (!g_haveLock) { g_lockedReg = startReg + j; g_lockedConv = c; g_haveLock = true; }
+                ++g_injCount;
                 if (!edited) { memcpy(scratch, data, copyVecs * 4 * sizeof(float)); edited = true; }
                 ApplyOffset(reinterpret_cast<Reg4*>(scratch + j * 4), c, o);
                 break;      // one convention per window; both cannot be true of one matrix
@@ -1116,17 +1128,44 @@ void ApplyVrFov() {
     float hFovDeg = 2.0f * atanf(tanf(vHalf) * aspect) * 57.2957795f;
     if (!(hFovDeg > 30.0f && hFovDeg < 170.0f)) return;      // never write nonsense
 
+    // ---- read BEFORE writing: does our value survive the engine's own camera update? ----
+    //
+    // Run 4 showed the rendered image pulsing between two fields of view - a flash on the
+    // monitor, black bars flicking in and out at the top and bottom in the headset. The
+    // suspicion is that the engine recomputes FOV each tick and interpolates back toward its
+    // own default, so our Present-time write survives some frames and not others, and the
+    // sawtooth is what the eye sees. Reading the field back before overwriting it settles
+    // that: if the write sticks, this reads our own value every frame; if the engine is
+    // fighting us, the min/max spread shows the shape of the fight.
+    float povBefore = Readable((void*)(cam + CAM_POV_FOV), 4)
+                      ? *reinterpret_cast<float*>(cam + CAM_POV_FOV) : -1.0f;
+    float desBefore = Readable((void*)(cam + CAM_DESIRED_FOV), 4)
+                      ? *reinterpret_cast<float*>(cam + CAM_DESIRED_FOV) : -1.0f;
+    float curBefore = Readable((void*)(cam + CAM_CURRENT_FOV), 4)
+                      ? *reinterpret_cast<float*>(cam + CAM_CURRENT_FOV) : -1.0f;
+
+    static float povMin = 1e9f, povMax = -1e9f;
+    if (povBefore > 0) { if (povBefore < povMin) povMin = povBefore;
+                         if (povBefore > povMax) povMax = povBefore; }
+
     if (Readable((void*)(cam + CAM_POV_FOV), 4))     *reinterpret_cast<float*>(cam + CAM_POV_FOV) = hFovDeg;
     if (Readable((void*)(cam + CAM_DESIRED_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_DESIRED_FOV) = hFovDeg;
     if (Readable((void*)(cam + CAM_CURRENT_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_CURRENT_FOV) = hFovDeg;
 
     static int n = 0;
-    if (++n % 300 == 1)
-        Log("VR FOV: asked the game for %.1f deg horizontal (headset vertical %.1f, aspect %.2f);"
-            " matrix reports %.1f x %.1f deg",
-            hFovDeg, vHalf * 2.0f * 57.2957795f, aspect,
+    if (++n % 60 == 1) {
+        Log("VR FOV: asked %.1f deg | read back before write: mCurrentPOV %.1f (range %.1f-%.1f"
+            " over the last 60), mDesiredPOV %.1f, mCurrentFOV %.1f",
+            hFovDeg, povBefore, povMin, povMax, desBefore, curBefore);
+        Log("    matrix reports %.1f x %.1f deg (spread within the frame %.1f-%.1f deg horiz,"
+            " %d window(s) injected)",
             g_projTanX > 0 ? 2.0f * atanf(g_projTanX) * 57.2957795f : 0.0f,
-            g_projTanY > 0 ? 2.0f * atanf(g_projTanY) * 57.2957795f : 0.0f);
+            g_projTanY > 0 ? 2.0f * atanf(g_projTanY) * 57.2957795f : 0.0f,
+            g_capTanMin < 1e8f ? 2.0f * atanf(g_capTanMin) * 57.2957795f : 0.0f,
+            g_capTanMax > 0    ? 2.0f * atanf(g_capTanMax) * 57.2957795f : 0.0f,
+            g_injCount);
+        povMin = 1e9f; povMax = -1e9f;
+    }
 }
 
 void ReportScan() {
@@ -1238,6 +1277,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // constants for the frame about to be presented were uploaded just before we got here.
     RefreshCameraPosition();
     ApplyVrFov();
+    // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
+    g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.
