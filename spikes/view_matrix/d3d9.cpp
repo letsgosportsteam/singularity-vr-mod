@@ -182,6 +182,9 @@ uintptr_t g_camClass = 0, g_camera = 0;
 // Writing them was proven useless in spike 8 - the render does not read them back.
 const int ACTOR_LOCATION   = 0x0054;   // FVector, 3 floats
 const int CAM_POV_LOC      = 0x0420;   // mCurrentPOV location
+const int CAM_POV_FOV      = 0x0438;   // mCurrentPOV FOV - proven to steer the projection
+const int CAM_DESIRED_FOV  = 0x0470;   // mDesiredPOV FOV, the interpolation target
+const int CAM_CURRENT_FOV  = 0x0490;   // mCurrentFOV
 
 uintptr_t FindController() {
     if (g_controller && g_ctlClass && Readable((void*)g_controller, 0x600) &&
@@ -331,6 +334,46 @@ volatile LONG g_sixDof = 0;        // F10
 float g_hmdOffset[3] = {0,0,0};    // game-world offset from the recentre point, in UU
 float g_centrePos[3] = {0,0,0};    // headset position captured at recentre, in XR metres
 bool  g_haveCentrePos = false;
+
+// ---- VR-correct projection (F6) ----
+//
+// Until now the projection layer claimed the game's image spanned the HEADSET's field of view.
+// That is a lie whenever the game renders a different one, and it is why nothing in the
+// headset could be measured against anything: everything was uniformly stretched, so head
+// movement, world scale and object size were all wrong together and none of them could be
+// judged against the others.
+//
+// The fix has two halves that have to travel together:
+//   1. Tell OpenXR the truth - derive the frustum the game ACTUALLY rendered and submit that.
+//   2. Ask the game for a field of view that covers the headset, so the truth is also a
+//      full-coverage image rather than a small correct rectangle floating in black.
+//
+// The truth is read from the matrix rather than assumed, in the same spirit as everything
+// else here: the x and y columns of a world->clip matrix are the projection scales times unit
+// world axes, so their lengths ARE the projection scales, and tan(halfFov) is the reciprocal.
+// That works without knowing whether UE3's FOVAngle is horizontal or vertical, or how it
+// folds in aspect ratio - we never ask, we just read what came out.
+volatile LONG g_vrProjection = 1;      // on by default: it is the correct behaviour
+UINT  g_lockedReg  = 0;
+int   g_lockedConv = CONV_ROW;
+bool  g_haveLock   = false;
+float g_projTanX = 0.0f, g_projTanY = 0.0f;   // tan of half FOV, horizontal and vertical
+
+// The projection scales, from the x and y columns. See ClipW for how the conventions differ.
+inline void ProjTangents(const Reg4* r, int conv, float* tanX, float* tanY) {
+    float xc[3], yc[3];
+    if (conv == CONV_ROW) {
+        xc[0] = r[0].x; xc[1] = r[1].x; xc[2] = r[2].x;
+        yc[0] = r[0].y; yc[1] = r[1].y; yc[2] = r[2].y;
+    } else {
+        xc[0] = r[0].x; xc[1] = r[0].y; xc[2] = r[0].z;
+        yc[0] = r[1].x; yc[1] = r[1].y; yc[2] = r[1].z;
+    }
+    float lx = sqrtf(xc[0]*xc[0] + xc[1]*xc[1] + xc[2]*xc[2]);
+    float ly = sqrtf(yc[0]*yc[0] + yc[1]*yc[1] + yc[2]*yc[2]);
+    *tanX = (lx > 1e-6f) ? 1.0f / lx : 0.0f;
+    *tanY = (ly > 1e-6f) ? 1.0f / ly : 0.0f;
+}
 
 // clip.w for point p under the given convention.
 inline float ClipW(const Reg4* r, int conv, const float* p) {
@@ -808,7 +851,21 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         // XR is Y-up, right-handed, forward = -Z, metres. The game is Z-up, X forward,
         // Y right, UU. So decompose the XR offset onto the head's centre axes, then rebuild
         // it on the game's axes at the yaw the game had when we recentred.
-        if ((vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) && g_haveCentrePos) {
+        // Positional tracking can drop while orientation keeps working - the IMU carries
+        // rotation, but position needs the cameras. Run 3 ended with the offset frozen at
+        // (29.8, -30.8, -27.7) UU, repeated identically frame after frame: roughly 0.9 m of
+        // permanent displacement with no way back. Freezing is the wrong failure mode, so
+        // decay to neutral instead. The view drifts home over about a second and recovers by
+        // itself when tracking returns.
+        if (!(vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+            static bool warned = false;
+            if (!warned && InterlockedCompareExchange(&g_sixDof, 0, 0)) {
+                Log("positional tracking LOST - decaying the 6-DOF offset to neutral");
+                warned = true;
+            }
+            for (int i = 0; i < 3; ++i) g_hmdOffset[i] *= 0.94f;
+        }
+        else if (g_haveCentrePos) {
             float ox = views[0].pose.position.x - g_centrePos[0];
             float oy = views[0].pose.position.y - g_centrePos[1];
             float oz = views[0].pose.position.z - g_centrePos[2];
@@ -861,10 +918,22 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 // Both eyes reference the SAME image - this is the MonoTracked rung, not
                 // stereo. It reads as depth-free but correctly oriented, because the game
                 // already rendered from wherever the head was pointing.
+                // Submit the frustum the game ACTUALLY rendered, not the headset's. Claiming
+                // the headset's FOV for an image drawn with a different one stretches
+                // everything uniformly, which is precisely what made scale unjudgeable.
+                bool useDerived = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
+                                  g_projTanX > 0.0f && g_projTanY > 0.0f;
+                XrFovf derived{};
+                if (useDerived) {
+                    derived.angleLeft  = -atanf(g_projTanX);
+                    derived.angleRight =  atanf(g_projTanX);
+                    derived.angleUp    =  atanf(g_projTanY);
+                    derived.angleDown  = -atanf(g_projTanY);
+                }
                 for (int i = 0; i < 2; ++i) {
                     projViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
                     projViews[i].pose = g_eyePose[i];
-                    projViews[i].fov  = g_eyeFov[i];
+                    projViews[i].fov  = useDerived ? derived : g_eyeFov[i];
                     projViews[i].subImage.swapchain = g_swapchain;
                     projViews[i].subImage.imageRect.offset = { 0, 0 };
                     projViews[i].subImage.imageRect.extent = { (int32_t)g_scWidth, (int32_t)g_scHeight };
@@ -912,6 +981,21 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     const bool scan   = InterlockedCompareExchange(&g_scanArmed, 0, 0) != 0;
     const bool sixDof = InterlockedCompareExchange(&g_sixDof, 0, 0) != 0;
     const bool inject = sixDof || InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
+
+    // Cheap always-on capture of the projection the game is really using. Once the matrix has
+    // been located we know exactly which register to look at, so this is a bounds check on
+    // most calls and a single window test on the few that carry it - affordable every frame,
+    // unlike the full scan. Verified per call rather than trusted, because the same register
+    // is reused by other passes.
+    if (g_haveLock && startReg <= g_lockedReg && g_lockedReg + 4 <= startReg + vec4Count) {
+        const Reg4* r = reinterpret_cast<const Reg4*>(data + (g_lockedReg - startReg) * 4);
+        float f[3]; FwdVec(r, g_lockedConv, f);
+        float len = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+        if (len > 0.3f && len < 3.0f && fabsf(r[3].w) <= kHitTolOriginUU) {
+            float dot = (f[0]*g_camFwd[0] + f[1]*g_camFwd[1] + f[2]*g_camFwd[2]) / len;
+            if (dot >= kMinDotFwd) ProjTangents(r, g_lockedConv, &g_projTanX, &g_projTanY);
+        }
+    }
     if ((!scan && !inject) || !data || vec4Count < 4 ||
         !InterlockedCompareExchange(&g_camPosValid, 0, 0))
         return g_origSetVSConstF(dev, startReg, data, vec4Count);
@@ -961,6 +1045,7 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
             for (int c = 0; c < 2; ++c) {
                 float w = 0, len = 0, dot = 0; int pt = 0;
                 if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot, pt)) continue;
+                if (!g_haveLock) { g_lockedReg = startReg + j; g_lockedConv = c; g_haveLock = true; }
                 if (!edited) { memcpy(scratch, data, copyVecs * 4 * sizeof(float)); edited = true; }
                 ApplyOffset(reinterpret_cast<Reg4*>(scratch + j * 4), c, o);
                 break;      // one convention per window; both cannot be true of one matrix
@@ -1008,6 +1093,42 @@ void RefreshCameraPosition() {
     InterlockedExchange(&g_camPosValid, (ok && d2 > 1000.0f) ? 1 : 0);
 }
 
+// Ask the game for a field of view wide enough to cover the headset.
+//
+// Match the headset's VERTICAL FOV rather than its horizontal. The game renders 16:9 (wider
+// than tall) while a per-eye view is nearly square, so equal vertical FOV leaves the game's
+// horizontal field comfortably wider than the headset needs - full coverage on both axes,
+// with the surplus simply falling outside the eye. Matching horizontally instead would leave
+// the top and bottom short, which is the visible half of the current aspect mismatch.
+//
+// Written every frame because the engine recomputes it, and to all three FOV fields so the
+// interpolator does not drag it back. mCurrentPOV's FOV is the one proven to steer the
+// projection; the other two stop it fighting.
+void ApplyVrFov() {
+    if (!InterlockedCompareExchange(&g_vrProjection, 0, 0)) return;
+    if (!g_haveEyes || g_srcW == 0 || g_srcH == 0) return;
+    uintptr_t cam = FindCamera();
+    if (!cam) return;
+
+    float vHalf = (fabsf(g_eyeFov[0].angleUp) + fabsf(g_eyeFov[0].angleDown)) * 0.5f;
+    if (!(vHalf > 0.05f && vHalf < 1.5f)) return;
+    float aspect = (float)g_srcW / (float)g_srcH;
+    float hFovDeg = 2.0f * atanf(tanf(vHalf) * aspect) * 57.2957795f;
+    if (!(hFovDeg > 30.0f && hFovDeg < 170.0f)) return;      // never write nonsense
+
+    if (Readable((void*)(cam + CAM_POV_FOV), 4))     *reinterpret_cast<float*>(cam + CAM_POV_FOV) = hFovDeg;
+    if (Readable((void*)(cam + CAM_DESIRED_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_DESIRED_FOV) = hFovDeg;
+    if (Readable((void*)(cam + CAM_CURRENT_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_CURRENT_FOV) = hFovDeg;
+
+    static int n = 0;
+    if (++n % 300 == 1)
+        Log("VR FOV: asked the game for %.1f deg horizontal (headset vertical %.1f, aspect %.2f);"
+            " matrix reports %.1f x %.1f deg",
+            hFovDeg, vHalf * 2.0f * 57.2957795f, aspect,
+            g_projTanX > 0 ? 2.0f * atanf(g_projTanX) * 57.2957795f : 0.0f,
+            g_projTanY > 0 ? 2.0f * atanf(g_projTanY) * 57.2957795f : 0.0f);
+}
+
 void ReportScan() {
     Log("--- scan complete: %d candidate window(s), camera (%.1f, %.1f, %.1f) POV (%.1f, %.1f, %.1f)",
         g_hitCount, g_camPos[0], g_camPos[1], g_camPos[2], g_povPos[0], g_povPos[1], g_povPos[2]);
@@ -1046,6 +1167,11 @@ void ReportScan() {
     }
     Log("    %d of %d windows pass BOTH tests (** marked). Only those are injected into.",
         passing, g_hitCount);
+    if (passing > 0 && IsViewMatrix(g_hits[0].w, g_hits[0].dotFwd, g_hits[0].pt)) {
+        g_lockedReg = g_hits[0].startReg; g_lockedConv = g_hits[0].conv; g_haveLock = true;
+        Log("    locked on c%u %s for per-frame projection capture",
+            g_lockedReg, g_lockedConv == CONV_ROW ? "ROW" : "COL");
+    }
     Log("    -> F3 offsets the camera %.0f UU along its own right axis. F11 changes the amount.",
         g_offsetUU);
 }
@@ -1084,6 +1210,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      Log("F3: matrix camera offset %s (%.0f UU along the camera's right axis)",
                          was?"OFF":"ON", g_offsetUU); }
     p3 = k3;
+    static bool p6 = false;
+    bool k6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (k6 && !p6) { LONG was = InterlockedCompareExchange(&g_vrProjection,0,0);
+                     InterlockedExchange(&g_vrProjection, was?0:1);
+                     Log("F6: VR-correct projection %s", was?"OFF (headset FOV claimed, as before)":"ON"); }
+    p6 = k6;
     static bool p10 = false;
     bool k10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     if (k10 && !p10) { LONG was = InterlockedCompareExchange(&g_sixDof,0,0);
@@ -1105,6 +1237,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // the frame's draw calls - which is exactly what Present-time refresh gives us, since the
     // constants for the frame about to be presented were uploaded just before we got here.
     RefreshCameraPosition();
+    ApplyVrFov();
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.

@@ -28,9 +28,9 @@ crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
 
-In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F8** recentre ·
-**F5/F4** flip yaw/pitch sign · **F7** scan for the view matrix · **F3** constant offset probe ·
-**F11** offset amount.
+In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F6** VR-correct projection ·
+**F8** recentre · **F5/F4** flip yaw/pitch sign · **F7** scan for the view matrix ·
+**F3** constant offset probe · **F11** offset amount.
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
@@ -69,15 +69,28 @@ Findings from the same runs, all in `ENGINE_NOTES.md`:
   1.4–2.9% band at 300 UU, and **0 px at 100 UU and below**. The planned FOV-widening job is
   therefore **dropped** — a real IPD is a few UU.
 
+## ✅ 6-DOF — working, confirmed 2026-07-29
+
+The headset's real position drives the view (F10). Leaning and ducking move the camera.
+
+## VR-correct projection — built, not yet run
+
+Scale could not be judged in the headset because the projection layer was claiming the
+**headset's** FOV for an image the game rendered at a different one — a uniform stretch that
+made head movement, world scale and object size all wrong together, so none could be measured
+against another. Now the submitted frustum is *derived from the matrix* (read, not assumed) and
+the game is asked for a vertical FOV matching the headset so that truth also fills the view.
+Toggle with **F6**.
+
 ### ⏭ Next actions
 
-1. **Test 6-DOF (F10)** — built, not yet run. Feeds the headset's real position in as the
-   offset. Leaning and ducking should move the view.
-2. **Get two images per frame** — the last piece for real stereo, and now the only hard one
-   left. The architecture renders once per frame, so this needs alternate-eye submission (one
-   frame stale per eye, cheap), engine re-entry (proper, hard), or depth reprojection.
-3. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) if head movement feels
-   over- or under-scaled in game.
+1. **Test the VR projection (F6, on by default)** — the log prints both the FOV asked for and
+   the FOV the matrix reports, so a clamp by UE3 shows up immediately.
+2. **Get two images per frame** — the last piece for real stereo, and the only hard one left.
+   The architecture renders once per frame, so this needs alternate-eye submission (one frame
+   stale per eye, cheap), engine re-entry (proper, hard), or depth reprojection.
+3. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) once the projection is
+   correct enough to judge scale against.
 
 ## Other known work, roughly by value
 

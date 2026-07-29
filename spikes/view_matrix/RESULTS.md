@@ -148,6 +148,7 @@ Connect Virtual Desktop first, launch the dev copy, reach gameplay.
 |---|---|
 | **F7** | Scan one frame for the view matrix, then report |
 | **F10** | **6-DOF** — drive the offset from the headset's real position |
+| **F6** | **VR-correct projection** (on by default) — submit the real frustum, widen the game FOV |
 | **F3** | Constant offset along the camera's right axis (the probe, not the product) |
 | **F11** | Cycle that constant: 300 / 100 / 30 / 10 / 3 UU |
 | F2 | Constant-pitch test (proves the rotation detour still works) |
@@ -179,14 +180,32 @@ If nothing matches, the log prints the closest window it saw, so a failed scan s
 evidence rather than silence. The remaining suspects would be a matrix split across two calls,
 or one reaching the GPU by some path other than `SetVertexShaderConstantF`.
 
+## Run 3 — 6-DOF works, and exposed two more things
+
+Head position drives the view; leaning and ducking move the camera. Two findings came out of
+the same log.
+
+**Scale was unjudgeable because the projection layer was lying.** It claimed the *headset's*
+FOV for an image the game rendered at a different one, which stretches everything by one
+uniform factor — head movement, world scale and object size all wrong together, so none can be
+measured against another. Now the frustum is **derived from the matrix** (the x and y column
+lengths are the projection scales; `tan(halfFov)` is the reciprocal), and the game is asked for
+a **vertical** FOV matching the headset — vertical because 16:9 is wider than a near-square eye
+view, so equal vertical FOV over-covers horizontally and fills both axes. Self-diagnosing: the
+log prints the FOV requested *and* the FOV the matrix reports, so a UE3 clamp is visible
+immediately.
+
+**The 6-DOF offset froze on tracking loss.** The run ended with `(29.8, -30.8, -27.7)` UU
+repeated identically — ~0.9 m of permanent displacement, no way back. Positional tracking had
+dropped while orientation kept working (IMU carries rotation, position needs cameras), so the
+update was skipped and the last value persisted forever. Skipping looked like the safe choice
+and was the worst one; the offset now decays to neutral instead and recovers by itself.
+
 ## Next
 
-1. **F11 down the offset** and find where the culling band stops mattering — that sizes the
-   FOV-widening job, or removes it
-2. **Widen the render FOV** via `mCurrentPOV +0x0438` so the margin covers the offset
-3. **Two images per frame**, the remaining piece for real stereo
-4. **6-DOF**, now mostly free — feed the HMD's positional delta in as the offset instead of a
-   constant
+1. **Two images per frame** — the last piece for real stereo, and the only hard one left
+2. **Tune `kMetresToUU`** (52.5, from UE3's 16 units per foot) once the projection is correct
+   enough to judge scale against
 
 ## What this build drops
 

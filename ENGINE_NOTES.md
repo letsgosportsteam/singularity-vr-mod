@@ -488,6 +488,49 @@ Caveat on the metric: it counts *near-black* columns, so a genuinely dark scene 
 — a 502 px reading appeared with injection **off**. That failure mode only ever inflates the
 number, never deflates it, so the zeros are trustworthy and the conclusion holds.
 
+#### The projection layer was claiming an FOV the game never rendered
+
+Until run 3 the OpenXR projection layer submitted `projViews[i].fov = <the headset's FOV>`,
+while the game was rendering something else entirely (65° horizontal, 16:9). That is a lie to
+the compositor, and it has a specific consequence: **everything is stretched by one uniform
+factor**, so head movement, world scale and object size are all wrong *together* — and nothing
+can be judged against anything else. This is why 6-DOF scale could not be assessed by eye.
+
+The fix has two halves that only work together:
+
+1. **Tell OpenXR the truth.** The frustum is *read from the matrix*, not assumed: the x and y
+   columns of a world→clip matrix are the projection scales times unit world axes, so their
+   lengths are the scales and `tan(halfFov)` is the reciprocal. This needs no knowledge of
+   whether UE3's `FOVAngle` is horizontal or vertical, or how it folds in aspect — we never
+   ask, we read what came out. Same trick as the forward vector, third time it has paid off.
+2. **Ask the game to cover the headset**, by writing FOV each frame to `mCurrentPOV +0x0438`
+   (plus `mDesiredPOV +0x0470` and `mCurrentFOV +0x0490`, so the interpolator does not drag it
+   back). Otherwise the truth is a small correct rectangle floating in black.
+
+Match the headset's **vertical** FOV, not its horizontal. The game renders 16:9 while a
+per-eye view is nearly square, so equal vertical FOV leaves the game's horizontal field
+comfortably wider than needed — full coverage on both axes, surplus falling outside the eye.
+Matching horizontally would leave top and bottom short, which is the visible half of the
+aspect mismatch.
+
+This is **self-diagnosing**: the log prints both the FOV asked for and the FOV the matrix
+reports. If UE3 clamps the request, the submitted frustum still matches reality — coverage
+suffers, correctness does not.
+
+Note this does **not** resurrect the culling problem. Widening the FOV widens the engine's own
+culling frustum, since the request goes through the engine rather than round it.
+
+#### Failure modes should decay, not freeze
+
+Run 3 ended with the 6-DOF offset frozen at `(29.8, -30.8, -27.7)` UU — about 0.9 m of
+permanent displacement — repeated identically frame after frame. Cause: positional tracking
+dropped while orientation kept working (the IMU carries rotation; position needs the cameras),
+so the update was skipped and the last value persisted forever with no way back.
+
+Skipping the update looked like the safe choice and was the worst one. The offset now decays
+toward neutral when `XR_VIEW_STATE_POSITION_VALID_BIT` is clear, so the view drifts home over
+about a second and recovers by itself when tracking returns.
+
 #### Measure in the game's frame, not the headset
 
 The band lives in the backbuffer. Judging it through the HMD would mean judging it through the
