@@ -2007,9 +2007,64 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateDevice)(IDirect3D9*, UINT, D3DDEVT
 PFN_CreateDevice g_origCreateDevice = nullptr;
 volatile LONG g_patched = 0;
 
+// ---- render resolution override, from SingularityVR.ini beside the DLL ----
+//
+// Run 13 pointed here. Narrowing the render FOV to 70% cut the texture flicker sharply while the
+// engine's own FOV stayed put (132 deg at 100%, 133 deg at 70%) - so streaming and LOD, which key
+// off the engine's FOV, cannot be the cause. What actually changed is angular sampling density:
+// the same 1280x1440 half squeezed into a narrower field.
+//
+//     100% -> 1280 px over 91.3 deg = 14.0 px/deg   (~55% of the headset's ~25 px/deg)
+//      70% -> 1280 px over 62.5 deg = 20.5 px/deg   (~80%)
+//
+// Undersampling a high-frequency texture and then upscaling it ~1.9x to fill the eye is exactly
+// what shimmers, worst on detailed interiors and small distant objects. So the fix is resolution,
+// not LOD - and raising it lets the full FOV come back.
+//
+// Read from an ini rather than hard-coded so resolutions can be tried without a rebuild, and
+// because mode selection has to live in an ini for the shipped mod anyway. Falls back to the
+// game's own parameters if the override is refused, since an unsupported mode must not be fatal.
+UINT g_forceResX = 0, g_forceResY = 0;
+
+void LoadIniSettings() {
+    char path[MAX_PATH]{};
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&LoadIniSettings, &self);
+    if (!GetModuleFileNameA(self, path, MAX_PATH)) return;
+    char* slash = strrchr(path, '\\');
+    if (!slash) return;
+    strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "SingularityVR.ini");
+
+    g_forceResX = (UINT)GetPrivateProfileIntA("Render", "ResX", 0, path);
+    g_forceResY = (UINT)GetPrivateProfileIntA("Render", "ResY", 0, path);
+    if (g_forceResX && g_forceResY)
+        Log("ini: forcing render resolution %ux%u (per eye %ux%u)",
+            g_forceResX, g_forceResY, g_forceResX / 2, g_forceResY);
+    else
+        Log("ini: no resolution override (add [Render] ResX/ResY to %s)", path);
+}
+
 HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYPE t, HWND w, DWORD f,
                                             D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
-    HRESULT hr = g_origCreateDevice(self, ad, t, w, f, pp, out);
+    LoadIniSettings();
+
+    HRESULT hr = E_FAIL;
+    if (g_forceResX && g_forceResY && pp) {
+        D3DPRESENT_PARAMETERS want = *pp;
+        want.BackBufferWidth  = g_forceResX;
+        want.BackBufferHeight = g_forceResY;
+        hr = g_origCreateDevice(self, ad, t, w, f, &want, out);
+        if (SUCCEEDED(hr)) {
+            Log("render resolution override accepted: %ux%u", g_forceResX, g_forceResY);
+            *pp = want;      // keep the game's copy honest about what it actually got
+        } else {
+            Log("render resolution override REFUSED (hr=0x%08lX) - falling back to %ux%u",
+                (unsigned long)hr, pp->BackBufferWidth, pp->BackBufferHeight);
+        }
+    }
+    if (FAILED(hr)) hr = g_origCreateDevice(self, ad, t, w, f, pp, out);
     if (SUCCEEDED(hr) && out && *out && InterlockedExchange(&g_patched, 1) == 0) {
         g_origPresent = (PFN_Present)PatchVTable(*out, 17, (void*)&Hook_Present);
         // Slot 94 = SetVertexShaderConstantF. Present at 17 already proved this vtable

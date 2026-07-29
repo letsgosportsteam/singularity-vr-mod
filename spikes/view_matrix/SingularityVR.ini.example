@@ -1,0 +1,24 @@
+; Singularity VR mod - settings
+;
+; [Render] ResX / ResY force the game's backbuffer size.
+;
+; With true stereo (F1) the frame is side by side, so each eye gets ResX/2 x ResY.
+; The headset wants roughly 2496x2688 per eye, so matching it means ResX ~= 4992.
+;
+; Why this matters: at the default 2560x1440 each eye is only 1280x1440, which is
+; about 14 pixels per degree at full FOV against the headset's ~25. That
+; undersampling, upscaled to fill the eye, is what makes textures shimmer.
+;
+; Cost: the frame copy is still a CPU round-trip, so pixels are expensive until
+; the D3D9Ex zero-copy path lands. Expect the frame rate to drop as this goes up.
+;
+; Suggested ladder - try these in order and watch both sharpness and fps:
+;   3200x1800   per eye 1600x1800   ~1.6x the pixels
+;   3840x2160   per eye 1920x2160   ~2.3x
+;   4992x2688   per eye 2496x2688   ~3.6x, matches the headset
+;
+; Set both to 0 (or delete them) to leave the game's own resolution alone.
+
+[Render]
+ResX=3840
+ResY=2160

@@ -203,6 +203,52 @@ Two scene-sized targets, both correctly split; the shadow map **is** correctly e
 simply always a small fraction (~1%), which is why excluding it changed nothing visible. Useful to
 have on record rather than assumed.
 
+### ✅ Run 13: the flicker is RESOLUTION, not LOD — theory refuted by its own test
+
+Narrowing the render FOV to 70% cut the flicker sharply. But the engine's own FOV barely moved
+between the two settings — **132.0° at 100% render, 133.4° at 70%** — and the culling headroom
+(PAGE UP) made no perceptible difference at all. Since streaming and LOD key off the *engine's*
+FOV, and that was constant, **the LOD/streaming theory is refuted.**
+
+What actually changed is angular sampling density. The same 1280×1440 half squeezed into a
+narrower field:
+
+| Render FOV | Per-eye px/deg | vs headset (~25 px/deg) |
+|---|---|---|
+| 100% (91.3°) | 1280/91.3 = **14.0** | ~55% |
+| 70% (62.5°) | 1280/62.5 = **20.5** | ~80% |
+
+Undersampling high-frequency texture and then upscaling ~1.9× to fill the eye is exactly what
+shimmers — worst on detailed interiors and small distant objects, which is precisely the reported
+pattern (building interiors, and a desk that vanished at 100% but was visible at 70%).
+
+So the answer to "should we fix LOD to keep the VR FOV" is **no** — the lever is resolution, and
+raising it lets the full FOV come back.
+
+**Test-design error worth recording:** PAGE UP was only ever pressed while at 70% render, where
+the engine's culling (79.9° vertical at headroom 1.0) already comfortably covered our 68.6° render.
+Headroom genuinely could not matter in that configuration, so "no difference" was not evidence
+about headroom at all. The instructions caused that.
+
+### Resolution override (new): `SingularityVR.ini` beside the DLL
+
+```ini
+[Render]
+ResX=3840
+ResY=2160
+```
+
+Forces the backbuffer at `CreateDevice`, falling back to the game's own parameters if the mode is
+refused. Side-by-side means each eye gets `ResX/2 × ResY`. Ladder to try:
+
+| ResX×ResY | Per eye | Pixels vs now |
+|---|---|---|
+| 3200×1800 | 1600×1800 | ~1.6× |
+| 3840×2160 | 1920×2160 | ~2.3× |
+| 4992×2688 | 2496×2688 | ~3.6× — matches the headset |
+
+This is also the first piece of the shipped-mod ini that mode selection will live in.
+
 ### ⚠️ Still open: texture flicker while walking
 
 Distinct from the one-eye bug and still present. Prime suspect is now the **culling headroom
@@ -402,10 +448,13 @@ Toggle with **F6**.
 **Decision taken: continue with true native stereo** (draw-call duplication). Depth reprojection
 stays documented above as the fallback if this path stalls again.
 
-1. **Test the flicker against both FOV controls.** PAGE DOWN first (it lowers what the engine must
-   cull, so it should let PAGE UP come down too), then PAGE UP. If flicker tracks either, the
-   engine's reported FOV is confirmed as the cause and the fix is to widen its culling frustum
-   without inflating the number streaming and LOD read.
+1. **Test the resolution ladder** in `SingularityVR.ini`, at **100%** render FOV (PAGE DOWN back to
+   100%). The prediction: at 3840×2160 the shimmer at full FOV should look roughly like 70% did at
+   2560×1440, because per-eye px/deg becomes 21.0 — nearly identical to the 20.5 that felt good.
+   That is a quantitative prediction, so it either lands or the resolution theory is wrong too.
+   Expect fps to fall; that is the CPU round-trip, and it is the point.
+2. **Then the D3D9Ex zero-copy path.** Now unambiguously the gating item: matching the headset means
+   ~49 MB per frame each way over the CPU, which is not viable. Everything else waits on it.
 2. **Then performance**, which is now the gating item rather than a later nicety. Two reasons it
    has been promoted: the frame copy scales with pixels, so matching the headset's resolution
    multiplies its cost; and the fps distribution is bimodal (median ~70, floor ~13), which is the
