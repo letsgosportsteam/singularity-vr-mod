@@ -148,7 +148,8 @@ Connect Virtual Desktop first, launch the dev copy, reach gameplay.
 |---|---|
 | **F7** | Scan one frame for the view matrix, then report |
 | **F10** | **6-DOF** — drive the offset from the headset's real position |
-| **F12** | **Alternate-eye stereo** — left/right on successive frames |
+| **F1** | **True stereo** — every scene draw issued twice, viewport split, both eyes one instant |
+| **F12** | **Alternate-eye stereo** — left/right on successive frames (flickers on head turn) |
 | **F6** | **VR-correct projection** (on by default) — force the frustum, widen the game FOV |
 | **F3** | Constant offset along the camera's right axis (the probe, not the product) |
 | **F11** | Cycle that constant: 300 / 100 / 30 / 10 / 3 UU |

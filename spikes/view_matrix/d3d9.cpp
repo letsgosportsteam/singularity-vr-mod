@@ -665,6 +665,31 @@ int     g_renderEye = 0;             // which eye the frame now being drawn belo
 XrPosef g_renderPose[2]{};           // the pose each eye's stored image was rendered from
 bool    g_eyeFilled[2] = { false, false };
 
+// ---- TRUE STEREO BY DRAW-CALL DUPLICATION (F1) ----
+//
+// Alternate-eye's flaw is temporal: the two eyes show the world at different instants, which
+// no amount of reprojection can reconcile, and head rotation makes it obvious. The fix is to
+// draw both eyes from the SAME instant, which means issuing every scene draw twice.
+//
+// The prototype needs no double-wide render target. Split the existing backbuffer down the
+// middle with the VIEWPORT: left half gets the left-eye matrix, right half the right-eye
+// matrix, and OpenXR is handed each half as a subImage rect. Half horizontal resolution per
+// eye, but the technique is complete and end-to-end - if it works here, widening the target
+// later is an optimisation rather than a question.
+//
+// Viewport switching rather than render-target switching is what keeps this affordable: two
+// extra API calls and one extra draw per scene draw, no target rebinds.
+//
+// Known-imperfect by design at this stage: full-screen passes (post-processing, HUD) are NOT
+// duplicated, because they do not have the camera matrix bound. They will process the
+// side-by-side image as a single picture, so expect bloom and similar effects to bleed across
+// the seam and the HUD to sit across both halves. That is the next problem, not this one.
+volatile LONG g_dupDraws = 0;
+float g_eyeDeltaUU[3] = {0,0,0};     // left eye -> right eye, in game world units
+bool  g_camMatrixBound = false;      // is the camera's view matrix the one currently set?
+float g_lastCamMat[16] = {0};        // the left-eye matrix exactly as we last sent it
+int   g_drawsTotal = 0, g_drawsDuped = 0;
+
 IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
 UINT g_srcW = 0, g_srcH = 0;
@@ -946,9 +971,12 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             // mono, use the midpoint of the two eyes so the view is not biased half an IPD to
             // the left.
             const bool stereoNow = InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
+            const bool dupNow = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
             const int nextEye = stereoNow ? (1 - g_renderEye) : 0;
             XrVector3f hp = views[nextEye].pose.position;
-            if (!stereoNow && n >= 2) {
+            // Duplication draws the LEFT eye through the constant hook and derives the right
+            // from it, so the base offset must be eye 0 exactly - not the midpoint.
+            if (!stereoNow && !dupNow && n >= 2) {
                 hp.x = (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
                 hp.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
                 hp.z = (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
@@ -971,6 +999,20 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             g_hmdOffset[0] = (bc * fwdAmt - bs * rightAmt) * kMetresToUU;
             g_hmdOffset[1] = (bs * fwdAmt + bc * rightAmt) * kMetresToUU;
             g_hmdOffset[2] = upAmt * kMetresToUU;
+
+            // Left eye -> right eye, through the identical transform. The mapping is linear,
+            // so it can be applied to the separation vector directly; interpupillary distance
+            // still never needs naming.
+            if (n >= 2) {
+                float dx = views[1].pose.position.x - views[0].pose.position.x;
+                float dy = views[1].pose.position.y - views[0].pose.position.y;
+                float dz = views[1].pose.position.z - views[0].pose.position.z;
+                float dFwd   = -(dx * sc) - (dz * cc);
+                float dRight =  (dx * cc) - (dz * sc);
+                g_eyeDeltaUU[0] = (bc * dFwd - bs * dRight) * kMetresToUU;
+                g_eyeDeltaUU[1] = (bs * dFwd + bc * dRight) * kMetresToUU;
+                g_eyeDeltaUU[2] = dy * kMetresToUU;
+            }
         }
         float dYaw = yawRad - g_centreYaw;
         while (dYaw >  3.14159265f) dYaw -= 6.2831853f;
@@ -1038,14 +1080,23 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 // rendered from - which for the eye not drawn this frame is a frame old. That
                 // stale pose is the honest one: telling the compositor where the image really
                 // came from lets it reproject correctly instead of mismatching the two eyes.
+                const bool dupNow = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
                 for (int i = 0; i < 2; ++i) {
                     const int src = stereo ? i : 0;
                     projViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
                     projViews[i].pose = stereo ? g_renderPose[i] : g_eyePose[i];
                     projViews[i].fov  = useDerived ? derived : g_eyeFov[i];
                     projViews[i].subImage.swapchain = g_swapchain[src];
-                    projViews[i].subImage.imageRect.offset = { 0, 0 };
-                    projViews[i].subImage.imageRect.extent = { (int32_t)g_scWidth, (int32_t)g_scHeight };
+                    if (dupNow) {
+                        // Both eyes live in one image, side by side. Hand each eye its half by
+                        // rect - no extra copy, and both were drawn in the same instant.
+                        const int32_t halfW = (int32_t)g_scWidth / 2;
+                        projViews[i].subImage.imageRect.offset = { i * halfW, 0 };
+                        projViews[i].subImage.imageRect.extent = { halfW, (int32_t)g_scHeight };
+                    } else {
+                        projViews[i].subImage.imageRect.offset = { 0, 0 };
+                        projViews[i].subImage.imageRect.extent = { (int32_t)g_scWidth, (int32_t)g_scHeight };
+                    }
                 }
                 // Nothing is submitted until BOTH eyes hold an image, otherwise the first
                 // stereo frame would show one eye a swapchain that has never been written.
@@ -1119,12 +1170,20 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                 ProjTangents(r, g_lockedConv, &g_projTanX, &g_projTanY);
                 if (g_projTanX < g_capTanMin) g_capTanMin = g_projTanX;
                 if (g_projTanX > g_capTanMax) g_capTanMax = g_projTanX;
+            } else {
+                g_camMatrixBound = false;
             }
+        } else {
+            // Something else has taken this register - a shadow or post pass. Draws issued now
+            // are not scene geometry and must not be duplicated.
+            g_camMatrixBound = false;
         }
     }
     const bool forceProj = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
                            g_targetTanX > 0.0f && g_targetTanY > 0.0f;
-    const bool modify = inject || forceProj;
+    // Duplication needs the final left-eye matrix cached, which only the modify path produces.
+    const bool dup = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    const bool modify = inject || forceProj || dup;
 
     if ((!scan && !modify) || !data || vec4Count < 4 ||
         !InterlockedCompareExchange(&g_camPosValid, 0, 0))
@@ -1205,6 +1264,10 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                     // arithmetic is right. Reading it back after the edit closes that loop.
                     ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
                 }
+                // Remember the finished left-eye matrix. The draw hook derives the right eye
+                // from this rather than from the engine's original, so the eye offset composes
+                // on top of the forced projection instead of fighting it.
+                if (dup) { memcpy(g_lastCamMat, m, sizeof(g_lastCamMat)); g_camMatrixBound = true; }
                 break;      // one convention per window; both cannot be true of one matrix
             }
         }
@@ -1212,6 +1275,59 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     }
 
     return g_origSetVSConstF(dev, startReg, data, vec4Count);
+}
+
+// ---------------------------------------------------------------- draw-call duplication
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE,
+                                                         INT, UINT, UINT, UINT, UINT);
+PFN_DrawPrim        g_origDrawPrim = nullptr;
+PFN_DrawIndexedPrim g_origDrawIndexedPrim = nullptr;
+
+// Issue one scene draw twice: left half of the viewport with the matrix already set, right half
+// with the same matrix shifted by the interpupillary offset. Restores both the viewport and the
+// constants afterwards so the game's own state is never disturbed.
+template <typename DrawFn>
+HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
+    ++g_drawsTotal;
+    if (!InterlockedCompareExchange(&g_dupDraws, 0, 0) || !g_camMatrixBound || !g_haveLock ||
+        !g_origSetVSConstF)
+        return draw();
+
+    D3DVIEWPORT9 full{};
+    if (FAILED(dev->GetViewport(&full)) || full.Width < 4) return draw();
+
+    D3DVIEWPORT9 half = full;
+    half.Width = full.Width / 2;
+
+    dev->SetViewport(&half);
+    HRESULT hr = draw();
+
+    float rightMat[16];
+    memcpy(rightMat, g_lastCamMat, sizeof(rightMat));
+    ApplyOffset(reinterpret_cast<Reg4*>(rightMat), g_lockedConv, g_eyeDeltaUU);
+
+    half.X = full.X + full.Width / 2;
+    dev->SetViewport(&half);
+    g_origSetVSConstF(dev, g_lockedReg, rightMat, 4);
+    draw();
+
+    g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
+    dev->SetViewport(&full);
+    ++g_drawsDuped;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
+                                        UINT start, UINT count) {
+    return StereoPair(dev, [&] { return g_origDrawPrim(dev, t, start, count); });
+}
+HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
+                                               INT baseVertex, UINT minIndex, UINT numVertices,
+                                               UINT startIndex, UINT primCount) {
+    return StereoPair(dev, [&] {
+        return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
+    });
 }
 
 // Refresh the camera position the detector substitutes. Runs once per frame in Present.
@@ -1277,8 +1393,11 @@ void ApplyVrFov() {
     // disagree and nothing can wobble. Vertical is the headset's own, horizontal follows from
     // the backbuffer's aspect, which keeps the forced frustum consistent with the 16:9 image
     // we are actually pasting into the eye.
+    // With duplication on, each eye occupies half the backbuffer's width, so the per-eye
+    // frustum is half as wide. Getting this wrong would stretch both eyes horizontally by 2x.
+    const bool dupOn = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
     g_targetTanY = tanf(vHalf);
-    g_targetTanX = g_targetTanY * aspect;
+    g_targetTanX = g_targetTanY * (dupOn ? aspect * 0.5f : aspect);
 
     // The request to the engine is deliberately wider: it now governs only culling.
     float askDeg = 2.0f * atanf(tanf(vHalf) * aspect * kFovHeadroom) * 57.2957795f;
@@ -1424,6 +1543,19 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      InterlockedExchange(&g_vrProjection, was?0:1);
                      Log("F6: VR-correct projection %s", was?"OFF (headset FOV claimed, as before)":"ON"); }
     p6 = k6;
+    static bool p1 = false;
+    bool k1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+    if (k1 && !p1) { LONG was = InterlockedCompareExchange(&g_dupDraws,0,0);
+                     InterlockedExchange(&g_dupDraws, was?0:1);
+                     // The two stereo methods are alternatives, never both at once. Duplication
+                     // also depends on the forced projection: each eye occupies half the
+                     // width, and without the matching per-eye frustum both come out squashed
+                     // horizontally by 2x. Turning it on here removes that broken combination.
+                     if (!was) { InterlockedExchange(&g_stereo, 0);
+                                 InterlockedExchange(&g_vrProjection, 1); }
+                     g_haveCentre = false;
+                     Log("F1: draw-call duplication (TRUE stereo) %s", was?"OFF":"ON"); }
+    p1 = k1;
     static bool p12 = false;
     bool k12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
     if (k12 && !p12) { LONG was = InterlockedCompareExchange(&g_stereo,0,0);
@@ -1458,8 +1590,30 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // constants for the frame about to be presented were uploaded just before we got here.
     RefreshCameraPosition();
     ApplyVrFov();
+    // "Can a 2010 game afford twice the draw calls" is the whole question this spike exists to
+    // answer, so measure it rather than reasoning about it. Frame time is wall clock between
+    // Presents, averaged over a second.
+    {
+        static LARGE_INTEGER freq{}, last{};
+        static int frames = 0; static double accum = 0.0;
+        static int dupPeak = 0, totPeak = 0;
+        if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        if (last.QuadPart) accum += double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
+        last = now;
+        if (g_drawsTotal > totPeak) totPeak = g_drawsTotal;
+        if (g_drawsDuped > dupPeak) dupPeak = g_drawsDuped;
+        if (++frames >= 120) {
+            Log("perf: %.1f fps (%.2f ms/frame) | draws/frame peak %d, of which duplicated %d%s",
+                frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
+                InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
+            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0;
+        }
+    }
+
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
     g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
+    g_drawsTotal = 0; g_drawsDuped = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.
@@ -1516,7 +1670,11 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         // Slot 94 = SetVertexShaderConstantF. Present at 17 already proved this vtable
         // indexing against the real interface, so 94 needs no separate verification.
         g_origSetVSConstF = (PFN_SetVSConstF)PatchVTable(*out, 94, (void*)&Hook_SetVSConstF);
-        Log("Present + SetVertexShaderConstantF hooked. F7 = find the view matrix, F3 = move it.");
+        // 81 = DrawPrimitive, 82 = DrawIndexedPrimitive - the two the scene passes use.
+        g_origDrawPrim        = (PFN_DrawPrim)PatchVTable(*out, 81, (void*)&Hook_DrawPrim);
+        g_origDrawIndexedPrim = (PFN_DrawIndexedPrim)PatchVTable(*out, 82, (void*)&Hook_DrawIndexedPrim);
+        Log("Present + SetVertexShaderConstantF + Draw hooks installed.");
+        Log("F7 find the matrix | F1 TRUE stereo | F12 alternate-eye | F10 6-DOF | F9 head tracking");
     }
     return hr;
 }

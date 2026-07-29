@@ -28,7 +28,8 @@ crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
 
-In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F12** alternate-eye stereo ·
+In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F1** true stereo
+(draw duplication) · **F12** alternate-eye stereo ·
 **F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
 **F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount.
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
@@ -73,7 +74,37 @@ Findings from the same runs, all in `ENGINE_NOTES.md`:
 
 The headset's real position drives the view (F10). Leaning and ducking move the camera.
 
-## Alternate-eye stereo — built, not yet run (F12)
+## True stereo by draw-call duplication — prototype built, not yet run (F1)
+
+Alternate-eye's flaw is **temporal** — the eyes show the world at different instants, which no
+reprojection can reconcile and head rotation makes obvious (confirmed run 6: "terrible flicker").
+So draw both eyes from the same instant by issuing every scene draw twice.
+
+**The prototype needs no double-wide render target.** It splits the existing backbuffer with the
+**viewport**: left half gets the left-eye matrix, right half the right, and OpenXR is handed each
+half as a `subImage` rect. Half horizontal resolution per eye (1280×1440), but the technique is
+complete end to end — if it works, widening the target is an optimisation, not an open question.
+Viewport switching rather than render-target switching is what keeps it affordable.
+
+Still no interpupillary distance anywhere: the eye separation vector goes through the same
+XR→game mapping as everything else, and the right-eye matrix is the left one plus that offset.
+
+**Expected to be wrong at this stage, deliberately:** full-screen passes are not duplicated (they
+do not have the camera matrix bound), so post-processing will treat the side-by-side frame as one
+picture — bloom and similar bleeding across the seam — and the HUD will sit across both halves.
+That is the next problem, and it is the one these projects normally stall on.
+
+Duplication forces the VR projection on, since each eye occupies half the width and without the
+matching per-eye frustum both come out squashed 2x horizontally.
+
+### Cost is not the risk here
+
+A 2010 game on a modern GPU has enormous headroom, so 2x geometry is affordable — the risk is
+**correctness** in the post-processing passes, not throughput. The build now logs frames per
+second and draw calls per frame (total and duplicated) so the throughput half is measured rather
+than assumed.
+
+## Alternate-eye stereo — works, but flickers on head turn (F12)
 
 The game renders once per frame and a D3D9 shim cannot make it render twice, so the cheap route
 to two images is to alternate: this frame is drawn from the left eye, the next from the right,
@@ -84,10 +115,27 @@ goes through exactly the same XR→game mapping 6-DOF already uses, and interpup
 never appears as its own quantity. Consequence worth knowing: stereo shares that path, so it
 brings positional head tracking with it whether or not F10 is on.
 
-The cost is real and is why it is a toggle, not the default: **each eye updates at half the
-frame rate**, and during fast head motion the two eyes disagree. The gain is that it is
-genuinely stereo with correct occlusion — each image really was rendered from that eye's
-position, not reprojected.
+Run 6 verdict: **the depth effect reads well and scale feels right, but head rotation produces
+terrible flicker.** Each eye updates at half the frame rate and the two disagree during motion.
+Superseded by the duplication prototype above, but kept — it costs nothing and may still be the
+best option on weak hardware.
+
+### Shipping plan: the mode is a user choice
+
+All three approaches share the same front half — matrix identification, per-eye offset, forced
+projection — and differ only in how the second image is produced. So the shipped mod should
+expose the choice (an ini beside the DLL, since hotkeys are a development affordance):
+
+| Mode | Trade |
+|---|---|
+| Draw-call duplication | True stereo, same instant, 2x geometry |
+| Depth reprojection | Same instant, full rate, disocclusion slivers — **not yet built** |
+| Alternate-eye | Cheapest, but flickers on head rotation |
+| Mono | Always works; the safe fallback |
+
+A fallback chain matters as much as the choice: reprojection needs INTZ depth support, and
+duplication may not survive every scene, so the mod should be able to drop to mono rather than
+fail.
 
 ## VR-correct projection — flicker FIXED (confirmed run 5)
 
@@ -130,18 +178,17 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Test alternate-eye stereo (F12)** — does it read as depth, and is the half-rate judder
-   tolerable? If it is not, the alternatives are engine re-entry (proper, hard) or depth
-   reprojection.
-2. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) — the projection is now
-   correct enough to judge scale against.
-3. **Explain the brightness change** (run 4, deferred): the image is brighter and less blue than
-   during 3-DOF testing, though not broken the way the sRGB double-encode was. Most likely UE3
-   auto-exposure adapting to a much wider field, which is benign; the alternative is our
-   injection touching a post-processing pass. Distinguishable by pressing F6 (projection off,
-   injection still on) and seeing whether the colour returns.
-4. **Performance** — the frame copy is still a full CPU round-trip, and the wide FOV now draws
-   considerably more geometry. Unmeasured.
+1. **Test draw-call duplication (F1)** — does the game survive it, what does it cost, and how
+   badly do the post-process passes break across the seam? The log now reports fps and draw
+   counts.
+2. **Fix the post-processing passes** if duplication is otherwise viable. This is the real work
+   and the usual stalling point: full-screen effects need running per half, or the scene needs a
+   genuine double-wide target with separate passes.
+3. **Depth reprojection** as the alternative, and a shipped mode either way.
+4. **The ini** for mode selection, plus a fallback to mono.
+5. **Explain the brightness change** (run 4, deferred): most likely UE3 auto-exposure adapting to
+   a much wider field, which is benign; the alternative is our injection touching a
+   post-processing pass. Distinguishable with F6.
 
 ## Other known work, roughly by value
 
