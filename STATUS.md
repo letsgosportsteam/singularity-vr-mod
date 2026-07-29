@@ -2,6 +2,21 @@
 
 Last updated **2026-07-29**. Read this first, then `ENGINE_NOTES.md`.
 
+## Ladder status (against the original plan)
+
+| Rung | State |
+|---|---|
+| Head-tracked image in the headset | ✅ done |
+| Colours — sRGB | ✅ done |
+| **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
+| **Stereo — per-eye offset for real depth** | 🔧 **working, artifacts remaining** — true native stereo by draw-call duplication; one-eye ground textures fixed run 12, texture flicker open |
+| FOV / aspect match | 🔧 projection is VR-correct and forced; **render resolution not yet matched** to the headset |
+| Performance — CPU round-trip → D3D9Ex + MANAGED wrapper | ⬜ not started, still planned |
+| Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
+
+So: **6-DOF is solved**, and stereo is *working* rather than done — the mechanism is right and the
+remaining issues are graphical.
+
 ## Where the project is
 
 A **working, wearable VR mod** for Singularity (2010, Unreal Engine 3, D3D9, x86):
@@ -32,7 +47,11 @@ In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F1** true 
 (draw duplication) · **F12** alternate-eye stereo ·
 **F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
 **F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount ·
-**INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment.
+**INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment ·
+**PAGE UP** cycle culling headroom (LOD/streaming trade).
+
+Mouse and head tracking now **add** rather than fight — turning with the mouse no longer snaps
+back, and the same fix is what stick-turning will need in the shipped mod.
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
@@ -169,8 +188,32 @@ across the seam into the other eye.
 Geometry checks out: the forced per-eye frustum is 91.3° × 98.0°, `tanX/tanY = 0.889` matching a
 1280×1440 half, and the remap maps that frustum onto exactly half the full-width viewport.
 
-**Built and installed, not yet run.** Prediction to test: ground textures and decals should stop
-appearing in one eye only, because the class of bug causing it is gone by construction.
+**✅ Confirmed fixed (run 12): ground textures no longer appear in one eye only.** The
+screen-space diagnosis was right and the remap is the correct mechanism.
+
+### The render-target census (run 12) — what is actually being drawn
+
+```
+2560x1440  A8R8G8B8       ~27000 draws/s  <- SPLIT   (LDR / backbuffer path)
+2560x1440  A16B16G16R16F  ~37000 draws/s  <- SPLIT   (HDR scene colour)
+ 512x512   R32F              ~840 draws/s  left alone (shadow depth)
+```
+
+Two scene-sized targets, both correctly split; the shadow map **is** correctly excluded — it was
+simply always a small fraction (~1%), which is why excluding it changed nothing visible. Useful to
+have on record rather than assumed.
+
+### ⚠️ Still open: texture flicker while walking
+
+Distinct from the one-eye bug and still present. Prime suspect is now the **culling headroom
+itself**: UE3 derives texture-streaming mip selection *and* mesh LOD from projected screen size, so
+telling the engine the field of view is **157.9°** makes everything read as far away and can thrash
+the streaming pool — which looks exactly like textures popping in and out while moving.
+
+That headroom is a real trade, not a value to get right once: wide buys culling coverage, narrow
+buys correct LOD and streaming. **PAGE UP** now cycles it (2.5 → 1.75 → 1.30 → 1.0) so the trade
+can be measured. If flicker tracks the headroom, the long-term fix is widening the engine's culling
+frustum *without* inflating the FOV it reports to streaming/LOD.
 
 ### Run 10: the eye mapping is CORRECT (this part stands)
 
@@ -338,15 +381,19 @@ Toggle with **F6**.
 **Decision taken: continue with true native stereo** (draw-call duplication). Depth reprojection
 stays documented above as the fallback if this path stalls again.
 
-1. **Test the clip-space remap rework (F1)** — the prediction is that one-eye ground textures and
-   decals stop, since the mechanism causing them no longer exists. The render-target census also
-   reports for the first time, so we learn what is actually taking the draws.
-2. **If some draws are still wrong**, the next lever is coverage rather than mechanism: draws whose
-   transform comes from a register we do not track get no remap and are merely scissored. The fix
-   is to recognise more matrices, using the same read-it-from-the-data approach that found `c0`.
-3. **Post-processing full-screen passes remain unsolved** — they use a pass-through transform and
+1. **Test the headroom trade (PAGE UP)** for the texture flicker — does it track the engine FOV?
+2. **Then performance**, which is now the gating item rather than a later nicety. Two reasons it
+   has been promoted: the frame copy scales with pixels, so matching the headset's resolution
+   multiplies its cost; and the fps distribution is bimodal (median ~70, floor ~13), which is the
+   signature of a CPU-bound stall rather than GPU load. Details under *Other known work*.
+3. **Then match the render resolution** to the headset — deliberately after performance, because
+   per-eye 1280×1440 vs the headset's ~2496×2688 means roughly 3.6× the pixels, on exactly the
+   path that is already the bottleneck.
+4. **Post-processing full-screen passes remain unsolved** — they use a pass-through transform and
    sample across the whole target, so they cannot be remapped this way. Expect seam artifacts from
    bloom and similar until handled per half.
+5. **Recognise more matrices** if specific objects (the weapon) stay wrong: draws whose transform
+   comes from a register we do not track get no remap and are merely scissored.
 3. **Depth reprojection** as the alternative approach, worth building regardless so there's a
    real comparison — and a shipped mode either way.
 4. **The ini** for mode selection, plus a fallback to mono.
@@ -356,9 +403,13 @@ stays documented above as the fallback if this path stalls again.
 
 ## Other known work, roughly by value
 
-- **Performance** — the frame copy is a full CPU round-trip (~14 MB each way at 2560×1440).
-  The fast path needs the game's device upgraded to D3D9Ex, which needs a
-  `D3DPOOL_MANAGED` → `DEFAULT` wrapper (**10,454** allocations measured in spike 2).
+- **Performance — now the gating item, not a later nicety.** The frame copy is a full CPU
+  round-trip (~14 MB each way at 2560×1440). The fast path needs the game's device upgraded to
+  D3D9Ex, which needs a `D3DPOOL_MANAGED` → `DEFAULT` wrapper (**10,454** allocations measured in
+  spike 2). Two measurements promote it: the run-12 fps distribution is **bimodal — median ~70,
+  floor ~13** across 66 samples, which is the signature of a CPU-bound stall rather than GPU load
+  (draw-call duplication doubled GPU work and barely moved the median); and matching the headset's
+  resolution multiplies the copy cost by ~3.6×, so it blocks that too.
 - **FOV / aspect mismatch** — game renders 16:9, per-eye view is ~2496×2688.
 - **Head-look vs aim are coupled** — `PlayerController.Rotation` drives both view and fire trace.
 - **Menus are inert** — intended; they need OpenXR *input* (controllers, thumbsticks, laser

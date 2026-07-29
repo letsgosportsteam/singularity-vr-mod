@@ -118,6 +118,10 @@ volatile LONG g_constTest = 0;    // constant-pitch proof
 const int32_t kConstPitch = 8000; // ~44 degrees up - unmissable
 
 int32_t g_wantPitch = 0, g_wantYaw = 0;
+// Our own last yaw write, so anything else that moved yaw since can be told apart from it and
+// folded in rather than overwritten. See the note at the write site.
+int32_t g_lastWrittenYaw = 0;
+bool    g_haveLastWrittenYaw = false;
 bool    g_haveWant = false;
 int     g_hookHits = 0;
 
@@ -386,7 +390,15 @@ float g_forcedTanX = 0.0f, g_forcedTanY = 0.0f;   // read back AFTER the edit, t
 // The headroom multiplies the tangent, so it must be large enough that even a 25-30 deg dip
 // still leaves the vertical covered. 2.5 asks ~160 deg, which holds >=130 deg through the
 // observed dips - comfortably past the ~128 deg needed for 98 deg vertical.
-const float kFovHeadroom = 2.5f;
+// Runtime-selectable, because the headroom is a genuine trade rather than a value to get right
+// once. A wide engine FOV buys culling coverage, but the engine also derives texture-streaming
+// mip selection and mesh LOD from projected screen size - so telling it the field is 158 deg
+// makes everything read as far away, which is a plausible cause of the texture flicker still
+// being reported. PAGE UP cycles this so the trade can be measured instead of argued about.
+const float kFovHeadroomSteps[] = { 2.5f, 1.75f, 1.30f, 1.0f };
+const int   kFovHeadroomCount = 4;
+int   g_fovHeadroomStep = 0;
+float kFovHeadroom = 2.5f;
 
 // Per-frame diagnostics, reset each Present. The spread catches a case the single captured
 // value cannot: c0 is written ~50 times a frame by different passes, and if two of them carry
@@ -1801,6 +1813,18 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     }
     pIns = kIns;
 
+    // PAGE UP: cycle the culling headroom, to test whether the very wide engine FOV it asks for
+    // is what is making textures flicker (streaming and LOD both key off projected size).
+    static bool pPgUp = false;
+    bool kPgUp = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+    if (kPgUp && !pPgUp) {
+        g_fovHeadroomStep = (g_fovHeadroomStep + 1) % kFovHeadroomCount;
+        kFovHeadroom = kFovHeadroomSteps[g_fovHeadroomStep];
+        Log("PAGE UP: culling headroom now x%.2f%s", kFovHeadroom,
+            kFovHeadroom < 1.05f ? " (no headroom - expect edge dropouts, but correct LOD)" : "");
+    }
+    pPgUp = kPgUp;
+
     // DELETE: reverse the mapping, so a confirmed swap can be fixed and verified immediately.
     static bool pDel = false;
     bool kDel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
@@ -1897,13 +1921,40 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // Yaw is not carried by the detour's seam, so write it directly - the mechanism proven
     // in the earlier spike. Pitch deliberately left alone here; the detour owns it.
+    //
+    // ---- letting the mouse (and later, a thumbstick) coexist with head tracking ----
+    //
+    // Writing an ABSOLUTE yaw every frame silently discarded every other source of turning:
+    // the engine would apply the mouse delta, then we would overwrite it, so the view visibly
+    // snapped back. Reported in run 12 and it would have hit stick input in the shipped mod
+    // just as hard - the same bug, not a testing-only inconvenience.
+    //
+    // The fix is to treat our own last write as the reference point. Anything that moved yaw
+    // since then was somebody else's input, so fold that difference into the base the head
+    // delta is measured from. Head tracking and mouse then add instead of fighting: yaw becomes
+    // body-turn (mouse/stick) plus head-turn, which is the arrangement VR wants anyway.
+    //
+    // The int32 subtraction wraps correctly through the FRotator's 65536-per-turn space, so
+    // crossing the wrap point needs no special case.
     if (InterlockedCompareExchange(&g_enabled, 0, 0) && g_haveWant) {
         uintptr_t ctl = FindController();
         if (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12)) {
-            reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1] = g_wantYaw;
+            int32_t* rot = reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION);
+            if (g_haveLastWrittenYaw) {
+                int32_t externalDelta = rot[1] - g_lastWrittenYaw;
+                if (externalDelta) {
+                    g_baseYaw += externalDelta;
+                    g_wantYaw += externalDelta;
+                }
+            }
+            rot[1] = g_wantYaw;
             if (Readable((void*)(ctl + CTL_ROTATION_2), 12))
                 reinterpret_cast<int32_t*>(ctl + CTL_ROTATION_2)[1] = g_wantYaw;
+            g_lastWrittenYaw = g_wantYaw;
+            g_haveLastWrittenYaw = true;
         }
+    } else {
+        g_haveLastWrittenYaw = false;   // stale reference once we stop steering
     }
     return g_origPresent(s, a, b, c, d);
 }
