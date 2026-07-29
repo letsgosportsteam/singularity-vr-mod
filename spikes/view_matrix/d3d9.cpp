@@ -323,6 +323,15 @@ const int   kOffsetStepCount = 5;
 int   g_offsetStep = 0;
 float g_offsetUU = 300.0f;
 
+// ---- 6-DOF: the headset's real position, fed in as the offset ----
+// UE3 scale is 16 units per foot, so 1 UU is 1.905 cm and a metre is 52.5 UU. If head movement
+// comes out feeling too large or too small in game, this is the number to adjust.
+const float kMetresToUU = 52.5f;
+volatile LONG g_sixDof = 0;        // F10
+float g_hmdOffset[3] = {0,0,0};    // game-world offset from the recentre point, in UU
+float g_centrePos[3] = {0,0,0};    // headset position captured at recentre, in XR metres
+bool  g_haveCentrePos = false;
+
 // clip.w for point p under the given convention.
 inline float ClipW(const Reg4* r, int conv, const float* p) {
     if (conv == CONV_ROW) return p[0]*r[0].w + p[1]*r[1].w + p[2]*r[2].w + r[3].w;
@@ -367,9 +376,24 @@ inline float FwdLen(const Reg4* r, int conv) {
 // term IS the camera's forward axis, and we know where the camera is actually facing from its
 // FRotator. Requiring those to agree is decisive - it rejects unrelated matrices AND picks the
 // correct convention, because ROW and COL read the forward vector from different components.
-const float kHitTolUU  = 25.0f;
-const float kNearTolUU = 5000.0f;
-const float kMinDotFwd = 0.99f;    // ~8 degrees of slack for the one-frame staleness
+// ---- tolerance depends on WHICH probe point matched ----
+//
+// The loose tolerance exists only to absorb the one-frame staleness of the camera position we
+// substitute. That staleness applies to the two world-position probes; it does NOT apply to
+// the origin probe, where the test reduces to "is r[3].w near zero" - pure matrix content,
+// with no camera reading involved and therefore nothing to go stale.
+//
+// Run 2 showed why this matters. Under a flat 25 UU tolerance, three extra windows passed
+// (c8/c11/c14 COL, w around -10.5, 4 uploads each) alongside the real matrix at w = -0.0020
+// with 50 uploads. Their 3-register spacing suggests a block of float3x4 transforms that the
+// sliding 4-register window straddles. Injecting into those would corrupt something unrelated
+// for no benefit. A tight origin tolerance separates -0.002 from -10.5 decisively.
+const float kHitTolUU       = 25.0f;    // world-position probes: staleness-dominated
+const float kHitTolOriginUU = 1.0f;     // origin probe: no staleness, so demand a real zero
+const float kNearTolUU      = 5000.0f;
+const float kMinDotFwd      = 0.99f;    // ~8 degrees of slack
+
+inline float TolFor(int pt) { return (pt == 2) ? kHitTolOriginUU : kHitTolUU; }
 
 // A failed scan should still yield evidence, so the closest non-qualifying window is kept.
 // Without this, "nothing matched" cannot be told apart from "matched at 30 UU".
@@ -422,7 +446,9 @@ inline bool TestWindow(const Reg4* r, int conv, const float* const pts[3],
 }
 
 // A window is the view matrix only if it passes BOTH tests.
-inline bool IsViewMatrix(float w, float dot) { return fabsf(w) <= kHitTolUU && dot >= kMinDotFwd; }
+inline bool IsViewMatrix(float w, float dot, int pt) {
+    return fabsf(w) <= TolFor(pt) && dot >= kMinDotFwd;
+}
 
 // Pre-multiply a world-space translation into the matrix: M' = T(-o) * M, which is exactly
 // "move the camera by o" and is correct for any offset, including forward, with no knowledge
@@ -666,9 +692,15 @@ void MeasureCullBand(const uint8_t* bits, int pitch, UINT w, UINT h) {
     // without needing timestamps or the user to remember which step they were on.
     static int n = 0;
     if (++n % 60 == 0) {
-        bool on = InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
-        Log("cull band: left=%u right=%u of %u px (%.2f%% / %.2f%%)  offset=%s%.0f UU",
-            l, r, w, 100.0 * l / w, 100.0 * r / w, on ? "" : "OFF, was ", g_offsetUU);
+        if (InterlockedCompareExchange(&g_sixDof, 0, 0)) {
+            Log("cull band: left=%u right=%u of %u px (%.2f%% / %.2f%%)  6DOF offset "
+                "(%.1f, %.1f, %.1f) UU", l, r, w, 100.0 * l / w, 100.0 * r / w,
+                g_hmdOffset[0], g_hmdOffset[1], g_hmdOffset[2]);
+        } else {
+            bool on = InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
+            Log("cull band: left=%u right=%u of %u px (%.2f%% / %.2f%%)  offset=%s%.0f UU",
+                l, r, w, 100.0 * l / w, 100.0 * r / w, on ? "" : "OFF, was ", g_offsetUU);
+        }
     }
 }
 
@@ -753,8 +785,44 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             uintptr_t ctl = FindController();
             g_baseYaw = (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12))
                         ? reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1] : 0;
+            g_centrePos[0] = views[0].pose.position.x;
+            g_centrePos[1] = views[0].pose.position.y;
+            g_centrePos[2] = views[0].pose.position.z;
+            g_haveCentrePos = (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
             g_haveCentre = true;
-            Log("recentred: head yaw %.1f, game yaw %d", yawRad * 57.2958f, g_baseYaw);
+            Log("recentred: head yaw %.1f, game yaw %d, head pos (%.3f, %.3f, %.3f)%s",
+                yawRad * 57.2958f, g_baseYaw,
+                g_centrePos[0], g_centrePos[1], g_centrePos[2],
+                g_haveCentrePos ? "" : " [POSITION NOT TRACKED]");
+        }
+
+        // ---- headset position -> game-world offset ----
+        //
+        // The mapping is fixed at RECENTRE, not taken from where the camera points now. That
+        // distinction is the whole correctness argument: an XR position is expressed in the
+        // XR world frame, so turning the head does not change it. If the offset were mapped
+        // through the camera's current facing, rotating the head would swing a stationary
+        // body offset around the world - leaning right, then turning, would send the view
+        // somewhere it should not be.
+        //
+        // XR is Y-up, right-handed, forward = -Z, metres. The game is Z-up, X forward,
+        // Y right, UU. So decompose the XR offset onto the head's centre axes, then rebuild
+        // it on the game's axes at the yaw the game had when we recentred.
+        if ((vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) && g_haveCentrePos) {
+            float ox = views[0].pose.position.x - g_centrePos[0];
+            float oy = views[0].pose.position.y - g_centrePos[1];
+            float oz = views[0].pose.position.z - g_centrePos[2];
+
+            const float sc = sinf(g_centreYaw), cc = cosf(g_centreYaw);
+            float fwdAmt   = -(ox * sc) - (oz * cc);   // along the head's centre forward
+            float rightAmt =  (ox * cc) - (oz * sc);   // along the head's centre right
+            float upAmt    =  oy;
+
+            const float baseYawRad = g_baseYaw * (6.2831853f / 65536.0f);
+            const float bc = cosf(baseYawRad), bs = sinf(baseYawRad);
+            g_hmdOffset[0] = (bc * fwdAmt - bs * rightAmt) * kMetresToUU;
+            g_hmdOffset[1] = (bs * fwdAmt + bc * rightAmt) * kMetresToUU;
+            g_hmdOffset[2] = upAmt * kMetresToUU;
         }
         float dYaw = yawRad - g_centreYaw;
         while (dYaw >  3.14159265f) dYaw -= 6.2831853f;
@@ -842,7 +910,8 @@ const UINT kScratchVecs    = 256;   // vs_3_0's full float-constant file
 HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                                            const float* data, UINT vec4Count) {
     const bool scan   = InterlockedCompareExchange(&g_scanArmed, 0, 0) != 0;
-    const bool inject = InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
+    const bool sixDof = InterlockedCompareExchange(&g_sixDof, 0, 0) != 0;
+    const bool inject = sixDof || InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
     if ((!scan && !inject) || !data || vec4Count < 4 ||
         !InterlockedCompareExchange(&g_camPosValid, 0, 0))
         return g_origSetVSConstF(dev, startReg, data, vec4Count);
@@ -878,17 +947,20 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         bool edited = false;
         const UINT copyVecs = vec4Count;
         if (copyVecs > kScratchVecs) return g_origSetVSConstF(dev, startReg, data, vec4Count);
-        // Offset along the camera's RIGHT axis, not a world axis. That is the actual stereo
-        // primitive - a per-eye offset is exactly this - and it keeps the effect the same
-        // whichever way the player happens to be facing.
-        const float o[3] = { g_camRight[0] * g_offsetUU,
-                             g_camRight[1] * g_offsetUU,
-                             g_camRight[2] * g_offsetUU };
+        // 6-DOF wins when both are on: it is the real thing, the F3 constant is only a probe.
+        // Otherwise offset along the camera's RIGHT axis, not a world axis - that is the
+        // actual stereo primitive, and it keeps the effect the same whichever way the player
+        // happens to be facing.
+        float o[3];
+        if (sixDof) { o[0] = g_hmdOffset[0]; o[1] = g_hmdOffset[1]; o[2] = g_hmdOffset[2]; }
+        else        { o[0] = g_camRight[0] * g_offsetUU;
+                      o[1] = g_camRight[1] * g_offsetUU;
+                      o[2] = g_camRight[2] * g_offsetUU; }
         for (UINT j = 0; j <= windows && j + 4 <= copyVecs; ++j) {
             const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
             for (int c = 0; c < 2; ++c) {
                 float w = 0, len = 0, dot = 0; int pt = 0;
-                if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot)) continue;
+                if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot, pt)) continue;
                 if (!edited) { memcpy(scratch, data, copyVecs * 4 * sizeof(float)); edited = true; }
                 ApplyOffset(reinterpret_cast<Reg4*>(scratch + j * 4), c, o);
                 break;      // one convention per window; both cannot be true of one matrix
@@ -957,15 +1029,15 @@ void ReportScan() {
     // view matrix at the top even when a dozen unrelated matrices clear the w test.
     for (int i = 0; i < g_hitCount; ++i)
         for (int j = i + 1; j < g_hitCount; ++j) {
-            bool pi = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd);
-            bool pj = IsViewMatrix(g_hits[j].w, g_hits[j].dotFwd);
+            bool pi = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd, g_hits[i].pt);
+            bool pj = IsViewMatrix(g_hits[j].w, g_hits[j].dotFwd, g_hits[j].pt);
             if ((pj && !pi) || (pj == pi && g_hits[j].dotFwd > g_hits[i].dotFwd)) {
                 MatHit t = g_hits[i]; g_hits[i] = g_hits[j]; g_hits[j] = t;
             }
         }
     int passing = 0;
     for (int i = 0; i < g_hitCount; ++i) {
-        bool pass = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd);
+        bool pass = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd, g_hits[i].pt);
         if (pass) ++passing;
         Log("    %s c%-3u %s  w=%+.4f  fwdLen=%.4f  dotFwd=%+.4f  hits=%-5d  zero at %s",
             pass ? "**" : "  ", g_hits[i].startReg, g_hits[i].conv == CONV_ROW ? "ROW" : "COL",
@@ -1012,6 +1084,13 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      Log("F3: matrix camera offset %s (%.0f UU along the camera's right axis)",
                          was?"OFF":"ON", g_offsetUU); }
     p3 = k3;
+    static bool p10 = false;
+    bool k10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (k10 && !p10) { LONG was = InterlockedCompareExchange(&g_sixDof,0,0);
+                       InterlockedExchange(&g_sixDof, was?0:1);
+                       g_haveCentre = false;      // recentre so the offset starts from zero
+                       Log("F10: 6-DOF head position %s", was?"OFF":"ON"); }
+    p10 = k10;
     static bool p11 = false;
     bool k11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
     if (k11 && !p11) {

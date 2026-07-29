@@ -28,8 +28,9 @@ crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
 
-In gameplay: **F9** head tracking · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
-**F7** scan for the view matrix · **F3** offset the camera through it · **F11** offset amount.
+In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F8** recentre ·
+**F5/F4** flip yaw/pitch sign · **F7** scan for the view matrix · **F3** constant offset probe ·
+**F11** offset amount.
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
@@ -58,26 +59,25 @@ view moved.
 | Space | **translated-world** — UE3 pre-subtracts the view origin on the CPU |
 | To move by `o` | `row3 -= o.x*row0 + o.y*row1 + o.z*row2` |
 
-Two findings from the same run, both in `ENGINE_NOTES.md`:
+Findings from the same runs, all in `ENGINE_NOTES.md`:
 
 - **The engine renders in translated-world space.** Probing the world camera position alone
   would have found nothing; the origin probe is what made the scan work.
-- **CPU frustum culling clips the offset view** — a black band at the frame edge, because
-  geometry newly visible after the offset was culled before it was ever drawn. The fix is to
-  make the game render wider than it displays; `mCurrentPOV` FOV at `+0x0438` is proven
-  writable and is the lever. At real IPD scale (a few UU, not the 300 UU used for the proof)
-  this should be close to negligible.
+- **The convention was settled by a direction test**, not the position test — `c0` read as ROW
+  gives `dotFwd = +1.0000`, read as COL gives `+0.0023`, from identical bytes.
+- **CPU frustum culling is a non-issue at stereo scale.** Measured from the backbuffer: a
+  1.4–2.9% band at 300 UU, and **0 px at 100 UU and below**. The planned FOV-widening job is
+  therefore **dropped** — a real IPD is a few UU.
 
 ### ⏭ Next actions
 
-1. **Step the offset down** (F11 cycles 300 / 100 / 30 / 10 / 3 UU) and find where the culling
-   band stops mattering. This sizes the FOV-widening job, or removes it.
-2. **Widen the render FOV** via `mCurrentPOV +0x0438` so the margin covers the offset.
-3. **Get two images per frame** — the remaining piece for real stereo. The architecture renders
-   once per frame, so this needs alternate-eye submission (one frame stale per eye, cheap),
-   engine re-entry (proper, hard), or depth reprojection (fallback).
-4. **6-DOF** is now mostly free: feed the HMD's positional delta in as the offset instead of a
-   constant.
+1. **Test 6-DOF (F10)** — built, not yet run. Feeds the headset's real position in as the
+   offset. Leaning and ducking should move the view.
+2. **Get two images per frame** — the last piece for real stereo, and now the only hard one
+   left. The architecture renders once per frame, so this needs alternate-eye submission (one
+   frame stale per eye, cheap), engine re-entry (proper, hard), or depth reprojection.
+3. **Tune `kMetresToUU`** (currently 52.5, from UE3's 16 units per foot) if head movement feels
+   over- or under-scaled in game.
 
 ## Other known work, roughly by value
 

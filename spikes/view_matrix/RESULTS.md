@@ -28,11 +28,26 @@ several with `w` of exactly `+1.0000`. The reason: `clip.w` at `p = (0,0,0)` col
 matrix with a near-zero w constant — which is most of them. The zero-cancellation argument only
 carries information when the probe point is far from the origin.
 
-Fixed by adding an independent second test, now in this build: for a genuine world→clip matrix
-the xyz of the w term **is the camera's forward axis**, and the camera's real facing is known
-from its `FRotator`. Requiring agreement (`dotFwd >= 0.99`) rejects the unrelated matrices *and*
-resolves the storage convention, since ROW and COL read the forward vector from different
-components. Injection now targets only windows passing both tests, instead of all 18.
+Fixed by adding an independent second test: for a genuine world→clip matrix the xyz of the w
+term **is the camera's forward axis**, and the camera's real facing is known from its
+`FRotator`. Requiring agreement (`dotFwd >= 0.99`) rejects the unrelated matrices *and* resolves
+the storage convention. Run 2 shows it settling the convention on identical bytes:
+
+```
+** c0  ROW  w=-0.0020  dotFwd=+1.0000  hits=50    <- the view matrix
+   c0  COL  w=-0.0020  dotFwd=+0.0023  hits=9     <- same bytes, wrong convention
+```
+
+**3. Tolerance has to depend on which probe point matched.** Run 2 still passed three extra
+windows (`c8`/`c11`/`c14` COL, `w` ≈ −10.5, 4 uploads each) beside the real one at −0.0020 with
+50. Their 3-register spacing suggests a block of `float3x4` transforms the sliding window
+straddles — injecting into those would corrupt something unrelated for no benefit.
+
+The fix follows from what the tolerance is *for*: absorbing the one-frame staleness of the
+camera position we substitute. That applies to the world-position probes; it does **not** apply
+to the origin probe, where the test is just "is `r[3].w` near zero" — pure matrix content, no
+camera reading, nothing to go stale. So the origin probe now uses a tight **1 UU** tolerance,
+which separates −0.002 from −10.5 decisively, and only `c0 ROW` should survive.
 
 **The band is measured, not eyeballed.** Every frame, the backbuffer's edge columns are scanned
 for near-black and the width is logged once a second alongside the offset that produced it — so
@@ -41,12 +56,20 @@ on. Reading the game's own frame also sidesteps a real methodological trap: the 
 in the backbuffer, so judging it through the headset would mean judging it through the aspect
 mismatch and the lens distortion too, neither of which will exist in the final product.
 
-**Known artefact: a black band at the frame edge.** The game culls geometry on the CPU against
+**The culling band turned out to be a non-issue.** The game culls geometry on the CPU against
 its *original* frustum, so anything newly visible after the offset was never submitted to the
-GPU. Moving the matrix cannot conjure draw calls that were never issued. Standard VR-injection
-problem with a standard fix — render wider than you display (`mCurrentPOV` FOV at `+0x0438` is
-proven writable). The proof used 300 UU deliberately; a real IPD is a few UU, so F11 now steps
-the offset down through 300 / 100 / 30 / 10 / 3 to find where it stops mattering.
+GPU — moving the matrix cannot conjure draw calls that were never issued. Measured:
+
+| Offset | Band |
+|---|---|
+| 300 UU | 35–73 px of 2560 (1.4–2.9%), one 721 px spike |
+| **100 UU** | **0 px** |
+| 30 / 10 / 3 UU | 0 px |
+
+Gone entirely at 100 UU and below, and a real IPD is a few UU — so **stereo needs no mitigation
+and the FOV-widening job is dropped.** One caveat on the metric: it counts near-black columns,
+so a dark scene reads as a band (a 502 px reading appeared with injection *off*). That failure
+mode only inflates the number, never deflates it, so the zeros are trustworthy.
 
 ## Why this approach
 
@@ -124,10 +147,18 @@ Connect Virtual Desktop first, launch the dev copy, reach gameplay.
 | Key | Effect |
 |---|---|
 | **F7** | Scan one frame for the view matrix, then report |
-| **F3** | Offset the camera along its own right axis through what was found |
-| **F11** | Cycle the offset: 300 / 100 / 30 / 10 / 3 UU |
+| **F10** | **6-DOF** — drive the offset from the headset's real position |
+| **F3** | Constant offset along the camera's right axis (the probe, not the product) |
+| **F11** | Cycle that constant: 300 / 100 / 30 / 10 / 3 UU |
 | F2 | Constant-pitch test (proves the rotation detour still works) |
 | F9 / F8 / F5 / F4 | Head tracking · recentre · flip yaw sign · flip pitch sign |
+
+6-DOF wins over F3 when both are on. F10 recentres on toggle, so the offset starts at zero.
+
+The XR→game mapping is fixed at **recentre**, not taken from where the camera points now. That
+is the correctness argument: an XR position lives in the XR world frame, so turning the head
+does not change it. Mapping it through the camera's *current* facing would swing a stationary
+body offset around the world as the head turned.
 
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`
 

@@ -440,21 +440,60 @@ Generalised lesson, and the second time this project has hit it: **a test that d
 well in one regime can be vacuous in another.** Check what your test degenerates to at the
 point you are actually evaluating it.
 
-#### ⚠️ Consequence: CPU frustum culling clips the offset view
+The direction test settled the convention outright on run 2 — the same register read two ways:
 
-Offsetting the camera left a **black band** down the edge of the frame. Cause: the game culls
+```
+** c0  ROW  w=-0.0020  dotFwd=+1.0000  hits=50    <- the view matrix
+   c0  COL  w=-0.0020  dotFwd=+0.0023  hits=9     <- same bytes, wrong convention
+```
+
+Identical `w`, because at the origin both conventions read the same component. The forward
+vector is what separates them, and `+0.0023` means the COL reading is essentially perpendicular
+to where the camera actually points — rejected outright.
+
+#### Tolerance must depend on which probe point matched
+
+Run 2 also showed a flat tolerance is wrong. Three extra windows passed (`c8`/`c11`/`c14` COL,
+`w` ≈ −10.5, 4 uploads each) beside the real matrix at `w` = −0.0020 with 50 uploads. Their
+**3-register spacing** suggests a block of `float3x4` transforms that the sliding 4-register
+window straddles. Injecting into those would corrupt something unrelated for no benefit.
+
+The fix follows from what the tolerance is *for*: it absorbs the one-frame staleness of the
+camera position being substituted. That applies to the two world-position probes. It does **not**
+apply to the origin probe, where the test reduces to "is `r[3].w` near zero" — pure matrix
+content, no camera reading, nothing to go stale. So the origin probe gets a tight **1 UU**
+tolerance, which separates −0.002 from −10.5 decisively; world probes keep 25 UU.
+
+#### ✅ CPU frustum culling — a non-issue at stereo scale (measured)
+
+Offsetting the camera leaves a **black band** down the edge of the frame: the game culls
 geometry on the CPU against its **original** frustum, so anything newly visible after the offset
 was never submitted to the GPU at all. Modifying the matrix moves the view but cannot conjure
 draw calls that were never issued.
 
-This is a standard VR-injection problem, and the standard fix applies: make the game render a
-**wider** field than is displayed, so the margin covers the offset. `mCurrentPOV` FOV at
-`+0x0438` is already proven writable and steers the projection, which makes it the obvious lever.
+Measured by scanning the backbuffer's edge columns (run 2), rather than judged by eye:
 
-Scale matters here and is reassuring: the proof used **300 UU**, deliberately unmissable. A real
-interpupillary distance is only a **few UU**, so the band at stereo-relevant offsets should be
-close to negligible. Spike 9 has F11 to step the offset down through 300 / 100 / 30 / 10 / 3 UU
-to find where the artefact stops mattering.
+| Offset | Band |
+|---|---|
+| 300 UU | 35–73 px of 2560 (1.4–2.9%), one 721 px spike |
+| **100 UU** | **0 px** |
+| 30 / 10 / 3 UU | 0 px |
+
+**It disappears completely at 100 UU and below.** A real interpupillary distance is only a few
+UU, so stereo needs no mitigation at all — the planned FOV-widening job (via `mCurrentPOV` FOV
+`+0x0438`, still the lever if it is ever needed) can be **dropped**. It would only return for
+large positional offsets, which 6-DOF head movement does not produce.
+
+Caveat on the metric: it counts *near-black* columns, so a genuinely dark scene reads as a band
+— a 502 px reading appeared with injection **off**. That failure mode only ever inflates the
+number, never deflates it, so the zeros are trustworthy and the conclusion holds.
+
+#### Measure in the game's frame, not the headset
+
+The band lives in the backbuffer. Judging it through the HMD would mean judging it through the
+aspect mismatch (game renders 16:9, per-eye view is near-square) and the lens distortion as
+well — neither of which will exist in the finished mod. Reading the backbuffer directly reports
+the same number whether or not anyone is wearing the headset.
 
 #### The three object-model attempts that failed first
 
