@@ -680,15 +680,18 @@ bool    g_eyeFilled[2] = { false, false };
 // Viewport switching rather than render-target switching is what keeps this affordable: two
 // extra API calls and one extra draw per scene draw, no target rebinds.
 //
-// Known-imperfect by design at this stage: full-screen passes (post-processing, HUD) are NOT
-// duplicated, because they do not have the camera matrix bound. They will process the
-// side-by-side image as a single picture, so expect bloom and similar effects to bleed across
-// the seam and the HUD to sit across both halves. That is the next problem, not this one.
+// Known-imperfect by design: full-screen passes (post-processing, HUD) do not have the camera
+// matrix bound, so StereoPair duplicates them into both halves WITHOUT an offset - each half
+// gets an identical, un-parallaxed copy. For most such passes that is close to correct (they
+// sample screen-space UVs relative to whatever viewport is active, so each half is filled
+// properly); the visible compromise is that they carry no depth/stereo cue, not that they are
+// missing or wrong-side. That is a smaller problem than the one this used to have - see the
+// comment on StereoPair for what that was.
 volatile LONG g_dupDraws = 0;
 float g_eyeDeltaUU[3] = {0,0,0};     // left eye -> right eye, in game world units
 bool  g_camMatrixBound = false;      // is the camera's view matrix the one currently set?
 float g_lastCamMat[16] = {0};        // the left-eye matrix exactly as we last sent it
-int   g_drawsTotal = 0, g_drawsDuped = 0;
+int   g_drawsTotal = 0, g_drawsDuped = 0, g_drawsDupedOffset = 0;
 
 IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
@@ -1284,18 +1287,33 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrim)(IDirect3DDevice9*, D3DP
 PFN_DrawPrim        g_origDrawPrim = nullptr;
 PFN_DrawIndexedPrim g_origDrawIndexedPrim = nullptr;
 
-// Issue one scene draw twice: left half of the viewport with the matrix already set, right half
-// with the same matrix shifted by the interpupillary offset. Restores both the viewport and the
-// constants afterwards so the game's own state is never disturbed.
+// Issue one scene draw twice: left half of the viewport, then right. When the draw's matrix
+// is confirmed as the tracked camera, the right half gets it shifted by the eye offset - true
+// parallax. Otherwise the SAME unmodified state is used for both halves.
+//
+// Run 7 found the bug in getting this backwards. The original version skipped the whole split
+// for any draw whose matrix didn't pass the camera identity check (decals, per-object
+// transforms, screen-space effects), drawing it ONCE at full un-split width. Since the
+// finished backbuffer is sliced in half at submission - left half to the left eye, right half
+// to the right - a full-width draw only survives the crop in whichever half it happened to
+// land in. That one mechanism produced every symptom reported: geometry present in only one
+// eye, an ammo pickup flickering as its alignment crossed the detection threshold while the
+// head tilted, a manhole decal missing outright, and a screen-space effect that never got a
+// second offset copy reading as sliding with the view instead of staying put.
+//
+// The fix is to stop gating the SPLIT on camera identification at all - split unconditionally
+// whenever duplication is on, and use identification only to decide whether the right half
+// gets an offset or an exact copy. A flat, non-parallaxed duplicate in both eyes is a small
+// visual compromise; a duplicate missing from one eye outright is not.
 template <typename DrawFn>
 HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     ++g_drawsTotal;
-    if (!InterlockedCompareExchange(&g_dupDraws, 0, 0) || !g_camMatrixBound || !g_haveLock ||
-        !g_origSetVSConstF)
-        return draw();
+    if (!InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
 
     D3DVIEWPORT9 full{};
     if (FAILED(dev->GetViewport(&full)) || full.Width < 4) return draw();
+
+    const bool offsetKnown = g_camMatrixBound && g_haveLock && g_origSetVSConstF;
 
     D3DVIEWPORT9 half = full;
     half.Width = full.Width / 2;
@@ -1303,18 +1321,21 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     dev->SetViewport(&half);
     HRESULT hr = draw();
 
-    float rightMat[16];
-    memcpy(rightMat, g_lastCamMat, sizeof(rightMat));
-    ApplyOffset(reinterpret_cast<Reg4*>(rightMat), g_lockedConv, g_eyeDeltaUU);
+    if (offsetKnown) {
+        float rightMat[16];
+        memcpy(rightMat, g_lastCamMat, sizeof(rightMat));
+        ApplyOffset(reinterpret_cast<Reg4*>(rightMat), g_lockedConv, g_eyeDeltaUU);
+        g_origSetVSConstF(dev, g_lockedReg, rightMat, 4);
+    }
 
     half.X = full.X + full.Width / 2;
     dev->SetViewport(&half);
-    g_origSetVSConstF(dev, g_lockedReg, rightMat, 4);
     draw();
 
-    g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
+    if (offsetKnown) g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
     dev->SetViewport(&full);
     ++g_drawsDuped;
+    if (offsetKnown) ++g_drawsDupedOffset;
     return hr;
 }
 
@@ -1596,24 +1617,30 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     {
         static LARGE_INTEGER freq{}, last{};
         static int frames = 0; static double accum = 0.0;
-        static int dupPeak = 0, totPeak = 0;
+        static int dupPeak = 0, totPeak = 0, offsetPeak = 0;
         if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
         if (last.QuadPart) accum += double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
         last = now;
         if (g_drawsTotal > totPeak) totPeak = g_drawsTotal;
         if (g_drawsDuped > dupPeak) dupPeak = g_drawsDuped;
+        if (g_drawsDupedOffset > offsetPeak) offsetPeak = g_drawsDupedOffset;
         if (++frames >= 120) {
-            Log("perf: %.1f fps (%.2f ms/frame) | draws/frame peak %d, of which duplicated %d%s",
+            // "duplicated" is every draw split across both eye halves; "with offset" is the
+            // subset that also got true parallax. The gap between them is drawn flat/mono in
+            // both eyes - visible now, not silently dropped from one eye as it was before.
+            Log("perf: %.1f fps (%.2f ms/frame) | draws/frame peak %d, split %d (%d with"
+                " parallax, %d flat)%s",
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
+                offsetPeak, dupPeak - offsetPeak,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
-            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0;
+            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0;
         }
     }
 
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
     g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
-    g_drawsTotal = 0; g_drawsDuped = 0;
+    g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.

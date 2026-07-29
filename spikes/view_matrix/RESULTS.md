@@ -230,10 +230,38 @@ Also measured: rendering wider than the engine culled for produced **0 px** of c
 throughout gameplay, so UE3's per-object culling carries real slack. The headroom stays as
 insurance rather than a demonstrated necessity.
 
+## Run 6 — alternate-eye works, but flickers on head turn
+
+Depth read well, scale felt right, but rotating the head produced bad flicker — the expected
+consequence of a temporal method: the two eyes show the world at different instants, and no
+reprojection reconciles that. This is what motivated draw-call duplication (F1) below.
+
+## Run 7 — duplication: ~70 fps confirmed, and a real bug found
+
+**Performance is not the risk.** A steady ~70 fps throughout normal gameplay with duplication
+on — a real jump from the 15–40 fps range seen before F1 existed. A 2010 game has geometry
+headroom to spare for 2x draw calls.
+
+**Four symptoms, one bug.** Objects present in only one eye; an ammo pickup flickering on/off
+while the head tilted; a manhole decal missing outright; a screen-space effect that seemed to
+slide with head movement. All four came from the same place: the old code only split a draw
+across both eye halves when it could positively identify the draw's matrix as the camera.
+Anything that failed that check — decals, per-object transforms, screen effects — fell back to
+a single, un-split, full-width draw. Since the backbuffer is sliced in half at submission, a
+full-width draw survives the crop only in whichever half it happened to land in. One mechanism,
+four symptoms.
+
+**Fixed:** stop gating the split on identification. Duplicate into both halves unconditionally
+whenever F1 is on; identification now only decides whether the right half gets the eye offset
+or an exact copy of the left. A flat, non-parallaxed duplicate in both eyes is a minor visual
+compromise; a duplicate missing from one eye outright is not. The perf log now reports `split`
+(everything) vs `with parallax` (correctly offset) vs `flat` (duplicated but not offset), so
+the size of the remaining problem is visible.
+
 ## Next
 
-1. **Test alternate-eye stereo (F12)** — does it read as depth, and is the half-rate judder
-   tolerable?
+1. **Re-test F1** — do the four run-7 symptoms clear? Watch the new `flat` count in the perf
+   log for how much of the scene still lacks true parallax.
 2. **Tune `kMetresToUU`** (52.5, from UE3's 16 units per foot) — the projection is finally
    correct enough to judge scale against
 

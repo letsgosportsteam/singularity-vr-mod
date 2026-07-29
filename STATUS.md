@@ -74,7 +74,7 @@ Findings from the same runs, all in `ENGINE_NOTES.md`:
 
 The headset's real position drives the view (F10). Leaning and ducking move the camera.
 
-## True stereo by draw-call duplication — prototype built, not yet run (F1)
+## True stereo by draw-call duplication — bug found and fixed, next run pending (F1)
 
 Alternate-eye's flaw is **temporal** — the eyes show the world at different instants, which no
 reprojection can reconcile and head rotation makes obvious (confirmed run 6: "terrible flicker").
@@ -83,26 +83,46 @@ So draw both eyes from the same instant by issuing every scene draw twice.
 **The prototype needs no double-wide render target.** It splits the existing backbuffer with the
 **viewport**: left half gets the left-eye matrix, right half the right, and OpenXR is handed each
 half as a `subImage` rect. Half horizontal resolution per eye (1280×1440), but the technique is
-complete end to end — if it works, widening the target is an optimisation, not an open question.
-Viewport switching rather than render-target switching is what keeps it affordable.
+complete end to end. Viewport switching rather than render-target switching is what keeps it
+affordable.
 
 Still no interpupillary distance anywhere: the eye separation vector goes through the same
 XR→game mapping as everything else, and the right-eye matrix is the left one plus that offset.
 
-**Expected to be wrong at this stage, deliberately:** full-screen passes are not duplicated (they
-do not have the camera matrix bound), so post-processing will treat the side-by-side frame as one
-picture — bloom and similar bleeding across the seam — and the HUD will sit across both halves.
-That is the next problem, and it is the one these projects normally stall on.
-
 Duplication forces the VR projection on, since each eye occupies half the width and without the
 matching per-eye frustum both come out squashed 2x horizontally.
 
-### Cost is not the risk here
+### Cost is not the risk — run 7 confirmed it
 
-A 2010 game on a modern GPU has enormous headroom, so 2x geometry is affordable — the risk is
-**correctness** in the post-processing passes, not throughput. The build now logs frames per
-second and draw calls per frame (total and duplicated) so the throughput half is measured rather
-than assumed.
+A 2010 game on a modern GPU has enormous headroom, and run 7 proved it: a steady **~70 fps**
+throughout normal gameplay with duplication on, a real improvement over the 15–40 fps seen
+before F1 existed. Throughput is not the open question here.
+
+### ✅ Bug found (run 7) and fixed: objects vanishing from one eye
+
+Run 7 surfaced four symptoms at once: geometry present in only one eye, an ammo pickup
+flickering on/off as the head tilted, a manhole decal missing outright, and a screen-space
+effect that appeared to slide with head movement. All four traced to **one mechanism**.
+
+The original code only split a draw across both eye halves when it could positively identify
+the draw's matrix as the tracked camera (small `w` at origin, forward vector matching the
+camera's real facing). Any draw that failed that test — decals, per-object transforms, screen
+effects — fell through to a single, un-split, full-width draw instead. Since the finished
+backbuffer is sliced in half at submission (left half to the left eye, right half to the
+right), a full-width draw only survives the crop in whichever half it happened to occupy. One
+mechanism, four symptoms: an object present in one eye, an object whose identification
+flickered pass/fail as viewing angle changed while tilting, a decal with an unrecognized matrix
+gone entirely, an effect with no offset copy reading as unstable relative to a properly-doubled
+scene.
+
+**Fix:** stop gating the *split* on identification. Always duplicate into both halves when F1
+is on; use identification only to decide whether the right half's copy gets the eye offset or
+is an exact copy of the left. A flat, non-parallaxed duplicate in both eyes is a minor visual
+compromise; a duplicate missing from one eye outright is not. The perf log now separately
+reports `split` (everything, both eyes) vs `with parallax` (the subset correctly offset) vs
+`flat` (duplicated but without offset) — so the extent of the remaining problem is visible
+rather than hidden. **Not yet re-run** — needs the same test as before, and the manhole/ammo
+symptoms specifically.
 
 ## Alternate-eye stereo — works, but flickers on head turn (F12)
 
@@ -178,15 +198,15 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Test draw-call duplication (F1)** — does the game survive it, what does it cost, and how
-   badly do the post-process passes break across the seam? The log now reports fps and draw
-   counts.
-2. **Fix the post-processing passes** if duplication is otherwise viable. This is the real work
-   and the usual stalling point: full-screen effects need running per half, or the scene needs a
-   genuine double-wide target with separate passes.
-3. **Depth reprojection** as the alternative, and a shipped mode either way.
-4. **The ini** for mode selection, plus a fallback to mono.
-5. **Explain the brightness change** (run 4, deferred): most likely UE3 auto-exposure adapting to
+1. **Re-test F1** after the run-7 fix — the geometry-only-in-one-eye bug, the ammo flicker, and
+   the missing manhole should all be gone, since they shared one cause. Watch the new perf log
+   `flat` count for how much of the scene still lacks true parallax (post-processing, decals,
+   anything not sharing the tracked camera matrix) — that's the honest remaining gap, now
+   visible instead of hidden.
+2. **Depth reprojection** as the alternative approach, worth building regardless so there's a
+   real comparison — and a shipped mode either way.
+3. **The ini** for mode selection, plus a fallback to mono.
+4. **Explain the brightness change** (run 4, deferred): most likely UE3 auto-exposure adapting to
    a much wider field, which is benign; the alternative is our injection touching a
    post-processing pass. Distinguishable with F6.
 
