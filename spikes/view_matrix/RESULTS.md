@@ -1,9 +1,45 @@
 # Spike 9 — the view matrix on its way to the GPU
 
-**Status: built, NOT YET RUN.** Needs a headset session to produce results.
+**Status: ✅ WORKED.** Camera position is controllable. Run 2026-07-29.
 
-Attacks the one blocking problem: camera **position**, which gates both stereo (a per-eye
+Attacked the one blocking problem: camera **position**, which gates both stereo (a per-eye
 offset *is* a position offset) and 6-DOF.
+
+## Result
+
+```
+--- scan complete: 18 candidate window(s), camera (18992.2, -22941.2, 180.0)
+    c0   ROW  w=-0.0020  fwdLen=1.0000  hits=50   zero at origin(translated-world)
+```
+
+`c0`, ROW storage, cancelling to two thousandths of a unit with a unit-length forward vector
+and 50 uploads in the scanned frame. Pressing F3 moved the view. **Position is solved.**
+
+Two things the run taught us beyond the headline, both fed back into this build:
+
+**1. The engine renders in translated-world space.** Every match landed on the *origin* probe
+point, never the camera's world position — UE3 pre-subtracts the view origin on the CPU to
+protect float precision at large world coordinates. Probing `(0,0,0)` as a third point is the
+only reason the scan found anything at all.
+
+**2. At the origin, the zero test degenerates.** It returned 18 candidates, most spurious,
+several with `w` of exactly `+1.0000`. The reason: `clip.w` at `p = (0,0,0)` collapses to
+`r[3].w` under *both* storage conventions, so the test cannot tell ROW from COL and admits any
+matrix with a near-zero w constant — which is most of them. The zero-cancellation argument only
+carries information when the probe point is far from the origin.
+
+Fixed by adding an independent second test, now in this build: for a genuine world→clip matrix
+the xyz of the w term **is the camera's forward axis**, and the camera's real facing is known
+from its `FRotator`. Requiring agreement (`dotFwd >= 0.99`) rejects the unrelated matrices *and*
+resolves the storage convention, since ROW and COL read the forward vector from different
+components. Injection now targets only windows passing both tests, instead of all 18.
+
+**Known artefact: a black band at the frame edge.** The game culls geometry on the CPU against
+its *original* frustum, so anything newly visible after the offset was never submitted to the
+GPU. Moving the matrix cannot conjure draw calls that were never issued. Standard VR-injection
+problem with a standard fix — render wider than you display (`mCurrentPOV` FOV at `+0x0438` is
+proven writable). The proof used 300 UU deliberately; a real IPD is a few UU, so F11 now steps
+the offset down through 300 / 100 / 30 / 10 / 3 to find where it stops mattering.
 
 ## Why this approach
 
@@ -81,29 +117,38 @@ Connect Virtual Desktop first, launch the dev copy, reach gameplay.
 | Key | Effect |
 |---|---|
 | **F7** | Scan one frame for the view matrix, then report |
-| **F3** | Offset the camera +300 UU on world Y through whatever was found |
+| **F3** | Offset the camera along its own right axis through what was found |
+| **F11** | Cycle the offset: 300 / 100 / 30 / 10 / 3 UU |
 | F2 | Constant-pitch test (proves the rotation detour still works) |
 | F9 / F8 / F5 / F4 | Head tracking · recentre · flip yaw sign · flip pitch sign |
 
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`
 
-## Reading the result
+## Reading the report
 
-**Stand still, press F7.** The report lists each matching window as
-`c<register> ROW|COL w=<residual> fwdLen=<length> hits=<count> zero at <probe point>`.
+**Stand still, press F7.** Each window is listed as
 
-- `w` near zero and `fwdLen` near 1.0 → a genuine view matrix
-- Which probe point matched tells us whether the engine uses **world** or **translated-world**
-  space, which is worth recording either way
-- Several registers matching is normal and expected — UE3 uploads the view-projection to
-  different slots for different shaders
+```
+** c0   ROW  w=-0.0020  fwdLen=1.0000  dotFwd=+0.9998  hits=50  zero at origin(translated-world)
+```
 
-Then **press F3**. If the view slides sideways, **camera position is solved** and both stereo
-and 6-DOF are unblocked.
+`**` marks the windows passing **both** tests — small `w` *and* a forward axis agreeing with
+where the camera really points. Only those are injected into. Unmarked rows are kept in the
+report deliberately, so it is visible *why* something was rejected rather than it silently
+vanishing.
 
 If nothing matches, the log prints the closest window it saw, so a failed scan still produces
-evidence rather than silence. The remaining suspects at that point are a matrix split across
-two calls, or one reaching the GPU by some path other than `SetVertexShaderConstantF`.
+evidence rather than silence. The remaining suspects would be a matrix split across two calls,
+or one reaching the GPU by some path other than `SetVertexShaderConstantF`.
+
+## Next
+
+1. **F11 down the offset** and find where the culling band stops mattering — that sizes the
+   FOV-widening job, or removes it
+2. **Widen the render FOV** via `mCurrentPOV +0x0438` so the margin covers the offset
+3. **Two images per frame**, the remaining piece for real stereo
+4. **6-DOF**, now mostly free — feed the HMD's positional delta in as the offset instead of a
+   constant
 
 ## What this build drops
 

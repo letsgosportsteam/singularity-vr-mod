@@ -29,7 +29,7 @@ R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
 
 In gameplay: **F9** head tracking · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
-**F7** scan for the view matrix · **F3** offset the camera through it.
+**F7** scan for the view matrix · **F3** offset the camera through it · **F11** offset amount.
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
@@ -44,44 +44,40 @@ Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo 
 | FOV | write to `mCurrentPOV` FOV, `+0x0438` |
 | Finding live objects | `GObjects` walk; live actor = `Outer == PersistentLevel`, name lacks `Default__` |
 
-## The one blocking problem: camera POSITION
+## ✅ Camera POSITION — solved 2026-07-29
 
-Unsolved, and it gates **both 6-DOF and stereo** (per-eye separation *is* a position offset).
-Three approaches tried, all documented in `ENGINE_NOTES.md`:
+This was the blocker for **both 6-DOF and stereo**, and it is now controllable. Not through the
+engine's object model — three attempts at that failed — but by intercepting the **world→clip
+matrix** on its way to the GPU and pre-multiplying a translation into it. Confirmed live: the
+view moved.
 
-1. Writing all five candidate position fields at once — no effect
-2. Hardware write breakpoint on camera `Location` — only generic actor-move plumbing with a
-   dozen callers each; no camera-specific seam
-3. `FUN_0104e420` (adjacent to the rotation source) — turned out to be rotation, not position
+| Fact | Value |
+|---|---|
+| Where | `SetVertexShaderConstantF`, device vtable slot 94 |
+| Register | `c0`, ROW storage (registers are matrix rows) |
+| Space | **translated-world** — UE3 pre-subtracts the view origin on the CPU |
+| To move by `o` | `row3 -= o.x*row0 + o.y*row1 + o.z*row2` |
 
-The pattern suggests this engine simply doesn't compute camera position at one interceptable
-point the way it does rotation.
+Two findings from the same run, both in `ENGINE_NOTES.md`:
 
-### ⏭ Next action: run spike 9 — `spikes/view_matrix/`
+- **The engine renders in translated-world space.** Probing the world camera position alone
+  would have found nothing; the origin probe is what made the scan work.
+- **CPU frustum culling clips the offset view** — a black band at the frame edge, because
+  geometry newly visible after the offset was culled before it was ever drawn. The fix is to
+  make the game render wider than it displays; `mCurrentPOV` FOV at `+0x0438` is proven
+  writable and is the lever. At real IPD scale (a few UU, not the 300 UU used for the proof)
+  this should be close to negligible.
 
-**Built and compiling clean; needs a headset session to produce results.** It intercepts the
-**view matrix on its way to the GPU** (`SetVertexShaderConstantF`), bypassing the object model
-entirely — the approach established VR injectors use, and one that solves 6-DOF *and* stereo
-with a single mechanism.
+### ⏭ Next actions
 
-It finds the matrix rather than guessing at register numbers: for a world→clip matrix `clip.w`
-is view-space depth, so the camera itself must transform to `w = 0`. Substituting the known
-camera position and keeping the 4-register windows that cancel to near zero — from ~20,000 UU
-out — is a test that is very hard to pass by accident. Both matrix storage conventions and
-three probe points are covered in one scan, the third being the origin, which catches UE3's
-translated-world case.
-
-To run: `.\spikes\view_matrix\build.ps1 -Install`, reach gameplay, **stand still**, press **F7**
-to scan, read the log, then **F3** to offset the camera 300 UU on world Y. If the view slides,
-position is solved. Full interpretation guide in `spikes/view_matrix/RESULTS.md`.
-
-Note stereo needs a **second** thing beyond position control — see below.
-
-### Stereo needs a second thing beyond position control
-
-Two images per frame. Options: alternate-eye (one frame stale per eye, cheap), engine re-entry
-(proper, hard), or depth reprojection (fallback). The current architecture renders once per
-frame, so this stays open even once the matrix is controllable.
+1. **Step the offset down** (F11 cycles 300 / 100 / 30 / 10 / 3 UU) and find where the culling
+   band stops mattering. This sizes the FOV-widening job, or removes it.
+2. **Widen the render FOV** via `mCurrentPOV +0x0438` so the margin covers the offset.
+3. **Get two images per frame** — the remaining piece for real stereo. The architecture renders
+   once per frame, so this needs alternate-eye submission (one frame stale per eye, cheap),
+   engine re-entry (proper, hard), or depth reprojection (fallback).
+4. **6-DOF** is now mostly free: feed the HMD's positional delta in as the offset instead of a
+   constant.
 
 ## Other known work, roughly by value
 

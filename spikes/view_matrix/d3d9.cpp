@@ -291,6 +291,7 @@ struct MatHit {
     int   pt;            // index into kPointName
     float w;             // clip.w for that point - the closer to 0 the better
     float fwdLen;        // length of the w-term xyz, ~1.0 for a real view matrix
+    float dotFwd;        // agreement with the camera's real facing - the decisive test
     int   count;         // how many times this window matched during the armed frame
 };
 
@@ -309,18 +310,33 @@ float g_camPos[3] = {0,0,0};
 float g_povPos[3] = {0,0,0};
 volatile LONG g_camPosValid = 0;
 
-const float kInjectUU = 300.0f;   // ~6 m on world Y - the same unmissable constant spike 8 used
+// The camera's own axes, from its FRotator. These are what make the origin case decidable -
+// see the direction test below.
+float g_camFwd[3]   = {1,0,0};
+float g_camRight[3] = {0,1,0};
+
+// Injection magnitude, cycled at runtime with F11. 300 UU is unmissable and proves the
+// mechanism; a real interpupillary distance is only a few UU, which is what stereo will
+// actually use, so being able to dial down and confirm the artifacts shrink matters.
+const float kOffsetSteps[] = { 300.0f, 100.0f, 30.0f, 10.0f, 3.0f };
+const int   kOffsetStepCount = 5;
+int   g_offsetStep = 0;
+float g_offsetUU = 300.0f;
 
 // clip.w for point p under the given convention.
 inline float ClipW(const Reg4* r, int conv, const float* p) {
     if (conv == CONV_ROW) return p[0]*r[0].w + p[1]*r[1].w + p[2]*r[2].w + r[3].w;
     else                  return p[0]*r[3].x + p[1]*r[3].y + p[2]*r[3].z + r[3].w;
 }
+// The xyz of the w term. For a world->clip matrix clip.w is view depth, so this is the
+// camera's forward axis expressed in world axes.
+inline void FwdVec(const Reg4* r, int conv, float* out) {
+    if (conv == CONV_ROW) { out[0] = r[0].w; out[1] = r[1].w; out[2] = r[2].w; }
+    else                  { out[0] = r[3].x; out[1] = r[3].y; out[2] = r[3].z; }
+}
 inline float FwdLen(const Reg4* r, int conv) {
-    float a, b, c;
-    if (conv == CONV_ROW) { a = r[0].w; b = r[1].w; c = r[2].w; }
-    else                  { a = r[3].x; b = r[3].y; c = r[3].z; }
-    return sqrtf(a*a + b*b + c*c);
+    float f[3]; FwdVec(r, conv, f);
+    return sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
 }
 
 // Does this window transform the camera to w ~ 0?
@@ -334,8 +350,26 @@ inline float FwdLen(const Reg4* r, int conv) {
 //
 // The forward-length window rejects degenerate blocks whose w term is all zeros - those pass
 // the zero test for every point and mean nothing.
+//
+// ---- why the zero test alone is not enough, learned from the first run ----
+//
+// The first scan matched 18 windows, all of them at the ORIGIN probe point (so this engine
+// does use translated-world space - confirmed). But in that case the test degenerates badly:
+// at p = (0,0,0) the clip.w expression collapses to r[3].w under BOTH conventions, so
+//
+//   * ROW and COL become indistinguishable - every origin hit is reported twice, and
+//   * any matrix at all with a near-zero w constant qualifies, which is most of them.
+//
+// That is why w values of exactly +1.0000 showed up alongside the real one. The zero test
+// only carries real information when the probe point is far from the origin.
+//
+// The fix is an independent second test: for a genuine world->clip matrix the xyz of the w
+// term IS the camera's forward axis, and we know where the camera is actually facing from its
+// FRotator. Requiring those to agree is decisive - it rejects unrelated matrices AND picks the
+// correct convention, because ROW and COL read the forward vector from different components.
 const float kHitTolUU  = 25.0f;
 const float kNearTolUU = 5000.0f;
+const float kMinDotFwd = 0.99f;    // ~8 degrees of slack for the one-frame staleness
 
 // A failed scan should still yield evidence, so the closest non-qualifying window is kept.
 // Without this, "nothing matched" cannot be told apart from "matched at 30 UU".
@@ -354,22 +388,26 @@ inline void NoteNearMiss(UINT reg, int conv, float w, float len) {
     }
 }
 
-void RecordHit(UINT reg, int conv, int pt, float w, float len) {
+void RecordHit(UINT reg, int conv, int pt, float w, float len, float dot) {
     for (int i = 0; i < g_hitCount; ++i) {
         if (g_hits[i].startReg == reg && g_hits[i].conv == conv) {
             g_hits[i].count++;
-            if (fabsf(w) < fabsf(g_hits[i].w)) { g_hits[i].w = w; g_hits[i].fwdLen = len; g_hits[i].pt = pt; }
+            if (fabsf(w) < fabsf(g_hits[i].w)) {
+                g_hits[i].w = w; g_hits[i].fwdLen = len; g_hits[i].pt = pt; g_hits[i].dotFwd = dot;
+            }
             return;
         }
     }
-    if (g_hitCount < kMaxHits) g_hits[g_hitCount++] = { reg, conv, pt, w, len, 1 };
+    if (g_hitCount < kMaxHits) g_hits[g_hitCount++] = { reg, conv, pt, w, len, dot, 1 };
 }
 
-// Test one window against all three probe points and return the best-cancelling result.
+// Test one window against all three probe points and return the best-cancelling result,
+// together with how well its forward axis agrees with where the camera is really facing.
 // Returns false if the window has no plausible forward vector at all.
 inline bool TestWindow(const Reg4* r, int conv, const float* const pts[3],
-                       float* outW, float* outLen, int* outPt) {
-    float len = FwdLen(r, conv);
+                       float* outW, float* outLen, int* outPt, float* outDot) {
+    float f[3]; FwdVec(r, conv, f);
+    float len = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
     if (!(len > 0.3f && len < 3.0f)) return false;
     bool any = false;
     for (int i = 0; i < 3; ++i) {
@@ -377,9 +415,14 @@ inline bool TestWindow(const Reg4* r, int conv, const float* const pts[3],
         if (!(w > -kNearTolUU && w < kNearTolUU)) continue;      // also rejects NaN
         if (!any || fabsf(w) < fabsf(*outW)) { *outW = w; *outPt = i; any = true; }
     }
-    if (any) *outLen = len;
-    return any;
+    if (!any) return false;
+    *outLen = len;
+    *outDot = (f[0]*g_camFwd[0] + f[1]*g_camFwd[1] + f[2]*g_camFwd[2]) / len;
+    return true;
 }
+
+// A window is the view matrix only if it passes BOTH tests.
+inline bool IsViewMatrix(float w, float dot) { return fabsf(w) <= kHitTolUU && dot >= kMinDotFwd; }
 
 // Pre-multiply a world-space translation into the matrix: M' = T(-o) * M, which is exactly
 // "move the camera by o" and is correct for any offset, including forward, with no knowledge
@@ -765,9 +808,11 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         for (UINT j = 0; j <= windows; ++j) {
             const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
             for (int c = 0; c < 2; ++c) {
-                float w = 0, len = 0; int pt = 0;
-                if (!TestWindow(r, c, pts, &w, &len, &pt)) continue;
-                if (fabsf(w) <= kHitTolUU) RecordHit(startReg + j, c, pt, w, len);
+                float w = 0, len = 0, dot = 0; int pt = 0;
+                if (!TestWindow(r, c, pts, &w, &len, &pt, &dot)) continue;
+                // Everything inside the w tolerance is recorded, passing or not, so the report
+                // can show WHY the rejects were rejected rather than hiding them.
+                if (fabsf(w) <= kHitTolUU) RecordHit(startReg + j, c, pt, w, len, dot);
                 else                       NoteNearMiss(startReg + j, c, w, len);
             }
         }
@@ -787,13 +832,18 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         bool edited = false;
         const UINT copyVecs = vec4Count;
         if (copyVecs > kScratchVecs) return g_origSetVSConstF(dev, startReg, data, vec4Count);
+        // Offset along the camera's RIGHT axis, not a world axis. That is the actual stereo
+        // primitive - a per-eye offset is exactly this - and it keeps the effect the same
+        // whichever way the player happens to be facing.
+        const float o[3] = { g_camRight[0] * g_offsetUU,
+                             g_camRight[1] * g_offsetUU,
+                             g_camRight[2] * g_offsetUU };
         for (UINT j = 0; j <= windows && j + 4 <= copyVecs; ++j) {
             const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
             for (int c = 0; c < 2; ++c) {
-                float w = 0, len = 0; int pt = 0;
-                if (!TestWindow(r, c, pts, &w, &len, &pt) || fabsf(w) > kHitTolUU) continue;
+                float w = 0, len = 0, dot = 0; int pt = 0;
+                if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot)) continue;
                 if (!edited) { memcpy(scratch, data, copyVecs * 4 * sizeof(float)); edited = true; }
-                const float o[3] = { 0.0f, kInjectUU, 0.0f };
                 ApplyOffset(reinterpret_cast<Reg4*>(scratch + j * 4), c, o);
                 break;      // one convention per window; both cannot be true of one matrix
             }
@@ -821,6 +871,19 @@ void RefreshCameraPosition() {
     }
     if (Readable((void*)(cam + CAM_POV_LOC), 12)) memcpy(g_povPos, (void*)(cam + CAM_POV_LOC), 12);
     else memcpy(g_povPos, g_camPos, 12);
+
+    // Camera axes from its FRotator. UE3 convention: X forward, Y right, Z up, angles as
+    // int32 with 65536 = 360 degrees. This is what makes the origin (translated-world) case
+    // decidable - the position test alone cannot tell a view matrix from any other matrix
+    // there, but the facing direction can.
+    if (Readable((void*)(cam + ACTOR_ROTATION), 12)) {
+        const int32_t* rot = reinterpret_cast<const int32_t*>(cam + ACTOR_ROTATION);
+        const float kUUToRad = 6.2831853f / 65536.0f;
+        float pitch = rot[0] * kUUToRad, yaw = rot[1] * kUUToRad;
+        float cp = cosf(pitch), sp = sinf(pitch), cy = cosf(yaw), sy = sinf(yaw);
+        g_camFwd[0]   = cp * cy; g_camFwd[1]   = cp * sy; g_camFwd[2]   = sp;
+        g_camRight[0] = -sy;     g_camRight[1] = cy;      g_camRight[2] = 0.0f;
+    }
     // A camera sitting exactly at the origin would make the w test meaningless - every matrix
     // would pass on its constant term alone. Wait for a real position before scanning.
     float d2 = g_camPos[0]*g_camPos[0] + g_camPos[1]*g_camPos[1] + g_camPos[2]*g_camPos[2];
@@ -830,6 +893,8 @@ void RefreshCameraPosition() {
 void ReportScan() {
     Log("--- scan complete: %d candidate window(s), camera (%.1f, %.1f, %.1f) POV (%.1f, %.1f, %.1f)",
         g_hitCount, g_camPos[0], g_camPos[1], g_camPos[2], g_povPos[0], g_povPos[1], g_povPos[2]);
+    Log("    camera facing (%.3f, %.3f, %.3f), right (%.3f, %.3f, %.3f)",
+        g_camFwd[0], g_camFwd[1], g_camFwd[2], g_camRight[0], g_camRight[1], g_camRight[2]);
     if (g_hitCount == 0) {
         if (g_haveNear)
             Log("    closest window: c%u %s w=%+.2f fwdLen=%.4f (tolerance was %.0f)",
@@ -842,16 +907,29 @@ void ReportScan() {
         Log("    than SetVertexShaderConstantF, or a block split across two calls.");
         return;
     }
-    // Smallest |w| first - that is the best-cancelling, most likely genuine one.
+    // Passing windows first, then by how well the facing agrees - that ordering puts the real
+    // view matrix at the top even when a dozen unrelated matrices clear the w test.
     for (int i = 0; i < g_hitCount; ++i)
-        for (int j = i + 1; j < g_hitCount; ++j)
-            if (fabsf(g_hits[j].w) < fabsf(g_hits[i].w)) { MatHit t = g_hits[i]; g_hits[i] = g_hits[j]; g_hits[j] = t; }
-    for (int i = 0; i < g_hitCount; ++i)
-        Log("    c%-3u %s  w=%+.4f  fwdLen=%.4f  hits=%-5d  zero at %s",
-            g_hits[i].startReg, g_hits[i].conv == CONV_ROW ? "ROW" : "COL",
-            g_hits[i].w, g_hits[i].fwdLen, g_hits[i].count, kPointName[g_hits[i].pt]);
-    Log("    -> press F3 to offset the camera +%.0f UU on world Y through these. If the view"
-        " slides, camera position is SOLVED.", kInjectUU);
+        for (int j = i + 1; j < g_hitCount; ++j) {
+            bool pi = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd);
+            bool pj = IsViewMatrix(g_hits[j].w, g_hits[j].dotFwd);
+            if ((pj && !pi) || (pj == pi && g_hits[j].dotFwd > g_hits[i].dotFwd)) {
+                MatHit t = g_hits[i]; g_hits[i] = g_hits[j]; g_hits[j] = t;
+            }
+        }
+    int passing = 0;
+    for (int i = 0; i < g_hitCount; ++i) {
+        bool pass = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd);
+        if (pass) ++passing;
+        Log("    %s c%-3u %s  w=%+.4f  fwdLen=%.4f  dotFwd=%+.4f  hits=%-5d  zero at %s",
+            pass ? "**" : "  ", g_hits[i].startReg, g_hits[i].conv == CONV_ROW ? "ROW" : "COL",
+            g_hits[i].w, g_hits[i].fwdLen, g_hits[i].dotFwd, g_hits[i].count,
+            kPointName[g_hits[i].pt]);
+    }
+    Log("    %d of %d windows pass BOTH tests (** marked). Only those are injected into.",
+        passing, g_hitCount);
+    Log("    -> F3 offsets the camera %.0f UU along its own right axis. F11 changes the amount.",
+        g_offsetUU);
 }
 
 void InstallViewHook() {
@@ -885,8 +963,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     bool k3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
     if (k3 && !p3) { LONG was = InterlockedCompareExchange(&g_injectOn,0,0);
                      InterlockedExchange(&g_injectOn, was?0:1);
-                     Log("F3: matrix camera offset %s (%.0f UU on world Y)", was?"OFF":"ON", kInjectUU); }
+                     Log("F3: matrix camera offset %s (%.0f UU along the camera's right axis)",
+                         was?"OFF":"ON", g_offsetUU); }
     p3 = k3;
+    static bool p11 = false;
+    bool k11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    if (k11 && !p11) {
+        g_offsetStep = (g_offsetStep + 1) % kOffsetStepCount;
+        g_offsetUU = kOffsetSteps[g_offsetStep];
+        Log("F11: offset now %.0f UU", g_offsetUU);
+    }
+    p11 = k11;
     p9=k9;p8=k8;p5=k5;p4=k4;p2=k2;
 
     // The camera position the detector substitutes must be this frame's, read before any of

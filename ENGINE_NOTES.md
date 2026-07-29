@@ -391,10 +391,72 @@ Why the earlier approaches failed, in one line each:
 Yaw appeared to work only because our write happened to survive into the same frame; it was
 never actually authoritative.
 
-### Camera POSITION — unsolved, and harder than rotation
+### ⭐ Camera POSITION — **SOLVED** via the view matrix (2026-07-29, spike 9)
 
-Needed for **both** stereo (per-eye offset is a position offset) and 6-DOF. Two approaches tried
-2026-07-29, both negative:
+Needed for **both** stereo (per-eye offset is a position offset) and 6-DOF. Three attempts
+through the object model failed (recorded below — they are why the working approach is what it
+is). What works is intercepting the **world→clip matrix** in the vertex shader constants and
+pre-multiplying a translation into it. Confirmed live: the view moved.
+
+| Fact | Value |
+|---|---|
+| Where | `SetVertexShaderConstantF`, D3D9 device vtable slot **94** |
+| Register | **`c0`**, a 4-register block |
+| Storage | **ROW** — registers are the rows of a row-vector matrix (`clip = v * M`) |
+| Space | **TRANSLATED-WORLD**, not world (see below) |
+| Residual | `w = -0.0020`, `fwdLen = 1.0000`, 50 uploads in the scanned frame |
+
+To move the camera by `o`: `M' = T(-o) · M`, i.e. `row3 -= o.x*row0 + o.y*row1 + o.z*row2`.
+Exact for any offset including forward, and needs no knowledge of the projection.
+
+#### This engine renders in TRANSLATED-WORLD space
+
+Every match landed on the **origin** probe point, never the camera's world position. So UE3
+pre-subtracts the view origin on the CPU before uploading — its standard trick for keeping
+float precision usable at large world coordinates — which puts the camera at the shader-space
+origin. Two consequences:
+
+- A world-position test alone would have found **nothing**. Probing `(0,0,0)` as a third point
+  is what made the scan work at all.
+- A world-space *offset* is still the same vector in translated-world space (the translation
+  moves the origin, not the axes), so the injection maths is unaffected.
+
+#### ⚠️ Method trap: at the origin, the w test degenerates
+
+The first scan returned **18** candidates, most of them spurious, including several with
+`w` of exactly `+1.0000`. The reason is worth remembering: `clip.w` at `p = (0,0,0)` collapses
+to `r[3].w` under **both** storage conventions. So at that probe point the test
+
+- cannot tell **ROW** from **COL** — every hit is reported twice, and
+- admits **any** matrix whose w constant is near zero, which is most of them.
+
+The zero-cancellation test only carries information when the probe point is far from the
+origin. Fixed with an independent second test: for a genuine world→clip matrix the xyz of the
+w term **is the camera's forward axis**, and the camera's real facing is known from its
+`FRotator`. Requiring agreement rejects unrelated matrices *and* resolves the convention,
+because ROW and COL read the forward vector from different components.
+
+Generalised lesson, and the second time this project has hit it: **a test that discriminates
+well in one regime can be vacuous in another.** Check what your test degenerates to at the
+point you are actually evaluating it.
+
+#### ⚠️ Consequence: CPU frustum culling clips the offset view
+
+Offsetting the camera left a **black band** down the edge of the frame. Cause: the game culls
+geometry on the CPU against its **original** frustum, so anything newly visible after the offset
+was never submitted to the GPU at all. Modifying the matrix moves the view but cannot conjure
+draw calls that were never issued.
+
+This is a standard VR-injection problem, and the standard fix applies: make the game render a
+**wider** field than is displayed, so the margin covers the offset. `mCurrentPOV` FOV at
+`+0x0438` is already proven writable and steers the projection, which makes it the obvious lever.
+
+Scale matters here and is reassuring: the proof used **300 UU**, deliberately unmissable. A real
+interpupillary distance is only a **few UU**, so the band at stereo-relevant offsets should be
+close to negligible. Spike 9 has F11 to step the offset down through 300 / 100 / 30 / 10 / 3 UU
+to find where the artefact stops mattering.
+
+#### The three object-model attempts that failed first
 
 **1. Direct writes — no effect.** Wrote a 300 UU constant simultaneously to every plausible
 field: camera `AActor::Location +0x54`, `mCurrentOffset +0x408`, `mCurrentPOV` location `+0x420`,
@@ -424,13 +486,15 @@ again, not position.
 Lesson: two functions of near-identical size, adjacent in memory, called from the same site can
 still do unrelated things. Adjacency was not evidence.
 
-**Better approach, not yet attempted:** intercept the **view matrix on its way to the GPU**
-(`SetVertexShaderConstantF`) and apply the per-eye / positional offset there. UE3 is
-shader-based, so the view transform passes through as vertex shader constants. This bypasses the
-engine's object model entirely, is how established VR injectors (vorpX, 3Dmigoto) do stereo, and
-solves stereo *and* 6-DOF with one mechanism. Cost: identifying which constant register holds the
-matrix, and the current architecture renders once per frame — so stereo also needs either
-alternate-eye submission (one frame stale per eye) or engine re-entry (render the scene twice).
+All three failures share one root cause, now understood: **the engine's camera position fields
+are inputs to a computation whose output we could not reach, and that output is the matrix.**
+Going straight to the matrix skipped the entire problem. Recorded as method: when several
+attempts to steer a value upstream all fail, look for the place the value is *consumed* rather
+than another place it might be produced.
+
+Stereo still needs a second thing beyond position control: the current architecture renders once
+per frame, so two images means alternate-eye submission (one frame stale per eye), engine
+re-entry (render the scene twice), or depth reprojection.
 
 ### Consequence: head-look and weapon aim are coupled
 
