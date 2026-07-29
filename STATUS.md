@@ -31,7 +31,8 @@ R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F1** true stereo
 (draw duplication) · **F12** alternate-eye stereo ·
 **F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
-**F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount.
+**F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount ·
+**INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment.
 Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
@@ -97,6 +98,52 @@ matching per-eye frustum both come out squashed 2x horizontally.
 A 2010 game on a modern GPU has enormous headroom, and run 7 proved it: a steady **~70 fps**
 throughout normal gameplay with duplication on, a real improvement over the 15–40 fps seen
 before F1 existed. Throughput is not the open question here.
+
+### ✅ Run 9: the both-eyes disappearances are a CULLING shortfall, not a stereo bug
+
+Ammo, the gun and the manhole vanish from **both** eyes — and the manhole was already flickering
+before duplication existed. That rules stereo out: if a draw call is never issued, our hook
+never sees it and duplication cannot help.
+
+Cause, measured. The engine's FOV is **horizontal at 16:9** — a wide, short frustum. Ours is the
+headset's: narrow and **tall**. Vertical coverage is therefore the binding constraint, and the
+old 1.15 headroom never met it. Asking 133.9°, the engine actually held ~124°, dipping to 105.8°:
+
+| Engine horizontal | Its vertical culling FOV | We render | Shortfall |
+|---|---|---|---|
+| 124.0° | 93.2° | 98.0° | ~5° |
+| 105.8° | 73.2° | 98.0° | ~25° |
+
+Anything in that band is culled before a draw call exists. Ground objects entering the bottom
+shortfall as the head tilts down is exactly the reported ammo/gun behaviour.
+
+**Fix:** `kFovHeadroom` 1.15 → **2.5** (asks ~160°, holds ≥130° through the observed dips,
+comfortably past the ~128° needed for 98° vertical). Not yet re-run.
+
+### ⚠️ Run 9: rocks visible in one eye only — INVERTED from the obvious explanation
+
+Rocks off to the **left** are missing from the **left** eye — the eye *nearer* to them — and stay
+missing regardless of view direction. That is backwards from frustum clipping: for an object off
+to the left, the **right** eye sits further away and sees it at the *larger* off-axis angle, so
+the right eye should lose it first.
+
+The eye separation itself is confirmed correct — **3.32 UU = 6.3 cm**, textbook IPD, stable all
+session — so this is not a magnitude or sign error in that vector.
+
+That leaves either a reversed half-to-eye mapping, or a cause that is not clipping at all.
+Reading the submission path found no swap. This being the second wrong guess in a row, the build
+now **measures** instead:
+
+- **INSERT** — cycle: both halves / left half only / right half only. Whichever eye goes black
+  identifies the mapping unambiguously.
+- **DELETE** — swap the assignment, so a confirmed reversal can be verified on the spot.
+
+### ⚠️ Correction: the "with parallax" count is optimistic
+
+`g_camMatrixBound` is **sticky** — it reflects the last upload to the tracked register, not
+whether *this* draw's transform actually comes from it. So "100% with parallax" means the camera
+matrix was the last thing written there, not that every draw was genuinely offset. A draw taking
+its transform from a different register counts as parallaxed while receiving no offset at all.
 
 ### ✅ Bug found (run 7) and fixed: objects vanishing from one eye
 
@@ -198,15 +245,15 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Re-test F1** after the run-7 fix — the geometry-only-in-one-eye bug, the ammo flicker, and
-   the missing manhole should all be gone, since they shared one cause. Watch the new perf log
-   `flat` count for how much of the scene still lacks true parallax (post-processing, decals,
-   anything not sharing the tracked camera matrix) — that's the honest remaining gap, now
-   visible instead of hidden.
-2. **Depth reprojection** as the alternative approach, worth building regardless so there's a
+1. **Re-test F1 with the culling fix** — ammo, gun and manhole should stop vanishing from both
+   eyes now that the engine culls wider than we render on the vertical axis too.
+2. **Run the INSERT mapping test** for the one-eye rocks: press INSERT once (left half only) and
+   report which eye goes black. If it is the LEFT eye, the assignment is reversed and DELETE
+   fixes it; if the RIGHT eye, the mapping is correct and the cause is elsewhere.
+3. **Depth reprojection** as the alternative approach, worth building regardless so there's a
    real comparison — and a shipped mode either way.
-3. **The ini** for mode selection, plus a fallback to mono.
-4. **Explain the brightness change** (run 4, deferred): most likely UE3 auto-exposure adapting to
+4. **The ini** for mode selection, plus a fallback to mono.
+5. **Explain the brightness change** (run 4, deferred): most likely UE3 auto-exposure adapting to
    a much wider field, which is benign; the alternative is our injection touching a
    post-processing pass. Distinguishable with F6.
 

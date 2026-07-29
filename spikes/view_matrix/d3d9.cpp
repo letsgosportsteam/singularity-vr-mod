@@ -364,7 +364,29 @@ float g_forcedTanX = 0.0f, g_forcedTanY = 0.0f;   // read back AFTER the edit, t
 // Ask the engine for more FOV than we actually render with. Its value now only governs CPU
 // culling, and culling wider than we draw costs a little geometry and guarantees no bare edges
 // even on the frames where its interpolation dips well below what we asked for.
-const float kFovHeadroom = 1.15f;
+//
+// ---- why 1.15 was far too little (run 9) ----
+//
+// The engine's FOV is HORIZONTAL at the game's 16:9 aspect, so its culling frustum is wide and
+// short. Ours is the headset's: narrow and TALL. Coverage on the vertical axis is therefore the
+// binding constraint, and 1.15 did not come close to meeting it.
+//
+// Measured, asking 133.9 deg: the engine actually held ~124 deg, dipping to 105.8. Vertical
+// culling FOV = 2*atan(tan(H/2)/1.778), so:
+//
+//     124.0 deg horizontal -> 93.2 deg vertical    (we render 98.0 - SHORT by ~5 deg)
+//     105.8 deg horizontal -> 73.2 deg vertical    (SHORT by ~25 deg)
+//
+// Anything in that shortfall band is culled before a draw call is ever issued, so our hook
+// never sees it and duplication cannot help: the object is missing from BOTH eyes. That is
+// exactly the reported behaviour of ammo and the gun vanishing when the head tilts down (ground
+// objects entering the bottom shortfall), and of the manhole decal - which was also flickering
+// BEFORE duplication existed, because this shortfall predates it.
+//
+// The headroom multiplies the tangent, so it must be large enough that even a 25-30 deg dip
+// still leaves the vertical covered. 2.5 asks ~160 deg, which holds >=130 deg through the
+// observed dips - comfortably past the ~128 deg needed for 98 deg vertical.
+const float kFovHeadroom = 2.5f;
 
 // Per-frame diagnostics, reset each Present. The spread catches a case the single captured
 // value cannot: c0 is written ~50 times a frame by different passes, and if two of them carry
@@ -688,6 +710,22 @@ bool    g_eyeFilled[2] = { false, false };
 // missing or wrong-side. That is a smaller problem than the one this used to have - see the
 // comment on StereoPair for what that was.
 volatile LONG g_dupDraws = 0;
+
+// ---- diagnostics for "visible in one eye only" (run 9) ----
+//
+// Run 9 reported rocks off to the LEFT that are missing from the LEFT eye - the eye NEARER to
+// them - and stay missing regardless of view direction. That is inverted from what frustum
+// clipping predicts. For an object off to the left, the RIGHT eye sits further from it and so
+// sees it at the LARGER off-axis angle, meaning the right eye should lose it first. Observing
+// the opposite says either the half-to-eye mapping is reversed somewhere, or the cause is not
+// clipping at all. Reading the code did not find a swap, and this is the second wrong guess in
+// a row, so: measure instead.
+//
+// INSERT blanks one half - whichever eye goes black identifies the mapping unambiguously.
+// DELETE swaps the assignment, so if it is reversed the fix can be confirmed on the spot.
+volatile LONG g_eyeDebug = 0;        // 0 = both halves, 1 = left half only, 2 = right half only
+volatile LONG g_swapEyes = 0;        // reverse which half feeds which eye
+
 float g_eyeDeltaUU[3] = {0,0,0};     // left eye -> right eye, in game world units
 bool  g_camMatrixBound = false;      // is the camera's view matrix the one currently set?
 float g_lastCamMat[16] = {0};        // the left-eye matrix exactly as we last sent it
@@ -832,7 +870,18 @@ void MeasureCullBand(const uint8_t* bits, int pitch, UINT w, UINT h) {
     // without needing timestamps or the user to remember which step they were on.
     static int n = 0;
     if (++n % 60 == 0) {
-        if (InterlockedCompareExchange(&g_sixDof, 0, 0)) {
+        if (InterlockedCompareExchange(&g_dupDraws, 0, 0)) {
+            // A real interpupillary distance is a few UU (kMetresToUU * ~0.063 m ~= 3-4 UU).
+            // Logging it directly settles, rather than guesses at, whether "visible in only
+            // one eye no matter where you look" is a real magnitude/sign bug in this vector
+            // versus a genuine (and much smaller) parallax/occlusion effect.
+            float mag = sqrtf(g_eyeDeltaUU[0]*g_eyeDeltaUU[0] + g_eyeDeltaUU[1]*g_eyeDeltaUU[1] +
+                              g_eyeDeltaUU[2]*g_eyeDeltaUU[2]);
+            Log("cull band: left=%u right=%u of %u px (%.2f%% / %.2f%%)  eye delta "
+                "(%.2f, %.2f, %.2f) UU, |%.2f|%s", l, r, w, 100.0 * l / w, 100.0 * r / w,
+                g_eyeDeltaUU[0], g_eyeDeltaUU[1], g_eyeDeltaUU[2], mag,
+                (mag > 20.0f) ? "  <-- FAR outside real IPD range, suspect a bug" : "");
+        } else if (InterlockedCompareExchange(&g_sixDof, 0, 0)) {
             Log("cull band: left=%u right=%u of %u px (%.2f%% / %.2f%%)  6DOF offset "
                 "(%.1f, %.1f, %.1f) UU", l, r, w, 100.0 * l / w, 100.0 * r / w,
                 g_hmdOffset[0], g_hmdOffset[1], g_hmdOffset[2]);
@@ -1094,7 +1143,9 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                         // Both eyes live in one image, side by side. Hand each eye its half by
                         // rect - no extra copy, and both were drawn in the same instant.
                         const int32_t halfW = (int32_t)g_scWidth / 2;
-                        projViews[i].subImage.imageRect.offset = { i * halfW, 0 };
+                        const bool swapEyes = InterlockedCompareExchange(&g_swapEyes, 0, 0) != 0;
+                        const int32_t src = swapEyes ? (1 - i) : i;
+                        projViews[i].subImage.imageRect.offset = { src * halfW, 0 };
                         projViews[i].subImage.imageRect.extent = { halfW, (int32_t)g_scHeight };
                     } else {
                         projViews[i].subImage.imageRect.offset = { 0, 0 };
@@ -1314,25 +1365,31 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     if (FAILED(dev->GetViewport(&full)) || full.Width < 4) return draw();
 
     const bool offsetKnown = g_camMatrixBound && g_haveLock && g_origSetVSConstF;
+    const LONG dbg = InterlockedCompareExchange(&g_eyeDebug, 0, 0);
 
     D3DVIEWPORT9 half = full;
     half.Width = full.Width / 2;
 
-    dev->SetViewport(&half);
-    HRESULT hr = draw();
-
-    if (offsetKnown) {
-        float rightMat[16];
-        memcpy(rightMat, g_lastCamMat, sizeof(rightMat));
-        ApplyOffset(reinterpret_cast<Reg4*>(rightMat), g_lockedConv, g_eyeDeltaUU);
-        g_origSetVSConstF(dev, g_lockedReg, rightMat, 4);
+    HRESULT hr = S_OK;
+    if (dbg != 2) {
+        dev->SetViewport(&half);
+        hr = draw();
     }
 
-    half.X = full.X + full.Width / 2;
-    dev->SetViewport(&half);
-    draw();
+    if (dbg != 1) {
+        if (offsetKnown) {
+            float rightMat[16];
+            memcpy(rightMat, g_lastCamMat, sizeof(rightMat));
+            ApplyOffset(reinterpret_cast<Reg4*>(rightMat), g_lockedConv, g_eyeDeltaUU);
+            g_origSetVSConstF(dev, g_lockedReg, rightMat, 4);
+        }
+        half.X = full.X + full.Width / 2;
+        dev->SetViewport(&half);
+        HRESULT hr2 = draw();
+        if (dbg == 2) hr = hr2;
+        if (offsetKnown) g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
+    }
 
-    if (offsetKnown) g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
     dev->SetViewport(&full);
     ++g_drawsDuped;
     if (offsetKnown) ++g_drawsDupedOffset;
@@ -1577,6 +1634,27 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      g_haveCentre = false;
                      Log("F1: draw-call duplication (TRUE stereo) %s", was?"OFF":"ON"); }
     p1 = k1;
+
+    // INSERT: blank one half. Whichever eye goes black tells us the half-to-eye mapping for
+    // certain, which reading the code did not settle.
+    static bool pIns = false;
+    bool kIns = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+    if (kIns && !pIns) {
+        LONG next = (InterlockedCompareExchange(&g_eyeDebug,0,0) + 1) % 3;
+        InterlockedExchange(&g_eyeDebug, next);
+        Log("INSERT: eye debug %s", next == 0 ? "OFF (both halves drawn)"
+            : next == 1 ? "drawing LEFT half only -> the RIGHT eye should go black"
+                        : "drawing RIGHT half only -> the LEFT eye should go black");
+    }
+    pIns = kIns;
+
+    // DELETE: reverse the mapping, so a confirmed swap can be fixed and verified immediately.
+    static bool pDel = false;
+    bool kDel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+    if (kDel && !pDel) { LONG was = InterlockedCompareExchange(&g_swapEyes,0,0);
+                         InterlockedExchange(&g_swapEyes, was?0:1);
+                         Log("DELETE: eye/half assignment %s", was?"NORMAL":"SWAPPED"); }
+    pDel = kDel;
     static bool p12 = false;
     bool k12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
     if (k12 && !p12) { LONG was = InterlockedCompareExchange(&g_stereo,0,0);
