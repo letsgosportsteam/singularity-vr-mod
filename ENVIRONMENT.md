@@ -19,7 +19,23 @@ Hashes differ only because Steam's copy carries the SteamStub `.bind` wrapper; t
 compiled code is the same build (see FEASIBILITY.md).
 
 The dev copy lives on `R:` deliberately — **not** under `C:\Users\...\OneDrive\`, so 7.58 GB does
-not get synced. The source tree (this repo) is inside OneDrive and should stay small.
+not get synced.
+
+## Repository location
+
+**`R:\code\claude\singularity_vr_mod`** — moved off OneDrive 2026-07-29.
+
+It started under `OneDrive\Desktop\code\...`, which meant every rebuild pushed a fresh
+`d3d9.dll`, `.obj`, `.pdb` and `.ilk` to the cloud. `.gitignore` stops *git* tracking those but
+does not stop OneDrive syncing them, and personal OneDrive has no pattern-based exclusions.
+Syncing `.git` also risks corrupting the object store if a sync lands mid-operation.
+
+**Start Claude Code sessions from this path.** Build scripts resolve their own directory and use
+absolute `R:\` paths for the SDK, toolchain and game, so nothing is tied to the repo location —
+verified by a clean rebuild immediately after the move.
+
+The move gave up OneDrive's offsite backup. A private git remote is the better replacement: it
+versions the source and does not sync build output.
 
 ## Toolchain
 
