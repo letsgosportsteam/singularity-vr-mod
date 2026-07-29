@@ -729,7 +729,7 @@ volatile LONG g_swapEyes = 0;        // reverse which half feeds which eye
 float g_eyeDeltaUU[3] = {0,0,0};     // left eye -> right eye, in game world units
 bool  g_camMatrixBound = false;      // is the camera's view matrix the one currently set?
 float g_lastCamMat[16] = {0};        // the left-eye matrix exactly as we last sent it
-int   g_drawsTotal = 0, g_drawsDuped = 0, g_drawsDupedOffset = 0;
+int   g_drawsTotal = 0, g_drawsDuped = 0, g_drawsDupedOffset = 0, g_drawsOffscreen = 0;
 
 IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
@@ -1338,6 +1338,43 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrim)(IDirect3DDevice9*, D3DP
 PFN_DrawPrim        g_origDrawPrim = nullptr;
 PFN_DrawIndexedPrim g_origDrawIndexedPrim = nullptr;
 
+// ---- only split draws aimed at the SCENE, never at offscreen targets (run 9) ----
+//
+// Run 9's decisive clue: with both halves drawn, distant building textures drop out and return
+// when you look away and back; with only ONE half drawn (INSERT) they are mostly stable. So the
+// damage comes from doing two draws, not from the matrices or the eye mapping - which the same
+// run confirmed is correct (left half -> left eye).
+//
+// The cause is that the run-7 fix went too far. Splitting EVERY draw also split draws aimed at
+// render targets that have nothing to do with the eyes: shadow maps above all. Rendering the
+// shadow scene twice into two halves of a shadow map leaves it holding two squashed copies,
+// each covering half its width. Objects then sample garbage shadow data, which reads exactly as
+// distant surfaces going dark and recovering when the view changes and the cascade is rebuilt.
+// One half is less wrong than two, hence "mostly stable" with INSERT.
+//
+// Fix: track the bound render target and only split when it is scene-sized. Shadow maps,
+// reflection buffers and half-res post buffers all differ in size and are left alone.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+PFN_SetRenderTarget g_origSetRenderTarget = nullptr;
+volatile LONG g_rtIsScene = 1;
+
+HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
+                                              IDirect3DSurface9* surf) {
+    HRESULT hr = g_origSetRenderTarget(dev, idx, surf);
+    if (idx == 0) {
+        // Before the backbuffer size is known, assume scene - the initial target IS the
+        // backbuffer, and refusing to split would silently disable stereo instead of failing
+        // in a way anyone would notice.
+        bool scene = true;
+        if (surf && g_srcW && g_srcH) {
+            D3DSURFACE_DESC d{};
+            if (SUCCEEDED(surf->GetDesc(&d))) scene = (d.Width == g_srcW && d.Height == g_srcH);
+        }
+        InterlockedExchange(&g_rtIsScene, scene ? 1 : 0);
+    }
+    return hr;
+}
+
 // Issue one scene draw twice: left half of the viewport, then right. When the draw's matrix
 // is confirmed as the tracked camera, the right half gets it shifted by the eye offset - true
 // parallax. Otherwise the SAME unmodified state is used for both halves.
@@ -1360,6 +1397,9 @@ template <typename DrawFn>
 HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     ++g_drawsTotal;
     if (!InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
+    // Never split a draw aimed at a shadow map or other offscreen target - see the note on
+    // Hook_SetRenderTarget for what that corrupts.
+    if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) { ++g_drawsOffscreen; return draw(); }
 
     D3DVIEWPORT9 full{};
     if (FAILED(dev->GetViewport(&full)) || full.Width < 4) return draw();
@@ -1695,7 +1735,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     {
         static LARGE_INTEGER freq{}, last{};
         static int frames = 0; static double accum = 0.0;
-        static int dupPeak = 0, totPeak = 0, offsetPeak = 0;
+        static int dupPeak = 0, totPeak = 0, offsetPeak = 0, offscreenPeak = 0;
         if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
         if (last.QuadPart) accum += double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
@@ -1703,22 +1743,23 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (g_drawsTotal > totPeak) totPeak = g_drawsTotal;
         if (g_drawsDuped > dupPeak) dupPeak = g_drawsDuped;
         if (g_drawsDupedOffset > offsetPeak) offsetPeak = g_drawsDupedOffset;
+        if (g_drawsOffscreen > offscreenPeak) offscreenPeak = g_drawsOffscreen;
         if (++frames >= 120) {
             // "duplicated" is every draw split across both eye halves; "with offset" is the
             // subset that also got true parallax. The gap between them is drawn flat/mono in
             // both eyes - visible now, not silently dropped from one eye as it was before.
             Log("perf: %.1f fps (%.2f ms/frame) | draws/frame peak %d, split %d (%d with"
-                " parallax, %d flat)%s",
+                " parallax, %d flat), offscreen left alone %d%s",
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
-                offsetPeak, dupPeak - offsetPeak,
+                offsetPeak, dupPeak - offsetPeak, offscreenPeak,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
-            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0;
+            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0;
         }
     }
 
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
     g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
-    g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0;
+    g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0; g_drawsOffscreen = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.
@@ -1778,7 +1819,9 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         // 81 = DrawPrimitive, 82 = DrawIndexedPrimitive - the two the scene passes use.
         g_origDrawPrim        = (PFN_DrawPrim)PatchVTable(*out, 81, (void*)&Hook_DrawPrim);
         g_origDrawIndexedPrim = (PFN_DrawIndexedPrim)PatchVTable(*out, 82, (void*)&Hook_DrawIndexedPrim);
-        Log("Present + SetVertexShaderConstantF + Draw hooks installed.");
+        // 37 = SetRenderTarget, so draws aimed at shadow maps can be told apart from scene draws.
+        g_origSetRenderTarget = (PFN_SetRenderTarget)PatchVTable(*out, 37, (void*)&Hook_SetRenderTarget);
+        Log("Present + SetVertexShaderConstantF + Draw + SetRenderTarget hooks installed.");
         Log("F7 find the matrix | F1 TRUE stereo | F12 alternate-eye | F10 6-DOF | F9 head tracking");
     }
     return hr;

@@ -120,7 +120,44 @@ shortfall as the head tilts down is exactly the reported ammo/gun behaviour.
 **Fix:** `kFovHeadroom` 1.15 → **2.5** (asks ~160°, holds ≥130° through the observed dips,
 comfortably past the ~128° needed for 98° vertical). Not yet re-run.
 
-### ⚠️ Run 9: rocks visible in one eye only — INVERTED from the obvious explanation
+### ✅ Run 10: the eye mapping is CORRECT, and the real culprit is offscreen targets
+
+The INSERT test settled the mapping: left-half-only blanked the **right** eye, right-half-only
+blanked the **left**. That is correct, so the swap theory is dead and DELETE is not needed.
+
+The decisive clue was elsewhere in the same report: with both halves drawn, distant building
+textures drop out and return when looking away and back; with only **one** half drawn they are
+*mostly stable*. So the damage comes from **doing two draws**, not from matrices or mapping.
+
+Cause: the run-7 fix over-corrected. Splitting *every* draw also split draws aimed at render
+targets that have nothing to do with the eyes — **shadow maps** above all. Rendering the shadow
+scene twice into two halves of a shadow map leaves it holding two squashed copies, each covering
+half its width. Objects then sample garbage shadow data, which reads exactly as distant surfaces
+going dark and recovering when the view shifts and the cascade is rebuilt. One half is less wrong
+than two, hence "mostly stable" under INSERT.
+
+**Fix:** hook `SetRenderTarget` (vtable 37), track whether the bound target is scene-sized, and
+only split when it is. Shadow maps, reflection buffers and half-res post buffers are left alone.
+The perf log now reports how many draws were skipped as offscreen.
+
+### ⚠️ Structural finding: the half-width viewport breaks unrecognized matrices
+
+Worth recording because it changes the plan. Every game projection matrix assumes the render
+target's **16:9** aspect. Rendering into a half-width viewport silently invalidates that. For the
+one matrix we recognize we compensate (`ApplyProjection` forces the per-eye frustum), but for
+every matrix we do **not** recognize there is no compensation — it renders with the wrong aspect
+in each half. The first-person weapon is the obvious victim, and the reported "gun disappeared,
+as if the in-game gun covered it" is consistent with a weapon drawn through its own separate
+narrow-FOV matrix landing wrong.
+
+**Therefore the double-wide render target is not an optimisation — it is required for
+correctness.** At 5120×1440 each half is exactly 2560×1440, the size and aspect the game already
+expects, so every matrix stays valid with no per-draw compensation, and per-eye resolution
+returns to full. Cost: 2x backbuffer memory, 2x pixels, and a 2x frame copy (~28 MB round trip)
+on a path that is already the bottleneck. Needs `D3DPRESENT_PARAMETERS` interception at
+`CreateDevice` plus matching interception of UE3's own scene-sized targets.
+
+### ⚠️ Run 9: rocks visible in one eye only — still unexplained
 
 Rocks off to the **left** are missing from the **left** eye — the eye *nearer* to them — and stay
 missing regardless of view direction. That is backwards from frustum clipping: for an object off
@@ -130,13 +167,14 @@ the right eye should lose it first.
 The eye separation itself is confirmed correct — **3.32 UU = 6.3 cm**, textbook IPD, stable all
 session — so this is not a magnitude or sign error in that vector.
 
-That leaves either a reversed half-to-eye mapping, or a cause that is not clipping at all.
-Reading the submission path found no swap. This being the second wrong guess in a row, the build
-now **measures** instead:
+With the mapping now confirmed correct (run 10), a swap is ruled out — so the cause is **not**
+frustum clipping and not the eye assignment. Still open. The shadow-map fix above may resolve it
+as a side effect, since corrupted shadow data can black out a surface entirely; if it does not,
+the next suspect is a depth-prepass/base-pass mismatch, where one pass gets the offset applied
+and the other does not, so geometry fails the depth-equal test in one half only.
 
-- **INSERT** — cycle: both halves / left half only / right half only. Whichever eye goes black
-  identifies the mapping unambiguously.
-- **DELETE** — swap the assignment, so a confirmed reversal can be verified on the spot.
+Diagnostics available: **INSERT** cycles both halves / left only / right only. **DELETE** swaps
+the assignment (kept, though the mapping is now known correct).
 
 ### ⚠️ Correction: the "with parallax" count is optimistic
 
@@ -245,11 +283,12 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-1. **Re-test F1 with the culling fix** — ammo, gun and manhole should stop vanishing from both
-   eyes now that the engine culls wider than we render on the vertical axis too.
-2. **Run the INSERT mapping test** for the one-eye rocks: press INSERT once (left half only) and
-   report which eye goes black. If it is the LEFT eye, the assignment is reversed and DELETE
-   fixes it; if the RIGHT eye, the mapping is correct and the cause is elsewhere.
+1. **Re-test F1** with two fixes stacked: the culling headroom (both-eyes disappearances) and the
+   offscreen-target gate (distant textures dropping out). Watch the new `offscreen left alone`
+   count — if it is 0, the shadow-map theory is wrong and the size test is not catching them.
+2. **Decide on the double-wide render target** — now understood as required for correctness, not
+   an optimisation (see the structural finding above). It is the biggest remaining piece of work
+   on this path and worth weighing against depth reprojection before committing.
 3. **Depth reprojection** as the alternative approach, worth building regardless so there's a
    real comparison — and a shipped mode either way.
 4. **The ini** for mode selection, plus a fallback to mono.
