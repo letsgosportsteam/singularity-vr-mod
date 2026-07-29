@@ -562,6 +562,39 @@ void ApplyProjection(Reg4* r, int conv, float curTanX, float curTanY,
     }
 }
 
+// Squeeze the image into one half of the frame in CLIP SPACE, leaving the viewport alone.
+//
+// This replaces viewport-halving, and the reason is run 11. Halving the viewport breaks every
+// UE3 shader that derives texture coordinates from screen position - deferred decals (a manhole
+// IS a decal), projected ground effects, SSAO. Those shaders compute
+//
+//     UV = (clipPos.xy / clipPos.w) * ScreenPositionScaleBias.xy + ScreenPositionScaleBias.wz
+//
+// where that constant was computed for the FULL render target: NDC [-1,1] -> UV [0,1]. With a
+// half viewport the geometry lands in half the pixels while the shader still samples the whole
+// texture. The mismatch differs per half, which is exactly why a ground texture showed up in one
+// eye and not the other.
+//
+// Remapping in clip space instead keeps the two mappings consistent. Scale x by 0.5 and shift by
+// s (-0.5 left, +0.5 right) and the left eye occupies NDC x in [-1,0]; the full-width viewport
+// puts that in pixels [0, W/2]; and the shader's own maths gives UV [0, 0.5] - the same half.
+// Geometry and texture lookups agree again, because the viewport never lied to the shader.
+//
+// The offset must be scaled by w: clip coordinates are homogeneous, so a constant shift has to
+// ride on the w term to survive the perspective divide.
+void ApplyEyeRemap(Reg4* r, int conv, float s) {
+    if (conv == CONV_ROW) {
+        // clip.x = sum_i v_i * r[i].x + r[3].x, clip.w likewise from the .w column.
+        for (int i = 0; i < 4; ++i) r[i].x = 0.5f * r[i].x + s * r[i].w;
+    } else {
+        // Register 0 IS the x column, register 3 the w column.
+        r[0].x = 0.5f * r[0].x + s * r[3].x;
+        r[0].y = 0.5f * r[0].y + s * r[3].y;
+        r[0].z = 0.5f * r[0].z + s * r[3].z;
+        r[0].w = 0.5f * r[0].w + s * r[3].w;
+    }
+}
+
 void ApplyOffset(Reg4* r, int conv, const float* o) {
     if (conv == CONV_ROW) {
         float* r3 = &r[3].x;
@@ -1442,6 +1475,18 @@ void ReportRenderTargets() {
 // whenever duplication is on, and use identification only to decide whether the right half
 // gets an offset or an exact copy. A flat, non-parallaxed duplicate in both eyes is a small
 // visual compromise; a duplicate missing from one eye outright is not.
+//
+// ---- run 11 rework: clip-space remap + SCISSOR, never the viewport ----
+//
+// The viewport is now left exactly as the game set it, because changing it was silently breaking
+// every screen-space-sampling shader (see ApplyEyeRemap for the full argument). Each eye is
+// placed in its half by remapping clip space in the matrix instead, which keeps the shader's
+// NDC->UV mapping and the hardware's NDC->pixel mapping in agreement.
+//
+// The scissor rectangle does the clipping the halved viewport used to do. Crucially, scissor
+// discards pixels WITHOUT altering the NDC->pixel transform, so it costs nothing in shader
+// correctness - it just stops draws we could not remap (their transform comes from a register we
+// do not track) from spilling across the seam into the other eye.
 template <typename DrawFn>
 HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     ++g_drawsTotal;
@@ -1454,35 +1499,53 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     D3DVIEWPORT9 full{};
     if (FAILED(dev->GetViewport(&full)) || full.Width < 4) return draw();
 
-    const bool offsetKnown = g_camMatrixBound && g_haveLock && g_origSetVSConstF;
+    const bool remapKnown = g_camMatrixBound && g_haveLock && g_origSetVSConstF;
     const LONG dbg = InterlockedCompareExchange(&g_eyeDebug, 0, 0);
+    const LONG halfW = (LONG)(full.Width / 2);
 
-    D3DVIEWPORT9 half = full;
-    half.Width = full.Width / 2;
+    // Save the scissor state so the game's own setup is restored untouched.
+    RECT  oldRect{};
+    DWORD oldScissorOn = FALSE;
+    dev->GetScissorRect(&oldRect);
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissorOn);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
 
+    float mat[16];
     HRESULT hr = S_OK;
+
     if (dbg != 2) {
-        dev->SetViewport(&half);
+        RECT lr = { (LONG)full.X, (LONG)full.Y,
+                    (LONG)full.X + halfW, (LONG)(full.Y + full.Height) };
+        dev->SetScissorRect(&lr);
+        if (remapKnown) {
+            memcpy(mat, g_lastCamMat, sizeof(mat));
+            ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), g_lockedConv, -0.5f);
+            g_origSetVSConstF(dev, g_lockedReg, mat, 4);
+        }
         hr = draw();
     }
 
     if (dbg != 1) {
-        if (offsetKnown) {
-            float rightMat[16];
-            memcpy(rightMat, g_lastCamMat, sizeof(rightMat));
-            ApplyOffset(reinterpret_cast<Reg4*>(rightMat), g_lockedConv, g_eyeDeltaUU);
-            g_origSetVSConstF(dev, g_lockedReg, rightMat, 4);
+        RECT rr = { (LONG)full.X + halfW, (LONG)full.Y,
+                    (LONG)(full.X + full.Width), (LONG)(full.Y + full.Height) };
+        dev->SetScissorRect(&rr);
+        if (remapKnown) {
+            memcpy(mat, g_lastCamMat, sizeof(mat));
+            // Eye offset first, then the half-frame remap - the offset is a world-space camera
+            // move and must happen before clip space is rescaled.
+            ApplyOffset(reinterpret_cast<Reg4*>(mat), g_lockedConv, g_eyeDeltaUU);
+            ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), g_lockedConv, +0.5f);
+            g_origSetVSConstF(dev, g_lockedReg, mat, 4);
         }
-        half.X = full.X + full.Width / 2;
-        dev->SetViewport(&half);
         HRESULT hr2 = draw();
         if (dbg == 2) hr = hr2;
-        if (offsetKnown) g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
     }
 
-    dev->SetViewport(&full);
+    if (remapKnown) g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
+    dev->SetScissorRect(&oldRect);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissorOn);
     ++g_drawsDuped;
-    if (offsetKnown) ++g_drawsDupedOffset;
+    if (remapKnown) ++g_drawsDupedOffset;
     return hr;
 }
 

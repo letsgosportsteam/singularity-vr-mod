@@ -149,6 +149,29 @@ computed for a 5120-wide target and still be wrong for each 2560 half.
 **Diagnostic added:** a render-target census logging every distinct target (size, format, draw
 count) once a second, so what is actually being split is known rather than assumed.
 
+### 🔧 The rework this motivated: clip-space remap + scissor, never the viewport
+
+The diagnosis points at a better design rather than a workaround. **Stop changing the viewport.**
+Leave it exactly as the game set it, and place each eye in its half by remapping **clip space** in
+the matrix: scale x by 0.5, shift by ∓0.5, so the left eye occupies NDC x ∈ [−1,0].
+
+Why that fixes it. A shader computing `UV = (clip.xy/clip.w) * scale + bias` with constants built
+for the full target maps NDC [−1,1] → UV [0,1]. Under the remap, left-eye geometry lands in NDC
+x ∈ [−1,0], the full-width viewport puts that in pixels [0, W/2], and the shader's own maths gives
+UV [0, 0.5] — **the same half**. Geometry and texture lookups agree again, because the viewport
+never lied to the shader.
+
+The **scissor** rectangle takes over the clipping the halved viewport used to do. Scissor discards
+pixels without altering the NDC→pixel transform, so it costs nothing in shader correctness — it
+only stops draws we could not remap (transform sourced from a register we do not track) spilling
+across the seam into the other eye.
+
+Geometry checks out: the forced per-eye frustum is 91.3° × 98.0°, `tanX/tanY = 0.889` matching a
+1280×1440 half, and the remap maps that frustum onto exactly half the full-width viewport.
+
+**Built and installed, not yet run.** Prediction to test: ground textures and decals should stop
+appearing in one eye only, because the class of bug causing it is gone by construction.
+
 ### Run 10: the eye mapping is CORRECT (this part stands)
 
 The INSERT test settled the mapping: left-half-only blanked the **right** eye, right-half-only
@@ -312,20 +335,18 @@ Toggle with **F6**.
 
 ### ⏭ Next actions
 
-**A decision point has been reached — see the run-11 wall above.**
+**Decision taken: continue with true native stereo** (draw-call duplication). Depth reprojection
+stays documented above as the fallback if this path stalls again.
 
-1. **Recommended: pivot to depth reprojection.** It sidesteps this entire class of problem because
-   the game renders **one ordinary full-screen frame** — no viewport games, so every screen-space
-   constant the engine computes stays correct, and every shader behaves exactly as shipped. Both
-   eyes still come from one instant, so the run-6 alternate-eye flicker does not return. The known
-   cost is disocclusion slivers at silhouettes, and the culling-band measurement already showed
-   IPD-scale offsets are tiny. Needs INTZ depth access.
-2. **Or continue duplication** by hunting the screen-space constants (`ScreenPositionScaleBias`
-   and relatives) and rewriting them per half. The same read-it-from-the-data technique that
-   found the view matrix would apply, but it is an open-ended investigation and there may be
-   several such constants rather than one.
-3. **Run the census either way** — one more F1 run reports exactly which targets take the draws,
-   which is worth having on record before abandoning this path.
+1. **Test the clip-space remap rework (F1)** — the prediction is that one-eye ground textures and
+   decals stop, since the mechanism causing them no longer exists. The render-target census also
+   reports for the first time, so we learn what is actually taking the draws.
+2. **If some draws are still wrong**, the next lever is coverage rather than mechanism: draws whose
+   transform comes from a register we do not track get no remap and are merely scissored. The fix
+   is to recognise more matrices, using the same read-it-from-the-data approach that found `c0`.
+3. **Post-processing full-screen passes remain unsolved** — they use a pass-through transform and
+   sample across the whole target, so they cannot be remapped this way. Expect seam artifacts from
+   bloom and similar until handled per half.
 3. **Depth reprojection** as the alternative approach, worth building regardless so there's a
    real comparison — and a shipped mode either way.
 4. **The ini** for mode selection, plus a fallback to mono.
