@@ -400,6 +400,26 @@ const int   kFovHeadroomCount = 4;
 int   g_fovHeadroomStep = 0;
 float kFovHeadroom = 2.5f;
 
+// How much of the headset's field of view we actually render, as a fraction of its half-angle.
+//
+// This is the other half of the same trade as the headroom above, and the more useful end of it.
+// The engine has to cull at least as wide as we draw, and because its FOV is horizontal at 16:9
+// while ours is tall and narrow, covering our 98 deg vertical forces its reported FOV up to
+// ~128 deg before any safety margin - which is what drags streaming and LOD off. Rendering a
+// little less vertical FOV lowers that requirement much faster than it costs immersion:
+//
+//     100% -> 98.0 deg vertical, needs the engine at ~128 deg
+//      85% -> 83.3 deg vertical, needs the engine at ~112 deg
+//      70% -> 68.6 deg vertical, needs the engine at ~96 deg
+//
+// The submitted OpenXR frustum is derived from the same numbers, so narrowing this stays
+// geometrically honest - the image simply subtends less of the eye, with black beyond it, rather
+// than being wrong.
+const float kRenderFovSteps[] = { 1.0f, 0.85f, 0.70f };
+const int   kRenderFovCount = 3;
+int   g_renderFovStep = 0;
+float g_renderFovScale = 1.0f;
+
 // Per-frame diagnostics, reset each Present. The spread catches a case the single captured
 // value cannot: c0 is written ~50 times a frame by different passes, and if two of them carry
 // genuinely different projections then "the" FOV depends on which one happened to write last -
@@ -1628,6 +1648,9 @@ void ApplyVrFov() {
 
     float vHalf = (fabsf(g_eyeFov[0].angleUp) + fabsf(g_eyeFov[0].angleDown)) * 0.5f;
     if (!(vHalf > 0.05f && vHalf < 1.5f)) return;
+    // Render only the requested fraction of the headset's field. Scaling the ANGLE rather than
+    // the tangent keeps the steps behaving the way they read.
+    vHalf *= g_renderFovScale;
     float aspect = (float)g_srcW / (float)g_srcH;
     float hFovDeg = 2.0f * atanf(tanf(vHalf) * aspect) * 57.2957795f;
     if (!(hFovDeg > 30.0f && hFovDeg < 170.0f)) return;      // never write nonsense
@@ -1824,6 +1847,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             kFovHeadroom < 1.05f ? " (no headroom - expect edge dropouts, but correct LOD)" : "");
     }
     pPgUp = kPgUp;
+
+    // PAGE DOWN: how much of the headset's field we render. Lowers what the engine has to cull,
+    // which is the same trade as PAGE UP approached from the other side.
+    static bool pPgDn = false;
+    bool kPgDn = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
+    if (kPgDn && !pPgDn) {
+        g_renderFovStep = (g_renderFovStep + 1) % kRenderFovCount;
+        g_renderFovScale = kRenderFovSteps[g_renderFovStep];
+        Log("PAGE DOWN: rendering %.0f%% of the headset's field of view", g_renderFovScale * 100.0f);
+    }
+    pPgDn = kPgDn;
 
     // DELETE: reverse the mapping, so a confirmed swap can be fixed and verified immediately.
     static bool pDel = false;

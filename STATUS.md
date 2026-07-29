@@ -48,7 +48,7 @@ In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F1** true 
 **F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
 **F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount ·
 **INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment ·
-**PAGE UP** cycle culling headroom (LOD/streaming trade).
+**PAGE UP** cycle culling headroom · **PAGE DOWN** cycle how much of the headset's FOV we render.
 
 Mouse and head tracking now **add** rather than fight — turning with the mouse no longer snaps
 back, and the same fix is what stick-turning will need in the shipped mod.
@@ -214,6 +214,27 @@ That headroom is a real trade, not a value to get right once: wide buys culling 
 buys correct LOD and streaming. **PAGE UP** now cycles it (2.5 → 1.75 → 1.30 → 1.0) so the trade
 can be measured. If flicker tracks the headroom, the long-term fix is widening the engine's culling
 frustum *without* inflating the FOV it reports to streaming/LOD.
+
+### FOV controls — what exists
+
+Three separate things, worth keeping distinct:
+
+| Control | What it does |
+|---|---|
+| **F6** | VR-correct projection off → the game renders its **native ~65°** and we claim the headset's FOV. This is the "standard FOV" toggle, and it has been there since run 4. Only meaningful in **mono** — with F1 on it leaves the per-eye frustum unforced and both halves come out squashed. |
+| **PAGE DOWN** | *New.* Render only 100% / 85% / 70% of the headset's field. Geometrically honest: the submitted frustum follows the same numbers, so the image just subtends less of the eye. |
+| **PAGE UP** | Culling headroom multiplier on top of whatever PAGE DOWN selected. |
+
+PAGE DOWN is the more useful end of the same trade as PAGE UP. Because the engine's FOV is
+horizontal at 16:9 while ours is tall and narrow, covering 98° vertical forces its reported FOV to
+~128° *before* any margin — which is what drags streaming and LOD off. Narrowing the render lowers
+that requirement faster than it costs immersion:
+
+```
+100% -> 98.0 deg vertical, needs the engine at ~128 deg
+ 85% -> 83.3 deg vertical, needs the engine at ~112 deg
+ 70% -> 68.6 deg vertical, needs the engine at ~96 deg
+```
 
 ### Run 10: the eye mapping is CORRECT (this part stands)
 
@@ -381,7 +402,10 @@ Toggle with **F6**.
 **Decision taken: continue with true native stereo** (draw-call duplication). Depth reprojection
 stays documented above as the fallback if this path stalls again.
 
-1. **Test the headroom trade (PAGE UP)** for the texture flicker — does it track the engine FOV?
+1. **Test the flicker against both FOV controls.** PAGE DOWN first (it lowers what the engine must
+   cull, so it should let PAGE UP come down too), then PAGE UP. If flicker tracks either, the
+   engine's reported FOV is confirmed as the cause and the fix is to widen its culling frustum
+   without inflating the number streaming and LOD read.
 2. **Then performance**, which is now the gating item rather than a later nicety. Two reasons it
    has been promoted: the frame copy scales with pixels, so matching the headset's resolution
    multiplies its cost; and the fps distribution is bimodal (median ~70, floor ~13), which is the
