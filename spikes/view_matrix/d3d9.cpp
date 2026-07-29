@@ -627,6 +627,51 @@ bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
     return true;
 }
 
+// ---------------------------------------------------------------- culling band measurement
+//
+// Offsetting the camera reveals geometry the game culled on the CPU against its ORIGINAL
+// frustum, so it was never submitted as a draw call and comes out as a dead strip down the
+// edge of the frame. How wide that strip is decides whether the FOV-widening work is needed
+// at stereo-relevant offsets, or whether it can be skipped entirely.
+//
+// Measuring it beats eyeballing it, and not only for precision: the artefact lives in the
+// GAME's frame, so judging it through the headset would mean judging it through the aspect
+// mismatch and the lens distortion as well - neither of which will be there in the final
+// product. Reading the backbuffer directly sidesteps all of that, and reports the same number
+// whether or not anyone is wearing the headset.
+//
+// The scan walks in from each edge counting columns that are uniformly near-black. Sampling
+// every 16th row is plenty: the strip spans the full height, so a partial sample cannot miss
+// it, and a bright frame stops the scan on its first column.
+int g_bandLeft = 0, g_bandRight = 0;
+
+void MeasureCullBand(const uint8_t* bits, int pitch, UINT w, UINT h) {
+    const int kDark = 12;           // out of 255, per channel - "nothing was drawn here"
+    const UINT kRowStep = 16;
+    const UINT kMaxBand = w / 2;
+
+    auto columnIsDark = [&](UINT x) {
+        for (UINT y = 0; y < h; y += kRowStep) {
+            const uint8_t* px = bits + (size_t)y * pitch + (size_t)x * 4;   // BGRA
+            if (px[0] > kDark || px[1] > kDark || px[2] > kDark) return false;
+        }
+        return true;
+    };
+
+    UINT l = 0; while (l < kMaxBand && columnIsDark(l)) ++l;
+    UINT r = 0; while (r < kMaxBand && columnIsDark(w - 1 - r)) ++r;
+    g_bandLeft = (int)l; g_bandRight = (int)r;
+
+    // Report periodically with the offset that produced it, so the log correlates the two
+    // without needing timestamps or the user to remember which step they were on.
+    static int n = 0;
+    if (++n % 60 == 0) {
+        bool on = InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
+        Log("cull band: left=%u right=%u of %u px (%.2f%% / %.2f%%)  offset=%s%.0f UU",
+            l, r, w, 100.0 * l / w, 100.0 * r / w, on ? "" : "OFF, was ", g_offsetUU);
+    }
+}
+
 // Pull the game's finished frame across to D3D11. This is the expensive part: a full
 // GPU->CPU readback followed by a CPU->GPU upload, roughly 14 MB each way at 2560x1440.
 bool CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
@@ -658,6 +703,7 @@ bool CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
     uint8_t* d = static_cast<uint8_t*>(ms.pData);
     const size_t rowBytes = (size_t)g_srcW * 4;
     for (UINT y = 0; y < g_srcH; ++y) memcpy(d + (size_t)y * ms.RowPitch, s + (size_t)y * lr.Pitch, rowBytes);
+    MeasureCullBand(s, lr.Pitch, g_srcW, g_srcH);
     g_ctx11->Unmap(g_uploadTex, 0);
     g_sysmemSurf->UnlockRect();
     return true;

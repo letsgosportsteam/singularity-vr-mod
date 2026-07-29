@@ -34,6 +34,13 @@ from its `FRotator`. Requiring agreement (`dotFwd >= 0.99`) rejects the unrelate
 resolves the storage convention, since ROW and COL read the forward vector from different
 components. Injection now targets only windows passing both tests, instead of all 18.
 
+**The band is measured, not eyeballed.** Every frame, the backbuffer's edge columns are scanned
+for near-black and the width is logged once a second alongside the offset that produced it — so
+the log correlates the two without timestamps or anyone having to remember which step they were
+on. Reading the game's own frame also sidesteps a real methodological trap: the artefact lives
+in the backbuffer, so judging it through the headset would mean judging it through the aspect
+mismatch and the lens distortion too, neither of which will exist in the final product.
+
 **Known artefact: a black band at the frame edge.** The game culls geometry on the CPU against
 its *original* frustum, so anything newly visible after the offset was never submitted to the
 GPU. Moving the matrix cannot conjure draw calls that were never issued. Standard VR-injection
