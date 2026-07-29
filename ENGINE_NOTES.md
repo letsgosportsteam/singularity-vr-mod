@@ -470,7 +470,11 @@ Open questions before committing:
 ## Renderer facts (from the live pool probe, `spikes/d3d9_pool_probe/`)
 
 - Entry point used: `Direct3DCreate9` (**non-Ex**) — so the device must be upgraded for sharing.
-- Backbuffer `2560x1440`, `D3DFMT_X8R8G8B8`, **no MSAA** (no resolve step needed before sharing).
+- Backbuffer `2560x1440`, **`D3DFMT_A8R8G8B8` (21)**, **no MSAA** (no resolve step needed before
+  sharing). *Corrected 2026-07-29 — this originally read `X8R8G8B8`, which is format 22, not 21.
+  The mistake propagated into spike 8 and made `GetRenderTargetData` fail with
+  `D3DERR_INVALIDCALL`, since it requires identical formats on both surfaces. Read the format
+  from the surface descriptor rather than hardcoding it.*
 - `CreateDevice` flags `0x142` = `HARDWARE_VERTEXPROCESSING | FPU_PRESERVE | MULTITHREADED`.
 - **10,454 `D3DPOOL_MANAGED` allocations vs 47 `DEFAULT`** in one session — the wrapper must
   translate MANAGED→DEFAULT and own the backing store.

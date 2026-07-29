@@ -1,0 +1,673 @@
+// vr_render - Singularity VR mod, spike 8
+//
+// FIRST BUILD THAT PUTS A PICTURE IN THE HEADSET. Extends spike 7 (view_hook) by copying
+// the game's rendered frame into an OpenXR swapchain and submitting it, so the head-tracked
+// image is actually visible in VR instead of only on the monitor.
+//
+// Ladder rung: "MonoTracked" - one image shown to both eyes, with the game camera driven by
+// the HMD. Not yet stereo (no per-eye offset), but already an immersive view rather than a
+// floating screen, because the game renders from wherever the head is pointing.
+//
+// Frame path: game backbuffer -> D3D9 SYSTEMMEM surface -> CPU -> D3D11 texture -> XR
+// swapchain. That CPU round-trip is deliberately the slow option: zero-copy sharing needs the
+// game's device upgraded to D3D9Ex, which needs the D3DPOOL_MANAGED wrapper (10,454
+// allocations measured in spike 2). This path needs none of that and gets a picture in front
+// of the user today; the fast path replaces it later.
+//
+// One frame of latency is inherent here: the backbuffer being copied was rendered with the
+// pose submitted on the PREVIOUS frame.
+//
+// -------- inherited from spike 7 --------
+// Injects head rotation at the SOURCE instead of fighting the engine downstream.
+//
+// A hardware write breakpoint on the controller's pitch traced the real writer to:
+//     01034105  CALL 0x0104e390     ; returns a pointer to an FRotator
+//     0103410d  MOV  ECX,[EAX]      ; pitch
+//     0103411e  MOV  [ESI+0x60],ECX ; -> AActor::Rotation
+// so FUN_0104e390 computes the view rotation. Detour it, adjust the FRotator it returns, and
+// the engine consumes our value through its own pipeline - correct frame timing, engine
+// clamping preserved, no mouse emulation, no menu special-casing.
+//
+// Replaces seven earlier attempts that all wrote downstream state and were overwritten.
+//
+// Controls:
+//   F2  constant-pitch test (+8000 UU, ignores the headset) - proves the detour works
+//   F9  head tracking on/off
+//   F8  recentre
+//   F5/F4  flip yaw / pitch sign
+//
+// Log: %LOCALAPPDATA%\SingularityVR\view_hook.log
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <shlobj.h>
+#include <d3d9.h>
+#include <d3d11.h>
+
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_D3D11
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include "MinHook.h"
+
+#include <cstdio>
+#include <cstdint>
+#include <cmath>
+
+#pragma comment(lib, "d3d11.lib")
+
+namespace {
+
+// ---------------------------------------------------------------- logging
+CRITICAL_SECTION g_lock;
+char g_logPath[MAX_PATH] = {};
+bool g_logReady = false;
+
+void LogInit() {
+    InitializeCriticalSection(&g_lock);
+    char base[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, base))) {
+        strcat_s(base, "\\SingularityVR");
+        CreateDirectoryA(base, nullptr);
+        sprintf_s(g_logPath, "%s\\vr_render.log", base);
+        FILE* f = nullptr;
+        if (fopen_s(&f, g_logPath, "w") == 0 && f) fclose(f);
+        g_logReady = true;
+    }
+}
+void Log(const char* fmt, ...) {
+    if (!g_logReady) return;
+    EnterCriticalSection(&g_lock);
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_logPath, "a") == 0 && f) {
+        va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+        fputc('\n', f); fclose(f);
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+// ---------------------------------------------------------------- the view rotation hook
+struct FRotator { int32_t pitch, yaw, roll; };
+
+// FUN_0104e390 is __thiscall. MSVC will not let a free function be __thiscall, so declare it
+// __fastcall with an unused EDX slot - that produces the identical register/stack layout
+// (this in ECX, everything else on the stack). Arg count MUST match: the callee cleans the
+// stack, so one arg too few or too many corrupts it.
+//
+// From the prologue, five stack args are read: [EBP+8] .. [EBP+0x18], the last a float.
+// The caller pushes a pointer to a local FRotator as the first one and uses the returned
+// EAX as that rotator, so arg 1 is the output buffer.
+typedef FRotator* (__fastcall* PFN_CalcViewRotation)(
+    void* self, void* edx_unused,
+    FRotator* outRot, uint32_t a2, uint32_t a3, uint32_t a4, float a5);
+
+const uintptr_t kCalcViewRotationAddr = 0x0104e390;   // no ASLR: file address == runtime
+PFN_CalcViewRotation g_origCalcViewRotation = nullptr;
+
+volatile LONG g_enabled = 0;      // head tracking
+volatile LONG g_constTest = 0;    // constant-pitch proof
+const int32_t kConstPitch = 8000; // ~44 degrees up - unmissable
+
+int32_t g_wantPitch = 0, g_wantYaw = 0;
+bool    g_haveWant = false;
+int     g_hookHits = 0;
+
+FRotator* __fastcall Hook_CalcViewRotation(void* self, void* edx,
+        FRotator* outRot, uint32_t a2, uint32_t a3, uint32_t a4, float a5) {
+    FRotator* r = g_origCalcViewRotation(self, edx, outRot, a2, a3, a4, a5);
+    if (!r) return r;
+
+    if (++g_hookHits <= 3)
+        Log("hook hit #%d: engine returned pitch=%d yaw=%d roll=%d", g_hookHits, r->pitch, r->yaw, r->roll);
+
+    if (InterlockedCompareExchange(&g_constTest, 0, 0)) {
+        r->pitch = kConstPitch;
+    } else if (InterlockedCompareExchange(&g_enabled, 0, 0) && g_haveWant) {
+        r->pitch = g_wantPitch;
+        r->yaw   = g_wantYaw;
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------- engine objects (yaw path)
+// The detour owns PITCH: the call site stores only [EAX] (pitch) into AActor::Rotation, while
+// yaw goes to a local and is handled further along. Direct writes to controller+0x64 were
+// already proven to steer yaw, so drive each axis where it actually works.
+const uintptr_t kGNamesTArray   = 0x01CD4A1C;
+const uintptr_t kGObjectsTArray = 0x01CD4A4C;
+const int OBJ_OUTER = 0x28, OBJ_NAME = 0x2C, OBJ_CLASS = 0x34;
+const int ACTOR_ROTATION = 0x0060;    // pitch, yaw, roll
+const int CTL_ROTATION_2 = 0x05D4;
+
+bool Readable(const void* p, size_t n) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return ((uintptr_t)p + n) <= ((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
+}
+
+bool NameOf(uintptr_t obj, char* buf, size_t cap) {
+    buf[0] = 0;
+    if (!Readable((void*)kGNamesTArray, 12) || !Readable((void*)obj, 0x40)) return false;
+    uintptr_t nd = *reinterpret_cast<uintptr_t*>(kGNamesTArray);
+    int32_t nc = *reinterpret_cast<int32_t*>(kGNamesTArray + 4);
+    int32_t idx = *reinterpret_cast<int32_t*>(obj + OBJ_NAME);
+    if (!nd || idx < 0 || idx >= nc || !Readable((void*)(nd + idx*4), 4)) return false;
+    uintptr_t e = reinterpret_cast<uintptr_t*>(nd)[idx];
+    if (!e || !Readable((void*)e, 0x40)) return false;
+    bool wide = (*reinterpret_cast<uint32_t*>(e + 8)) & 1;
+    size_t n = 0;
+    if (wide) { auto* w = reinterpret_cast<const wchar_t*>(e + 0x10);
+                for (; n < cap-1 && w[n]; ++n) buf[n] = (char)(w[n] < 127 ? w[n] : '?'); }
+    else      { auto* a = reinterpret_cast<const char*>(e + 0x10);
+                for (; n < cap-1 && a[n]; ++n) buf[n] = a[n]; }
+    buf[n] = 0;
+    return n > 0;
+}
+
+uintptr_t g_ctlClass = 0, g_controller = 0;
+
+uintptr_t FindController() {
+    if (g_controller && g_ctlClass && Readable((void*)g_controller, 0x600) &&
+        *reinterpret_cast<uintptr_t*>(g_controller + OBJ_CLASS) == g_ctlClass) return g_controller;
+    g_controller = 0;
+    if (!Readable((void*)kGObjectsTArray, 12)) return 0;
+    uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+    int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+    if (!data || count < 100) return 0;
+    auto* objs = reinterpret_cast<uintptr_t*>(data);
+    char nm[128], on[128];
+    if (!g_ctlClass) {
+        for (int i = 0; i < count; ++i) {
+            if (!Readable((void*)(data + i*4), 4)) continue;
+            uintptr_t o = objs[i];
+            if (!o || !Readable((void*)o, 0x40)) continue;
+            if (!NameOf(o, nm, sizeof(nm)) || _stricmp(nm, "RvPlayerController") != 0) continue;
+            uintptr_t ou = *reinterpret_cast<uintptr_t*>(o + OBJ_OUTER);
+            if (ou && Readable((void*)ou, 0x40) && NameOf(ou, on, sizeof(on)) && !_stricmp(on, "RvGame")) {
+                g_ctlClass = o; break;
+            }
+        }
+        if (!g_ctlClass) return 0;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (!Readable((void*)(data + i*4), 4)) continue;
+        uintptr_t o = objs[i];
+        if (!o || !Readable((void*)o, 0x600)) continue;
+        if (*reinterpret_cast<uintptr_t*>(o + OBJ_CLASS) != g_ctlClass) continue;
+        if (!NameOf(o, nm, sizeof(nm)) || strncmp(nm, "Default__", 9) == 0) continue;
+        g_controller = o;
+        return o;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- OpenXR
+XrInstance g_xrInstance = XR_NULL_HANDLE;
+XrSession  g_xrSession  = XR_NULL_HANDLE;
+XrSpace    g_xrSpace    = XR_NULL_HANDLE;
+XrSystemId g_xrSystem   = XR_NULL_SYSTEM_ID;
+ID3D11Device* g_dev11 = nullptr;
+ID3D11DeviceContext* g_ctx11 = nullptr;
+bool g_xrReady = false, g_xrRunning = false;
+
+bool InitXR() {
+    const char* exts[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+    // VirtualDesktopXR is OpenXR 1.0 only and rejects a 1.1 instance with -4.
+    XrVersion versions[] = { XR_MAKE_VERSION(1,0,34), XR_CURRENT_API_VERSION };
+    XrResult r = XR_ERROR_RUNTIME_FAILURE;
+    for (XrVersion v : versions) {
+        XrInstanceCreateInfo ici{ XR_TYPE_INSTANCE_CREATE_INFO };
+        strcpy_s(ici.applicationInfo.applicationName, "SingularityVR");
+        ici.applicationInfo.apiVersion = v;
+        ici.enabledExtensionCount = 1;
+        ici.enabledExtensionNames = exts;
+        r = xrCreateInstance(&ici, &g_xrInstance);
+        if (XR_SUCCEEDED(r)) break;
+    }
+    if (XR_FAILED(r)) { Log("no OpenXR instance (headset not connected?) - detour still usable via F2"); return false; }
+
+    XrSystemGetInfo sgi{ XR_TYPE_SYSTEM_GET_INFO };
+    sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    if (XR_FAILED(xrGetSystem(g_xrInstance, &sgi, &g_xrSystem))) { Log("no HMD"); return false; }
+
+    PFN_xrGetD3D11GraphicsRequirementsKHR pfn = nullptr;
+    xrGetInstanceProcAddr(g_xrInstance, "xrGetD3D11GraphicsRequirementsKHR", (PFN_xrVoidFunction*)&pfn);
+    if (!pfn) return false;
+    XrGraphicsRequirementsD3D11KHR req{ XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR };
+    if (XR_FAILED(pfn(g_xrInstance, g_xrSystem, &req))) return false;
+
+    IDXGIFactory1* fac = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&fac))) return false;
+    IDXGIAdapter1* ad = nullptr; IDXGIAdapter1* chosen = nullptr;
+    for (UINT i = 0; fac->EnumAdapters1(i, &ad) != DXGI_ERROR_NOT_FOUND; ++i) {
+        DXGI_ADAPTER_DESC1 d{}; ad->GetDesc1(&d);
+        if (d.AdapterLuid.LowPart == req.adapterLuid.LowPart &&
+            d.AdapterLuid.HighPart == req.adapterLuid.HighPart) { chosen = ad; break; }
+        ad->Release();
+    }
+    fac->Release();
+    if (!chosen) return false;
+    D3D_FEATURE_LEVEL lv[] = { D3D_FEATURE_LEVEL_11_0 }, got{};
+    if (FAILED(D3D11CreateDevice(chosen, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, lv, 1, D3D11_SDK_VERSION, &g_dev11, &got, &g_ctx11))) {
+        chosen->Release(); return false;
+    }
+    chosen->Release();
+
+    XrGraphicsBindingD3D11KHR bind{ XR_TYPE_GRAPHICS_BINDING_D3D11_KHR };
+    bind.device = g_dev11;
+    XrSessionCreateInfo sci{ XR_TYPE_SESSION_CREATE_INFO };
+    sci.next = &bind; sci.systemId = g_xrSystem;
+    if (XR_FAILED(xrCreateSession(g_xrInstance, &sci, &g_xrSession))) return false;
+
+    XrReferenceSpaceCreateInfo rs{ XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+    rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rs.poseInReferenceSpace.orientation.w = 1.0f;
+    if (XR_FAILED(xrCreateReferenceSpace(g_xrSession, &rs, &g_xrSpace))) return false;
+
+    Log("OpenXR ready");
+    g_xrReady = true;
+    return true;
+}
+
+void PumpXR() {
+    XrEventDataBuffer ev{ XR_TYPE_EVENT_DATA_BUFFER };
+    while (xrPollEvent(g_xrInstance, &ev) == XR_SUCCESS) {
+        if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            auto* s = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
+            if (s->state == XR_SESSION_STATE_READY) {
+                XrSessionBeginInfo bi{ XR_TYPE_SESSION_BEGIN_INFO };
+                bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                if (XR_SUCCEEDED(xrBeginSession(g_xrSession, &bi))) { g_xrRunning = true; Log("session running"); }
+            } else if (s->state == XR_SESSION_STATE_STOPPING) {
+                xrEndSession(g_xrSession); g_xrRunning = false;
+            }
+        }
+        ev = { XR_TYPE_EVENT_DATA_BUFFER };
+    }
+}
+
+// ---------------------------------------------------------------- VR frame submission
+XrSwapchain g_swapchain = XR_NULL_HANDLE;
+uint32_t g_scWidth = 0, g_scHeight = 0;
+ID3D11Texture2D** g_scImages = nullptr;
+uint32_t g_scImageCount = 0;
+
+IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
+ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
+UINT g_srcW = 0, g_srcH = 0;
+D3DFORMAT g_srcFmt = D3DFMT_UNKNOWN;
+float g_headFovDeg = 0.0f;
+XrPosef g_eyePose[2]{};
+XrFovf  g_eyeFov[2]{};
+bool    g_haveEyes = false;
+int     g_framesSubmitted = 0;
+
+// Create the XR swapchain lazily, sized to the game's backbuffer - we are pasting the game's
+// own image, so matching its dimensions avoids any rescale on the way in.
+bool EnsureSwapchain(UINT w, UINT h) {
+    if (g_swapchain != XR_NULL_HANDLE && w == g_scWidth && h == g_scHeight) return true;
+    if (g_swapchain != XR_NULL_HANDLE) { xrDestroySwapchain(g_swapchain); g_swapchain = XR_NULL_HANDLE; }
+    if (g_scImages) { delete[] g_scImages; g_scImages = nullptr; }
+
+    uint32_t fmtCount = 0;
+    xrEnumerateSwapchainFormats(g_xrSession, 0, &fmtCount, nullptr);
+    int64_t* fmts = new int64_t[fmtCount ? fmtCount : 1];
+    xrEnumerateSwapchainFormats(g_xrSession, fmtCount, &fmtCount, fmts);
+    // Colour space matters here. The game writes sRGB-ENCODED pixels into its backbuffer. If
+    // the swapchain is declared linear (plain _UNORM), the compositor assumes the values are
+    // linear and applies its own linear->sRGB conversion, encoding them a second time - which
+    // looks washed out and low-contrast. Declaring an _SRGB format tells the compositor the
+    // data is already encoded, so it decodes before compositing.
+    //
+    // B8G8R8A8_UNORM_SRGB is bit-identical to the D3D9 A8R8G8B8 layout, and shares a type
+    // group with B8G8R8A8_UNORM, so CopyResource from the upload texture is still legal.
+    const int64_t prefer[] = {
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT_B8G8R8A8_UNORM,
+    };
+    int64_t chosen = fmtCount ? fmts[0] : 0;
+    bool picked = false;
+    for (int p = 0; p < 3 && !picked; ++p)
+        for (uint32_t i = 0; i < fmtCount; ++i)
+            if (fmts[i] == prefer[p]) { chosen = fmts[i]; picked = true; break; }
+    Log("swapchain format %lld %s", (long long)chosen,
+        (chosen == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB || chosen == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+            ? "(sRGB - correct for the game's output)" : "(LINEAR - expect washed out colours)");
+    delete[] fmts;
+
+    XrSwapchainCreateInfo sci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = chosen;
+    sci.sampleCount = 1;
+    sci.width = w; sci.height = h;
+    sci.faceCount = 1; sci.arraySize = 1; sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(g_xrSession, &sci, &g_swapchain))) { Log("xrCreateSwapchain failed"); return false; }
+
+    xrEnumerateSwapchainImages(g_swapchain, 0, &g_scImageCount, nullptr);
+    XrSwapchainImageD3D11KHR* imgs = new XrSwapchainImageD3D11KHR[g_scImageCount];
+    for (uint32_t i = 0; i < g_scImageCount; ++i) imgs[i] = { XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR };
+    xrEnumerateSwapchainImages(g_swapchain, g_scImageCount, &g_scImageCount,
+                               reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs));
+    g_scImages = new ID3D11Texture2D*[g_scImageCount];
+    for (uint32_t i = 0; i < g_scImageCount; ++i) g_scImages[i] = imgs[i].texture;
+    delete[] imgs;
+
+    g_scWidth = w; g_scHeight = h;
+    Log("XR swapchain %ux%u fmt=%lld images=%u", w, h, (long long)chosen, g_scImageCount);
+    return true;
+}
+
+// D3D9 SYSTEMMEM surface + matching CPU-writable D3D11 texture, both sized to the backbuffer.
+bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
+    if (g_sysmemSurf && g_uploadTex && w == g_srcW && h == g_srcH && fmt == g_srcFmt) return true;
+    if (g_sysmemSurf) { g_sysmemSurf->Release(); g_sysmemSurf = nullptr; }
+    if (g_uploadTex)  { g_uploadTex->Release();  g_uploadTex = nullptr; }
+
+    // GetRenderTargetData demands identical size AND format on both surfaces. Take the format
+    // from the backbuffer rather than assuming: this build reports 21 = D3DFMT_A8R8G8B8, and
+    // hardcoding X8R8G8B8 (22) is what made the call return D3DERR_INVALIDCALL.
+    if (FAILED(dev->CreateOffscreenPlainSurface(w, h, fmt, D3DPOOL_SYSTEMMEM,
+                                                &g_sysmemSurf, nullptr))) {
+        Log("CreateOffscreenPlainSurface failed for fmt=%d", (int)fmt); return false;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DYNAMIC;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g_dev11->CreateTexture2D(&td, nullptr, &g_uploadTex))) {
+        Log("CreateTexture2D(upload) failed"); return false;
+    }
+    g_srcW = w; g_srcH = h; g_srcFmt = fmt;
+    Log("copy resources ready for %ux%u fmt=%d", w, h, (int)fmt);
+    return true;
+}
+
+// Pull the game's finished frame across to D3D11. This is the expensive part: a full
+// GPU->CPU readback followed by a CPU->GPU upload, roughly 14 MB each way at 2560x1440.
+bool CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
+    IDirect3DSurface9* back = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) return false;
+    D3DSURFACE_DESC sd{};
+    back->GetDesc(&sd);
+    if (!EnsureCopyResources(dev, sd.Width, sd.Height, sd.Format)) { back->Release(); return false; }
+
+    HRESULT hr = dev->GetRenderTargetData(back, g_sysmemSurf);
+    back->Release();
+    if (FAILED(hr)) {
+        static bool once = false;
+        if (!once) {
+            Log("GetRenderTargetData failed hr=0x%08lX (backbuffer %ux%u fmt=%d msaa=%d)",
+                hr, sd.Width, sd.Height, (int)sd.Format, (int)sd.MultiSampleType);
+            once = true;
+        }
+        return false;
+    }
+
+    D3DLOCKED_RECT lr{};
+    if (FAILED(g_sysmemSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return false;
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    if (FAILED(g_ctx11->Map(g_uploadTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        g_sysmemSurf->UnlockRect(); return false;
+    }
+    const uint8_t* s = static_cast<const uint8_t*>(lr.pBits);
+    uint8_t* d = static_cast<uint8_t*>(ms.pData);
+    const size_t rowBytes = (size_t)g_srcW * 4;
+    for (UINT y = 0; y < g_srcH; ++y) memcpy(d + (size_t)y * ms.RowPitch, s + (size_t)y * lr.Pitch, rowBytes);
+    g_ctx11->Unmap(g_uploadTex, 0);
+    g_sysmemSurf->UnlockRect();
+    return true;
+}
+
+const float kRadToUU = 65536.0f / 6.2831853f;
+int   g_yawSign = -1, g_pitchSign = 1;
+bool  g_haveCentre = false;
+float g_centreYaw = 0.0f;
+int32_t g_baseYaw = 0;
+int   g_tick = 0;
+
+void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
+    if (!g_xrReady) return;
+    PumpXR();
+    if (!g_xrRunning) return;
+
+    XrFrameState fs{ XR_TYPE_FRAME_STATE };
+    if (XR_FAILED(xrWaitFrame(g_xrSession, nullptr, &fs))) return;
+    xrBeginFrame(g_xrSession, nullptr);
+
+    XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+    uint32_t n = 0;
+    XrViewLocateInfo vli{ XR_TYPE_VIEW_LOCATE_INFO };
+    vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    vli.displayTime = fs.predictedDisplayTime;
+    vli.space = g_xrSpace;
+    XrViewState vs{ XR_TYPE_VIEW_STATE };
+    if (XR_SUCCEEDED(xrLocateViews(g_xrSession, &vli, &vs, 2, &n, views)) && n >= 1 &&
+        (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
+        // keep the per-eye poses/FOVs for the projection layer submitted below
+        for (uint32_t i = 0; i < n && i < 2; ++i) { g_eyePose[i] = views[i].pose; g_eyeFov[i] = views[i].fov; }
+        g_haveEyes = (n >= 2);
+        g_headFovDeg = (fabsf(views[0].fov.angleLeft) + fabsf(views[0].fov.angleRight)) * 57.2957795f;
+
+        const XrQuaternionf& q = views[0].pose.orientation;
+        float sinp = 2.0f * (q.w * q.x - q.y * q.z);
+        if (sinp > 1.0f) sinp = 1.0f;
+        if (sinp < -1.0f) sinp = -1.0f;
+        float pitchRad = asinf(sinp);
+        float yawRad = atan2f(2.0f * (q.w * q.y + q.z * q.x),
+                              1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        // Anchor to the GAME's current yaw, not our own previous output. Seeding from
+        // g_wantYaw (initially 0) made enabling snap the view to world yaw 0.
+        if (!g_haveCentre) {
+            g_centreYaw = yawRad;
+            uintptr_t ctl = FindController();
+            g_baseYaw = (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12))
+                        ? reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1] : 0;
+            g_haveCentre = true;
+            Log("recentred: head yaw %.1f, game yaw %d", yawRad * 57.2958f, g_baseYaw);
+        }
+        float dYaw = yawRad - g_centreYaw;
+        while (dYaw >  3.14159265f) dYaw -= 6.2831853f;
+        while (dYaw < -3.14159265f) dYaw += 6.2831853f;
+
+        int32_t p = (int32_t)(g_pitchSign * pitchRad * kRadToUU);
+        if (p >  16000) p =  16000;
+        if (p < -16000) p = -16000;
+        g_wantPitch = p;
+        g_wantYaw   = g_baseYaw + (int32_t)(g_yawSign * dYaw * kRadToUU);
+        g_haveWant  = true;
+
+        if (++g_tick % 180 == 0)
+            Log("head pitch %.1f yaw %.1f -> want pitch %d yaw %d (hook hits %d)",
+                pitchRad*57.2958f, yawRad*57.2958f, g_wantPitch, g_wantYaw, g_hookHits);
+    }
+
+    // ---- copy the game's frame into the swapchain and submit it ----
+    XrCompositionLayerProjection layer{ XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    XrCompositionLayerProjectionView projViews[2]{};
+    const XrCompositionLayerBaseHeader* layers[1] = { nullptr };
+    uint32_t layerCount = 0;
+
+    if (fs.shouldRender && g_haveEyes && gameDev && CopyBackbufferToD3D11(gameDev)
+        && EnsureSwapchain(g_srcW, g_srcH)) {
+        uint32_t idx = 0;
+        XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_swapchain, &ai, &idx))) {
+            XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+            wi.timeout = XR_INFINITE_DURATION;
+            if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain, &wi))) {
+                g_ctx11->CopyResource(g_scImages[idx], g_uploadTex);
+                XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+                xrReleaseSwapchainImage(g_swapchain, &ri);
+
+                // Both eyes reference the SAME image - this is the MonoTracked rung, not
+                // stereo. It reads as depth-free but correctly oriented, because the game
+                // already rendered from wherever the head was pointing.
+                for (int i = 0; i < 2; ++i) {
+                    projViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+                    projViews[i].pose = g_eyePose[i];
+                    projViews[i].fov  = g_eyeFov[i];
+                    projViews[i].subImage.swapchain = g_swapchain;
+                    projViews[i].subImage.imageRect.offset = { 0, 0 };
+                    projViews[i].subImage.imageRect.extent = { (int32_t)g_scWidth, (int32_t)g_scHeight };
+                }
+                layer.space = g_xrSpace;
+                layer.viewCount = 2;
+                layer.views = projViews;
+                layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
+                layerCount = 1;
+                if (++g_framesSubmitted == 1) Log("*** FIRST FRAME SUBMITTED TO THE HEADSET ***");
+            } else {
+                XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+                xrReleaseSwapchainImage(g_swapchain, &ri);
+            }
+        }
+    }
+
+    XrFrameEndInfo fei{ XR_TYPE_FRAME_END_INFO };
+    fei.displayTime = fs.predictedDisplayTime;
+    fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    fei.layerCount = layerCount;
+    fei.layers = layerCount ? layers : nullptr;
+    xrEndFrame(g_xrSession, &fei);
+}
+
+// ---------------------------------------------------------------- d3d9 plumbing
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+PFN_Present g_origPresent = nullptr;
+volatile LONG g_initTried = 0;
+
+void InstallViewHook() {
+    if (MH_Initialize() != MH_OK) { Log("MH_Initialize failed"); return; }
+    void* target = reinterpret_cast<void*>(kCalcViewRotationAddr);
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_CalcViewRotation),
+                      reinterpret_cast<void**>(&g_origCalcViewRotation)) != MH_OK) {
+        Log("MH_CreateHook failed at 0x%08X", kCalcViewRotationAddr); return;
+    }
+    if (MH_EnableHook(target) != MH_OK) { Log("MH_EnableHook failed"); return; }
+    Log("view rotation detour installed at 0x%08X", kCalcViewRotationAddr);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
+    if (InterlockedExchange(&g_initTried, 1) == 0) { InstallViewHook(); InitXR(); }
+
+    static bool p9=false,p8=false,p5=false,p4=false,p2=false;
+    bool k9=(GetAsyncKeyState(VK_F9)&0x8000)!=0, k8=(GetAsyncKeyState(VK_F8)&0x8000)!=0;
+    bool k5=(GetAsyncKeyState(VK_F5)&0x8000)!=0, k4=(GetAsyncKeyState(VK_F4)&0x8000)!=0;
+    bool k2=(GetAsyncKeyState(VK_F2)&0x8000)!=0;
+    if (k9&&!p9) { LONG was=InterlockedCompareExchange(&g_enabled,0,0);
+                   InterlockedExchange(&g_enabled, was?0:1); g_haveCentre=false;
+                   Log("F9: head tracking %s", was?"OFF":"ON"); }
+    if (k2&&!p2) { LONG was=InterlockedCompareExchange(&g_constTest,0,0);
+                   InterlockedExchange(&g_constTest, was?0:1);
+                   Log("F2: constant pitch test %s", was?"OFF":"ON"); }
+    if (k8&&!p8) { g_haveCentre=false; Log("F8: recentre"); }
+    if (k5&&!p5) { g_yawSign=-g_yawSign; g_haveCentre=false; Log("F5: yaw sign %+d", g_yawSign); }
+    if (k4&&!p4) { g_pitchSign=-g_pitchSign; Log("F4: pitch sign %+d", g_pitchSign); }
+    p9=k9;p8=k8;p5=k5;p4=k4;p2=k2;
+
+    UpdateFromHeadset(s);
+
+    // Yaw is not carried by the detour's seam, so write it directly - the mechanism proven
+    // in the earlier spike. Pitch deliberately left alone here; the detour owns it.
+    if (InterlockedCompareExchange(&g_enabled, 0, 0) && g_haveWant) {
+        uintptr_t ctl = FindController();
+        if (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12)) {
+            reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1] = g_wantYaw;
+            if (Readable((void*)(ctl + CTL_ROTATION_2), 12))
+                reinterpret_cast<int32_t*>(ctl + CTL_ROTATION_2)[1] = g_wantYaw;
+        }
+    }
+    return g_origPresent(s, a, b, c, d);
+}
+
+void* PatchVTable(void* obj, int index, void* repl) {
+    void** vt = *reinterpret_cast<void***>(obj);
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[index], sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
+    void* orig = vt[index];
+    vt[index] = repl;
+    VirtualProtect(&vt[index], sizeof(void*), old, &old);
+    return orig;
+}
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateDevice)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+PFN_CreateDevice g_origCreateDevice = nullptr;
+volatile LONG g_patched = 0;
+
+HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYPE t, HWND w, DWORD f,
+                                            D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
+    HRESULT hr = g_origCreateDevice(self, ad, t, w, f, pp, out);
+    if (SUCCEEDED(hr) && out && *out && InterlockedExchange(&g_patched, 1) == 0) {
+        g_origPresent = (PFN_Present)PatchVTable(*out, 17, (void*)&Hook_Present);
+        Log("Present hooked. F2 = constant pitch proof, F9 = head tracking.");
+    }
+    return hr;
+}
+
+HMODULE g_real = nullptr;
+typedef IDirect3D9* (WINAPI *PFN_C9)(UINT);
+typedef HRESULT (WINAPI *PFN_C9Ex)(UINT, IDirect3D9Ex**);
+typedef int (WINAPI *PFN_icw)(D3DCOLOR, LPCWSTR); typedef int (WINAPI *PFN_iv)(void);
+typedef DWORD (WINAPI *PFN_dv)(void); typedef void (WINAPI *PFN_vcw)(D3DCOLOR, LPCWSTR);
+typedef BOOL (WINAPI *PFN_bv)(void); typedef void (WINAPI *PFN_vd)(DWORD); typedef void (WINAPI *PFN_vv)(void);
+PFN_C9 p_C9=nullptr; PFN_C9Ex p_C9Ex=nullptr; PFN_icw p_Begin=nullptr; PFN_iv p_End=nullptr;
+PFN_dv p_Status=nullptr; PFN_vcw p_Marker=nullptr,p_Region=nullptr; PFN_bv p_Repeat=nullptr;
+PFN_vd p_Options=nullptr; PFN_vv p_Mute=nullptr;
+
+bool LoadReal() {
+    char sys[MAX_PATH] = {};
+    if (!GetSystemDirectoryA(sys, MAX_PATH)) return false;
+    strcat_s(sys, "\\d3d9.dll");
+    g_real = LoadLibraryA(sys);
+    if (!g_real) return false;
+    p_C9=(PFN_C9)GetProcAddress(g_real,"Direct3DCreate9");
+    p_C9Ex=(PFN_C9Ex)GetProcAddress(g_real,"Direct3DCreate9Ex");
+    p_Begin=(PFN_icw)GetProcAddress(g_real,"D3DPERF_BeginEvent");
+    p_End=(PFN_iv)GetProcAddress(g_real,"D3DPERF_EndEvent");
+    p_Status=(PFN_dv)GetProcAddress(g_real,"D3DPERF_GetStatus");
+    p_Marker=(PFN_vcw)GetProcAddress(g_real,"D3DPERF_SetMarker");
+    p_Region=(PFN_vcw)GetProcAddress(g_real,"D3DPERF_SetRegion");
+    p_Repeat=(PFN_bv)GetProcAddress(g_real,"D3DPERF_QueryRepeatFrame");
+    p_Options=(PFN_vd)GetProcAddress(g_real,"D3DPERF_SetOptions");
+    p_Mute=(PFN_vv)GetProcAddress(g_real,"DebugSetMute");
+    return p_C9 != nullptr;
+}
+
+}  // namespace
+
+extern "C" {
+IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
+    if (!p_C9) return nullptr;
+    IDirect3D9* d3d = p_C9(sdk);
+    if (d3d) g_origCreateDevice = (PFN_CreateDevice)PatchVTable(d3d, 16, (void*)&Hook_CreateDevice);
+    return d3d;
+}
+HRESULT WINAPI Direct3DCreate9Ex(UINT sdk, IDirect3D9Ex** o) { return p_C9Ex ? p_C9Ex(sdk,o) : E_NOTIMPL; }
+int   WINAPI D3DPERF_BeginEvent(D3DCOLOR c, LPCWSTR n) { return p_Begin ? p_Begin(c,n) : 0; }
+int   WINAPI D3DPERF_EndEvent(void)                    { return p_End ? p_End() : 0; }
+DWORD WINAPI D3DPERF_GetStatus(void)                   { return p_Status ? p_Status() : 0; }
+void  WINAPI D3DPERF_SetMarker(D3DCOLOR c, LPCWSTR n)  { if (p_Marker) p_Marker(c,n); }
+void  WINAPI D3DPERF_SetRegion(D3DCOLOR c, LPCWSTR n)  { if (p_Region) p_Region(c,n); }
+BOOL  WINAPI D3DPERF_QueryRepeatFrame(void)            { return p_Repeat ? p_Repeat() : FALSE; }
+void  WINAPI D3DPERF_SetOptions(DWORD o)               { if (p_Options) p_Options(o); }
+void  WINAPI DebugSetMute(void)                        { if (p_Mute) p_Mute(); }
+}
+
+BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(m);
+        LogInit();
+        Log("=== view_hook attached - detours the view rotation source at 0x0104e390 ===");
+        if (!LoadReal()) { Log("FATAL: real d3d9.dll not loadable"); return FALSE; }
+    }
+    return TRUE;
+}
