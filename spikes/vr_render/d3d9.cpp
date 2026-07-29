@@ -169,6 +169,18 @@ bool NameOf(uintptr_t obj, char* buf, size_t cap) {
 }
 
 uintptr_t g_ctlClass = 0, g_controller = 0;
+uintptr_t g_camClass = 0, g_camera = 0;
+
+// ---- camera POSITION probe (prerequisite for both stereo and 6DOF) ----
+// Stereo is a per-eye position offset, so we need positional camera control before either is
+// possible. Rotation took seven wrong guesses; this time write every plausible position field
+// at once with an unmissable constant, and only narrow down once something actually moves.
+const int ACTOR_LOCATION   = 0x0054;   // FVector, 3 floats
+const int CAM_CURRENT_OFF  = 0x0408;   // mCurrentOffset - camera offset relative to the player
+const int CAM_POV_LOC      = 0x0420;   // mCurrentPOV location
+const int CAM_Z_OFFSET     = 0x0688;   // mCameraZOffset (single float)
+volatile LONG g_posTest = 0;
+const float kPosTestUU = 300.0f;       // ~6 m sideways - impossible to miss
 
 uintptr_t FindController() {
     if (g_controller && g_ctlClass && Readable((void*)g_controller, 0x600) &&
@@ -203,6 +215,149 @@ uintptr_t FindController() {
         return o;
     }
     return 0;
+}
+
+uintptr_t FindCamera() {
+    if (g_camera && g_camClass && Readable((void*)g_camera, 0x700) &&
+        *reinterpret_cast<uintptr_t*>(g_camera + OBJ_CLASS) == g_camClass) return g_camera;
+    g_camera = 0;
+    if (!Readable((void*)kGObjectsTArray, 12)) return 0;
+    uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+    int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+    if (!data || count < 100) return 0;
+    auto* objs = reinterpret_cast<uintptr_t*>(data);
+    char nm[128], on[128];
+    if (!g_camClass) {
+        for (int i = 0; i < count; ++i) {
+            if (!Readable((void*)(data + i*4), 4)) continue;
+            uintptr_t o = objs[i];
+            if (!o || !Readable((void*)o, 0x40)) continue;
+            if (!NameOf(o, nm, sizeof(nm)) || _stricmp(nm, "RvPlayerCamera") != 0) continue;
+            uintptr_t ou = *reinterpret_cast<uintptr_t*>(o + OBJ_OUTER);
+            if (ou && Readable((void*)ou, 0x40) && NameOf(ou, on, sizeof(on)) && !_stricmp(on, "RvGame")) {
+                g_camClass = o; break;
+            }
+        }
+        if (!g_camClass) return 0;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (!Readable((void*)(data + i*4), 4)) continue;
+        uintptr_t o = objs[i];
+        if (!o || !Readable((void*)o, 0x700)) continue;
+        if (*reinterpret_cast<uintptr_t*>(o + OBJ_CLASS) != g_camClass) continue;
+        if (!NameOf(o, nm, sizeof(nm)) || strncmp(nm, "Default__", 9) == 0) continue;
+        g_camera = o;
+        return o;
+    }
+    return 0;
+}
+
+// ---- who writes the camera's position? ----
+// Writing all five candidate position fields moved nothing, exactly as with pitch. So stop
+// guessing and let the CPU report the writer: a hardware write breakpoint on the camera's
+// AActor::Location, whose EIPs map straight into the Ghidra database (no ASLR).
+#include <tlhelp32.h>
+
+volatile LONG g_bpArmed = 0;
+uintptr_t g_bpAddr = 0;
+uintptr_t g_bpSeen[16];
+int g_bpSeenCount = 0;
+PVOID g_veh = nullptr;
+
+void SetDebugRegsAllThreads(uintptr_t addr, bool enable) {
+    DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{}; te.dwSize = sizeof(te);
+    int done = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid) continue;
+            HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                   FALSE, te.th32ThreadID);
+            if (!th) continue;
+            bool self = (te.th32ThreadID == GetCurrentThreadId());
+            if (!self) SuspendThread(th);
+            CONTEXT ctx{}; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(th, &ctx)) {
+                if (enable) {
+                    ctx.Dr0 = addr;
+                    ctx.Dr7 = (ctx.Dr7 & ~0xFULL) | 0x1ULL | (0x1ULL << 16) | (0x3ULL << 18);
+                } else {
+                    ctx.Dr0 = 0;
+                    ctx.Dr7 &= ~0xF0001ULL;
+                }
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                if (SetThreadContext(th, &ctx)) done++;
+            }
+            if (!self) ResumeThread(th);
+            CloseHandle(th);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    Log("debug registers %s on %d threads (addr 0x%08X)", enable ? "ARMED" : "cleared", done, addr);
+}
+
+LONG NTAPI PosVEH(PEXCEPTION_POINTERS ei) {
+    if (ei->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (!(ei->ContextRecord->Dr6 & 0x1)) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t eip = (uintptr_t)ei->ContextRecord->Eip;
+    bool fresh = true;
+    for (int i = 0; i < g_bpSeenCount; ++i) if (g_bpSeen[i] == eip) { fresh = false; break; }
+    if (fresh && g_bpSeenCount < 16) {
+        g_bpSeen[g_bpSeenCount++] = eip;
+        float now = Readable((void*)g_bpAddr, 4) ? *reinterpret_cast<float*>(g_bpAddr) : 0.0f;
+        Log("POSITION WRITER #%d: EIP=0x%08X  (value now %.2f)", g_bpSeenCount, eip, now);
+        if (g_bpSeenCount >= 8) {
+            Log("collected 8 writers - disarming");
+            InterlockedExchange(&g_bpArmed, 0);
+            SetDebugRegsAllThreads(0, false);
+        }
+    }
+    ei->ContextRecord->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+uintptr_t FindCamera();
+void TogglePositionBreakpoint() {
+    if (InterlockedCompareExchange(&g_bpArmed, 0, 0)) {
+        InterlockedExchange(&g_bpArmed, 0);
+        SetDebugRegsAllThreads(0, false);
+        Log("F6: position breakpoint DISARMED");
+        return;
+    }
+    uintptr_t cam = FindCamera();
+    if (!cam) { Log("F6: no camera"); return; }
+    g_bpAddr = cam + ACTOR_LOCATION;   // watch X, the first float of the camera's Location
+    g_bpSeenCount = 0;
+    if (!g_veh) g_veh = AddVectoredExceptionHandler(1, PosVEH);
+    InterlockedExchange(&g_bpArmed, 1);
+    SetDebugRegsAllThreads(g_bpAddr, true);
+    Log("F6: position breakpoint ARMED at 0x%08X - now WALK AROUND", g_bpAddr);
+}
+
+// Shove every candidate position field sideways by a constant. If the view moves, positional
+// control is possible and we narrow down which field did it; if nothing moves, the position
+// source needs the hardware-breakpoint treatment that cracked pitch.
+void ApplyPositionTest() {
+    if (!InterlockedCompareExchange(&g_posTest, 0, 0)) return;
+    uintptr_t cam = FindCamera();
+    if (cam) {
+        if (Readable((void*)(cam + ACTOR_LOCATION), 12))
+            reinterpret_cast<float*>(cam + ACTOR_LOCATION)[1] += kPosTestUU;   // Y
+        if (Readable((void*)(cam + CAM_CURRENT_OFF), 12))
+            reinterpret_cast<float*>(cam + CAM_CURRENT_OFF)[1] = kPosTestUU;
+        if (Readable((void*)(cam + CAM_POV_LOC), 12))
+            reinterpret_cast<float*>(cam + CAM_POV_LOC)[1] += kPosTestUU;
+        if (Readable((void*)(cam + CAM_Z_OFFSET), 4))
+            *reinterpret_cast<float*>(cam + CAM_Z_OFFSET) = kPosTestUU;
+    }
+    uintptr_t ctl = FindController();
+    if (ctl && Readable((void*)(ctl + ACTOR_LOCATION), 12))
+        reinterpret_cast<float*>(ctl + ACTOR_LOCATION)[1] += kPosTestUU;
+
+    static int n = 0;
+    if (++n % 120 == 1) Log("position test active (cam=0x%08X ctl=0x%08X)", cam, ctl);
 }
 
 // ---------------------------------------------------------------- OpenXR
@@ -572,7 +727,20 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     if (k8&&!p8) { g_haveCentre=false; Log("F8: recentre"); }
     if (k5&&!p5) { g_yawSign=-g_yawSign; g_haveCentre=false; Log("F5: yaw sign %+d", g_yawSign); }
     if (k4&&!p4) { g_pitchSign=-g_pitchSign; Log("F4: pitch sign %+d", g_pitchSign); }
+    static bool p3 = false;
+    bool k3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+    if (k3 && !p3) { LONG was = InterlockedCompareExchange(&g_posTest,0,0);
+                     InterlockedExchange(&g_posTest, was?0:1);
+                     Log("F3: camera position test %s (%.0f UU sideways, ALL candidates)",
+                         was?"OFF":"ON", kPosTestUU); }
+    static bool p6 = false;
+    bool k6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    if (k6 && !p6) TogglePositionBreakpoint();
+    p6 = k6;
+    p3 = k3;
     p9=k9;p8=k8;p5=k5;p4=k4;p2=k2;
+
+    ApplyPositionTest();
 
     UpdateFromHeadset(s);
 

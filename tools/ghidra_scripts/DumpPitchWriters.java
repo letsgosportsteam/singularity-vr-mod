@@ -22,12 +22,14 @@ import java.io.PrintWriter;
 public class DumpPitchWriters extends GhidraScript {
 
     // caught by the hardware write breakpoint, most interesting first
-    // 0x0104e390 is the prize: the instruction stream at 0x01034105 CALLs it and stores the
-    // FRotator it returns straight into the controller's rotation. That makes it the view
-    // rotation SOURCE, and therefore the correct detour target.
+    // Camera POSITION writers, caught by a hardware breakpoint on the live camera's
+    // AActor::Location while walking. 0x00A0FD0B sits inside FUN_00a0f6e0 - the same generic
+    // actor-move plumbing already seen writing rotation - so the interesting ones are the
+    // other two.
     private static final String[] EIPS = {
-        "0104e390",   // <-- view rotation source
-        "0104e420",   // the neighbouring call seen in the same region
+        "00a15845",   // fired first
+        "00b75dab",
+        "00a0fd0b",   // the known generic SetLocation/SetRotation path
     };
 
     @Override

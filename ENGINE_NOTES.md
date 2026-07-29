@@ -391,6 +391,36 @@ Why the earlier approaches failed, in one line each:
 Yaw appeared to work only because our write happened to survive into the same frame; it was
 never actually authoritative.
 
+### Camera POSITION — unsolved, and harder than rotation
+
+Needed for **both** stereo (per-eye offset is a position offset) and 6-DOF. Two approaches tried
+2026-07-29, both negative:
+
+**1. Direct writes — no effect.** Wrote a 300 UU constant simultaneously to every plausible
+field: camera `AActor::Location +0x54`, `mCurrentOffset +0x408`, `mCurrentPOV` location `+0x420`,
+`mCameraZOffset +0x688`, and the controller's `Location`. The view did not move at all.
+
+**2. Hardware write breakpoint on the camera's `Location`** — caught three writers while walking:
+
+| EIP | What it is |
+|---|---|
+| `0x00A15845` | inside `FUN_00a15550` (858 b) — writes Location XYZ from locals, recurses over a child list at `[ESI+0x160]`. Attachment/hierarchy propagation. **12 callers.** |
+| `0x00A0FD0B` | inside `FUN_00a0f6e0` — the same generic actor-move routine already seen writing *rotation* (`0x00a0fd10`). |
+| `0x00B75DAB` | a `POP ESI`; the real write was `MOV [ESI+0x20]`. Can only hit our address if another object was reallocated there — noise. |
+
+Unlike rotation, there is **no single upstream source**. Rotation resolved cleanly because its
+call site did `CALL FUN_0104e390` then stored the returned `FRotator` directly. Position instead
+flows through generic actor plumbing shared with every actor in the game, reached from a dozen
+call sites. Detouring that would affect everything that moves, not just the camera.
+
+**Better approach, not yet attempted:** intercept the **view matrix on its way to the GPU**
+(`SetVertexShaderConstantF`) and apply the per-eye / positional offset there. UE3 is
+shader-based, so the view transform passes through as vertex shader constants. This bypasses the
+engine's object model entirely, is how established VR injectors (vorpX, 3Dmigoto) do stereo, and
+solves stereo *and* 6-DOF with one mechanism. Cost: identifying which constant register holds the
+matrix, and the current architecture renders once per frame — so stereo also needs either
+alternate-eye submission (one frame stale per eye) or engine re-entry (render the scene twice).
+
 ### Consequence: head-look and weapon aim are coupled
 
 In UE3 `PlayerController.Rotation` drives **both** the view and the weapon fire trace. Since that
