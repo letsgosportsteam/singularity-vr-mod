@@ -49,16 +49,15 @@ HookUserPointerDraws=0
 ; to 2100-3800 and every reported object came back solid. The engine was
 ; throwing away 50-70% of its own draw calls.
 ;
-; Reporting "visible" is the correct answer here, not a workaround. Single-view
-; occlusion culling is not well defined in stereo - the engine issues ONE query
-; and gets ONE answer, but an object hidden from the left eye can be plainly
-; visible from the right, so any single yes/no is wrong for one of them.
 ; "Visible" is conservative: it can never wrongly delete geometry, it can only
-; fail to save work.
+; fail to save work. It is however BRUTE FORCE - a proper fix exists and is
+; written up in STATUS.md. Do not read this as the final design.
 ;
-; The cost is small and measured. Frame rate held at 37-40 fps with peaks of
-; 70, unchanged, because this build is bottlenecked on the CPU frame copy
-; rather than on draw calls.
+; The cost is small and measured, for now. Frame rate held at 37-40 fps with
+; peaks of 70, unchanged, because this build is bottlenecked on the CPU frame
+; copy rather than on draw calls. Once the D3D9Ex zero-copy path removes that
+; bottleneck, ~7,600 real draw calls a frame will matter and this should be
+; revisited.
 ;
 ;   0 = auto: report visible while true stereo is on, normal in mono  <- default
 ;   1 = always report visible

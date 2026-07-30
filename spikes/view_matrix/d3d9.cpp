@@ -2220,14 +2220,27 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
 // reported object came back solid. The engine was discarding 50-70% of its own draw calls as
 // occluded when they were not.
 //
-// Reporting "visible" is not a workaround, it is the correct answer for this renderer. Single-view
-// occlusion culling is not well defined in stereo: the engine issues ONE query and gets ONE
-// answer, but an object hidden from the left eye can be plainly visible from the right, so any
-// single yes/no is wrong for one of them. "Visible" is the conservative resolution - it can never
-// wrongly delete geometry, only fail to save work.
+// Reporting "visible" is safe in the sense that matters - it can never wrongly delete geometry,
+// only fail to save work. But it IS brute force, and a proper fix exists. See STATUS.md, "Why the
+// root cause was never pinned down".
+//
+// Do not repeat the claim this comment used to make, that single-view occlusion culling is "not
+// well defined in stereo" and therefore has no correct answer. The engine issues one query, but we
+// draw the box TWICE - once into each eye-half - so the returned count is the SUM, which is
+// exactly the union of what the two eyes can see. That is the correct conservative answer for
+// stereo, so correct culling is achievable and this override is a stand-in for it.
+//
+// Why the real mechanism is still unknown: occlusion boxes are drawn with colour writes disabled,
+// so they are invisible by construction and every visual diagnostic in this file was blind to
+// them. The leading hypothesis is that they arrive via DrawPrimitiveUP, which is unhooked, so they
+// are drawn at FULL-FRAME coordinates against a depth buffer holding half-remapped geometry.
+// Testable by hooking IDirect3DQuery9::Issue (slot 6) and counting how many draws inside each
+// query window were never remapped.
 //
 // The cost is small here and measured: frame rate held at 37-40 fps with peaks of 70, unchanged
 // from before, because this build is bottlenecked on the CPU frame copy rather than on draw calls.
+// That masking will end with the D3D9Ex work - 3,806 split draws is ~7,600 real draw calls a
+// frame, ~290k/sec, which is a lot for D3D9. Re-measure then, and fix it properly if it matters.
 //
 // Default is AUTO: overridden while duplication is on, left alone in mono, so the safe fallback
 // mode keeps the engine's own culling and its speed.

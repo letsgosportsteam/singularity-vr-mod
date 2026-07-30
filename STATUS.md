@@ -48,6 +48,9 @@ debugging.
    The frame copy is a full CPU round-trip (~14 MB each way at 1440p) and the fps distribution is
    bimodal, the signature of a CPU-bound stall. It also gates everything below, since matching the
    headset's resolution multiplies the copy cost ~3.6×.
+   **Re-measure the occlusion override immediately afterwards** — it is currently free only because
+   the frame copy hides it, and ~7,600 draw calls a frame will not stay free. See *Better fixes*
+   under run 30.
 2. **Resolution.** Per-eye is currently 1280×1440 against the headset's 2496×2688. Needs the
    command-line detour (design already written up under *How resolution will work*), and probably
    per-eye render targets given the ~4096 cap.
@@ -469,14 +472,61 @@ draws/frame peak 2272 ... 3809          <- was ~1000
 perf: 70.6 fps ... 37-40 fps            <- unchanged
 ```
 
-**This is a fix, not a workaround.** Single-view occlusion culling is not well defined in stereo:
-the engine issues *one* query and gets *one* answer, but an object hidden from the left eye can be
-plainly visible from the right, so any single yes/no is wrong for one of them. Reporting "visible"
-is the conservative resolution — it can never wrongly delete geometry, only fail to save work.
+Reporting "visible" is safe in the sense that matters — it can never wrongly delete geometry, only
+fail to save work. But it is **brute force**, and the section below says how to do it properly.
 
-The exact sub-mechanism (boxes landing wrong against the split depth buffer, versus being clipped
-at the seam) is **not** pinned down, and is deliberately not guessed at here. It does not need to
-be: the query cannot be made correct for two eyes with one answer.
+> ⚠️ **Correction, recorded because it was written down wrong first.** The original claim here was
+> that single-view occlusion culling "is not well defined in stereo", so no correct answer exists.
+> That is too strong. The engine issues one query, but we draw the box **twice**, once into each
+> eye-half, so the returned pixel count is the *sum* — which is exactly the **union** of what the
+> two eyes can see, and that is the correct conservative answer for stereo. Correct occlusion
+> culling is achievable here. The override is a stand-in for a fix, not a substitute for one.
+
+### ⬜ Why the root cause was never pinned down — and how to
+
+**Occlusion boxes are drawn with colour writes disabled.** They are invisible by construction, so
+HOME, END, INSERT and every other visual test in this project was *structurally blind* to them.
+Whatever is happening to those boxes has never been seen. That is worth remembering before
+reaching for another visual toggle.
+
+**Leading hypothesis: the boxes go through `DrawPrimitiveUP`.** UE3 builds occlusion bounding
+boxes on the CPU each frame, which is precisely what the user-pointer draw path is for. Those
+hooks are off, so such draws pass through untouched at **full-frame coordinates**, while the depth
+buffer they are tested against holds geometry we remapped into halves. The box is then compared
+against depth from a different part of the screen entirely — which fails *systematically* rather
+than marginally, matching the observed 50–70%. The magnitudes agree too: 245–370 user-pointer
+draws per frame is the right order for per-primitive occlusion boxes.
+
+This is inference, not measurement. **The cheap test:** hook `IDirect3DQuery9::Issue` (vtable slot
+6) to detect `D3DISSUE_BEGIN`/`END`, and count how many draws inside each query window took the
+unhooked or mono-fallback path rather than being remapped. That settles it in one run.
+
+### ⬜ Better fixes, in increasing order of effort
+
+1. **Selective override.** Track whether the draws inside each query window were ones we
+   successfully remapped. Trust the result when they were; override only the untrustworthy ones.
+   Restores most of the culling, surgical rather than global. Needs `Issue` hooked and a per-query
+   flag.
+2. **Fix the boxes.** Get the box draws remapped exactly like scene geometry and the query becomes
+   correct on its own, with no override at all. Needs the user-pointer hooks working, which needs
+   the draw classification that also fixes the run-28 rainbow — one piece of work buys both.
+3. **Per-eye render targets** (Stage 4B below). No seam, no remap, boxes land correctly by
+   construction, queries simply work. Also doubles per-eye resolution. Biggest job.
+
+### ⚠️ Sequencing: do NOT do this before the D3D9Ex work
+
+Right now the extra draws cost **nothing measurable** — frame rate was identical before and after,
+because the CPU frame copy dominates everything else.
+
+That changes once D3D9Ex lands. `split 3806` means 3,806 original draws each issued twice, so
+roughly **7,600 real D3D9 draw calls per frame — about 290,000/sec at 38 fps.** That is a great
+deal for D3D9, where draw submission is CPU-bound and expensive. Occlusion culling was doing real
+work; its absence is currently hidden behind a bigger bottleneck.
+
+So: **finish D3D9Ex, re-measure, then decide.** Doing it now would be optimising something the
+profile says is free, with no way to tell whether it helped.
+
+
 
 ### What it cost to get here, and why
 
