@@ -379,6 +379,41 @@ so its vertical culling frustum is far smaller than its headline number, and it 
 65° default (~39° vertical) while we render 98°. Geometry in that gap is culled before a draw call
 exists, so nothing downstream can recover it.
 
+#### ✅ Run 21: culling CONFIRMED — and there are TWO opposed mechanisms, not one
+
+The 40% test worked as designed. At 55% and 40% the chest came back, and the monster stopped
+vanishing. **Culling is confirmed as a real cause.**
+
+But a residual remained — "things disappearing at a distance" — and the decisive evidence is a
+control the user ran unprompted: **in the unmodified game those objects are visible from much
+further away than where they vanish in the mod.** So the mod is culling early; this is not the
+game's own draw distance.
+
+That identifies a **second** mechanism, and it is driven by the same field as the first, in the
+opposite direction:
+
+| Mechanism | Caused by | Wants the engine FOV to be |
+|---|---|---|
+| Vertical frustum shortfall — geometry outside the engine's culling frustum | engine FOV **too low** (dips to 65°) | **wider** |
+| Early distance culling — UE3 picks LOD and cull distance from projected screen size | engine FOV **too high** (we ask 157.9°) | **narrower** |
+
+At 157.9° the inflation is **2.4× native**, which makes objects project about **8× smaller** than
+the engine was tuned for — so anything with a screen-size-based draw distance culls roughly 8×
+closer than vanilla. That is exactly the reported symptom.
+
+**And headroom does not even fix the first problem**, because a dip to the 65° default is a dip
+regardless of what we asked for. So high headroom buys little and costs a lot. The build now logs
+the inflation factor and the implied shrink, so both sides of the trade are visible.
+
+The consistent operating point is **render 40% + headroom 1.0**: the ask lands at ~64.6°, essentially
+native, so inflation is ~1.0 (no LOD distortion) *and* the 39.2° rendered vertical is exactly
+covered. Narrow, but it should be free of both mechanisms — which makes it the test that confirms
+the second one.
+
+Real fixes, both needing reverse engineering rather than tuning: find what resets the FOV to 65
+(hardware write breakpoint on the field), or find UE3's draw-distance/LOD scale and compensate for
+the inflation directly.
+
 **A decisive test now exists rather than another guess.** PAGE DOWN gained two steps (55%, **40%**).
 At 40% we render 39.2° vertical — just inside the engine's *worst observed* case, so no shortfall is
 possible on any frame:

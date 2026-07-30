@@ -1867,6 +1867,22 @@ void ApplyVrFov() {
         // NB this is the WORST frame in the window, so it flags a shortfall if any single frame
         // dipped - which is the right sensitivity for a flicker that only needs one bad frame to
         // be visible, but do not read it as "75% of the time".
+        // How far we have inflated the engine's FOV above the game's native 65 deg, and what that
+        // does to projected size. UE3 culls and picks LOD by screen-space size, so an object at a
+        // given distance appears (tan(native/2) / tan(asked/2)) times smaller than the engine was
+        // tuned for - which makes it cull things far closer than vanilla does. Run 21 caught this
+        // by checking the unmodified game: objects that vanish in the mod are visible from much
+        // further away without it, so the mod is culling early, not the game.
+        //
+        // This is the direct cost of culling headroom, and it pulls AGAINST the vertical coverage
+        // the headroom exists to buy. Both numbers have to be read together.
+        {
+            const float nativeTanHalf = tanf(32.5f / 57.2957795f);      // 65 deg native
+            const float askedTanHalf  = tanf(hFovDeg * 0.5f / 57.2957795f);
+            Log("    FOV inflation vs native 65 deg: x%.2f -> objects project %.1fx smaller than"
+                " the engine expects (early distance culling)",
+                hFovDeg / 65.0f, askedTanHalf / nativeTanHalf);
+        }
         Log("    worst engine VERTICAL cull this window: %.1f deg vs %.1f deg rendered -> %s",
             engVertMin, 2.0f * atanf(g_targetTanY) * 57.2957795f,
             engVertMin + 1.0f < 2.0f * atanf(g_targetTanY) * 57.2957795f
