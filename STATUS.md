@@ -2,6 +2,30 @@
 
 Last updated **2026-07-29**. Read this first, then `ENGINE_NOTES.md`.
 
+## How resolution will work in the shipped mod (design, run 17)
+
+Manual `-ResX=`/`-ResY=` is a **development crutch, not the shipping design.** Every other VR title
+inherits resolution from the headset and lets the platform's own render-scale slider adjust it, and
+this mod should behave the same way.
+
+The mechanism: OpenXR's `xrEnumerateViewConfigurationViews` reports a *recommended* per-eye rect,
+and that value **already includes whatever render-scale the user set in SteamVR or the Meta app**.
+So honouring it gives exactly the expected behaviour, with no per-user command line. The build now
+queries and logs it, along with the exact launch line it implies:
+
+```
+headset wants 2496x2688 per eye (max ...) - includes your runtime's render-scale setting
+  => for side-by-side stereo, launch the game with:  -ResX=4992 -ResY=2688 -windowed
+```
+
+To remove the manual step entirely, the DLL loads **before** the game parses its command line, so it
+can detour `GetCommandLineW`/`A` and append the computed `-ResX`/`-ResY`. That is the piece that
+turns this from guidance into automatic behaviour — **not yet implemented**, deliberately: it must
+fail safe (leave the command line untouched if the XR query fails) or the game will not launch.
+
+Note this is also why forcing the backbuffer failed (run 14): the resolution has to reach UE3's own
+system settings, which the command line does and a `CreateDevice` override does not.
+
 ## Ladder status (against the original plan)
 
 | Rung | State |
@@ -52,7 +76,9 @@ In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F1** true 
 
 Mouse and head tracking now **add** rather than fight — turning with the mouse no longer snaps
 back, and the same fix is what stick-turning will need in the shipped mod.
-Log: `%LOCALAPPDATA%\SingularityVR\view_matrix.log`. Uninstall = delete `d3d9.dll`.
+Log: `C:\Users\<you>\AppData\Local\SingularityVR\view_matrix.log` — **read it directly from disk**;
+it does not need pasting into chat. Truncated at each attach and now stamped with the run's date and
+time on line 1, so a stale file is obvious at a glance. Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
 

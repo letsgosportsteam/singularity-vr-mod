@@ -661,6 +661,10 @@ ID3D11Device* g_dev11 = nullptr;
 ID3D11DeviceContext* g_ctx11 = nullptr;
 bool g_xrReady = false, g_xrRunning = false;
 
+// What the runtime recommends per eye, once known. Drives the resolution guidance now and the
+// automatic sizing later.
+uint32_t g_recEyeW = 0, g_recEyeH = 0;
+
 bool InitXR() {
     const char* exts[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
     // VirtualDesktopXR is OpenXR 1.0 only and rejects a 1.1 instance with -4.
@@ -680,6 +684,37 @@ bool InitXR() {
     XrSystemGetInfo sgi{ XR_TYPE_SYSTEM_GET_INFO };
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     if (XR_FAILED(xrGetSystem(g_xrInstance, &sgi, &g_xrSystem))) { Log("no HMD"); return false; }
+
+    // Ask the runtime what resolution it actually wants per eye.
+    //
+    // This is the number the shipped mod must drive the game from, and it is the right one for a
+    // reason worth recording: the recommended rect ALREADY includes whatever render-scale the user
+    // set in SteamVR or the Meta app. So honouring it gives the behaviour every other VR title
+    // has - resolution inherited from the headset, adjustable through the platform's own slider -
+    // with no per-user command line anywhere.
+    //
+    // Side-by-side stereo needs twice the width in one frame, hence the doubling.
+    {
+        uint32_t viewCount = 0;
+        xrEnumerateViewConfigurationViews(g_xrInstance, g_xrSystem,
+                                          XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                          0, &viewCount, nullptr);
+        if (viewCount >= 1 && viewCount <= 4) {
+            XrViewConfigurationView vcv[4]{};
+            for (uint32_t i = 0; i < viewCount; ++i) vcv[i] = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
+            if (XR_SUCCEEDED(xrEnumerateViewConfigurationViews(
+                    g_xrInstance, g_xrSystem, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                    viewCount, &viewCount, vcv))) {
+                g_recEyeW = vcv[0].recommendedImageRectWidth;
+                g_recEyeH = vcv[0].recommendedImageRectHeight;
+                Log("headset wants %ux%u per eye (max %ux%u) - includes your runtime's"
+                    " render-scale setting", g_recEyeW, g_recEyeH,
+                    vcv[0].maxImageRectWidth, vcv[0].maxImageRectHeight);
+                Log("  => for side-by-side stereo, launch the game with:"
+                    "  -ResX=%u -ResY=%u -windowed", g_recEyeW * 2, g_recEyeH);
+            }
+        }
+    }
 
     PFN_xrGetD3D11GraphicsRequirementsKHR pfn = nullptr;
     xrGetInstanceProcAddr(g_xrInstance, "xrGetD3D11GraphicsRequirementsKHR", (PFN_xrVoidFunction*)&pfn);
@@ -2210,7 +2245,15 @@ BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(m);
         LogInit();
-        Log("=== view_matrix attached - hunting the world->clip matrix in vertex shader constants ===");
+        // Stamp the run so a log can be told apart from the previous one at a glance. The file is
+        // truncated at attach, but without a date there is no way to know whether what you are
+        // reading is this run or the last one - which matters when the log is read from disk
+        // rather than pasted, and cost real confusion across earlier sessions.
+        {
+            SYSTEMTIME st{}; GetLocalTime(&st);
+            Log("=== view_matrix attached %04d-%02d-%02d %02d:%02d:%02d - run starts here ===",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        }
         if (!LoadReal()) { Log("FATAL: real d3d9.dll not loadable"); return FALSE; }
     }
     return TRUE;
