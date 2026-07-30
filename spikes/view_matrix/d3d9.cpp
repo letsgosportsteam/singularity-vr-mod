@@ -1546,6 +1546,7 @@ PFN_DrawIndexedPrim    g_origDrawIndexedPrim = nullptr;
 PFN_DrawPrimUP         g_origDrawPrimUP = nullptr;
 PFN_DrawIndexedPrimUP  g_origDrawIndexedPrimUP = nullptr;
 int g_drawsUP = 0;           // how many draws came through the user-pointer forms
+bool g_hookUserPtrDraws = true;   // ini-switchable; see LoadIniSettings for why it must be
 
 // ---- only split draws aimed at the SCENE, never at offscreen targets (run 9) ----
 //
@@ -1783,7 +1784,11 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
 // we HOOKED was being split correctly, so whatever was vanishing had to be a draw we never saw.
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
+    if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
     ++g_drawsUP;
+    // Prove the hook is entered at all, and how early. If startup stalls again, the presence or
+    // absence of this line says whether we ever got here - which the last attempt could not tell.
+    if (g_drawsUP == 1) Log("first user-pointer draw seen (DrawPrimitiveUP)");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
 
@@ -1791,7 +1796,9 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
                                                 UINT minVtxIndex, UINT numVertices, UINT primCount,
                                                 const void* idxData, D3DFORMAT idxFormat,
                                                 const void* vtxData, UINT vtxStride) {
+    if (!g_origDrawIndexedPrimUP) return D3DERR_INVALIDCALL;
     ++g_drawsUP;
+    if (g_drawsUP == 1) Log("first user-pointer draw seen (DrawIndexedPrimitiveUP)");
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
@@ -2365,6 +2372,15 @@ void LoadIniSettings() {
         Log("ini: [Render] ResX/ResY are IGNORED - forcing the backbuffer does not change UE3's");
         Log("     render resolution, it only desynchronises it. Use the in-game video options.");
     }
+
+    // Escape hatch. Hooking the user-pointer draw calls stopped the game reaching its menus once
+    // (run 24), and the cause is still unexplained - the vtable indices are confirmed correct
+    // against d3d9.h, and the hooks are pass-through until F1 is pressed, so nothing they DO can
+    // be responsible. Since a bad interaction here blocks launching entirely, it must be
+    // switchable without a rebuild.
+    g_hookUserPtrDraws = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 1, path) != 0;
+    Log("ini: HookUserPointerDraws=%d%s", g_hookUserPtrDraws ? 1 : 0,
+        g_hookUserPtrDraws ? "  (set to 0 in SingularityVR.ini if the game will not start)" : "");
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYPE t, HWND w, DWORD f,
@@ -2379,10 +2395,26 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         // 81 = DrawPrimitive, 82 = DrawIndexedPrimitive - the two the scene passes use.
         g_origDrawPrim        = (PFN_DrawPrim)PatchVTable(*out, 81, (void*)&Hook_DrawPrim);
         g_origDrawIndexedPrim = (PFN_DrawIndexedPrim)PatchVTable(*out, 82, (void*)&Hook_DrawIndexedPrim);
-        // 83/84 = the user-pointer draw forms. UE3 uses them for dynamic geometry, and leaving them
-        // unhooked meant those draws were never split - see the note on Hook_DrawPrimUP.
-        g_origDrawPrimUP        = (PFN_DrawPrimUP)PatchVTable(*out, 83, (void*)&Hook_DrawPrimUP);
-        g_origDrawIndexedPrimUP = (PFN_DrawIndexedPrimUP)PatchVTable(*out, 84, (void*)&Hook_DrawIndexedPrimUP);
+        // 83/84 = the user-pointer draw forms, VERIFIED against d3d9.h rather than from memory:
+        // enumerating IDirect3DDevice9's declarations and anchoring on the slots already known to
+        // work (Present 17, SetRenderTarget 37, DrawPrimitive 81, SetVertexShaderConstantF 94)
+        // gives a consistent offset and puts these two at 83 and 84. So the indices were right the
+        // first time and "wrong index" was NOT why startup broke - that remains unexplained, which
+        // is exactly why this is switchable from the ini without a rebuild.
+        if (g_hookUserPtrDraws) {
+            g_origDrawPrimUP        = (PFN_DrawPrimUP)PatchVTable(*out, 83, (void*)&Hook_DrawPrimUP);
+            g_origDrawIndexedPrimUP = (PFN_DrawIndexedPrimUP)PatchVTable(*out, 84, (void*)&Hook_DrawIndexedPrimUP);
+            Log("user-pointer draw hooks installed (83=%p, 84=%p)",
+                (void*)g_origDrawPrimUP, (void*)g_origDrawIndexedPrimUP);
+            // A null original means the patch failed and forwarding would crash - drop the hook
+            // rather than take the game down with it.
+            if (!g_origDrawPrimUP || !g_origDrawIndexedPrimUP) {
+                Log("*** one of the user-pointer patches FAILED - disabling to stay safe ***");
+                g_hookUserPtrDraws = false;
+            }
+        } else {
+            Log("user-pointer draw hooks DISABLED by ini");
+        }
         // 37 = SetRenderTarget, so draws aimed at shadow maps can be told apart from scene draws.
         g_origSetRenderTarget = (PFN_SetRenderTarget)PatchVTable(*out, 37, (void*)&Hook_SetRenderTarget);
         Log("Present + SetVertexShaderConstantF + Draw + SetRenderTarget hooks installed.");
