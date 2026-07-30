@@ -1039,10 +1039,10 @@ volatile LONG g_noScissor = 0;
 // construction. So the theory stands untested, and the scan cannot settle it either - it looks for
 // VIEW matrices, and a composed local-to-clip matrix can never pass its camera-at-origin test.
 //
-// This settles it without parsing a single shader. Upload a c0 whose x and y columns are scaled
-// down by 1000, so everything driven by it collapses to a dot at the centre of the frame.
-// Whatever is STILL VISIBLE is, by construction, geometry we do not remap - and therefore
-// geometry the scissor is clipping at the seam while it still holds full-frame coordinates.
+// This settles it without parsing a single shader. Upload a c0 that forces clip.w negative, so
+// every triangle driven by it is discarded by the hardware before rasterisation. Whatever is
+// STILL VISIBLE is, by construction, geometry we do not remap - and therefore geometry the
+// scissor is clipping at the seam while it still holds full-frame coordinates.
 //
 //   the chest is sitting there when everything else collapses  -> run 18 was right all along
 //   the screen goes essentially empty                          -> run 18 is finally dead
@@ -1741,9 +1741,22 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         // geometry we do not remap. Applied before the cache below, so the draw hook's per-eye
         // copies inherit it too. See the note by g_blankCamMat.
         if (InterlockedCompareExchange(&g_blankCamMat, 0, 0)) {
-            float tx = 0, ty = 0;
-            ProjTangents(m, c, &tx, &ty);
-            ApplyProjection(m, c, tx, ty, tx * 1000.0f, ty * 1000.0f);
+            // CLIP it out, do not collapse it. Run 29 scaled the x/y columns down by 1000, which
+            // piles every triangle in the world onto a few pixels at the centre of the frame -
+            // catastrophic overdraw, which bloom and tonemapping then smear across everything.
+            // The result was a rainbow with nothing legible in it, so the test destroyed its own
+            // readability and the run was wasted.
+            //
+            // Forcing clip.w negative makes the hardware discard the geometry before
+            // rasterisation instead. Nothing is drawn, nothing is overdrawn, and post-processing
+            // has an ordinary near-empty frame to work on.
+            //
+            // For a zeroed block clip.w reduces to r[3].w under BOTH conventions - ROW sums
+            // v_i*r[i].w + r[3].w, COL takes dot(r[3].xyz, v) + r[3].w - so one assignment covers
+            // the pair, and every vertex fails the -w <= x <= w test.
+            float* f = reinterpret_cast<float*>(m);
+            for (int k = 0; k < 16; ++k) f[k] = 0.0f;
+            f[15] = -1.0f;
         }
         // Record the finished left-eye matrix. The draw hook derives both eyes from it, so the
         // eye offset and the half-frame remap compose on top of the forced projection instead of
@@ -2594,10 +2607,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         LONG was = InterlockedCompareExchange(&g_blankCamMat, 0, 0);
         InterlockedExchange(&g_blankCamMat, was ? 0 : 1);
         Log("END: camera matrix %s", was ? "restored"
-            : "COLLAPSED  <-- everything driven by the tracked register shrinks to a dot."
-              " WHATEVER IS STILL VISIBLE is geometry we cannot remap, and therefore geometry the"
-              " scissor clips at the seam. If the vanishing object is sitting there in plain view,"
-              " run 18 was right: it takes its transform from a register we never touch.");
+            : "CLIPPED OUT  <-- everything driven by the tracked register is discarded before"
+              " rasterisation, so the world should simply be GONE. WHATEVER IS STILL VISIBLE is"
+              " geometry we cannot remap, and therefore geometry the scissor clips at the seam."
+              " The HUD should survive - it never used this register - which doubles as proof the"
+              " test is working rather than the frame having failed.");
     }
     pEnd = kEnd;
 
