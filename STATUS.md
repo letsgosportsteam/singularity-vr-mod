@@ -431,7 +431,33 @@ At 40% the per-eye frustum is only ~35° wide (±17.6°), so a nearby off-centre
 outside it. The 40% setting is confounded for anything off-centre; it is only trustworthy for
 head-on objects.
 
-#### ⏭ Stop theorising: isolate by elimination
+#### ✅ Run 23: FOUND IT — splitting a draw we could not remap clips it at the seam
+
+Elimination worked where five theories had not. With head tracking **off**, the chest was **visible
+in alternate-eye mode and gone in duplication mode** — which placed the cause inside the draw hook
+and ruled out rotation, FOV and culling in a single test.
+
+The bug: **splitting was unconditional while the remap was conditional.** Splitting was made
+unconditional back in run 7, to stop objects vanishing from one eye — correct at the time, because
+the split then used the *viewport*. Under the clip-space scheme the two must travel together:
+
+- Scissoring geometry we did **not** remap clips it to a half while it still holds **full-frame**
+  coordinates.
+- The centre of the frame **is** the seam. So a head-on object is discarded in *both* halves at once,
+  while an off-centre one partly survives — exactly the reported pattern.
+
+It was intermittent because the camera slot goes briefly invalid every time `c0` is written with
+something that is not a view matrix, which happens repeatedly *within* a frame. That intermittency
+is what "flickering" was.
+
+**Fix:** when there is no live camera matrix, draw once, full frame, untouched — no scissor, no
+split. That costs the object its parallax for a frame instead of its existence. The log now reports
+a `mono-fallback` count so how often it happens is visible rather than inferred.
+
+Worth recording that this also explains earlier confusion: the flicker never responded to FOV,
+headroom, resolution or shadow changes because none of them touched the actual mechanism.
+
+#### The elimination plan that found it (kept for method)
 
 Five theories have been built and knocked down by their own diagnostics. The variable never
 isolated is **which of our interventions** causes it, so test that directly rather than proposing a

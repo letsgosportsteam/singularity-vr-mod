@@ -888,6 +888,9 @@ CamMatSlot g_camMats[kMaxCamMats]{};
 int g_camMatUsed = 0;                // high-water mark of slots ever allocated
 int g_camMatValidPeak = 0;           // diagnostic: how many were live in a frame
 int   g_drawsTotal = 0, g_drawsDuped = 0, g_drawsDupedOffset = 0, g_drawsOffscreen = 0;
+// Draws that had no live camera matrix and so were drawn once, unsplit. These are the ones that
+// used to be scissored-but-unremapped and therefore vanished at the seam.
+int   g_drawsMonoFallback = 0;
 
 IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
@@ -1675,7 +1678,25 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
         for (int s = 0; s < g_camMatUsed && nSlots < kMaxCamMats; ++s)
             if (g_camMats[s].valid) slots[nSlots++] = s;
     if (nSlots > g_camMatValidPeak) g_camMatValidPeak = nSlots;
-    const bool remapKnown = nSlots > 0;
+
+    // If we cannot remap this draw, do NOT split it either - draw it once, full frame, untouched.
+    //
+    // This is the flicker, found by elimination in run 22/23. With head tracking off, the chest was
+    // visible in alternate-eye mode and gone in duplication mode, which put the cause squarely in
+    // this function rather than in rotation, FOV or culling.
+    //
+    // The bug: splitting was unconditional (made so in run 7, to stop objects vanishing from ONE
+    // eye) while the remap is conditional on having a live camera matrix. Under the clip-space
+    // scheme those two must travel together. Scissoring geometry we did not remap clips it to a
+    // half while it still holds full-frame coordinates - and the centre of the frame IS the seam,
+    // so a head-on object is discarded in both halves at once. Off to one side it partly survives.
+    //
+    // The camera slot goes briefly invalid whenever c0 is written with something that is not a view
+    // matrix, which happens repeatedly within a frame, so this fired intermittently - which is
+    // exactly what "flickering" was. Falling back to one unsplit draw costs that object its
+    // parallax for a frame; it does not cost its existence.
+    if (nSlots == 0) { ++g_drawsMonoFallback; return draw(); }
+    const bool remapKnown = true;
 
     // Save the scissor state so the game's own setup is restored untouched.
     RECT  oldRect{};
@@ -2106,7 +2127,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     {
         static LARGE_INTEGER freq{}, last{};
         static int frames = 0; static double accum = 0.0;
-        static int dupPeak = 0, totPeak = 0, offsetPeak = 0, offscreenPeak = 0;
+        static int dupPeak = 0, totPeak = 0, offsetPeak = 0, offscreenPeak = 0, monoPeak = 0;
         if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
         if (last.QuadPart) accum += double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
@@ -2115,14 +2136,19 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (g_drawsDuped > dupPeak) dupPeak = g_drawsDuped;
         if (g_drawsDupedOffset > offsetPeak) offsetPeak = g_drawsDupedOffset;
         if (g_drawsOffscreen > offscreenPeak) offscreenPeak = g_drawsOffscreen;
+        if (g_drawsMonoFallback > monoPeak) monoPeak = g_drawsMonoFallback;
         if (++frames >= 120) {
             // "duplicated" is every draw split across both eye halves; "with offset" is the
             // subset that also got true parallax. The gap between them is drawn flat/mono in
             // both eyes - visible now, not silently dropped from one eye as it was before.
+            // monoFallback is the number that matters for the run-23 flicker: these draws had no
+            // live camera matrix, so they are drawn once instead of being scissored into a half
+            // they were never remapped into. A high or spiky count means the camera slot is going
+            // invalid often, which costs parallax on those objects even though they now appear.
             Log("perf: %.1f fps (%.2f ms/frame) | draws/frame peak %d, split %d (%d with"
-                " parallax, %d flat), offscreen left alone %d%s",
+                " parallax, %d flat), offscreen %d, mono-fallback %d%s",
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
-                offsetPeak, dupPeak - offsetPeak, offscreenPeak,
+                offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
             if (InterlockedCompareExchange(&g_dupDraws, 0, 0)) {
                 // Stereo silently doing nothing is the worst failure mode there is - run 14 lost
@@ -2145,7 +2171,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 g_camMatValidPeak = 0;
                 ReportRenderTargets();
             }
-            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0;
+            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0; monoPeak = 0;
         }
     }
 
@@ -2169,7 +2195,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
     g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
-    g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0; g_drawsOffscreen = 0;
+    g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0; g_drawsOffscreen = 0; g_drawsMonoFallback = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.
