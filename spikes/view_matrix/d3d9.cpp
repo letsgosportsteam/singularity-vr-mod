@@ -842,7 +842,28 @@ volatile LONG g_swapEyes = 0;        // reverse which half feeds which eye
 
 float g_eyeDeltaUU[3] = {0,0,0};     // left eye -> right eye, in game world units
 bool  g_camMatrixBound = false;      // is the camera's view matrix the one currently set?
-float g_lastCamMat[16] = {0};        // the left-eye matrix exactly as we last sent it
+
+// ---- every register currently holding a camera view-projection, not just one ----
+//
+// Run 18: a monster vanished when directly in FRONT of the player. Dead centre of the view is dead
+// centre of the full-width frame, which is precisely the seam between the two eye halves - so
+// geometry that never gets remapped into a half straddles the seam and the scissor discards it in
+// BOTH. Off to one side part of it survives in one half; centred, it goes completely.
+//
+// The cause is that a single locked register cannot cover the frame. Skeletal meshes lay their
+// constants out differently from static meshes, because a bone palette occupies a block of
+// registers, so characters take their view-projection from somewhere else entirely. Tracking one
+// register meant characters were never remapped.
+//
+// So track a small set. Each slot holds the finished LEFT-eye matrix for one register; the draw
+// hook derives both eyes from every valid slot. Slots are invalidated as soon as their register is
+// seen carrying something that is not a camera matrix, so a stale entry can never be re-uploaded
+// over live engine state.
+struct CamMatSlot { UINT reg; int conv; bool valid; float m[16]; };
+const int kMaxCamMats = 8;
+CamMatSlot g_camMats[kMaxCamMats]{};
+int g_camMatUsed = 0;                // high-water mark of slots ever allocated
+int g_camMatValidPeak = 0;           // diagnostic: how many were live in a frame
 int   g_drawsTotal = 0, g_drawsDuped = 0, g_drawsDupedOffset = 0, g_drawsOffscreen = 0;
 
 IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
@@ -1409,24 +1430,18 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                              o[2] = g_camRight[2] * g_offsetUU; }
         }
 
-        // Once the matrix is located, only its window needs testing. That matters now that
-        // the projection is forced on every frame rather than only while 6-DOF is on: the
-        // full sliding scan across thousands of calls per frame would be far too expensive to
-        // leave running permanently, while a bounds check plus one window test is not.
-        // Only ever touch the ONE window a scan has identified as the scene matrix.
+        // Test EVERY window, not just the locked one - see the note on g_camMats for why one
+        // register cannot cover the frame. Restricting to the locked convention is still safe and
+        // halves the work: the engine uses one storage convention throughout.
         //
-        // Previously, with no lock yet, this modified EVERY window that passed - and run 16 shows
-        // why that is wrong: the locked register alone saw 194 distinct projections over a
-        // session, from 36.7x21.1 deg to 143.9x119.8 deg. Some of that is the engine's own FOV
-        // drifting, but values that far apart are different passes (the first-person weapon has
-        // its own narrower FOV). Forcing all of them to the scene frustum corrupts the ones that
-        // legitimately differ. Waiting for a lock costs a frame or two of mono and is worth it.
-        if (!g_haveLock) return g_origSetVSConstF(dev, startReg, data, vec4Count);
-        if (startReg > g_lockedReg || g_lockedReg + 4 > startReg + vec4Count)
-            return g_origSetVSConstF(dev, startReg, data, vec4Count);
-        const UINT first = g_lockedReg - startReg, last = first;
+        // Consistency is why this has to be all-or-nothing. A remapped matrix must also be forced
+        // to the SAME target frustum, or its object lands in the right half at the wrong scale.
+        //
+        // Affordable because most uploads are small - a 4-register upload yields a single window -
+        // and none of this runs unless the bound target is scene-sized.
+        uint32_t touched = 0;        // which slots this call refreshed, so the rest can be aged out
 
-        for (UINT j = first; j <= last && j + 4 <= copyVecs; ++j) {
+        for (UINT j = 0; j <= windows && j + 4 <= copyVecs; ++j) {
             const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
             for (int c = 0; c < 2; ++c) {
                 if (g_haveLock && c != g_lockedConv) continue;
@@ -1446,11 +1461,35 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                     // arithmetic is right. Reading it back after the edit closes that loop.
                     ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
                 }
-                // Remember the finished left-eye matrix. The draw hook derives the right eye
-                // from this rather than from the engine's original, so the eye offset composes
-                // on top of the forced projection instead of fighting it.
-                if (dup) { memcpy(g_lastCamMat, m, sizeof(g_lastCamMat)); g_camMatrixBound = true; }
+                // Record the finished left-eye matrix for this register. The draw hook derives
+                // both eyes from it, so the eye offset and the half-frame remap compose on top of
+                // the forced projection instead of fighting it.
+                if (dup) {
+                    const UINT reg = startReg + j;
+                    int slot = -1;
+                    for (int s = 0; s < g_camMatUsed; ++s)
+                        if (g_camMats[s].reg == reg) { slot = s; break; }
+                    if (slot < 0 && g_camMatUsed < kMaxCamMats) slot = g_camMatUsed++;
+                    if (slot >= 0) {
+                        g_camMats[slot].reg = reg;
+                        g_camMats[slot].conv = c;
+                        g_camMats[slot].valid = true;
+                        memcpy(g_camMats[slot].m, m, sizeof(g_camMats[slot].m));
+                        touched |= (1u << slot);
+                    }
+                    g_camMatrixBound = true;
+                }
                 break;      // one convention per window; both cannot be true of one matrix
+            }
+        }
+
+        // Any tracked register that this upload covered but did NOT match now holds something
+        // else. Drop it, so the draw hook can never write a stale matrix over live engine state.
+        if (dup) {
+            for (int s = 0; s < g_camMatUsed; ++s) {
+                if (!g_camMats[s].valid || (touched & (1u << s))) continue;
+                if (g_camMats[s].reg >= startReg && g_camMats[s].reg + 4 <= startReg + vec4Count)
+                    g_camMats[s].valid = false;
             }
         }
         if (edited) return g_origSetVSConstF(dev, startReg, scratch, copyVecs);
@@ -1594,9 +1633,18 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     D3DVIEWPORT9 full{};
     if (FAILED(dev->GetViewport(&full)) || full.Width < 4) return draw();
 
-    const bool remapKnown = g_camMatrixBound && g_haveLock && g_origSetVSConstF;
     const LONG dbg = InterlockedCompareExchange(&g_eyeDebug, 0, 0);
     const LONG halfW = (LONG)(full.Width / 2);
+
+    // Collect every register currently holding a camera matrix. Each needs its own per-eye version
+    // uploaded, or geometry driven by an untouched register keeps full-frame coordinates and gets
+    // scissored away at the seam - the run-18 vanishing-monster bug.
+    int slots[kMaxCamMats]; int nSlots = 0;
+    if (g_origSetVSConstF)
+        for (int s = 0; s < g_camMatUsed && nSlots < kMaxCamMats; ++s)
+            if (g_camMats[s].valid) slots[nSlots++] = s;
+    if (nSlots > g_camMatValidPeak) g_camMatValidPeak = nSlots;
+    const bool remapKnown = nSlots > 0;
 
     // Save the scissor state so the game's own setup is restored untouched.
     RECT  oldRect{};
@@ -1612,10 +1660,11 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
         RECT lr = { (LONG)full.X, (LONG)full.Y,
                     (LONG)full.X + halfW, (LONG)(full.Y + full.Height) };
         dev->SetScissorRect(&lr);
-        if (remapKnown) {
-            memcpy(mat, g_lastCamMat, sizeof(mat));
-            ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), g_lockedConv, -0.5f);
-            g_origSetVSConstF(dev, g_lockedReg, mat, 4);
+        for (int i = 0; i < nSlots; ++i) {
+            const CamMatSlot& cs = g_camMats[slots[i]];
+            memcpy(mat, cs.m, sizeof(mat));
+            ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), cs.conv, -0.5f);
+            g_origSetVSConstF(dev, cs.reg, mat, 4);
         }
         hr = draw();
     }
@@ -1624,19 +1673,22 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
         RECT rr = { (LONG)full.X + halfW, (LONG)full.Y,
                     (LONG)(full.X + full.Width), (LONG)(full.Y + full.Height) };
         dev->SetScissorRect(&rr);
-        if (remapKnown) {
-            memcpy(mat, g_lastCamMat, sizeof(mat));
+        for (int i = 0; i < nSlots; ++i) {
+            const CamMatSlot& cs = g_camMats[slots[i]];
+            memcpy(mat, cs.m, sizeof(mat));
             // Eye offset first, then the half-frame remap - the offset is a world-space camera
             // move and must happen before clip space is rescaled.
-            ApplyOffset(reinterpret_cast<Reg4*>(mat), g_lockedConv, g_eyeDeltaUU);
-            ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), g_lockedConv, +0.5f);
-            g_origSetVSConstF(dev, g_lockedReg, mat, 4);
+            ApplyOffset(reinterpret_cast<Reg4*>(mat), cs.conv, g_eyeDeltaUU);
+            ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), cs.conv, +0.5f);
+            g_origSetVSConstF(dev, cs.reg, mat, 4);
         }
         HRESULT hr2 = draw();
         if (dbg == 2) hr = hr2;
     }
 
-    if (remapKnown) g_origSetVSConstF(dev, g_lockedReg, g_lastCamMat, 4);
+    // Put back exactly what the engine had set, for every register we disturbed.
+    for (int i = 0; i < nSlots; ++i)
+        g_origSetVSConstF(dev, g_camMats[slots[i]].reg, g_camMats[slots[i]].m, 4);
     dev->SetScissorRect(&oldRect);
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissorOn);
     ++g_drawsDuped;
@@ -2013,6 +2065,16 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     Log("*** WARNING: TRUE STEREO is ON but NOTHING was split (%d draws seen)."
                         " The scene target does not match the backbuffer %ux%u - stereo is"
                         " inactive. ***", totPeak, g_srcW, g_srcH);
+                // Decisive for the run-18 theory. If this only ever reads 1, characters do NOT
+                // take their view-projection from a second register and the vanishing-monster
+                // explanation is wrong - so the number is worth stating plainly either way.
+                Log("camera matrices tracked: %d register(s) live at once (of %d ever seen)",
+                    g_camMatValidPeak, g_camMatUsed);
+                for (int s = 0; s < g_camMatUsed; ++s)
+                    Log("    c%-3u %s %s", g_camMats[s].reg,
+                        g_camMats[s].conv == CONV_ROW ? "ROW" : "COL",
+                        g_camMats[s].valid ? "live" : "(idle)");
+                g_camMatValidPeak = 0;
                 ReportRenderTargets();
             }
             frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0;
