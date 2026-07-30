@@ -37,7 +37,32 @@
 ; ---------------------------------------------------------------------------
 
 [Render]
-HookUserPointerDraws=3
+HookUserPointerDraws=0
+
+; ---------------------------------------------------------------------------
+; DisableOcclusionQueries
+;
+; A MEASUREMENT, not a setting. Leave at 0 for normal play.
+;
+; UE3 draws a bounding box per primitive inside an occlusion query, reads the
+; pixel count back, and skips drawing that primitive later if it came back
+; zero. When that goes wrong you get objects popping in and out, worst when
+; looked at directly, on individual props rather than on world geometry - which
+; is the reported behaviour exactly, and the offenders (a chest, a locker door,
+; a corpse, ammo) are precisely the things that get their own query.
+;
+; By run 29 this is one of only two surviving candidates, and it has never been
+; tested. Setting this to 1 refuses D3DQUERYTYPE_OCCLUSION, which makes UE3
+; fall back to no occlusion culling - the same path it takes on hardware
+; without the feature, so a supported configuration rather than a novel one.
+;
+;   objects come back -> occlusion queries are the mechanism
+;   nothing changes   -> ruled out, permanently
+;
+;   0 = normal
+;   1 = refuse occlusion queries
+; ---------------------------------------------------------------------------
+DisableOcclusionQueries=0
 
 ; ---------------------------------------------------------------------------
 ; There is deliberately no resolution setting here.

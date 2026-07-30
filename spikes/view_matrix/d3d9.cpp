@@ -1031,6 +1031,26 @@ volatile LONG g_swapEyes = 0;        // reverse which half feeds which eye
 // it was without any test that could tell drawn-then-clipped from never-drawn.
 volatile LONG g_noScissor = 0;
 
+// ---- END: collapse c0, and read off what is left (run 29) ----
+//
+// The question nothing here has ever answered: does the geometry that vanishes actually take its
+// transform from the register we remap? Run 18 said no, STATUS records that as refuted by
+// "register count measured 1, ever", and run 28 showed that counter is capped at 1 by
+// construction. So the theory stands untested, and the scan cannot settle it either - it looks for
+// VIEW matrices, and a composed local-to-clip matrix can never pass its camera-at-origin test.
+//
+// This settles it without parsing a single shader. Upload a c0 whose x and y columns are scaled
+// down by 1000, so everything driven by it collapses to a dot at the centre of the frame.
+// Whatever is STILL VISIBLE is, by construction, geometry we do not remap - and therefore
+// geometry the scissor is clipping at the seam while it still holds full-frame coordinates.
+//
+//   the chest is sitting there when everything else collapses  -> run 18 was right all along
+//   the screen goes essentially empty                          -> run 18 is finally dead
+//
+// The blanking is applied before the matrix is cached, so StereoPair's per-eye uploads inherit it
+// and there is no path by which an unblanked copy reaches the GPU.
+volatile LONG g_blankCamMat = 0;
+
 float g_eyeDeltaUU[3] = {0,0,0};     // left eye -> right eye, in game world units
 bool  g_camMatrixBound = false;      // is the camera's view matrix the one currently set?
 
@@ -1717,6 +1737,14 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
             // Reading it back after the edit closes that loop.
             ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
         }
+        // END: collapse everything this register drives, so whatever survives on screen is
+        // geometry we do not remap. Applied before the cache below, so the draw hook's per-eye
+        // copies inherit it too. See the note by g_blankCamMat.
+        if (InterlockedCompareExchange(&g_blankCamMat, 0, 0)) {
+            float tx = 0, ty = 0;
+            ProjTangents(m, c, &tx, &ty);
+            ApplyProjection(m, c, tx, ty, tx * 1000.0f, ty * 1000.0f);
+        }
         // Record the finished left-eye matrix. The draw hook derives both eyes from it, so the
         // eye offset and the half-frame remap compose on top of the forced projection instead of
         // fighting it.
@@ -2141,6 +2169,43 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     });
 }
 
+// ---- occlusion queries: the mechanism nothing here has ever looked at (run 29) ----
+//
+// UE3 draws a bounding box per primitive inside a D3DQUERYTYPE_OCCLUSION query, reads the pixel
+// count back, and skips drawing that primitive on a later frame if it came back zero. When that
+// goes wrong the symptom is objects popping in and out, worst when looked at directly, on
+// individual props rather than on world geometry - which is the reported behaviour to the letter,
+// and the list of offenders (a chest, a locker door, a corpse, ammo) is exactly the set of things
+// that get their own occlusion query.
+//
+// It has never been tested here, and by run 29 it is one of only two surviving candidates.
+//
+// The test is to take the feature away: refusing to create an occlusion query makes UE3 fall back
+// to no occlusion culling, which is the same path it follows on hardware that does not support
+// the feature - a supported configuration, not an unexplored one. If the objects come back, the
+// mechanism is named. If nothing changes, it is ruled out for good.
+//
+// Ini-switchable rather than a hotkey, because these are created during startup and the decision
+// has to be made before the engine probes for support.
+bool g_killOcclusionQueries = false;
+int  g_occlusionQueriesRefused = 0;
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateQuery)(IDirect3DDevice9*, D3DQUERYTYPE, IDirect3DQuery9**);
+PFN_CreateQuery g_origCreateQuery = nullptr;
+
+HRESULT STDMETHODCALLTYPE Hook_CreateQuery(IDirect3DDevice9* dev, D3DQUERYTYPE type,
+                                           IDirect3DQuery9** out) {
+    if (g_killOcclusionQueries && type == D3DQUERYTYPE_OCCLUSION) {
+        // D3DERR_NOTAVAILABLE is the documented "this device does not support that query type"
+        // answer, and the one UE3's support probe is written to handle.
+        if (++g_occlusionQueriesRefused == 1)
+            Log("occlusion queries REFUSED (ini) - UE3 should fall back to no occlusion culling");
+        if (out) *out = nullptr;
+        return D3DERR_NOTAVAILABLE;
+    }
+    return g_origCreateQuery(dev, type, out);
+}
+
 // Refresh the camera position the detector substitutes. Runs once per frame in Present.
 void RefreshCameraPosition() {
     // FindCamera is cheap once it has a live instance cached - it just revalidates the
@@ -2522,6 +2587,20 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     }
     pHome = kHome;
 
+    // END: collapse c0 - see the note by g_blankCamMat.
+    static bool pEnd = false;
+    bool kEnd = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+    if (kEnd && !pEnd) {
+        LONG was = InterlockedCompareExchange(&g_blankCamMat, 0, 0);
+        InterlockedExchange(&g_blankCamMat, was ? 0 : 1);
+        Log("END: camera matrix %s", was ? "restored"
+            : "COLLAPSED  <-- everything driven by the tracked register shrinks to a dot."
+              " WHATEVER IS STILL VISIBLE is geometry we cannot remap, and therefore geometry the"
+              " scissor clips at the seam. If the vanishing object is sitting there in plain view,"
+              " run 18 was right: it takes its transform from a register we never touch.");
+    }
+    pEnd = kEnd;
+
     // DELETE: reverse the mapping, so a confirmed swap can be fixed and verified immediately.
     static bool pDel = false;
     bool kDel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
@@ -2862,6 +2941,12 @@ void LoadIniSettings() {
     //
     // Whichever level first fails names the culprit exactly, and costs one relaunch instead of a
     // round trip through me.
+    // See the note above Hook_CreateQuery. Off by default: this removes a feature the engine
+    // expects to have, so it is a measurement, not a setting.
+    g_killOcclusionQueries = GetPrivateProfileIntA("Render", "DisableOcclusionQueries", 0, path) != 0;
+    Log("ini: DisableOcclusionQueries=%d%s", g_killOcclusionQueries ? 1 : 0,
+        g_killOcclusionQueries ? "  <-- occlusion culling is being taken away from the engine" : "");
+
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;
     g_hookUserPtrDraws = g_userPtrHookLevel > 0;
@@ -2905,6 +2990,13 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         }
         // 37 = SetRenderTarget, so draws aimed at shadow maps can be told apart from scene draws.
         g_origSetRenderTarget = (PFN_SetRenderTarget)PatchVTable(*out, 37, (void*)&Hook_SetRenderTarget);
+        // 118 = CreateQuery, the last method on IDirect3DDevice9. Counted forward from
+        // SetVertexShaderConstantF at 94, which is independently confirmed working.
+        g_origCreateQuery = (PFN_CreateQuery)PatchVTable(*out, 118, (void*)&Hook_CreateQuery);
+        if (!g_origCreateQuery && g_killOcclusionQueries) {
+            Log("*** CreateQuery patch FAILED - leaving occlusion queries alone ***");
+            g_killOcclusionQueries = false;
+        }
         Log("Present + SetVertexShaderConstantF + Draw + SetRenderTarget hooks installed.");
         Log("F7 find the matrix | F1 TRUE stereo | F12 alternate-eye | F10 6-DOF | F9 head tracking");
     }
