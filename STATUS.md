@@ -414,6 +414,40 @@ Real fixes, both needing reverse engineering rather than tuning: find what reset
 (hardware write breakpoint on the field), or find UE3's draw-distance/LOD scale and compensate for
 the inflation directly.
 
+#### ❌ Run 22: at the artifact-free operating point, objects STILL disappear
+
+The clean configuration was genuinely reached — the log confirms it, not inference:
+
+```
+FOV inflation vs native 65 deg: x1.00        (engine FOV 64.7-64.8, no LOD distortion)
+worst engine VERTICAL cull: 39.2 deg vs 39.2 deg rendered -> covered
+```
+
+No inflation, no shortfall. **And distant objects still vanish.** So culling and LOD distortion,
+while real, are not the whole story — there is a **third** mechanism. Four theories now dead.
+
+One reported detail is probably *not* a bug: a close water fountain vanishing when off to the left.
+At 40% the per-eye frustum is only ~35° wide (±17.6°), so a nearby off-centre object is legitimately
+outside it. The 40% setting is confounded for anything off-centre; it is only trustworthy for
+head-on objects.
+
+#### ⏭ Stop theorising: isolate by elimination
+
+Five theories have been built and knocked down by their own diagnostics. The variable never
+isolated is **which of our interventions** causes it, so test that directly rather than proposing a
+sixth mechanism. Each step removes one thing:
+
+| Test | Keys | If the flicker STOPS |
+|---|---|---|
+| A. No head tracking | F1 on, **F9 off** | The rotation write is the cause — likely a frame-lag mismatch where the engine culls using the rotation it had *before* our write, then renders from where we put it. Would explain "depends on where my head is pointed" and survives every FOV fix. |
+| B. No duplication | **F1 off**, F9 on | Stereo/draw duplication is the cause |
+| C. No projection forcing | **F6 off**, F1 off | Our matrix edits are the cause |
+| D. Nothing on | all off | The mod is innocent; it is the game or the streaming link |
+
+Run them in order and stop at the first one that clears it. That names the culprit in one session
+instead of another round of theory. Note the flicker was reported on a manhole cover **before F12
+was ever pressed**, which already hints the cause is not stereo — test A first.
+
 **A decisive test now exists rather than another guess.** PAGE DOWN gained two steps (55%, **40%**).
 At 40% we render 39.2° vertical — just inside the engine's *worst observed* case, so no shortfall is
 possible on any frame:
