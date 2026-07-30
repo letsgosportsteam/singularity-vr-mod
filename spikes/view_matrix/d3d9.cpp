@@ -1546,7 +1546,8 @@ PFN_DrawIndexedPrim    g_origDrawIndexedPrim = nullptr;
 PFN_DrawPrimUP         g_origDrawPrimUP = nullptr;
 PFN_DrawIndexedPrimUP  g_origDrawIndexedPrimUP = nullptr;
 int g_drawsUP = 0;           // how many draws came through the user-pointer forms
-bool g_hookUserPtrDraws = true;   // ini-switchable; see LoadIniSettings for why it must be
+bool g_hookUserPtrDraws = false;  // ini-switchable; see LoadIniSettings for why it must be
+int  g_userPtrHookLevel = 0;      // 0 off, 1 patch only, 2 +counter, 3 full - a bisection ladder
 
 // ---- only split draws aimed at the SCENE, never at offscreen targets (run 9) ----
 //
@@ -1807,7 +1808,9 @@ void NoteFirstUserPtrDraw(const char* which) {
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
     if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
+    if (g_userPtrHookLevel <= 1) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     ++g_drawsUP;
+    if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
@@ -1817,7 +1820,13 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
                                                 const void* idxData, D3DFORMAT idxFormat,
                                                 const void* vtxData, UINT vtxStride) {
     if (!g_origDrawIndexedPrimUP) return D3DERR_INVALIDCALL;
+    if (g_userPtrHookLevel <= 1)
+        return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
+                                       idxData, idxFormat, vtxData, vtxStride);
     ++g_drawsUP;
+    if (g_userPtrHookLevel == 2)
+        return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
+                                       idxData, idxFormat, vtxData, vtxStride);
     NoteFirstUserPtrDraw("DrawIndexedPrimitiveUP");
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
@@ -2398,9 +2407,26 @@ void LoadIniSettings() {
     // against d3d9.h, and the hooks are pass-through until F1 is pressed, so nothing they DO can
     // be responsible. Since a bad interaction here blocks launching entirely, it must be
     // switchable without a rebuild.
-    g_hookUserPtrDraws = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 1, path) != 0;
-    Log("ini: HookUserPointerDraws=%d%s", g_hookUserPtrDraws ? 1 : 0,
-        g_hookUserPtrDraws ? "  (set to 0 in SingularityVR.ini if the game will not start)" : "");
+    // Levels rather than on/off, so the hang can be BISECTED without a rebuild each time.
+    //
+    // Three explanations for it have now been wrong - bad vtable index, bad signature, and file I/O
+    // in the hook - and both index and signature are since confirmed exact against d3d9.h. Rather
+    // than guess a fourth time, each level adds back one thing:
+    //
+    //   0 = not hooked at all                     (known good)
+    //   1 = hooked, forwards immediately          (tests whether the PATCH ALONE breaks it)
+    //   2 = level 1 plus the counter              (tests touching our own globals)
+    //   3 = full treatment, routed via StereoPair (tests the duplication path)
+    //
+    // Whichever level first fails names the culprit exactly, and costs one relaunch instead of a
+    // round trip through me.
+    g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
+    if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;
+    g_hookUserPtrDraws = g_userPtrHookLevel > 0;
+    Log("ini: HookUserPointerDraws=%d (%s)", g_userPtrHookLevel,
+        g_userPtrHookLevel == 0 ? "not hooked - known good" :
+        g_userPtrHookLevel == 1 ? "patch only, immediate forward" :
+        g_userPtrHookLevel == 2 ? "patch + counter" : "full StereoPair treatment");
 }
 
 HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYPE t, HWND w, DWORD f,

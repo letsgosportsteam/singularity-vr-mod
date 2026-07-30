@@ -1,36 +1,43 @@
 ; Singularity VR mod - settings
 ;
 ; ---------------------------------------------------------------------------
-; IF THE GAME WILL NOT REACH ITS MENUS, set this to 0 and relaunch.
+; HookUserPointerDraws - a BISECTION LADDER, not an on/off switch.
+;
+; Hooking DrawPrimitiveUP / DrawIndexedPrimitiveUP stops the game reaching its
+; menus, and three explanations for that have now been wrong (bad vtable slot,
+; bad signature, file I/O in the hook). Slot and signature are both since
+; confirmed exact against d3d9.h, so the cause is still unknown.
+;
+; Each level adds back exactly one thing. Launch once per level; whichever level
+; FIRST fails to reach the menus names the culprit.
+;
+;   0 = not hooked at all                    <- known good, safe default
+;   1 = hooked, forwards immediately          (does the patch alone break it?)
+;   2 = level 1 plus a counter                (does touching our globals break it?)
+;   3 = full per-eye treatment                (does the duplication path break it?)
+;
+; If a level hangs, set it back to 0 and relaunch. No rebuild needed.
+;
+; Why bother: those draws are how UE3 submits dynamic geometry (particles,
+; decals, sprites). They are never split per eye, so a centred one lands on the
+; seam between the eye halves and disappears - the suspected cause of the chest
+; and similar objects vanishing.
 ; ---------------------------------------------------------------------------
-;
-; HookUserPointerDraws controls whether the two user-pointer draw calls
-; (DrawPrimitiveUP / DrawIndexedPrimitiveUP) are intercepted. UE3 uses them for
-; dynamic geometry - particles, decals, sprites - and leaving them alone means
-; those draws never get split per eye, so a centred one lands on the seam
-; between the two eye halves and disappears.
-;
-; Hooking them once stopped the game reaching its menus, and that is still
-; unexplained: the vtable slots are confirmed correct against d3d9.h, and the
-; hooks do nothing at all until F1 is pressed. Since a bad interaction here
-; blocks launching entirely, it is switchable here rather than needing a rebuild.
-;
-; 1 = hooked (default)   0 = left alone
 
 [Render]
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------
-; There is deliberately no resolution setting.
+; There is deliberately no resolution setting here.
 ;
 ; Forcing the D3D9 backbuffer does NOT raise UE3's render resolution - the
 ; engine sizes its scene targets from its own configured resolution, so
 ; overriding the backbuffer only desynchronises the two and switches stereo off.
 ;
-; To change resolution, pass it on the command line, which the engine reads into
-; its own system settings:
+; Pass it on the command line instead, which the engine reads into its own
+; system settings:
 ;
 ;   Singularity.exe -ResX=3840 -ResY=2160 -windowed
 ;
-; -windowed is needed because fullscreen clamps to real display modes. Note
-; 4992x2688 is refused; the cap appears to be around 4096.
+; -windowed is required because fullscreen clamps to real display modes.
+; 4992x2688 is refused; the cap appears to be near 4096.
