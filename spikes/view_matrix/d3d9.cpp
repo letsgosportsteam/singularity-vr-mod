@@ -2214,10 +2214,27 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
 // all of them; the type check inside the hook keeps D3DQUERYTYPE_EVENT fences (which UE3 uses for
 // frame pacing) reading their true values.
 //
-// Ini-switchable rather than a hotkey, because queries are created during startup.
-//   0 = normal
-//   1 = queries answer "fully visible", so nothing is ever culled as occluded   <- the test
-//   2 = refuse to create them  ** CRASHES THIS BUILD, kept only so it is not retried **
+// ---- ✅ CONFIRMED run 30: this was the flicker, after seven eliminated mechanisms ----
+//
+// With results forced to "visible", draws per frame went from ~1000 to 2100-3800 and every
+// reported object came back solid. The engine was discarding 50-70% of its own draw calls as
+// occluded when they were not.
+//
+// Reporting "visible" is not a workaround, it is the correct answer for this renderer. Single-view
+// occlusion culling is not well defined in stereo: the engine issues ONE query and gets ONE
+// answer, but an object hidden from the left eye can be plainly visible from the right, so any
+// single yes/no is wrong for one of them. "Visible" is the conservative resolution - it can never
+// wrongly delete geometry, only fail to save work.
+//
+// The cost is small here and measured: frame rate held at 37-40 fps with peaks of 70, unchanged
+// from before, because this build is bottlenecked on the CPU frame copy rather than on draw calls.
+//
+// Default is AUTO: overridden while duplication is on, left alone in mono, so the safe fallback
+// mode keeps the engine's own culling and its speed.
+//   0 = auto - report visible while draw duplication is on, normal otherwise   <- default
+//   1 = always report visible
+//   2 = never override; the engine's occlusion culling is always live
+//   3 = refuse to create them  ** CRASHES THIS BUILD, kept only so it is not retried **
 int g_occlusionMode = 0;
 int g_occlusionForced = 0;
 
@@ -2232,10 +2249,17 @@ PFN_QueryGetData g_origQueryGetData = nullptr;
 // A pixel count large enough that no visibility threshold treats it as occluded.
 const DWORD kPretendVisiblePixels = 0x00010000;
 
+// Auto mode overrides only while duplication is on - that is the configuration whose split frame
+// invalidates the query, and mono has no reason to pay for it.
+inline bool OverrideOcclusion() {
+    if (g_occlusionMode == 1) return true;
+    return g_occlusionMode == 0 && InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+}
+
 HRESULT STDMETHODCALLTYPE Hook_QueryGetData(IDirect3DQuery9* q, void* data, DWORD size, DWORD flags) {
     HRESULT hr = g_origQueryGetData(q, data, size, flags);
     // S_FALSE means "not ready yet" and carries no data - only rewrite a completed result.
-    if (g_occlusionMode == 1 && hr == S_OK && data && size >= sizeof(DWORD) &&
+    if (OverrideOcclusion() && hr == S_OK && data && size >= sizeof(DWORD) &&
         q->GetType() == D3DQUERYTYPE_OCCLUSION) {
         *reinterpret_cast<DWORD*>(data) = kPretendVisiblePixels;
         ++g_occlusionForced;
@@ -2245,14 +2269,14 @@ HRESULT STDMETHODCALLTYPE Hook_QueryGetData(IDirect3DQuery9* q, void* data, DWOR
 
 HRESULT STDMETHODCALLTYPE Hook_CreateQuery(IDirect3DDevice9* dev, D3DQUERYTYPE type,
                                            IDirect3DQuery9** out) {
-    if (g_occlusionMode == 2 && type == D3DQUERYTYPE_OCCLUSION) {
+    if (g_occlusionMode == 3 && type == D3DQUERYTYPE_OCCLUSION) {
         if (out) *out = nullptr;
         return D3DERR_NOTAVAILABLE;
     }
     HRESULT hr = g_origCreateQuery(dev, type, out);
     // Patch GetData on the first real query we see. One patch covers every query from this
-    // device, since they all share a vtable.
-    if (g_occlusionMode == 1 && SUCCEEDED(hr) && out && *out && !g_origQueryGetData) {
+    // device, since they all share a vtable. Auto mode patches too - the hook decides per call.
+    if (g_occlusionMode <= 1 && SUCCEEDED(hr) && out && *out && !g_origQueryGetData) {
         g_origQueryGetData = (PFN_QueryGetData)PatchVTable(*out, 7, (void*)&Hook_QueryGetData);
         Log("occlusion queries will report FULLY VISIBLE (GetData patched, orig=%p)",
             (void*)g_origQueryGetData);
@@ -2774,12 +2798,13 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // Settles the run-26 theory rather than leaving it inferred. If this never appears
             // while the user-pointer hooks are on, those calls do NOT come from another thread
             // and the guard is costing us the very draws we hooked them to catch.
-            if (g_occlusionMode == 1) {
+            {
                 static bool saidOcclusion = false;
                 if (!saidOcclusion && g_occlusionForced > 0) {
                     saidOcclusion = true;
-                    Log("    occlusion results are being overridden to FULLY VISIBLE (%d so far)."
-                        " If the vanishing objects are solid now, query readback is the mechanism.",
+                    Log("    occlusion results overridden to FULLY VISIBLE (%d so far) - this is"
+                        " the run-30 fix. Single-view occlusion culling is not well defined in"
+                        " stereo, so reporting visible is the conservative correct answer.",
                         g_occlusionForced);
                 }
             }
@@ -3009,11 +3034,12 @@ void LoadIniSettings() {
     // round trip through me.
     // See the note above Hook_CreateQuery. Off by default: this removes a feature the engine
     // expects to have, so it is a measurement, not a setting.
-    g_occlusionMode = GetPrivateProfileIntA("Render", "DisableOcclusionQueries", 0, path);
-    if (g_occlusionMode < 0 || g_occlusionMode > 2) g_occlusionMode = 0;
-    Log("ini: DisableOcclusionQueries=%d (%s)", g_occlusionMode,
-        g_occlusionMode == 0 ? "normal" :
-        g_occlusionMode == 1 ? "queries answer FULLY VISIBLE - nothing culled as occluded"
+    g_occlusionMode = GetPrivateProfileIntA("Render", "OcclusionQueryMode", 0, path);
+    if (g_occlusionMode < 0 || g_occlusionMode > 3) g_occlusionMode = 0;
+    Log("ini: OcclusionQueryMode=%d (%s)", g_occlusionMode,
+        g_occlusionMode == 0 ? "auto - report visible while true stereo is on, normal in mono" :
+        g_occlusionMode == 1 ? "always report visible" :
+        g_occlusionMode == 2 ? "never override - the engine's own occlusion culling stays live"
                              : "refuse to create - WARNING, this crashed the game in run 30");
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);

@@ -40,37 +40,38 @@
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------
-; DisableOcclusionQueries
-;
-; A MEASUREMENT, not a setting. Leave at 0 for normal play.
+; OcclusionQueryMode   -- THIS IS THE FIX FOR THE VANISHING OBJECTS (run 30)
 ;
 ; UE3 draws a bounding box per primitive inside an occlusion query, reads the
 ; pixel count back, and skips drawing that primitive later if it came back
-; zero. When that goes wrong you get objects popping in and out, worst when
-; looked at directly, on individual props rather than on world geometry - which
-; is the reported behaviour exactly, and the offenders (a chest, a locker door,
-; a corpse, ammo) are precisely the things that get their own query.
+; zero. In true stereo that readback is wrong, and it was wrong on a huge
+; scale: with the results forced to "visible", draws per frame went from ~1000
+; to 2100-3800 and every reported object came back solid. The engine was
+; throwing away 50-70% of its own draw calls.
 ;
-; By run 29 this is the only surviving candidate, and it had never been tested.
+; Reporting "visible" is the correct answer here, not a workaround. Single-view
+; occlusion culling is not well defined in stereo - the engine issues ONE query
+; and gets ONE answer, but an object hidden from the left eye can be plainly
+; visible from the right, so any single yes/no is wrong for one of them.
+; "Visible" is conservative: it can never wrongly delete geometry, it can only
+; fail to save work.
 ;
-; Mode 1 lets every query be created and used exactly as the engine expects and
-; only changes the ANSWER - GetData reports a large pixel count, so nothing is
-; ever judged occluded. The engine's control flow is untouched.
+; The cost is small and measured. Frame rate held at 37-40 fps with peaks of
+; 70, unchanged, because this build is bottlenecked on the CPU frame copy
+; rather than on draw calls.
 ;
-;   objects come back -> occlusion query readback is the mechanism
-;   nothing changes   -> ruled out, permanently
+;   0 = auto: report visible while true stereo is on, normal in mono  <- default
+;   1 = always report visible
+;   2 = never override; the engine's own occlusion culling stays live
+;   3 = refuse to create them                   ** CRASHES THIS BUILD **
 ;
-;   0 = normal
-;   1 = queries answer "fully visible"          <- the test
-;   2 = refuse to create them                   ** CRASHES THIS BUILD **
-;
-; Mode 2 returns D3DERR_NOTAVAILABLE, which is the documented answer for an
-; unsupported query type and the path UE3 takes on hardware without the
-; feature. Run 30 tried it and the game died between the splash screens and the
-; main menu - consistent with the unchecked-NULL-from-a-factory habit already
-; recorded for Raven's code. It is kept only so nobody retries it.
+; Mode 3 returns D3DERR_NOTAVAILABLE, the documented answer for an unsupported
+; query type and the path UE3 takes on hardware without the feature. Run 30
+; tried it and the game died between the splash screens and the main menu -
+; consistent with the unchecked-NULL-from-a-factory habit already recorded for
+; Raven's code. Kept only so nobody retries it.
 ; ---------------------------------------------------------------------------
-DisableOcclusionQueries=0
+OcclusionQueryMode=0
 
 ; ---------------------------------------------------------------------------
 ; There is deliberately no resolution setting here.

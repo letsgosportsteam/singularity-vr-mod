@@ -2,11 +2,18 @@
 
 Last updated **2026-07-30** (end of run 27). Read this first, then `ENGINE_NOTES.md`.
 
-> **Run 27 changed the picture before a single new measurement was taken.** The "hang" that
-> blocked the user-pointer draw hooks for three sessions was a printf argument mismatch, not
-> threading; the counter that "validated" the stereo mechanism in run 16 was a compile-time
-> constant; and four separate paths were leaving a stale view matrix being pushed over live
-> engine state. All fixed and built. See **Run 27** below before acting on anything older.
+> # ✅ THE FLICKER IS SOLVED (run 30)
+>
+> **It was UE3's hardware occlusion queries.** The engine draws a bounding box per primitive,
+> reads the pixel count back, and skips drawing that primitive later if it came back zero. In
+> true stereo that readback is wrong, and it was wrong on a huge scale: with results forced to
+> "visible", **draws per frame went from ~1000 to 2100–3800** and every reported object came back
+> solid. The engine was discarding **50–70% of its own draw calls.**
+>
+> Fixed by `OcclusionQueryMode=0` (auto), now the default. Frame rate is unchanged — 37–40 fps
+> with peaks of 70 — because this build is bottlenecked on the CPU frame copy, not on draw calls.
+>
+> Seven mechanisms were eliminated by direct test before this one landed. See **Run 30**.
 
 ## TL;DR — where we stand
 
@@ -14,11 +21,8 @@ Last updated **2026-07-30** (end of run 27). Read this first, then `ENGINE_NOTES
 **true native stereo** with real per-eye parallax. The stereo mechanism is validated: the eyes line
 up, depth reads correctly, and it holds ~37 fps at 2560×1440 / ~28 at 3840×2160.
 
-**The one open defect:** some objects flicker or vanish — a chest, a locker door, a corpse. The
-mechanism is understood (see *the seam*, below). Run 27 found four separate code defects each
-capable of producing it, fixed them, and added the counters that say which one it actually was —
-that measurement has not been taken yet. Everything else on the list is planned work rather than a
-bug.
+**The flicker is fixed** (run 30 — occlusion query readback). Objects no longer vanish. Everything
+remaining on the list is planned work rather than a bug.
 
 ### If you are picking this up cold, read these three things
 
@@ -37,23 +41,29 @@ bug.
 
 ### Next session, in order
 
-**Everything below is now one measurement run.** The build already has the fixes; what it needs is
-someone in the headset reading four new numbers.
+With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
+debugging.
 
-1. **Launch with `HookUserPointerDraws=3`** (already set in the installed ini). The hang is
-   explained and fixed. If it still hangs, that is genuinely new information — set 0 and say so.
-2. **Play with F1 on and read the perf line.** Four numbers decide what happens next:
-   - `frames with NO identification` — non-zero means the whole-frame dropout is real and is
-     probably the flicker. It has never been measured before.
-   - `mono-fallback` — draws placed full-frame across the seam.
-   - `user-ptr` — how much geometry was invisible to us until now.
-   - `split N (M with parallax, K flat)` — this finally means something; K > 0 means the eyes are
-     showing the same image.
-3. **Read the two culling lines.** The census now prints one row per *surface*, and the shortfall
-   is reported both from `mCurrentPOV` (the old proxy) and from the arriving matrix (ground truth).
-   The log already suggests these disagree badly — see *the culling number was a proxy* below.
-4. **Then** either the structural fix (Stage 4, below) or the D3D9Ex performance work, chosen on
-   what step 2 says.
+1. **Performance — the D3D9Ex + `D3DPOOL_MANAGED` wrapper.** Now unambiguously the gating item.
+   The frame copy is a full CPU round-trip (~14 MB each way at 1440p) and the fps distribution is
+   bimodal, the signature of a CPU-bound stall. It also gates everything below, since matching the
+   headset's resolution multiplies the copy cost ~3.6×.
+2. **Resolution.** Per-eye is currently 1280×1440 against the headset's 2496×2688. Needs the
+   command-line detour (design already written up under *How resolution will work*), and probably
+   per-eye render targets given the ~4096 cap.
+3. **Controller input and menus.** Untouched — needs OpenXR input. Same work unlocks
+   motion-controller aiming.
+4. **Head roll.** F9 drives pitch and yaw only; `r->roll` is never written, so tilting your head
+   sideways does not tilt the view. Small job, and it is felt in VR without being easy to name.
+
+Two loose threads worth keeping visible, neither blocking:
+
+- **`HookUserPointerDraws` stays 0.** Level 3 routes UE3's `DrawDenormalizedQuad` — the fullscreen
+  quad every post-process pass uses — through `StereoPair`, which scissors it to a half and
+  overwrites `c0` underneath it. That is the "rainbow" of run 28. Fixing it needs draw
+  classification, and with the flicker solved there is no longer a reason to rush it.
+- **Post-processing still bleeds across the seam** (bloom and similar sample the whole target).
+  Stage 4 below addresses it as a side effect.
 
 ### Method note earned the hard way this session
 
@@ -94,7 +104,7 @@ system settings, which the command line does and a `CreateDevice` override does 
 | Head-tracked image in the headset | ✅ done |
 | Colours — sRGB | ✅ done |
 | **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
-| **Stereo — per-eye offset for real depth** | 🔧 **working, artifacts remaining** — true native stereo by draw-call duplication; eyes align and depth is correct. One-eye ground textures fixed (run 12). Objects vanishing at the seam still open |
+| **Stereo — per-eye offset for real depth** | ✅ **done** — true native stereo by draw-call duplication; eyes align, depth is correct, and the vanishing objects are fixed (run 30, occlusion query readback) |
 | FOV / aspect match | 🔧 projection is VR-correct and forced; **render resolution not yet matched** to the headset (needs 4992×2688, currently refused — see the 4096 cap item) |
 | Performance — CPU round-trip → D3D9Ex + MANAGED wrapper | ⬜ not started, **now the gating item** |
 | Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
@@ -147,7 +157,12 @@ In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F1** true 
 **F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
 **F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount ·
 **INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment ·
-**PAGE UP** cycle culling headroom · **PAGE DOWN** cycle how much of the headset's FOV we render.
+**PAGE UP** cycle culling headroom (now runs *down* from 1.0) · **PAGE DOWN** cycle how much of
+the headset's FOV we render · **HOME** scissor off (drawn-then-clipped vs never-drawn) ·
+**END** clip out everything driven by the tracked register (remapped vs unremapped).
+
+**Do not press F12 after F1.** F1 clears alternate-eye, but F12 does *not* clear duplication, so
+that order leaves both stereo modes running at once. F12 before F1 is harmless and pointless.
 
 Mouse and head tracking now **add** rather than fight — turning with the mouse no longer snaps
 back, and the same fix is what stick-turning will need in the shipped mod.
@@ -440,6 +455,62 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
+
+## ✅ Run 30: SOLVED — it was occlusion query readback
+
+The engine issues a `D3DQUERYTYPE_OCCLUSION` query per primitive, draws its bounding box, reads
+the pixel count back, and skips drawing that primitive on a later frame if it came back zero.
+Overriding `GetData` to report a large count fixed every reported symptom at once, and the draw
+counters quantify how much was being lost:
+
+```
+occlusion results overridden to FULLY VISIBLE (630 so far)
+draws/frame peak 2272 ... 3809          <- was ~1000
+perf: 70.6 fps ... 37-40 fps            <- unchanged
+```
+
+**This is a fix, not a workaround.** Single-view occlusion culling is not well defined in stereo:
+the engine issues *one* query and gets *one* answer, but an object hidden from the left eye can be
+plainly visible from the right, so any single yes/no is wrong for one of them. Reporting "visible"
+is the conservative resolution — it can never wrongly delete geometry, only fail to save work.
+
+The exact sub-mechanism (boxes landing wrong against the split depth buffer, versus being clipped
+at the seam) is **not** pinned down, and is deliberately not guessed at here. It does not need to
+be: the query cannot be made correct for two eyes with one answer.
+
+### What it cost to get here, and why
+
+Seven mechanisms were eliminated **by direct test**, not by argument:
+
+| Mechanism | Killed by |
+|---|---|
+| Shadow maps corrupted by splitting | Only 11 draws of ~1,640 were offscreen |
+| Characters use a second matrix register | The END test — clip `c0` and nothing unremapped is left standing |
+| FOV reset at the camera-update seam | Re-asserting there made the 10th-percentile FOV *worse* |
+| Vertical culling shortfall | The engine's own arriving matrix reads 112–135° vertical vs our 98° — covered |
+| Screen-size distance culling | Headroom walk to ×1.10 inflation, native LOD, centred object still gone |
+| Unremapped geometry clipped at the seam | HOME (scissor off) did not bring it back |
+| Draw-path coverage (`DrawPrimitiveUP`) | `mono-fallback 0`, and the artifacts are identical with the hooks off |
+
+**Two things made the difference after six failed rounds of theorising.** First, run 27 audited the
+*instruments* rather than proposing a seventh mechanism — and found three that were structurally
+incapable of reporting anything (see below). Second, every step from run 28 on built a
+**discriminator** rather than a hypothesis: HOME separates drawn-then-clipped from never-drawn,
+END separates remapped from unremapped, the headroom walk sweeps the inflation range end to end.
+Each one eliminated a whole class in a single session.
+
+The decisive logical step was narrowing by causality rather than by symptom: the chest not being
+drawn is a **CPU-side decision**, our CPU-side influences (FOV, rotation) were both ruled out by
+test, and the only path by which our GPU-side changes can reach a CPU decision at all is query
+readback. That named the answer before it was tested.
+
+### ⚠️ Refusing to create the queries CRASHES this build
+
+`D3DERR_NOTAVAILABLE` is the documented answer for an unsupported query type, and the path UE3
+takes on hardware without the feature. This build dies between the splash screens and the main
+menu — consistent with the unchecked-NULL-from-a-factory habit already recorded for Raven's code.
+Kept as `OcclusionQueryMode=3` and documented as fatal so it is not retried. **Override the answer,
+never the availability.**
 
 ## ✅ Run 27: four defects found by reading, no headset required
 
@@ -984,6 +1055,27 @@ stays documented above as the fallback if this path stalls again.
   GOG install with missing redistributables. The install guide must warn about it.
 
 ## Method notes that earned their keep
+
+- **Audit the instruments before proposing another mechanism.** Six theories died on their own
+  diagnostics; the seventh was found only after run 27 checked whether the diagnostics could
+  report anything at all. Three could not: `remapKnown` was `const bool ... = true`, the perf
+  line's `%s` was eating an integer argument, and `camera matrices tracked` is capped at 1 by
+  construction. Two of those had been quoted in this document as *evidence*.
+- **Build discriminators, not hypotheses.** A test that separates two whole classes
+  (drawn-then-clipped vs never-drawn; remapped vs unremapped) retires more in one session than
+  three rounds of argument. Every step from run 28 on was one of these, and each killed a class.
+- **Narrow by causality, not by symptom.** The answer was named before it was tested: the object
+  not being drawn is a CPU decision, both of our CPU-side influences were already eliminated, and
+  query readback is the only route by which a GPU-side change can reach a CPU decision.
+- **A test that destroys its own readability is a wasted run.** Collapsing `c0` to a point piled
+  every triangle onto a few pixels and let bloom smear the result over everything. Clipping the
+  geometry instead — same intent, legible frame — answered it immediately.
+- **Override the answer, not the availability.** Refusing to create the occlusion query crashed
+  the game; patching `GetData` to lie ran the identical experiment with the engine's control flow
+  untouched. Prefer the intervention that leaves the program on its normal path.
+- **Check which rows of the log you are reading.** The 51.1° culling figure that briefly revived
+  the shortfall theory came from a pre-gameplay frame. The instrument was right; the row was
+  wrong.
 
 - **Verify by writing, not by reading.** A struct holding plausible live values is not proof the
   renderer uses it. `mCurrentPOV` looked exactly like the camera and steers only FOV.
