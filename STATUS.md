@@ -230,6 +230,45 @@ the engine's culling (79.9° vertical at headroom 1.0) already comfortably cover
 Headroom genuinely could not matter in that configuration, so "no difference" was not evidence
 about headroom at all. The instructions caused that.
 
+### Run 16: alignment CONFIRMED FIXED; sharpness is arithmetic, not a bug
+
+**The eyes line up correctly now.** The revocable lock did its job — 10 bad locks were dropped and
+re-scanned, and parallax landed on essentially every split draw (`906 with parallax, 0 flat`) with
+the forced projection exact (`91.3 x 98.0 (want 91.3 x 98.0)`, 321 frames). The stereo mechanism is
+validated.
+
+#### Why 4K did not look sharp — side-by-side halves the width per eye
+
+This is arithmetic, and it is the key number for planning:
+
+| Frame | Per eye | vs headset (2496×2688) |
+|---|---|---|
+| 2560×1440 | 1280×1440 | 51% × 54% |
+| **3840×2160** | **1920×2160** | **77% × 80%** — still upscaled |
+| 4992×2688 | 2496×2688 | **100%** — parity |
+
+So "4K" in side-by-side stereo is really 1920 wide per eye. It is a genuine 1.5× improvement over
+1440p, but still short of the panel, which is exactly why it reads as soft rather than sharp.
+**`-ResX=4992 -ResY=2688` is the true VR-ready setting** — 3.6× the pixels of 1440p, and the reason
+the CPU round-trip has to go.
+
+#### ⚠️ Still open: the locked register saw 194 distinct projections
+
+Over one session, the locked window carried projections from **36.7×21.1°** to **143.9×119.8°**.
+Some of that spread is the engine's own FOV drifting frame to frame, but values that far apart are
+different *passes* — the first-person weapon renders with its own narrower FOV. Forcing all of them
+to the scene frustum corrupts the ones that legitimately differ.
+
+Two fixes for it:
+1. **Nothing is modified without a lock.** Previously, before a lock existed, every passing window
+   was modified — so unrelated passes were being forced. Now the scan must identify the scene
+   matrix first, and only that one window is ever touched.
+2. **The lock is chosen by upload count, not by facing agreement.** The scene view-projection is
+   uploaded once per pass and used by most of the frame's draws (50 uploads in the original scan,
+   against 4–9 for impostors). Ranking by dot-product let a rare pass win whenever its number was
+   marginally better, which is how a 36.7×21.1° matrix got locked. A minimum of 8 uploads is now
+   required to lock at all, and scans re-arm automatically since nothing is modified without one.
+
 ### ❌ Run 15: 4K worked, but exposed the biggest fragility in the design — a non-revocable lock
 
 `-ResX=3840 -ResY=2160 -windowed` on the command line **does** work (the engine sizes its scene
@@ -495,16 +534,12 @@ Toggle with **F6**.
 **Decision taken: continue with true native stereo** (draw-call duplication). Depth reprojection
 stays documented above as the fallback if this path stalls again.
 
-1. **Re-run at 4K with the revocable lock.** Launch via command line (this is the working route):
-   `Singularity.exe -ResX=3840 -ResY=2160 -windowed`. The log now answers the question directly —
-   `with parallax` must be most of the split count, not 0, and `own matrix on arrival` should read
-   ~128×98°, not 180×180° or 90×90°. If a lock goes bad you will see it dropped and re-scanned
-   rather than having to infer it.
-2. **Only then judge the shimmer** at 100% render FOV. The sampling prediction (1920×2160 =
-   21.0 px/deg ≈ the 20.5 that felt good at 70%) was never actually tested, because stereo was
-   broken for the whole run.
-3. **Then the D3D9Ex zero-copy path.** Unambiguously the gating item: matching the headset means
-   ~49 MB per frame each way over the CPU. 4K already halved the frame rate (~70 → ~37 fps).
+1. **Run at true parity resolution** to see the ceiling this approach can reach:
+   `Singularity.exe -ResX=4992 -ResY=2688 -windowed`. Frame rate will be poor — that is the
+   measurement, not a failure. Check the log for `LOCKED on cN` and a single stable value in
+   `own matrix on arrival` rather than the previous spread.
+2. **Then the D3D9Ex zero-copy path** — the gating item. Parity means ~49 MB per frame each way over
+   the CPU; 3840×2160 already halved the frame rate (~70 → ~37 fps).
 2. **Then performance**, which is now the gating item rather than a later nicety. Two reasons it
    has been promoted: the frame copy scales with pixels, so matching the headset's resolution
    multiplies its cost; and the fps distribution is bimodal (median ~70, floor ~13), which is the

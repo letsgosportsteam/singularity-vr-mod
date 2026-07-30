@@ -1378,12 +1378,18 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         // the projection is forced on every frame rather than only while 6-DOF is on: the
         // full sliding scan across thousands of calls per frame would be far too expensive to
         // leave running permanently, while a bounds check plus one window test is not.
-        UINT first = 0, last = windows;
-        if (g_haveLock) {
-            if (startReg > g_lockedReg || g_lockedReg + 4 > startReg + vec4Count)
-                return g_origSetVSConstF(dev, startReg, data, vec4Count);
-            first = last = g_lockedReg - startReg;
-        }
+        // Only ever touch the ONE window a scan has identified as the scene matrix.
+        //
+        // Previously, with no lock yet, this modified EVERY window that passed - and run 16 shows
+        // why that is wrong: the locked register alone saw 194 distinct projections over a
+        // session, from 36.7x21.1 deg to 143.9x119.8 deg. Some of that is the engine's own FOV
+        // drifting, but values that far apart are different passes (the first-person weapon has
+        // its own narrower FOV). Forcing all of them to the scene frustum corrupts the ones that
+        // legitimately differ. Waiting for a lock costs a frame or two of mono and is worth it.
+        if (!g_haveLock) return g_origSetVSConstF(dev, startReg, data, vec4Count);
+        if (startReg > g_lockedReg || g_lockedReg + 4 > startReg + vec4Count)
+            return g_origSetVSConstF(dev, startReg, data, vec4Count);
+        const UINT first = g_lockedReg - startReg, last = first;
 
         for (UINT j = first; j <= last && j + 4 <= copyVecs; ++j) {
             const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
@@ -1391,7 +1397,6 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                 if (g_haveLock && c != g_lockedConv) continue;
                 float w = 0, len = 0, dot = 0; int pt = 0;
                 if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot, pt)) continue;
-                if (!g_haveLock) { g_lockedReg = startReg + j; g_lockedConv = c; g_haveLock = true; }
                 ++g_injCount;
                 if (!edited) { memcpy(scratch, data, copyVecs * 4 * sizeof(float)); edited = true; }
                 Reg4* m = reinterpret_cast<Reg4*>(scratch + j * 4);
@@ -1767,13 +1772,17 @@ void ReportScan() {
         Log("    than SetVertexShaderConstantF, or a block split across two calls.");
         return;
     }
-    // Passing windows first, then by how well the facing agrees - that ordering puts the real
-    // view matrix at the top even when a dozen unrelated matrices clear the w test.
+    // Passing windows first, then by UPLOAD COUNT - the main scene view-projection is set once
+    // per pass and used by most of the frame's draws, so it is uploaded far more often than a
+    // weapon or reflection matrix that happens to share the register. The original scan showed
+    // exactly that: 50 uploads for the real one against 4-9 for the impostors. Ranking by
+    // agreement-with-facing put a rare pass first whenever its dot product was marginally
+    // better, which is how run 16 ended up locking onto 36.7x21.1 deg matrices.
     for (int i = 0; i < g_hitCount; ++i)
         for (int j = i + 1; j < g_hitCount; ++j) {
             bool pi = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd, g_hits[i].pt);
             bool pj = IsViewMatrix(g_hits[j].w, g_hits[j].dotFwd, g_hits[j].pt);
-            if ((pj && !pi) || (pj == pi && g_hits[j].dotFwd > g_hits[i].dotFwd)) {
+            if ((pj && !pi) || (pj == pi && g_hits[j].count > g_hits[i].count)) {
                 MatHit t = g_hits[i]; g_hits[i] = g_hits[j]; g_hits[j] = t;
             }
         }
@@ -1788,10 +1797,18 @@ void ReportScan() {
     }
     Log("    %d of %d windows pass BOTH tests (** marked). Only those are injected into.",
         passing, g_hitCount);
+    // A rarely-uploaded window is not the scene matrix however well it scores otherwise, so
+    // require it to carry a real share of the frame before trusting it.
+    const int kMinUploadsToLock = 8;
     if (passing > 0 && IsViewMatrix(g_hits[0].w, g_hits[0].dotFwd, g_hits[0].pt)) {
-        g_lockedReg = g_hits[0].startReg; g_lockedConv = g_hits[0].conv; g_haveLock = true;
-        Log("    locked on c%u %s for per-frame projection capture",
-            g_lockedReg, g_lockedConv == CONV_ROW ? "ROW" : "COL");
+        if (g_hits[0].count >= kMinUploadsToLock) {
+            g_lockedReg = g_hits[0].startReg; g_lockedConv = g_hits[0].conv; g_haveLock = true;
+            Log("    LOCKED on c%u %s (%d uploads this frame)", g_lockedReg,
+                g_lockedConv == CONV_ROW ? "ROW" : "COL", g_hits[0].count);
+        } else {
+            Log("    best window c%u only had %d uploads (< %d) - not locking, will rescan",
+                g_hits[0].startReg, g_hits[0].count, kMinUploadsToLock);
+        }
     }
     Log("    -> F3 offsets the camera %.0f UU along its own right axis. F11 changes the amount.",
         g_offsetUU);
@@ -2003,6 +2020,21 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             g_hitCount = 0;
             InterlockedExchange(&g_scanArmed, 1);
             Log("F7: scanning one frame for the view matrix...");
+        }
+    } else if (!g_haveLock && InterlockedCompareExchange(&g_camPosValid, 0, 0) &&
+               (InterlockedCompareExchange(&g_dupDraws, 0, 0) ||
+                InterlockedCompareExchange(&g_vrProjection, 0, 0))) {
+        // Nothing is modified without a lock now, so re-acquiring one has to be automatic -
+        // needing an F7 press would leave stereo simply switched off. Arming here rather than
+        // earlier in Present matters: the consume branch above runs first, so arming any sooner
+        // would have the scan collected in the same call, before a single frame was scanned.
+        // Rate-limited because a scan tests every window of every upload and is far too
+        // expensive to leave running.
+        static int rescanWait = 0;
+        if (++rescanWait >= 20) {
+            rescanWait = 0;
+            g_hitCount = 0;
+            InterlockedExchange(&g_scanArmed, 1);
         }
     }
     p7 = k7;
