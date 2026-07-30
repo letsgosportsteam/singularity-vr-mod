@@ -7,6 +7,8 @@
 *.pdb
 *.ilk
 *.log
+# /analyze output - build.ps1 runs a static-analysis pass, see the note in it
+*.nativecodeanalysis.xml
 
 # keep the OpenXR loader out - it is vendored at build time from the SDK
 openxr_loader*.dll

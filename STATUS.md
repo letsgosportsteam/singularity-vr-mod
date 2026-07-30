@@ -1,6 +1,12 @@
 # STATUS — session handoff
 
-Last updated **2026-07-29** (end of run 26). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-07-30** (end of run 27). Read this first, then `ENGINE_NOTES.md`.
+
+> **Run 27 changed the picture before a single new measurement was taken.** The "hang" that
+> blocked the user-pointer draw hooks for three sessions was a printf argument mismatch, not
+> threading; the counter that "validated" the stereo mechanism in run 16 was a compile-time
+> constant; and four separate paths were leaving a stale view matrix being pushed over live
+> engine state. All fixed and built. See **Run 27** below before acting on anything older.
 
 ## TL;DR — where we stand
 
@@ -9,8 +15,10 @@ Last updated **2026-07-29** (end of run 26). Read this first, then `ENGINE_NOTES
 up, depth reads correctly, and it holds ~37 fps at 2560×1440 / ~28 at 3840×2160.
 
 **The one open defect:** some objects flicker or vanish — a chest, a locker door, a corpse. The
-mechanism is understood (see *the seam*, below); what remains is that not every draw path can be
-caught. Everything else on the list is planned work rather than a bug.
+mechanism is understood (see *the seam*, below). Run 27 found four separate code defects each
+capable of producing it, fixed them, and added the counters that say which one it actually was —
+that measurement has not been taken yet. Everything else on the list is planned work rather than a
+bug.
 
 ### If you are picking this up cold, read these three things
 
@@ -19,21 +27,33 @@ caught. Everything else on the list is planned work rather than a bug.
    the centre of the frame **is** the seam, so a head-on object is clipped out of *both* halves and
    disappears. Three separate causes have fed into this one mechanism.
 2. **Draw-path coverage is the unsolved half.** Catching every route geometry takes to the GPU is
-   what keeps failing. `DrawPrimitiveUP`/`DrawIndexedPrimitiveUP` are the currently-known gap.
-3. **Those calls come from a different thread.** UE3 runs splash movies on their own thread; any
-   shared write from that path collapses throughput and looks like a hang. The hooks now stay inert
-   unless on the Present thread. This cost three blocked launches — do not touch that path without
-   the guard.
+   what keeps failing. `DrawPrimitiveUP`/`DrawIndexedPrimitiveUP` are the currently-known gap, and
+   as of run 27 they are hooked again — the thing that used to block them is fixed.
+3. **Placement depends on matrix identification, and that is the fragility.** A draw we cannot
+   remap gets drawn once at full-frame coordinates, which puts a centred object *on* the seam. So
+   any failure to recognise the view matrix — for one draw or for a whole frame — turns straight
+   into the reported artefact. Run 27 fixed several ways that failed; **Stage 4** below is the
+   change that removes the dependency altogether.
 
 ### Next session, in order
 
-1. **`HookUserPointerDraws=3`** in `SingularityVR.ini` — one attempt with the new thread guard. If
-   it hangs, set 0 and move on; the chest is cosmetic.
-2. **Performance: the D3D9Ex + `D3DPOOL_MANAGED` wrapper.** Well understood, does not touch the draw
-   path, and it is what gates the resolution/sharpness work actually wanted. **Start here if step 1
-   fails.**
-3. **Per-eye render targets** instead of two halves of one frame. Removes the seam class entirely
-   rather than chasing draw paths, and overlaps the D3D9Ex work.
+**Everything below is now one measurement run.** The build already has the fixes; what it needs is
+someone in the headset reading four new numbers.
+
+1. **Launch with `HookUserPointerDraws=3`** (already set in the installed ini). The hang is
+   explained and fixed. If it still hangs, that is genuinely new information — set 0 and say so.
+2. **Play with F1 on and read the perf line.** Four numbers decide what happens next:
+   - `frames with NO identification` — non-zero means the whole-frame dropout is real and is
+     probably the flicker. It has never been measured before.
+   - `mono-fallback` — draws placed full-frame across the seam.
+   - `user-ptr` — how much geometry was invisible to us until now.
+   - `split N (M with parallax, K flat)` — this finally means something; K > 0 means the eyes are
+     showing the same image.
+3. **Read the two culling lines.** The census now prints one row per *surface*, and the shortfall
+   is reported both from `mCurrentPOV` (the old proxy) and from the arriving matrix (ground truth).
+   The log already suggests these disagree badly — see *the culling number was a proxy* below.
+4. **Then** either the structural fix (Stage 4, below) or the D3D9Ex performance work, chosen on
+   what step 2 says.
 
 ### Method note earned the hard way this session
 
@@ -313,6 +333,11 @@ about headroom at all. The instructions caused that.
 
 ### Run 16: alignment CONFIRMED FIXED; sharpness is arithmetic, not a bug
 
+> ⚠️ **Superseded in part by run 27.** The `906 with parallax, 0 flat` below was a tautology —
+> `remapKnown` was `const bool ... = true`, so that line could not report anything else. The
+> forced-projection readback and the lock behaviour in this section still stand; the parallax
+> claim does not.
+
 **The eyes line up correctly now.** The revocable lock did its job — 10 bad locks were dropped and
 re-scanned, and parallax landed on essentially every split draw (`906 with parallax, 0 flat`) with
 the forced projection exact (`91.3 x 98.0 (want 91.3 x 98.0)`, 321 frames). The stereo mechanism is
@@ -415,6 +440,169 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
+
+## ✅ Run 27: four defects found by reading, no headset required
+
+No new theory of the flicker — instead, a pass over the code and the last log for things that are
+simply wrong. Four were, and each is capable of producing the reported symptoms on its own.
+
+### 1. The user-pointer "hang" was a printf argument mismatch
+
+The per-second perf line had **nine conversions and ten arguments**. `upPeak` was missing its `%d`,
+so `%s` consumed an `int` and formatted it as a `char*`. The evidence was in every log from run 23
+onward and went unread:
+
+```
+perf: ... offscreen 0, mono-fallback 0(null)
+```
+
+`(null)` is `upPeak == 0` printed as a string. `[TRUE STEREO ON]` never appeared once, because its
+argument was being swallowed.
+
+Harmless only while `upPeak` is zero — and `upPeak` is non-zero **exactly when
+`HookUserPointerDraws >= 2`**. At that point `%s` dereferences a small integer, inside `Log()`,
+inside `EnterCriticalSection`. The fault leaves the lock held, so every later `Log()` blocks
+forever: a hang, not a crash, which is what was reported.
+
+That is the whole of "level 1 reaches the menus, level 2 does not". **The run-26 conclusion that
+these calls arrive on a different thread was inferred from a symptom this fully explains.** The
+thread guard is kept — issuing device state changes from a thread that does not own the device is
+wrong regardless — but the log now *reports* whether these calls really are off-thread, so the
+question gets answered rather than assumed.
+
+`Log()` is now annotated `_Printf_format_string_` and `build.ps1` runs an `/analyze` pass that
+**fails the build** on a format defect. Both halves were needed: verified that `/W1` through `/W4`
+stay silent even with the annotation, and that `/analyze` without the annotation also says nothing.
+
+### 2. "with parallax" was a compile-time constant
+
+`const bool remapKnown = true;`, and the offset counter was incremented under it. So
+`split N (N with parallax, 0 flat)` could never read anything else. **Run 16's "906 with parallax,
+0 flat → the stereo mechanism is validated" was that constant, not a measurement.** It now keys on
+the eye-separation vector actually being non-zero.
+
+### 3. Four paths left a stale view matrix being pushed over live engine state
+
+`StereoPair` re-uploads `g_camMats[s].m` for every draw while the slot is valid. Four paths cleared
+the conditions for maintaining that slot without clearing the slot:
+
+| Path | Consequence |
+|---|---|
+| No valid camera position | `FindCamera` misses are retried only every **30 frames** → up to half a second in which every draw is forced through the previous frame's view-projection |
+| No lock | Same, until a rescan happens to succeed |
+| An upload that **overlaps** the tracked window without covering it | We re-upload our cached block over constants the engine just wrote |
+| Lock revoked after 60 unverified frames | Cleared `g_haveLock` but not the slot |
+
+A whole frame rendered from a frozen camera, then unfrozen, is indistinguishable from the flicker
+being chased. Every exit now leaves the slot honest.
+
+The camera-position gate was also simply wrong for the modify path: the winning probe is the
+**origin** one, whose test is `|r[3].w| ≈ 0` — pure matrix content, nothing to go stale, no camera
+reading involved. Only the *scan* needs a live camera position. That gate is now scan-only.
+
+### 4. Identification was gated on a stale facing test, and failing it costs the whole frame
+
+`IsViewMatrix` required `dotFwd >= 0.99` — about 8° — against `g_camFwd`, read at Present from the
+camera **actor**: a frame away from the constants being tested, and a different object from the one
+driving the render. At ~37 fps a 300°/s turn is ~8° per frame.
+
+The cost of a rejection was never appreciated. `c0` carries one matrix per frame, so a rejection is
+a **whole-frame** event: no forced projection and no per-eye split for any draw in it. That is a
+full-frame flash keyed to head movement — and **run 23's elimination test was run with head
+tracking off**, which could not have seen it.
+
+The per-call test now uses rotation-independent structure instead:
+
+- projection tangents in band (was only guarding the diagnostic, now a gate)
+- **the basis must be orthogonal** — for `M = V·P`, column 0 is `sx·right`, column 1 is `sy·up` and
+  the w column's xyz is `forward`, so normalised they are mutually perpendicular. Skinning
+  palettes, UI transforms and the float3x4 blocks the sliding window straddles all fail it.
+
+With those carrying the discrimination, the facing gate is loosened to **0.80 (~37°)** for the
+per-call path — enough to reject a matrix pointing somewhere else entirely, immune to a frame of
+lag. The scan keeps 0.99 for locking, where being strict is right and nothing is stale.
+
+New counters say whether this was the flicker: `frames with NO identification`, and the **best
+rejected `dotFwd`** — near 0.99 means rotation lag, far below means a genuinely different matrix.
+
+### ⚠️ The culling number has been a proxy all along
+
+The last log contains both, and they disagree:
+
+```
+engine FOV read back before write: mCurrentPOV 157.9
+engine's own matrix on arrival:     80.7 x 51.1 deg
+after forcing, the matrix measures 127.9 x 98.0 deg
+```
+
+The engine accepts 157.9 in the POV field but the matrix it actually builds carries **80.7° × 51.1°**
+— and that is the frustum it rendered, so it is the one its culling came from. We render **98°
+vertical against a ~51° culling frustum.** Every shortfall figure reported so far came from
+`mCurrentPOV` instead. The log now prints both and flags when the proxy said "covered" and was
+wrong.
+
+This does not overturn run 22 (which ran at 40%, where the ask is much lower), but it means the
+culling question was never actually measured at the operating point people played at.
+
+### Also fixed, smaller
+
+- The render-target census keyed on `(width, height, format)`, so **two distinct scene-sized
+  surfaces read as one row**. `g_rtIsScene` splits on size equality alone, so a full-resolution
+  offscreen target — a post ping-pong buffer, or the whole-scene dominant shadow map UE3 allocates
+  at scene resolution — is being split as if it were the scene, and the census could never show it.
+  Run 11's "shadow maps are not being separated by size" rested on that. Now one row per surface,
+  with a warning if more than two scene-sized surfaces are being split.
+- **F1 did not enable the position path.** The left eye is produced in the constant hook and the
+  right by adding the eye delta in `StereoPair`, so with F1 alone the left eye sat at the engine's
+  own camera and the right at +IPD — the pair biased half an interpupillary distance, and head
+  translation did nothing unless F10 happened to be on too.
+- `data` was dereferenced three lines above the null check that guards it.
+- Slot exhaustion (8 rescans onto different registers) would have switched stereo off silently.
+- A lock acquired on a non-origin probe point could never verify, so it would have looped
+  lock→drop→rescan for ever with stereo off. Now refused explicitly, with the reason logged.
+
+## ⬜ Stage 4: the structural fix — make placement independent of identification
+
+Run 27 removed several ways identification can fail. It did not remove the fact that **placement
+depends on it at all**, and that dependency is the whole seam class:
+
+| Draw | What happens today |
+|---|---|
+| Matrix recognised | Clip remap + scissor. Correct, and screen-space sampling stays consistent. |
+| Matrix not recognised | Drawn once, full-frame. A centred object lands *on* the cut — the left eye gets its right sliver at the far right edge, the right eye its left sliver at the far left. |
+
+The mono fallback (run 23) turned "vanishes" into "misplaced", which is better but is not correct.
+Three ways out, in order of preference:
+
+**A. Viewport split + per-half `ScreenPositionScaleBias` — recommended.** Place each eye with the
+**viewport**, which applies to every draw whether or not we can identify its matrix, so geometry
+can never be lost at the seam. That reintroduces exactly one problem, the one that forced the move
+to clip-space remapping in run 11: shaders computing `UV = ndc·scale + bias` with constants built
+for the full target sample the wrong half. Fix it at the source by patching that constant per half
+— with `ndc ∈ [−1,1]` wanting `uv ∈ [0,0.5]`, it is `scale·0.5` and `bias·0.5 (+0.5 for the right
+eye)`. The constant is findable the same way the view matrix was, and with a far stronger
+signature: it is derived from the render-target size, typically near `(0.5, −0.5, 0.5+½px,
+0.5+½px)`. **This also makes post-processing per-eye-correct**, which is currently listed as
+unsolved, and it composes with the D3D9Ex work rather than conflicting with it.
+
+**B. Per-eye full-size render targets.** Semantically cleanest — no seam, no remap, no scissor, and
+per-eye resolution doubles, which also sidesteps the 4096 cap and the sharpness problem. But it
+needs a render-target *and* depth-stencil swap per draw call; D3D9 flushes on those, and at ~1,600
+draws/frame that is ~3,200 switches. Likely unaffordable, but worth one measurement before ruling
+out.
+
+**C. Keep the clip remap and keep chasing draw paths.** This is what has been tried for six runs.
+
+Do not start Stage 4 before the run-27 measurement: if `frames with NO identification` turns out to
+be the flicker, the cheap fix already landed and Stage 4 becomes a resolution/quality project
+rather than a bug fix.
+
+### Method note
+
+**Four defects, none of them a new theory, all found by reading the code and the last log against
+each other.** Three of them had left evidence in the log for multiple sessions — `(null)` sat in
+every perf line since run 23. After six wrong theories the instinct is to reach for a seventh; the
+cheaper move was to check whether the instruments were telling the truth. Two of them were not.
 
 ### ⚠️ THE long-running open issue: objects and textures flickering
 

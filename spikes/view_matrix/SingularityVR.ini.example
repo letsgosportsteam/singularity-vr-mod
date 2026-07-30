@@ -8,26 +8,36 @@
 ; so a centred one lands on the seam between the eye halves and disappears -
 ; the suspected cause of the chest and similar objects vanishing.
 ;
-; Hooking them stopped the game reaching its menus. A bisection found why:
-; level 1 (patch installed, forward immediately) works, level 2 (identical plus
-; a single counter increment) does not. These calls arrive on a DIFFERENT THREAD
-; from the render loop - UE3 plays splash movies on its own thread - so any
-; shared write on that path is ruinously expensive, and D3D state changes from
-; it would be invalid regardless.
+; Hooking them stopped the game reaching its menus, and a bisection found that
+; level 1 (patch installed, forward immediately) works while level 2 (identical
+; plus a single counter increment) does not.
 ;
-; The hooks now stay completely inert unless called on the thread that drives
-; Present. Level 3 is worth one attempt with that guard in place.
+; ---- run 27: the cause was found, and it was not threading ----
 ;
-;   0 = not hooked                 <- safe default
+; The per-second perf log line had nine printf conversions and TEN arguments -
+; the user-pointer counter was missing its %d, so %s formatted an int as a
+; char*. That is harmless while the counter is zero and an access violation the
+; moment it is not, which is exactly at level 2. The fault happened inside
+; Log(), inside a held critical section, so the lock was never released and
+; every later log call blocked - a hang, not a crash.
+;
+; The evidence had been in every log since run 23: "mono-fallback 0(null)".
+;
+; So level 3 should now simply work. The thread guard is kept regardless -
+; issuing device state changes from a thread that does not own the device is
+; wrong either way - and the log now reports whether these calls really do
+; arrive off the render thread, which was only ever inferred.
+;
+;   0 = not hooked
 ;   1 = hooked, forwards immediately
-;   2 = level 1 plus a counter
-;   3 = full per-eye treatment
+;   2 = level 1 plus a counter        <- this is the one that used to hang
+;   3 = full per-eye treatment        <- try this
 ;
-; If it hangs, set back to 0 and relaunch. No rebuild needed.
+; If it still hangs, set back to 0 and relaunch. No rebuild needed.
 ; ---------------------------------------------------------------------------
 
 [Render]
-HookUserPointerDraws=0
+HookUserPointerDraws=3
 
 ; ---------------------------------------------------------------------------
 ; There is deliberately no resolution setting here.

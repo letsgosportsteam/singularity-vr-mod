@@ -82,7 +82,13 @@ void LogInit() {
         g_logReady = true;
     }
 }
-void Log(const char* fmt, ...) {
+// _Printf_format_string_ is what makes MSVC apply printf checking to a custom variadic function.
+// Without it the compiler has no idea this is a format string, which is why a nine-conversion /
+// ten-argument call sat in the perf line for four runs and presented as an unexplained startup
+// hang. Verified: the annotation alone is not enough either - /W1 through /W4 stay silent, and it
+// takes /analyze to read the annotation and report C6067. build.ps1 now runs that pass and fails
+// the build on it.
+void Log(_Printf_format_string_ const char* fmt, ...) {
     if (!g_logReady) return;
     EnterCriticalSection(&g_lock);
     FILE* f = nullptr;
@@ -312,6 +318,7 @@ struct MatHit {
     float fwdLen;        // length of the w-term xyz, ~1.0 for a real view matrix
     float dotFwd;        // agreement with the camera's real facing - the decisive test
     int   count;         // how many times this window matched during the armed frame
+    bool  shape;         // passed the tangent + orthogonality tests (see ViewMatrixShape)
 };
 
 const int kMaxHits = 24;
@@ -462,6 +469,11 @@ float g_renderFovScale = 1.0f;
 // genuinely different projections then "the" FOV depends on which one happened to write last -
 // a second, independent way to produce exactly the flicker seen in run 4.
 float g_capTanMin = 1e9f, g_capTanMax = -1e9f;
+// The VERTICAL tangent of the engine's own arriving matrix, tracked across a whole report window
+// rather than a frame. This is the number that governs culling, and until now the shortfall
+// warning was computed from mCurrentPOV instead - a proxy that the log shows disagreeing with it
+// badly (mCurrentPOV read 157.9 while the matrix the engine actually built carried 80.7 x 51.1).
+float g_capTanYMin = 1e9f;
 int   g_injCount = 0;
 
 // The projection scales, from the x and y columns. See ClipW for how the conventions differ.
@@ -478,6 +490,71 @@ inline void ProjTangents(const Reg4* r, int conv, float* tanX, float* tanY) {
     float ly = sqrtf(yc[0]*yc[0] + yc[1]*yc[1] + yc[2]*yc[2]);
     *tanX = (lx > 1e-6f) ? 1.0f / lx : 0.0f;
     *tanY = (ly > 1e-6f) ? 1.0f / ly : 0.0f;
+}
+
+// ---- structural tests, independent of where the camera is pointing (run 27) ----
+//
+// The facing test (dotFwd) was the only real discriminator on the hot path, and it is the one
+// quantity here that goes STALE: g_camFwd is read at Present from the camera ACTOR, a frame away
+// from the constants being tested and from a different object than the one driving the render. At
+// 37 fps a brisk turn covers more than the ~8 degrees of slack kMinDotFwd allows.
+//
+// And a rejection is not cheap. c0 carries one matrix per frame, so losing it loses the forced
+// projection AND the per-eye split for the WHOLE frame - a full-frame flash keyed to head
+// movement, which is exactly the symptom that has survived six theories. Worth noting that the
+// run-23 elimination test was performed with head tracking OFF, which would hide this completely.
+//
+// Two tests buy back what the tight facing gate was providing, with nothing stale in them:
+//
+//   * the projection tangents must be sane. Already used to guard the diagnostic; now a gate.
+//   * the basis must be orthogonal. For M = V*P with a row-vector V and a diagonal-ish P, column 0
+//     of M is sx*right, column 1 is sy*up and the w column's xyz is forward - the camera's own
+//     axes, scaled. Normalised they must be mutually perpendicular. Skinning palettes, UI
+//     transforms and the float3x4 blocks the sliding window straddles do not satisfy that.
+//
+// With those in place the facing test can be loosened to its actual job - rejecting a matrix that
+// is shaped like a view but points somewhere else entirely (a shadow cascade from a light, a
+// cube-map face, a mirror) - which needs nothing like 8 degrees of precision.
+inline void AxisCols(const Reg4* r, int conv, float* xc, float* yc, float* fc) {
+    if (conv == CONV_ROW) {
+        xc[0] = r[0].x; xc[1] = r[1].x; xc[2] = r[2].x;
+        yc[0] = r[0].y; yc[1] = r[1].y; yc[2] = r[2].y;
+        fc[0] = r[0].w; fc[1] = r[1].w; fc[2] = r[2].w;
+    } else {
+        xc[0] = r[0].x; xc[1] = r[0].y; xc[2] = r[0].z;
+        yc[0] = r[1].x; yc[1] = r[1].y; yc[2] = r[1].z;
+        fc[0] = r[3].x; fc[1] = r[3].y; fc[2] = r[3].z;
+    }
+}
+
+inline bool NormaliseVec3(float* v) {
+    float l = sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    if (!(l > 1e-6f)) return false;          // also rejects NaN
+    v[0] /= l; v[1] /= l; v[2] /= l;
+    return true;
+}
+
+const float kMaxAxisDot = 0.10f;             // ~6 degrees off perpendicular
+
+inline bool IsOrthogonalBasis(const Reg4* r, int conv) {
+    float xc[3], yc[3], fc[3];
+    AxisCols(r, conv, xc, yc, fc);
+    if (!NormaliseVec3(xc) || !NormaliseVec3(yc) || !NormaliseVec3(fc)) return false;
+    const float xy = xc[0]*yc[0] + xc[1]*yc[1] + xc[2]*yc[2];
+    const float xf = xc[0]*fc[0] + xc[1]*fc[1] + xc[2]*fc[2];
+    const float yf = yc[0]*fc[0] + yc[1]*fc[1] + yc[2]*fc[2];
+    return fabsf(xy) < kMaxAxisDot && fabsf(xf) < kMaxAxisDot && fabsf(yf) < kMaxAxisDot;
+}
+
+// Sane projection scales. Run 15 captured 180x180 deg (x column length ~0) and 90x90 deg (unit
+// columns - a cube-map face), neither of which is a scene world->clip matrix.
+const float kMinProjTan = 0.15f, kMaxProjTan = 8.0f;
+
+inline bool ViewMatrixShape(const Reg4* r, int conv, float* tanX, float* tanY) {
+    ProjTangents(r, conv, tanX, tanY);
+    if (!(*tanX > kMinProjTan && *tanX < kMaxProjTan)) return false;
+    if (!(*tanY > kMinProjTan && *tanY < kMaxProjTan)) return false;
+    return IsOrthogonalBasis(r, conv);
 }
 
 // clip.w for point p under the given convention.
@@ -539,7 +616,17 @@ inline float FwdLen(const Reg4* r, int conv) {
 const float kHitTolUU       = 25.0f;    // world-position probes: staleness-dominated
 const float kHitTolOriginUU = 1.0f;     // origin probe: no staleness, so demand a real zero
 const float kNearTolUU      = 5000.0f;
-const float kMinDotFwd      = 0.99f;    // ~8 degrees of slack
+const float kMinDotFwd      = 0.99f;    // ~8 degrees of slack - for LOCKING only, see below
+// ---- and why the per-call test uses a much looser one ----
+//
+// kMinDotFwd is right for the SCAN: it runs on a frame the player chose, it only has to pick a
+// register once, and being strict there is what stops a weapon or reflection pass being locked.
+//
+// It is wrong for the per-call test that runs on every upload thereafter. There, g_camFwd is a
+// frame stale (see the note by AxisCols), a single rejection costs the whole frame its projection
+// and its split, and the shape tests now carry the discrimination. All this gate still has to do
+// is reject a matrix pointing somewhere else entirely, which 37 degrees does comfortably.
+const float kTrackDotFwd    = 0.80f;    // ~37 degrees - immune to a frame of rotation lag
 
 inline float TolFor(int pt) { return (pt == 2) ? kHitTolOriginUU : kHitTolUU; }
 
@@ -560,24 +647,25 @@ inline void NoteNearMiss(UINT reg, int conv, float w, float len) {
     }
 }
 
-void RecordHit(UINT reg, int conv, int pt, float w, float len, float dot) {
+void RecordHit(UINT reg, int conv, int pt, float w, float len, float dot, bool shape) {
     for (int i = 0; i < g_hitCount; ++i) {
         if (g_hits[i].startReg == reg && g_hits[i].conv == conv) {
             g_hits[i].count++;
             if (fabsf(w) < fabsf(g_hits[i].w)) {
                 g_hits[i].w = w; g_hits[i].fwdLen = len; g_hits[i].pt = pt; g_hits[i].dotFwd = dot;
+                g_hits[i].shape = shape;
             }
             return;
         }
     }
-    if (g_hitCount < kMaxHits) g_hits[g_hitCount++] = { reg, conv, pt, w, len, dot, 1 };
+    if (g_hitCount < kMaxHits) g_hits[g_hitCount++] = { reg, conv, pt, w, len, dot, 1, shape };
 }
 
 // Test one window against all three probe points and return the best-cancelling result,
 // together with how well its forward axis agrees with where the camera is really facing.
 // Returns false if the window has no plausible forward vector at all.
 inline bool TestWindow(const Reg4* r, int conv, const float* const pts[3],
-                       float* outW, float* outLen, int* outPt, float* outDot) {
+                       float* outW, float* outLen, int* outPt, float* outDot, bool* outShape) {
     float f[3]; FwdVec(r, conv, f);
     float len = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
     if (!(len > 0.3f && len < 3.0f)) return false;
@@ -590,12 +678,35 @@ inline bool TestWindow(const Reg4* r, int conv, const float* const pts[3],
     if (!any) return false;
     *outLen = len;
     *outDot = (f[0]*g_camFwd[0] + f[1]*g_camFwd[1] + f[2]*g_camFwd[2]) / len;
+    float tx = 0, ty = 0;
+    *outShape = ViewMatrixShape(r, conv, &tx, &ty);
     return true;
 }
 
-// A window is the view matrix only if it passes BOTH tests.
-inline bool IsViewMatrix(float w, float dot, int pt) {
-    return fabsf(w) <= TolFor(pt) && dot >= kMinDotFwd;
+// A window is a candidate for LOCKING only if it passes all three tests. The shape test is what
+// would have rejected the 180x180 and 90x90 windows that run 15 locked onto at 4K, and the
+// fwdLen=1.4142 window sitting in the scan report with more uploads than the real matrix.
+inline bool IsViewMatrix(float w, float dot, int pt, bool shape) {
+    return fabsf(w) <= TolFor(pt) && dot >= kMinDotFwd && shape;
+}
+
+// The per-call test, shared by the verify path and the modify path so those two can never
+// disagree about what "this window is still the scene view-projection" means. They used to apply
+// visibly different tests to the same question.
+//
+// Note there is no probe point here. The engine is confirmed translated-world, so the camera sits
+// at the origin and clip.w for it collapses to r[3].w under both conventions - pure matrix
+// content, with no camera reading in it and therefore nothing to go stale. That is the whole
+// reason this path no longer needs a valid camera POSITION at all.
+inline bool TrackedViewMatrix(const Reg4* r, int conv, float* tanX, float* tanY, float* outDot) {
+    float f[3]; FwdVec(r, conv, f);
+    const float len = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+    *outDot = -2.0f;
+    if (!(len > 0.3f && len < 3.0f)) return false;
+    if (!(fabsf(r[3].w) <= kHitTolOriginUU)) return false;
+    if (!ViewMatrixShape(r, conv, tanX, tanY)) return false;
+    *outDot = (f[0]*g_camFwd[0] + f[1]*g_camFwd[1] + f[2]*g_camFwd[2]) / len;
+    return *outDot >= kTrackDotFwd;
 }
 
 // Pre-multiply a world-space translation into the matrix: M' = T(-o) * M, which is exactly
@@ -891,6 +1002,34 @@ int   g_drawsTotal = 0, g_drawsDuped = 0, g_drawsDupedOffset = 0, g_drawsOffscre
 // Draws that had no live camera matrix and so were drawn once, unsplit. These are the ones that
 // used to be scissored-but-unremapped and therefore vanished at the seam.
 int   g_drawsMonoFallback = 0;
+
+// ---- a slot that stays valid without a fresh upload behind it is a live corruption ----
+//
+// StereoPair re-uploads g_camMats[s].m for every draw while the slot is valid. If the constant
+// hook stops re-validating that slot but leaves it set, every draw of the frame is forced through
+// a view-projection captured on some EARLIER frame - the whole scene rendered from a frozen
+// camera, then unfrozen, which is indistinguishable from the flicker being chased.
+//
+// Three paths used to do exactly that, all of them early returns in Hook_SetVSConstF that skipped
+// the invalidation block at the bottom of the function: no valid camera position (retried only
+// every 30 frames, so up to half a second of frozen frames), no lock, and an upload that
+// overlapped the tracked window without covering it. The lock-drop path in Present was a fourth.
+//
+// Rule from here on: any path that leaves without positively re-validating must invalidate.
+inline void InvalidateCamMats() {
+    for (int s = 0; s < g_camMatUsed; ++s) g_camMats[s].valid = false;
+}
+
+// ---- how often identification fails, which nothing measured before ----
+//
+// c0 carries one matrix per frame, so a rejection is a whole-frame event: no forced projection and
+// no split for any draw in it. If that is happening even occasionally it is a violent artefact,
+// and the counters below are the only way to tell it apart from the other candidate mechanisms.
+// g_bestRejectDot is the diagnostic that names the cause: a rejection at 0.985 is rotation lag, a
+// rejection at -0.1 is a genuinely different matrix.
+int   g_lockUploads = 0, g_lockRejects = 0;      // per frame, reset in Present
+int   g_framesNoIdent = 0;                       // per report window: frames that lost it entirely
+float g_bestRejectDot = -2.0f;                   // per report window
 
 IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
@@ -1305,8 +1444,11 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                         // rect - no extra copy, and both were drawn in the same instant.
                         const int32_t halfW = (int32_t)g_scWidth / 2;
                         const bool swapEyes = InterlockedCompareExchange(&g_swapEyes, 0, 0) != 0;
-                        const int32_t src = swapEyes ? (1 - i) : i;
-                        projViews[i].subImage.imageRect.offset = { src * halfW, 0 };
+                        // Named `half`, not `src`: it shadowed the enclosing `src` (which selects
+                        // the SWAPCHAIN) with a different meaning (which HALF of the frame), and
+                        // both are live in this block. That is how an eye-swap bug gets written.
+                        const int32_t half = swapEyes ? (1 - i) : i;
+                        projViews[i].subImage.imageRect.offset = { half * halfW, 0 };
                         projViews[i].subImage.imageRect.extent = { halfW, (int32_t)g_scHeight };
                     } else {
                         projViews[i].subImage.imageRect.offset = { 0, 0 };
@@ -1361,70 +1503,82 @@ const UINT kScratchVecs    = 256;   // vs_3_0's full float-constant file
 
 HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                                            const float* data, UINT vec4Count) {
-    const bool scan   = InterlockedCompareExchange(&g_scanArmed, 0, 0) != 0;
+    bool scan = InterlockedCompareExchange(&g_scanArmed, 0, 0) != 0;
+    // Duplication needs the final left-eye matrix cached, which only the modify path produces.
+    const bool dup = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
     // Stereo and 6-DOF share one path: g_hmdOffset is the mapped position of the eye this
     // frame belongs to, which already contains both the head's movement and the eye's own
     // displacement. They cannot be separated here, so stereo necessarily brings positional
     // head tracking with it - which is the behaviour we want anyway.
+    //
+    // Draw duplication belongs in this list too, and its absence was a real asymmetry: the left
+    // eye is produced HERE and the right by adding g_eyeDeltaUU in StereoPair, so leaving this
+    // off put the left eye at the engine's own camera and the right at +IPD. The pair was biased
+    // half an interpupillary distance, and head translation did nothing under F1 unless F10
+    // happened to be on as well.
     const bool posOffset = InterlockedCompareExchange(&g_sixDof, 0, 0) != 0 ||
-                           InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
+                           InterlockedCompareExchange(&g_stereo, 0, 0) != 0 || dup;
     const bool inject = posOffset || InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
+
+    // Nothing below may touch `data` before this. The verify block used to dereference it three
+    // lines above the null check that guards it.
+    if (!data || vec4Count < 4) return g_origSetVSConstF(dev, startReg, data, vec4Count);
 
     // Cheap always-on capture of the projection the game is really using. Once the matrix has
     // been located we know exactly which register to look at, so this is a bounds check on
     // most calls and a single window test on the few that carry it - affordable every frame,
     // unlike the full scan. Verified per call rather than trusted, because the same register
     // is reused by other passes.
-    if (g_haveLock && startReg <= g_lockedReg && g_lockedReg + 4 <= startReg + vec4Count) {
+    const bool coversLock = g_haveLock && startReg <= g_lockedReg &&
+                            g_lockedReg + 4 <= startReg + vec4Count;
+    bool  lockOk = false;
+    float lockTanX = 0.0f, lockTanY = 0.0f;
+    if (coversLock) {
         const Reg4* r = reinterpret_cast<const Reg4*>(data + (g_lockedReg - startReg) * 4);
-        float f[3]; FwdVec(r, g_lockedConv, f);
-        float len = sqrtf(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
-        if (len > 0.3f && len < 3.0f && fabsf(r[3].w) <= kHitTolOriginUU) {
-            float dot = (f[0]*g_camFwd[0] + f[1]*g_camFwd[1] + f[2]*g_camFwd[2]) / len;
-            if (dot >= kMinDotFwd) {
-                // Sanity-bound the result. Run 15 captured 180x180 deg (x column length ~0) and
-                // 90x90 deg (unit columns - a cube-map face projection), neither of which is a
-                // scene world->clip matrix. Accepting those silently corrupted the diagnostic
-                // AND made a broken lock look healthy.
-                float tx = 0, ty = 0;
-                ProjTangents(r, g_lockedConv, &tx, &ty);
-                if (tx > 0.15f && tx < 8.0f && ty > 0.15f && ty < 8.0f) {
-                    g_projTanX = tx; g_projTanY = ty;
-                    g_lockVerified = true;
-                    if (g_projTanX < g_capTanMin) g_capTanMin = g_projTanX;
-                    if (g_projTanX > g_capTanMax) g_capTanMax = g_projTanX;
-                }
-            } else {
-                g_camMatrixBound = false;
-            }
+        float tx = 0, ty = 0, dot = -2.0f;
+        ++g_lockUploads;
+        lockOk = TrackedViewMatrix(r, g_lockedConv, &tx, &ty, &dot);
+        if (lockOk) {
+            lockTanX = tx; lockTanY = ty;
+            g_projTanX = tx; g_projTanY = ty;
+            g_lockVerified = true;
+            if (g_projTanX < g_capTanMin) g_capTanMin = g_projTanX;
+            if (g_projTanX > g_capTanMax) g_capTanMax = g_projTanX;
+            if (g_projTanY < g_capTanYMin) g_capTanYMin = g_projTanY;
         } else {
             // Something else has taken this register - a shadow or post pass. Draws issued now
             // are not scene geometry and must not be duplicated.
+            ++g_lockRejects;
+            if (dot > g_bestRejectDot) g_bestRejectDot = dot;
             g_camMatrixBound = false;
         }
     }
     const bool forceProj = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
                            g_targetTanX > 0.0f && g_targetTanY > 0.0f;
-    // Duplication needs the final left-eye matrix cached, which only the modify path produces.
-    const bool dup = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
     const bool modify = inject || forceProj || dup;
 
-    if ((!scan && !modify) || !data || vec4Count < 4 ||
-        !InterlockedCompareExchange(&g_camPosValid, 0, 0))
-        return g_origSetVSConstF(dev, startReg, data, vec4Count);
-
-    const float* const pts[3] = { g_camPos, g_povPos, g_zeroPos };
-    const UINT windows = (vec4Count - 4 < kMaxScanWindows) ? vec4Count - 4 : kMaxScanWindows;
+    // The SCAN genuinely needs a live camera position - its world-position probes are meaningless
+    // without one, and it is the only thing here that reads g_camPos at all.
+    //
+    // The MODIFY path does not, and gating it on the same flag is what turned a camera-pointer
+    // miss - retried only every 30 frames - into up to half a second in which no constant was
+    // examined, no slot was invalidated, and StereoPair went on re-uploading a frozen matrix over
+    // live engine state. Every test the modify path applies is now either pure matrix content or
+    // a loose facing check that is allowed to be stale, so it runs regardless.
+    if (!InterlockedCompareExchange(&g_camPosValid, 0, 0)) scan = false;
+    if (!scan && !modify) return g_origSetVSConstF(dev, startReg, data, vec4Count);
 
     if (scan) {
+        const float* const pts[3] = { g_camPos, g_povPos, g_zeroPos };
+        const UINT windows = (vec4Count - 4 < kMaxScanWindows) ? vec4Count - 4 : kMaxScanWindows;
         for (UINT j = 0; j <= windows; ++j) {
             const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
             for (int c = 0; c < 2; ++c) {
-                float w = 0, len = 0, dot = 0; int pt = 0;
-                if (!TestWindow(r, c, pts, &w, &len, &pt, &dot)) continue;
+                float w = 0, len = 0, dot = 0; int pt = 0; bool shape = false;
+                if (!TestWindow(r, c, pts, &w, &len, &pt, &dot, &shape)) continue;
                 // Everything inside the w tolerance is recorded, passing or not, so the report
                 // can show WHY the rejects were rejected rather than hiding them.
-                if (fabsf(w) <= kHitTolUU) RecordHit(startReg + j, c, pt, w, len, dot);
+                if (fabsf(w) <= kHitTolUU) RecordHit(startReg + j, c, pt, w, len, dot, shape);
                 else                       NoteNearMiss(startReg + j, c, w, len);
             }
         }
@@ -1441,9 +1595,30 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         // rather than forward a truncated copy if that assumption ever breaks - dropping
         // constants would corrupt the frame in a way that looks like a detection failure.
         static thread_local float scratch[kScratchVecs * 4];
-        bool edited = false;
         const UINT copyVecs = vec4Count;
         if (copyVecs > kScratchVecs) return g_origSetVSConstF(dev, startReg, data, vec4Count);
+
+        // ---- every exit from here on must leave the slot honest ----
+        //
+        // Does this upload touch the tracked window at all, and does it COVER it?
+        const bool touchesLock = g_haveLock && startReg < g_lockedReg + 4 &&
+                                 g_lockedReg < startReg + vec4Count;
+        if (!coversLock) {
+            // A partial overlap leaves the tracked block holding a mixture of what the engine
+            // just wrote and what we cached; re-uploading our copy over that in StereoPair would
+            // clobber the engine's own constants. Having no lock at all is the same situation
+            // with a wider blast radius. Both used to return here silently, leaving the slot set.
+            if (dup && (touchesLock || !g_haveLock)) InvalidateCamMats();
+            return g_origSetVSConstF(dev, startReg, data, vec4Count);
+        }
+        if (!lockOk) {
+            // The register now holds something that is not the scene view-projection - a shadow
+            // or post pass, or a frame where identification lapsed. Either way, pushing the
+            // cached copy over it for the rest of the frame is exactly the frozen-camera failure.
+            if (dup) InvalidateCamMats();
+            return g_origSetVSConstF(dev, startReg, data, vec4Count);
+        }
+
         // 6-DOF wins when both are on: it is the real thing, the F3 constant is only a probe.
         // Otherwise offset along the camera's RIGHT axis, not a world axis - that is the
         // actual stereo primitive, and it keeps the effect the same whichever way the player
@@ -1468,65 +1643,47 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         //
         // The lesson worth keeping: a wider net is not free when the test can produce false
         // positives, and this test can - the origin probe cannot tell a UI matrix from a view one.
-        uint32_t touched = 0;        // which slots this call refreshed, so the rest can be aged out
+        const UINT j = g_lockedReg - startReg;
+        const int  c = g_lockedConv;
 
-        if (!g_haveLock) return g_origSetVSConstF(dev, startReg, data, vec4Count);
-        if (startReg > g_lockedReg || g_lockedReg + 4 > startReg + vec4Count)
-            return g_origSetVSConstF(dev, startReg, data, vec4Count);
-        const UINT lockedWindow = g_lockedReg - startReg;
-
-        for (UINT j = lockedWindow; j <= lockedWindow && j + 4 <= copyVecs; ++j) {
-            const Reg4* r = reinterpret_cast<const Reg4*>(data + j * 4);
-            for (int c = 0; c < 2; ++c) {
-                if (g_haveLock && c != g_lockedConv) continue;
-                float w = 0, len = 0, dot = 0; int pt = 0;
-                if (!TestWindow(r, c, pts, &w, &len, &pt, &dot) || !IsViewMatrix(w, dot, pt)) continue;
-                ++g_injCount;
-                if (!edited) { memcpy(scratch, data, copyVecs * 4 * sizeof(float)); edited = true; }
-                Reg4* m = reinterpret_cast<Reg4*>(scratch + j * 4);
-                if (inject) ApplyOffset(m, c, o);
-                if (forceProj) {
-                    float tx = 0, ty = 0;
-                    ProjTangents(r, c, &tx, &ty);
-                    ApplyProjection(m, c, tx, ty, g_targetTanX, g_targetTanY);
-                    // Measure the RESULT, not just the input. The observed-FOV capture at the
-                    // top of this function reads the engine's matrix before we touch it, so it
-                    // reports the engine's drift and says nothing about whether our forcing
-                    // arithmetic is right. Reading it back after the edit closes that loop.
-                    ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
-                }
-                // Record the finished left-eye matrix for this register. The draw hook derives
-                // both eyes from it, so the eye offset and the half-frame remap compose on top of
-                // the forced projection instead of fighting it.
-                if (dup) {
-                    const UINT reg = startReg + j;
-                    int slot = -1;
-                    for (int s = 0; s < g_camMatUsed; ++s)
-                        if (g_camMats[s].reg == reg) { slot = s; break; }
-                    if (slot < 0 && g_camMatUsed < kMaxCamMats) slot = g_camMatUsed++;
-                    if (slot >= 0) {
-                        g_camMats[slot].reg = reg;
-                        g_camMats[slot].conv = c;
-                        g_camMats[slot].valid = true;
-                        memcpy(g_camMats[slot].m, m, sizeof(g_camMats[slot].m));
-                        touched |= (1u << slot);
-                    }
-                    g_camMatrixBound = true;
-                }
-                break;      // one convention per window; both cannot be true of one matrix
-            }
+        ++g_injCount;
+        memcpy(scratch, data, copyVecs * 4 * sizeof(float));
+        Reg4* m = reinterpret_cast<Reg4*>(scratch + j * 4);
+        if (inject) ApplyOffset(m, c, o);
+        if (forceProj) {
+            // lockTanX/Y were measured from the arriving matrix by the verify block above, so the
+            // two paths cannot disagree about what the engine sent.
+            ApplyProjection(m, c, lockTanX, lockTanY, g_targetTanX, g_targetTanY);
+            // Measure the RESULT, not just the input. The observed-FOV capture at the top of
+            // this function reads the engine's matrix before we touch it, so it reports the
+            // engine's drift and says nothing about whether our forcing arithmetic is right.
+            // Reading it back after the edit closes that loop.
+            ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
         }
-
-        // Any tracked register that this upload covered but did NOT match now holds something
-        // else. Drop it, so the draw hook can never write a stale matrix over live engine state.
+        // Record the finished left-eye matrix. The draw hook derives both eyes from it, so the
+        // eye offset and the half-frame remap compose on top of the forced projection instead of
+        // fighting it.
         if (dup) {
-            for (int s = 0; s < g_camMatUsed; ++s) {
-                if (!g_camMats[s].valid || (touched & (1u << s))) continue;
-                if (g_camMats[s].reg >= startReg && g_camMats[s].reg + 4 <= startReg + vec4Count)
-                    g_camMats[s].valid = false;
+            int slot = -1;
+            for (int s = 0; s < g_camMatUsed; ++s)
+                if (g_camMats[s].reg == g_lockedReg) { slot = s; break; }
+            if (slot < 0 && g_camMatUsed < kMaxCamMats) slot = g_camMatUsed++;
+            // Slots are only ever allocated per distinct locked register, so exhausting eight of
+            // them takes eight rescans onto different registers - remote, but the failure mode is
+            // the worst one there is: nothing gets cached, StereoPair sees nSlots == 0 for every
+            // draw, and stereo silently switches itself off. Reuse a dead slot instead.
+            if (slot < 0)
+                for (int s = 0; s < g_camMatUsed; ++s)
+                    if (!g_camMats[s].valid) { slot = s; break; }
+            if (slot >= 0) {
+                g_camMats[slot].reg  = g_lockedReg;
+                g_camMats[slot].conv = c;
+                g_camMats[slot].valid = true;
+                memcpy(g_camMats[slot].m, m, sizeof(g_camMats[slot].m));
             }
+            g_camMatrixBound = true;
         }
-        if (edited) return g_origSetVSConstF(dev, startReg, scratch, copyVecs);
+        return g_origSetVSConstF(dev, startReg, scratch, copyVecs);
     }
 
     return g_origSetVSConstF(dev, startReg, data, vec4Count);
@@ -1576,7 +1733,21 @@ volatile LONG g_rtIsScene = 1;
 // dominant shadows) or they never pass through SetRenderTarget(0) the way assumed. Either way
 // the theory was wrong, and rather than guess a fourth time, enumerate: every distinct target,
 // its size and format, and how many draws land on it. That says exactly what is being split.
-struct RtInfo { UINT w, h; D3DFORMAT fmt; int draws; };
+//
+// ---- and why it now keys on the SURFACE, not on (width, height, format) (run 27) ----
+//
+// The census merged every target sharing a descriptor into one row, so it could not distinguish
+// one scene colour target from several distinct surfaces of identical size and format. That is
+// exactly the case it needed to resolve: g_rtIsScene splits on size equality alone, so any
+// full-resolution offscreen target - a post ping-pong buffer, or the whole-scene dominant shadow
+// map UE3 allocates at scene resolution - is being split as if it were the scene, and the census
+// as written could never show it. Two 2560x1440 A8R8G8B8 surfaces read as one row of ~27000
+// draws, and run 11's conclusion that shadow maps "are not being separated by size" rested on it.
+//
+// Keying on the pointer can double-count if a surface is released and its address reused. For a
+// once-a-second census that is acceptable; the row simply appears twice, which is far less
+// misleading than two different targets appearing as one.
+struct RtInfo { IDirect3DSurface9* surf; UINT w, h; D3DFORMAT fmt; int draws; };
 RtInfo g_rtSeen[16]{};
 int    g_rtSeenCount = 0;
 int    g_rtCurrent = -1;
@@ -1609,12 +1780,10 @@ HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
             D3DSURFACE_DESC d{};
             if (SUCCEEDED(surf->GetDesc(&d))) {
                 if (g_srcW && g_srcH) scene = (d.Width == g_srcW && d.Height == g_srcH);
-                for (int i = 0; i < g_rtSeenCount; ++i) {
-                    if (g_rtSeen[i].w == d.Width && g_rtSeen[i].h == d.Height &&
-                        g_rtSeen[i].fmt == d.Format) { g_rtCurrent = i; break; }
-                }
+                for (int i = 0; i < g_rtSeenCount; ++i)
+                    if (g_rtSeen[i].surf == surf) { g_rtCurrent = i; break; }
                 if (g_rtCurrent < 0 && g_rtSeenCount < 16) {
-                    g_rtSeen[g_rtSeenCount] = { d.Width, d.Height, d.Format, 0 };
+                    g_rtSeen[g_rtSeenCount] = { surf, d.Width, d.Height, d.Format, 0 };
                     g_rtCurrent = g_rtSeenCount++;
                 }
             }
@@ -1625,14 +1794,24 @@ HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
 }
 
 void ReportRenderTargets() {
-    Log("render-target census (draws this second, scene is %ux%u):", g_srcW, g_srcH);
+    Log("render-target census (draws this second, scene is %ux%u; one row per SURFACE):",
+        g_srcW, g_srcH);
+    int sceneSurfaces = 0;
     for (int i = 0; i < g_rtSeenCount; ++i) {
         if (!g_rtSeen[i].draws) continue;
         bool isScene = (g_rtSeen[i].w == g_srcW && g_rtSeen[i].h == g_srcH);
-        Log("    %5ux%-5u %-14s %6d draws  %s", g_rtSeen[i].w, g_rtSeen[i].h,
+        if (isScene) ++sceneSurfaces;
+        Log("    %p  %5ux%-5u %-14s %6d draws  %s", (void*)g_rtSeen[i].surf,
+            g_rtSeen[i].w, g_rtSeen[i].h,
             FmtName(g_rtSeen[i].fmt), g_rtSeen[i].draws, isScene ? "<- SPLIT" : "left alone");
         g_rtSeen[i].draws = 0;
     }
+    // The scene test is size equality, so every one of these is being split. Two is expected
+    // (LDR + HDR scene colour). More than that means something which is not scene colour is
+    // being split as if it were - which is the shadow-map corruption theory, now visible.
+    if (sceneSurfaces > 2)
+        Log("    ^ %d distinct SCENE-SIZED surfaces are being split. Only the LDR and HDR scene"
+            " colour targets should be - check what the extras are.", sceneSurfaces);
 }
 
 // Issue one scene draw twice: left half of the viewport, then right. When the draw's matrix
@@ -1706,7 +1885,20 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     // exactly what "flickering" was. Falling back to one unsplit draw costs that object its
     // parallax for a frame; it does not cost its existence.
     if (nSlots == 0) { ++g_drawsMonoFallback; return draw(); }
-    const bool remapKnown = true;
+
+    // ---- "with parallax" has to mean something ----
+    //
+    // This used to be `const bool remapKnown = true;`, incremented unconditionally a few lines
+    // below - so the perf line's `split N (N with parallax, 0 flat)` was a tautology and could
+    // never read anything else. Run 16's "906 with parallax, 0 flat - the stereo mechanism is
+    // validated" was that constant, not a measurement.
+    //
+    // What actually decides whether the right half gains real depth is the eye separation vector,
+    // which is only non-zero while positional tracking is live. Zero here means both halves are
+    // the same image and the result is mono wearing a stereo costume - worth seeing.
+    const float ed2 = g_eyeDeltaUU[0]*g_eyeDeltaUU[0] + g_eyeDeltaUU[1]*g_eyeDeltaUU[1] +
+                      g_eyeDeltaUU[2]*g_eyeDeltaUU[2];
+    const bool haveParallax = ed2 > 0.01f;      // 0.1 UU ~ 2 mm; a real IPD is 3-4 UU
 
     // Save the scissor state so the game's own setup is restored untouched.
     RECT  oldRect{};
@@ -1754,7 +1946,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     dev->SetScissorRect(&oldRect);
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissorOn);
     ++g_drawsDuped;
-    if (remapKnown) ++g_drawsDupedOffset;
+    if (haveParallax) ++g_drawsDupedOffset;
     return hr;
 }
 
@@ -1802,10 +1994,38 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
 // So: do nothing at all unless we are on the thread that drives Present. During splash movies that
 // means pure pass-through; during gameplay, where these draws come from the render thread, the
 // per-eye treatment still applies.
+//
+// ---- run 27: the hang had a much simpler cause, and the theory above was never measured ----
+//
+// The perf log line had nine printf conversions and ten arguments; %s was consuming an int. That
+// is harmless while the user-pointer counter is zero and a fault inside a held critical section -
+// i.e. a hang - the moment it is not, which is exactly at level 2. See the note at that Log call.
+//
+// The thread guard is KEPT regardless: issuing SetVertexShaderConstantF, SetScissorRect and a
+// draw from a thread that does not own the device is wrong whether or not it explains the hang.
+// But it was never established that these calls arrive off the render thread at all - that was
+// inferred. g_upOffThread settles it for the cost of one write, ever.
 DWORD g_mainThreadId = 0;        // set on the first Present
+volatile LONG g_upOffThread = 0; // set once if a user-pointer draw ever arrives off that thread
 
 inline bool OnRenderThread() {
     return g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId;
+}
+
+// True if this user-pointer draw must be forwarded untouched. Deliberately write-once on the
+// off-thread flag: after the first sighting the line stays shared-read, so the hot cross-thread
+// write the run-26 note warns about never happens.
+inline bool UserPtrInert() {
+    if (g_userPtrHookLevel <= 1) return true;
+    if (!OnRenderThread()) {
+        // Deliberately a plain volatile read, not an Interlocked one (hence the suppression): a
+        // locked operation on every off-thread draw is the exact cost run 26 was worried about,
+        // and this flag only ever goes 0 -> 1, which an aligned LONG load reads atomically.
+#pragma warning(suppress: 28112)
+        if (g_upOffThread == 0) InterlockedExchange(&g_upOffThread, 1);
+        return true;
+    }
+    return false;
 }
 
 void NoteFirstUserPtrDraw(const char* which) {
@@ -1832,8 +2052,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
     if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
     // Touch nothing off the render thread - see the note above OnRenderThread.
-    if (g_userPtrHookLevel <= 1 || !OnRenderThread())
-        return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
+    if (UserPtrInert()) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     ++g_drawsUP;
     if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
@@ -1845,7 +2064,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
                                                 const void* idxData, D3DFORMAT idxFormat,
                                                 const void* vtxData, UINT vtxStride) {
     if (!g_origDrawIndexedPrimUP) return D3DERR_INVALIDCALL;
-    if (g_userPtrHookLevel <= 1 || !OnRenderThread())
+    if (UserPtrInert())
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     ++g_drawsUP;
@@ -2003,10 +2222,27 @@ void ApplyVrFov() {
                 " the engine expects (early distance culling)",
                 hFovDeg / 65.0f, askedTanHalf / nativeTanHalf);
         }
-        Log("    worst engine VERTICAL cull this window: %.1f deg vs %.1f deg rendered -> %s",
-            engVertMin, 2.0f * atanf(g_targetTanY) * 57.2957795f,
-            engVertMin + 1.0f < 2.0f * atanf(g_targetTanY) * 57.2957795f
-                ? "SHORTFALL, geometry culled" : "covered");
+        const float renderedVert = 2.0f * atanf(g_targetTanY) * 57.2957795f;
+        Log("    worst engine VERTICAL cull this window, from mCurrentPOV: %.1f deg vs %.1f deg"
+            " rendered -> %s", engVertMin, renderedVert,
+            engVertMin + 1.0f < renderedVert ? "SHORTFALL, geometry culled" : "covered");
+        // ---- and the same thing measured, not inferred (run 27) ----
+        //
+        // mCurrentPOV is a proxy, and the log shows it disagreeing with reality badly: it reads
+        // back the 157.9 we wrote while the matrix the engine actually built for the same frame
+        // carries 80.7 x 51.1 deg. The matrix is the frustum the engine really rendered, so it is
+        // also the one its culling was computed from. Every shortfall number until now came from
+        // the proxy.
+        if (g_capTanYMin < 1e8f) {
+            const float engVertMeasured = 2.0f * atanf(g_capTanYMin) * 57.2957795f;
+            Log("    worst engine VERTICAL cull this window, from the ARRIVING MATRIX (ground"
+                " truth): %.1f deg vs %.1f deg rendered -> %s%s",
+                engVertMeasured, renderedVert,
+                engVertMeasured + 1.0f < renderedVert ? "SHORTFALL, geometry culled" : "covered",
+                (engVertMeasured + 1.0f < renderedVert && engVertMin + 1.0f >= renderedVert)
+                    ? "   <-- the proxy said 'covered' and was WRONG" : "");
+        }
+        g_capTanYMin = 1e9f;
         Log("    after forcing, the matrix measures %.1f x %.1f deg (want %.1f x %.1f)",
             g_forcedTanX > 0 ? 2.0f * atanf(g_forcedTanX) * 57.2957795f : 0.0f,
             g_forcedTanY > 0 ? 2.0f * atanf(g_forcedTanY) * 57.2957795f : 0.0f,
@@ -2051,28 +2287,45 @@ void ReportScan() {
     // better, which is how run 16 ended up locking onto 36.7x21.1 deg matrices.
     for (int i = 0; i < g_hitCount; ++i)
         for (int j = i + 1; j < g_hitCount; ++j) {
-            bool pi = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd, g_hits[i].pt);
-            bool pj = IsViewMatrix(g_hits[j].w, g_hits[j].dotFwd, g_hits[j].pt);
+            bool pi = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd, g_hits[i].pt, g_hits[i].shape);
+            bool pj = IsViewMatrix(g_hits[j].w, g_hits[j].dotFwd, g_hits[j].pt, g_hits[j].shape);
             if ((pj && !pi) || (pj == pi && g_hits[j].count > g_hits[i].count)) {
                 MatHit t = g_hits[i]; g_hits[i] = g_hits[j]; g_hits[j] = t;
             }
         }
     int passing = 0;
     for (int i = 0; i < g_hitCount; ++i) {
-        bool pass = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd, g_hits[i].pt);
+        bool pass = IsViewMatrix(g_hits[i].w, g_hits[i].dotFwd, g_hits[i].pt, g_hits[i].shape);
         if (pass) ++passing;
-        Log("    %s c%-3u %s  w=%+.4f  fwdLen=%.4f  dotFwd=%+.4f  hits=%-5d  zero at %s",
+        Log("    %s c%-3u %s  w=%+.4f  fwdLen=%.4f  dotFwd=%+.4f  shape=%s  hits=%-5d  zero at %s",
             pass ? "**" : "  ", g_hits[i].startReg, g_hits[i].conv == CONV_ROW ? "ROW" : "COL",
-            g_hits[i].w, g_hits[i].fwdLen, g_hits[i].dotFwd, g_hits[i].count,
+            g_hits[i].w, g_hits[i].fwdLen, g_hits[i].dotFwd,
+            g_hits[i].shape ? "ok " : "BAD", g_hits[i].count,
             kPointName[g_hits[i].pt]);
     }
-    Log("    %d of %d windows pass BOTH tests (** marked). Only those are injected into.",
+    Log("    %d of %d windows pass ALL THREE tests (** marked). Only those are injected into.",
         passing, g_hitCount);
     // A rarely-uploaded window is not the scene matrix however well it scores otherwise, so
     // require it to carry a real share of the frame before trusting it.
     const int kMinUploadsToLock = 8;
-    if (passing > 0 && IsViewMatrix(g_hits[0].w, g_hits[0].dotFwd, g_hits[0].pt)) {
-        if (g_hits[0].count >= kMinUploadsToLock) {
+    if (passing > 0 && IsViewMatrix(g_hits[0].w, g_hits[0].dotFwd, g_hits[0].pt, g_hits[0].shape)) {
+        // ---- refuse to lock on anything but the translated-world probe ----
+        //
+        // TrackedViewMatrix, which every later upload is judged by, tests |r[3].w| ~ 0 - the
+        // translated-world case, where the camera sits at the origin. That is deliberate: it is
+        // pure matrix content, so nothing in it can go stale, which is what lets the per-call test
+        // survive a frame of rotation lag. It is also confirmed for this engine.
+        //
+        // But it means a lock acquired on the camActor or mCurrentPOV probe could never verify:
+        // the lock would be dropped after 60 frames, rescanned, relocked and dropped again, for
+        // ever, with stereo off the whole time. Refuse it and say why, rather than loop silently.
+        if (g_hits[0].pt != 2) {
+            Log("    NOT locking c%u - it matched at %s, not at the translated-world origin."
+                " The per-upload test only understands the origin case, so this lock could never"
+                " verify. If this ever fires, the engine is not translated-world and"
+                " TrackedViewMatrix needs the probe point carried with the lock.",
+                g_hits[0].startReg, kPointName[g_hits[0].pt]);
+        } else if (g_hits[0].count >= kMinUploadsToLock) {
             g_lockedReg = g_hits[0].startReg; g_lockedConv = g_hits[0].conv; g_haveLock = true;
             Log("    LOCKED on c%u %s (%d uploads this frame)", g_lockedReg,
                 g_lockedConv == CONV_ROW ? "ROW" : "COL", g_hits[0].count);
@@ -2138,6 +2391,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      // horizontally by 2x. Turning it on here removes that broken combination.
                      if (!was) { InterlockedExchange(&g_stereo, 0);
                                  InterlockedExchange(&g_vrProjection, 1); }
+                     // Slots are only maintained while duplication is on, so anything left over
+                     // from a previous F1 session is by definition stale. Clearing here stops the
+                     // first draws after re-enabling being pushed through a matrix from minutes
+                     // ago.
+                     InvalidateCamMats();
                      g_haveCentre = false;
                      Log("F1: draw-call duplication (TRUE stereo) %s", was?"OFF":"ON"); }
     p1 = k1;
@@ -2240,6 +2498,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (g_drawsOffscreen > offscreenPeak) offscreenPeak = g_drawsOffscreen;
         if (g_drawsMonoFallback > monoPeak) monoPeak = g_drawsMonoFallback;
         if (g_drawsUP > upPeak) upPeak = g_drawsUP;
+        // A frame in which the tracked register was uploaded but never once passed the test is a
+        // frame that got no forced projection and no per-eye split for ANY draw. Nothing measured
+        // this before, and it is the single most likely explanation left for a flicker that
+        // tracks head movement - which run 23's elimination test, run with head tracking off,
+        // could not have seen.
+        if (g_lockUploads > 0 && g_lockRejects == g_lockUploads) ++g_framesNoIdent;
         if (++frames >= 120) {
             // "duplicated" is every draw split across both eye halves; "with offset" is the
             // subset that also got true parallax. The gap between them is drawn flat/mono in
@@ -2248,11 +2512,62 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // live camera matrix, so they are drawn once instead of being scissored into a half
             // they were never remapped into. A high or spiky count means the camera slot is going
             // invalid often, which costs parallax on those objects even though they now appear.
+            // ---- ⚠️ THIS LINE IS WHY THE USER-POINTER HOOKS "HUNG" (found run 27) ----
+            //
+            // It had nine conversions and TEN arguments: upPeak was missing its %d, so %s
+            // consumed an int and formatted it as a char*. The evidence is in every log from
+            // run 23 onwards - "mono-fallback 0(null)", where (null) is upPeak == 0 printed as a
+            // string, and where [TRUE STEREO ON] never once appeared because its argument was
+            // being swallowed.
+            //
+            // Harmless only while upPeak stays zero. upPeak is non-zero exactly when
+            // HookUserPointerDraws >= 2 - at which point %s dereferences a small integer, inside
+            // Log(), inside EnterCriticalSection(&g_lock). The fault leaves the lock held, so
+            // every subsequent Log() blocks forever. That is precisely the reported behaviour:
+            // level 1 reaches the menus, level 2 does not, and it presents as a hang rather than
+            // a crash.
+            //
+            // So the run-26 conclusion - that these calls arrive on a different thread and a
+            // shared write on that path is ruinous - was inferred from a symptom this bug fully
+            // explains. The thread guard is kept (issuing device state changes from a thread that
+            // does not own the device is genuinely wrong), but it was not the fix.
+            //
+            // Lesson: printf argument mismatches are a latent crash a compiler will diagnose for
+            // free - but only if it is told the function is printf-like AND asked to look. Log()
+            // is now annotated _Printf_format_string_ and build.ps1 runs /analyze, which together
+            // make exactly this mistake fail the build. Neither half works alone.
             Log("perf: %.1f fps (%.2f ms/frame) | draws/frame peak %d, split %d (%d with"
-                " parallax, %d flat), offscreen %d, mono-fallback %d%s",
+                " parallax, %d flat), offscreen %d, mono-fallback %d, user-ptr %d,"
+                " frames with NO identification %d%s",
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
-                offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak, upPeak,
+                offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak, upPeak, g_framesNoIdent,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
+            // The identification counters are the point of this run. c0 carries one matrix per
+            // frame, so a rejection is a whole-frame event - no forced projection and no split for
+            // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
+            // flash, and g_bestRejectDot names the cause: near 0.99 is rotation lag against a
+            // stale g_camFwd, far below it is a genuinely different matrix taking the register.
+            if (g_framesNoIdent || g_bestRejectDot > -1.5f)
+                Log("    identification: %d of %d frames lost the matrix entirely; best rejected"
+                    " dotFwd this window %+.4f (gate %.2f)",
+                    g_framesNoIdent, frames, g_bestRejectDot, kTrackDotFwd);
+            g_framesNoIdent = 0;
+            g_bestRejectDot = -2.0f;
+            // Settles the run-26 theory rather than leaving it inferred. If this never appears
+            // while the user-pointer hooks are on, those calls do NOT come from another thread
+            // and the guard is costing us the very draws we hooked them to catch.
+            if (g_userPtrHookLevel >= 2) {
+                static bool saidOffThread = false, saidOnThread = false;
+                if (g_upOffThread && !saidOffThread) {
+                    saidOffThread = true;
+                    Log("    user-pointer draws DO arrive off the Present thread - those are being"
+                        " forwarded untouched, as intended");
+                } else if (!g_upOffThread && upPeak > 0 && !saidOnThread) {
+                    saidOnThread = true;
+                    Log("    user-pointer draws arrive ONLY on the Present thread (%d/frame) - the"
+                        " run-26 threading explanation does not hold", upPeak);
+                }
+            }
             if (InterlockedCompareExchange(&g_dupDraws, 0, 0)) {
                 // Stereo silently doing nothing is the worst failure mode there is - run 14 lost
                 // a whole session to it. If duplication is on and no draw was split, say so
@@ -2292,12 +2607,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             g_camMatrixBound = false;
             g_projTanX = g_projTanY = 0.0f;      // stale readings must not look healthy
             g_forcedTanX = g_forcedTanY = 0.0f;
+            // The fourth path that used to leave a slot valid with nothing behind it. Without
+            // this, dropping the lock left StereoPair re-uploading the last matrix it ever
+            // captured, over every draw, until a rescan happened to succeed.
+            InvalidateCamMats();
         }
         g_lockVerified = false;
     }
 
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
     g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
+    g_lockUploads = 0; g_lockRejects = 0;
     g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0; g_drawsOffscreen = 0; g_drawsMonoFallback = 0; g_drawsUP = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
@@ -2556,7 +2876,7 @@ BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
         // rather than pasted, and cost real confusion across earlier sessions.
         {
             SYSTEMTIME st{}; GetLocalTime(&st);
-            Log("=== view_matrix attached %04d-%02d-%02d %02d:%02d:%02d - run starts here ===",
+            Log("=== view_matrix attached %04u-%02u-%02u %02u:%02u:%02u - run starts here ===",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         }
         if (!LoadReal()) { Log("FATAL: real d3d9.dll not loadable"); return FALSE; }
