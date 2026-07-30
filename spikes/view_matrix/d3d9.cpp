@@ -1785,6 +1785,29 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
 //
 // Lesson: a diagnostic that is cheap "once" is not cheap if the thing gating it resets. Anything
 // logging from the hot path needs a one-shot that cannot be reset by unrelated bookkeeping.
+// ---- the user-pointer draws are on ANOTHER THREAD (run 26) ----
+//
+// The ladder localised it precisely: level 1 (patch, forward immediately) reaches the menus; level 2
+// (identical, plus `++g_drawsUP`) does not. A single non-atomic increment cannot hang anything by
+// itself, so the meaningful difference is not the arithmetic - it is that level 2 WRITES TO SHARED
+// STATE on this path and level 1 does not.
+//
+// That is the signature of these calls arriving on a different thread from the render loop. UE3
+// plays its splash movies on a separate thread, and a hot cross-thread write to a global that the
+// main thread also touches costs a cache-line transfer every time. If the movie thread issues these
+// in bulk, throughput collapses far enough to look like a hang - and every counter inside StereoPair
+// carries the same exposure, along with the far worse problem of issuing D3D state changes from a
+// thread that does not own the device.
+//
+// So: do nothing at all unless we are on the thread that drives Present. During splash movies that
+// means pure pass-through; during gameplay, where these draws come from the render thread, the
+// per-eye treatment still applies.
+DWORD g_mainThreadId = 0;        // set on the first Present
+
+inline bool OnRenderThread() {
+    return g_mainThreadId != 0 && GetCurrentThreadId() == g_mainThreadId;
+}
+
 void NoteFirstUserPtrDraw(const char* which) {
     static bool logged = false;      // genuinely once per process, not once per frame
     if (logged) return;
@@ -1808,7 +1831,9 @@ void NoteFirstUserPtrDraw(const char* which) {
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
     if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
-    if (g_userPtrHookLevel <= 1) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
+    // Touch nothing off the render thread - see the note above OnRenderThread.
+    if (g_userPtrHookLevel <= 1 || !OnRenderThread())
+        return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     ++g_drawsUP;
     if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
@@ -1820,7 +1845,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
                                                 const void* idxData, D3DFORMAT idxFormat,
                                                 const void* vtxData, UINT vtxStride) {
     if (!g_origDrawIndexedPrimUP) return D3DERR_INVALIDCALL;
-    if (g_userPtrHookLevel <= 1)
+    if (g_userPtrHookLevel <= 1 || !OnRenderThread())
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     ++g_drawsUP;
@@ -2072,6 +2097,9 @@ void InstallViewHook() {
 }
 
 HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
+    // Whoever calls Present owns the device. Recorded so the user-pointer draw hooks can tell
+    // render-thread calls from movie-playback-thread ones and stay completely inert on the latter.
+    g_mainThreadId = GetCurrentThreadId();
     if (InterlockedExchange(&g_initTried, 1) == 0) { InstallViewHook(); InitXR(); }
 
     static bool p9=false,p8=false,p5=false,p4=false,p2=false;
