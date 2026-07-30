@@ -125,6 +125,13 @@ bool    g_haveLastWrittenYaw = false;
 bool    g_haveWant = false;
 int     g_hookHits = 0;
 
+// Defined further down, once the camera offsets and FOV target exist. Re-writes the engine's FOV
+// fields to the value ApplyVrFov computed, cheaply enough to run on every camera update.
+void ReassertVrFov();
+float g_vrFovDeg = 0.0f;             // what ApplyVrFov decided to ask the engine for
+uintptr_t g_lastCam = 0;             // camera pointer, cached by ApplyVrFov
+int  g_fovReasserts = 0;             // diagnostic: how often the seam actually corrected something
+
 FRotator* __fastcall Hook_CalcViewRotation(void* self, void* edx,
         FRotator* outRot, uint32_t a2, uint32_t a3, uint32_t a4, float a5) {
     FRotator* r = g_origCalcViewRotation(self, edx, outRot, a2, a3, a4, a5);
@@ -139,6 +146,20 @@ FRotator* __fastcall Hook_CalcViewRotation(void* self, void* edx,
         r->pitch = g_wantPitch;
         r->yaw   = g_wantYaw;
     }
+
+    // Re-assert the FOV here as well as at Present, because THIS is the camera update - the seam
+    // upstream of both rendering and CPU culling.
+    //
+    // Run 19 measured why it matters. The FOV read back at Present sat at the game's default 65
+    // deg in 11 of 153 samples, and 18 of the 60-frame windows dipped there. At 65 deg horizontal
+    // on 16:9 the engine's VERTICAL culling frustum is only ~39 deg while we display 98 - so on
+    // those frames almost everything outside the very centre is culled before a draw call exists.
+    // Even the 10th-percentile 114.6 deg gives just ~82 deg vertical, still short of 98.
+    //
+    // That is the flicker, and it reframes run 13: narrowing the render FOV helped not because of
+    // pixel density but because it shrank this shortfall - which is also why PAGE UP appeared to do
+    // nothing when it was only ever tried at 70%, where no shortfall remained to fix.
+    ReassertVrFov();
     return r;
 }
 
@@ -1814,15 +1835,31 @@ void ApplyVrFov() {
     if (Readable((void*)(cam + CAM_DESIRED_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_DESIRED_FOV) = hFovDeg;
     if (Readable((void*)(cam + CAM_CURRENT_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_CURRENT_FOV) = hFovDeg;
 
+    // Hand the value and the camera to the camera-update seam, which re-asserts it there.
+    g_vrFovDeg = hFovDeg;
+    g_lastCam  = cam;
+
     static int n = 0;
     if (++n % 60 == 1) {
         Log("VR FOV: forcing %.1f x %.1f deg into the matrix; asked the engine for %.1f deg"
             " (culling headroom x%.2f)",
             2.0f * atanf(g_targetTanX) * 57.2957795f,
             2.0f * atanf(g_targetTanY) * 57.2957795f, hFovDeg, kFovHeadroom);
+        // The vertical figure is the one that matters: the engine's FOV is horizontal at 16:9, so
+        // its vertical culling frustum is much smaller, and OUR render is tall and narrow. When
+        // this drops below what we draw, geometry is culled before a draw call exists - which is
+        // invisible in the horizontal numbers alone and was the run-19 flicker.
+        const float engVertMin = 2.0f * atanf(tanf(povMin * 0.5f / 57.2957795f) /
+                                              ((float)g_srcW / (float)g_srcH)) * 57.2957795f;
         Log("    engine FOV read back before write: mCurrentPOV %.1f (range %.1f-%.1f over the"
             " last 60), mDesiredPOV %.1f, mCurrentFOV %.1f",
             povBefore, povMin, povMax, desBefore, curBefore);
+        Log("    worst engine VERTICAL cull this window: %.1f deg vs %.1f deg rendered -> %s"
+            " | re-asserted at the camera seam %d times",
+            engVertMin, 2.0f * atanf(g_targetTanY) * 57.2957795f,
+            engVertMin + 1.0f < 2.0f * atanf(g_targetTanY) * 57.2957795f
+                ? "SHORTFALL, geometry culled" : "covered", g_fovReasserts);
+        g_fovReasserts = 0;
         Log("    after forcing, the matrix measures %.1f x %.1f deg (want %.1f x %.1f)",
             g_forcedTanX > 0 ? 2.0f * atanf(g_forcedTanX) * 57.2957795f : 0.0f,
             g_forcedTanY > 0 ? 2.0f * atanf(g_forcedTanY) * 57.2957795f : 0.0f,
@@ -1840,6 +1877,21 @@ void ApplyVrFov() {
             g_injCount);
         povMin = 1e9f; povMax = -1e9f;
     }
+}
+
+// Re-assert the FOV at the camera-update seam. Deliberately minimal: no GObjects walk, no logging,
+// just the three writes, using the camera pointer and value ApplyVrFov already established. Runs
+// per camera update, so it must stay cheap.
+void ReassertVrFov() {
+    if (!InterlockedCompareExchange(&g_vrProjection, 0, 0)) return;
+    if (!g_vrFovDeg || !g_lastCam) return;
+    uintptr_t cam = g_lastCam;
+    if (!Readable((void*)(cam + CAM_POV_FOV), 4)) return;
+    float* pov = reinterpret_cast<float*>(cam + CAM_POV_FOV);
+    if (fabsf(*pov - g_vrFovDeg) > 0.5f) ++g_fovReasserts;
+    *pov = g_vrFovDeg;
+    if (Readable((void*)(cam + CAM_DESIRED_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_DESIRED_FOV) = g_vrFovDeg;
+    if (Readable((void*)(cam + CAM_CURRENT_FOV), 4)) *reinterpret_cast<float*>(cam + CAM_CURRENT_FOV) = g_vrFovDeg;
 }
 
 void ReportScan() {
