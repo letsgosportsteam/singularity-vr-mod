@@ -230,6 +230,37 @@ the engine's culling (79.9° vertical at headroom 1.0) already comfortably cover
 Headroom genuinely could not matter in that configuration, so "no difference" was not evidence
 about headroom at all. The instructions caused that.
 
+### ❌ Run 15: 4K worked, but exposed the biggest fragility in the design — a non-revocable lock
+
+`-ResX=3840 -ResY=2160 -windowed` on the command line **does** work (the engine sizes its scene
+targets from it, unlike the backbuffer override). But the run was a mess, and the cause was ours:
+
+```
+split 1274 (0 with parallax, 1274 flat)          <- NOTHING got an eye offset
+own matrix on arrival: 180.0 x 180.0   (x47)     <- degenerate columns
+own matrix on arrival:  90.0 x  90.0   (x12)     <- a cube-map face projection
+after forcing, the matrix measures 127.9 x 98.0 (want 91.3 x 98.0)   <- stale, not success
+```
+
+Register locking was added purely as an optimisation, and it quietly became the worst single point
+of failure: **once set it was never re-examined.** At 4K the lock landed on something that is not
+the scene matrix — a real one reads ~128×98°, these read 180×180° (x column length ≈ 0) and 90×90°
+(unit columns, i.e. a 90° cube-map face). Because the modify path only ever tests the *locked*
+window, recognition could never recover. So no draw was offset, no projection was forced, the
+geometry kept the engine's own ~158° projection while we submitted a 91.3° frustum, and the halves
+were sliced out of a mono wide image — which is exactly "wildly zoomed, eyes don't line up".
+
+Worse, it *reported success*: the forced-projection readback kept echoing 127.9 from before F1
+changed the target.
+
+**Three fixes:**
+1. **The lock is now revocable.** Verified every frame; after 60 frames without holding it is
+   dropped and the next frame re-scans. A wrong lock now costs a second, not a session.
+2. **Captured projections are sanity-bounded** (tangent 0.15–8.0), so 180×180 and 90×90 can no
+   longer pollute the diagnostic or make a broken lock look healthy.
+3. **The forced readback resets when the target changes**, so a leftover value can never again be
+   mistaken for partial success.
+
 ### ❌ Run 14: forcing the BACKBUFFER does not raise UE3's render resolution
 
 Tried, and it broke stereo outright. The census was unambiguous:
@@ -248,9 +279,16 @@ backbuffer) stopped matching, and duplication silently switched itself off. Slic
 black — exactly the reported symptom, and the cull band measured that black to the pixel
 (`right=1280 of 3840`).
 
-**Correct route:** change resolution in the game's **video options**, which makes the engine
-allocate scene targets at the new size and keeps backbuffer and scene consistent. There is no game
-ini to edit — Singularity keeps video settings in its binary `.ue3profile`.
+**Correct route (confirmed run 15):** UE3's own command line, which the engine reads into its
+system settings so it sizes scene targets to match:
+
+```
+Singularity.exe -ResX=3840 -ResY=2160 -windowed
+```
+
+`-windowed` is needed because fullscreen clamps to real display modes — on a 1440p monitor the
+video menu will not offer more. There is no game ini to edit; Singularity keeps video settings in
+its binary `.ue3profile`. (Driver DSR/VSR is the alternative, exposing higher modes to the menu.)
 
 The override has been removed rather than left as a disabled option, since it cannot work. The ini
 stays for the mode selection the shipped mod needs.
@@ -457,12 +495,16 @@ Toggle with **F6**.
 **Decision taken: continue with true native stereo** (draw-call duplication). Depth reprojection
 stays documented above as the fallback if this path stalls again.
 
-1. **Raise resolution in the game's video options** (not the ini), to 3840×2160 if offered, with
-   render FOV back at **100%** (PAGE DOWN twice from 70%). Prediction: per-eye becomes 1920×2160 =
-   21.0 px/deg, nearly the 20.5 that felt good at 70%, so shimmer at *full* FOV should look about
-   like 70% did. Quantitative, so it either lands or the sampling theory is wrong too.
-2. **Then the D3D9Ex zero-copy path.** Unambiguously the gating item now: matching the headset means
-   ~49 MB per frame each way over the CPU. Everything else waits on it.
+1. **Re-run at 4K with the revocable lock.** Launch via command line (this is the working route):
+   `Singularity.exe -ResX=3840 -ResY=2160 -windowed`. The log now answers the question directly —
+   `with parallax` must be most of the split count, not 0, and `own matrix on arrival` should read
+   ~128×98°, not 180×180° or 90×90°. If a lock goes bad you will see it dropped and re-scanned
+   rather than having to infer it.
+2. **Only then judge the shimmer** at 100% render FOV. The sampling prediction (1920×2160 =
+   21.0 px/deg ≈ the 20.5 that felt good at 70%) was never actually tested, because stereo was
+   broken for the whole run.
+3. **Then the D3D9Ex zero-copy path.** Unambiguously the gating item: matching the headset means
+   ~49 MB per frame each way over the CPU. 4K already halved the frame rate (~70 → ~37 fps).
 2. **Then performance**, which is now the gating item rather than a later nicety. Two reasons it
    has been promoted: the frame copy scales with pixels, so matching the headset's resolution
    multiplies its cost; and the fps distribution is bimodal (median ~70, floor ~13), which is the

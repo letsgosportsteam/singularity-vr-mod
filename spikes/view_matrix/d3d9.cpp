@@ -361,6 +361,20 @@ volatile LONG g_vrProjection = 1;      // on by default: it is the correct behav
 UINT  g_lockedReg  = 0;
 int   g_lockedConv = CONV_ROW;
 bool  g_haveLock   = false;
+// ---- the lock has to be revocable (run 15) ----
+//
+// Locking onto a register was added as a pure optimisation, and it quietly became the single
+// biggest fragility in the design: once set, it was never re-examined. Run 15 showed what that
+// costs. At 4K the lock ended up on something that is not the scene matrix - the captured
+// projection read 180x180 deg (degenerate columns) and 90x90 deg (a cube-map face) rather than
+// the ~128x98 a real one gives - and because the modify path only ever tests the locked window,
+// recognition never recovered. Result: 0 of ~2900 draws got parallax, every draw was flat, and
+// the forced projection silently kept reporting a stale success from before the lock went bad.
+//
+// So: verify the lock every frame and drop it when it stops holding, which makes the next frame
+// re-scan from scratch. A wrong lock now costs a second, not a session.
+bool  g_lockVerified   = false;
+int   g_lockMissFrames = 0;
 float g_projTanX = 0.0f, g_projTanY = 0.0f;   // tan of half FOV, as OBSERVED (diagnostic)
 float g_targetTanX = 0.0f, g_targetTanY = 0.0f;   // what we FORCE into the matrix, and submit
 float g_forcedTanX = 0.0f, g_forcedTanY = 0.0f;   // read back AFTER the edit, to prove it landed
@@ -1286,9 +1300,18 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         if (len > 0.3f && len < 3.0f && fabsf(r[3].w) <= kHitTolOriginUU) {
             float dot = (f[0]*g_camFwd[0] + f[1]*g_camFwd[1] + f[2]*g_camFwd[2]) / len;
             if (dot >= kMinDotFwd) {
-                ProjTangents(r, g_lockedConv, &g_projTanX, &g_projTanY);
-                if (g_projTanX < g_capTanMin) g_capTanMin = g_projTanX;
-                if (g_projTanX > g_capTanMax) g_capTanMax = g_projTanX;
+                // Sanity-bound the result. Run 15 captured 180x180 deg (x column length ~0) and
+                // 90x90 deg (unit columns - a cube-map face projection), neither of which is a
+                // scene world->clip matrix. Accepting those silently corrupted the diagnostic
+                // AND made a broken lock look healthy.
+                float tx = 0, ty = 0;
+                ProjTangents(r, g_lockedConv, &tx, &ty);
+                if (tx > 0.15f && tx < 8.0f && ty > 0.15f && ty < 8.0f) {
+                    g_projTanX = tx; g_projTanY = ty;
+                    g_lockVerified = true;
+                    if (g_projTanX < g_capTanMin) g_capTanMin = g_projTanX;
+                    if (g_projTanX > g_capTanMax) g_capTanMax = g_projTanX;
+                }
             } else {
                 g_camMatrixBound = false;
             }
@@ -1662,8 +1685,13 @@ void ApplyVrFov() {
     // With duplication on, each eye occupies half the backbuffer's width, so the per-eye
     // frustum is half as wide. Getting this wrong would stretch both eyes horizontally by 2x.
     const bool dupOn = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    const float prevTanX = g_targetTanX;
     g_targetTanY = tanf(vHalf);
     g_targetTanX = g_targetTanY * (dupOn ? aspect * 0.5f : aspect);
+    // If the target moved, discard the readback of the previous one. Run 15 reported "matrix
+    // measures 127.9 (want 91.3)" for a long stretch - the 127.9 was a leftover from before F1
+    // changed the target, so a total failure to force anything looked like a partial success.
+    if (fabsf(g_targetTanX - prevTanX) > 1e-4f) g_forcedTanX = g_forcedTanY = 0.0f;
 
     // The request to the engine is deliberately wider: it now governs only culling.
     float askDeg = 2.0f * atanf(tanf(vHalf) * aspect * kFovHeadroom) * 57.2957795f;
@@ -1937,6 +1965,24 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             }
             frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0;
         }
+    }
+
+    // Revoke a lock that has stopped holding, so the next frame re-scans instead of staying
+    // stuck on the wrong register forever. See the note by g_lockVerified.
+    if (g_haveLock) {
+        if (g_lockVerified) {
+            g_lockMissFrames = 0;
+        } else if (++g_lockMissFrames > 60) {
+            Log("*** lock on c%u %s stopped verifying for %d frames - DROPPING it and"
+                " re-scanning ***", g_lockedReg, g_lockedConv == CONV_ROW ? "ROW" : "COL",
+                g_lockMissFrames);
+            g_haveLock = false;
+            g_lockMissFrames = 0;
+            g_camMatrixBound = false;
+            g_projTanX = g_projTanY = 0.0f;      // stale readings must not look healthy
+            g_forcedTanX = g_forcedTanY = 0.0f;
+        }
+        g_lockVerified = false;
     }
 
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
