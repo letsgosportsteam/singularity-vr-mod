@@ -587,6 +587,20 @@ stays documented above as the fallback if this path stalls again.
 
 ## Other known work, roughly by value
 
+- **⬜ Remove the resolution cap, so the full headset resolution is actually reachable.**
+  What we know: **3840×2160 is accepted**, **4992×2688 is refused** — the engine silently falls back
+  to 2560×1440 (run 18). The headset wants **2496×2688 per eye**, so side-by-side needs 4992 wide.
+
+  Leading hypothesis: a **4096** limit, which is the classic D3D9-era maximum render-target
+  dimension. 3840 is under it, 4992 is over. Cheap to test by bisecting — try `-ResX=4096` then
+  `-ResY=4200` — and worth doing before assuming anything.
+
+  If 4096 is a hard cap it has an architectural consequence worth facing early: side-by-side in one
+  frame can never reach parity, because per eye it tops out around 2048 wide against the 2496
+  needed (~82%). Reaching true parity would then require **per-eye render targets** rather than two
+  halves of one — which means render-target switching, and touches the same area as the D3D9Ex work
+  below. Stacking the eyes vertically does not help either: 2496×5376 is further over the limit.
+
 - **Performance — now the gating item, not a later nicety.** The frame copy is a full CPU
   round-trip (~14 MB each way at 2560×1440). The fast path needs the game's device upgraded to
   D3D9Ex, which needs a `D3DPOOL_MANAGED` → `DEFAULT` wrapper (**10,454** allocations measured in
