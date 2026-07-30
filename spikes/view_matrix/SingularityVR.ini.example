@@ -51,16 +51,24 @@ HookUserPointerDraws=0
 ; is the reported behaviour exactly, and the offenders (a chest, a locker door,
 ; a corpse, ammo) are precisely the things that get their own query.
 ;
-; By run 29 this is one of only two surviving candidates, and it has never been
-; tested. Setting this to 1 refuses D3DQUERYTYPE_OCCLUSION, which makes UE3
-; fall back to no occlusion culling - the same path it takes on hardware
-; without the feature, so a supported configuration rather than a novel one.
+; By run 29 this is the only surviving candidate, and it had never been tested.
 ;
-;   objects come back -> occlusion queries are the mechanism
+; Mode 1 lets every query be created and used exactly as the engine expects and
+; only changes the ANSWER - GetData reports a large pixel count, so nothing is
+; ever judged occluded. The engine's control flow is untouched.
+;
+;   objects come back -> occlusion query readback is the mechanism
 ;   nothing changes   -> ruled out, permanently
 ;
 ;   0 = normal
-;   1 = refuse occlusion queries
+;   1 = queries answer "fully visible"          <- the test
+;   2 = refuse to create them                   ** CRASHES THIS BUILD **
+;
+; Mode 2 returns D3DERR_NOTAVAILABLE, which is the documented answer for an
+; unsupported query type and the path UE3 takes on hardware without the
+; feature. Run 30 tried it and the game died between the splash screens and the
+; main menu - consistent with the unchecked-NULL-from-a-factory habit already
+; recorded for Raven's code. It is kept only so nobody retries it.
 ; ---------------------------------------------------------------------------
 DisableOcclusionQueries=0
 

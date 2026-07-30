@@ -2198,25 +2198,68 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
 // the feature - a supported configuration, not an unexplored one. If the objects come back, the
 // mechanism is named. If nothing changes, it is ruled out for good.
 //
-// Ini-switchable rather than a hotkey, because these are created during startup and the decision
-// has to be made before the engine probes for support.
-bool g_killOcclusionQueries = false;
-int  g_occlusionQueriesRefused = 0;
+// ---- ⚠️ mode 2 (refuse to create) CRASHES this build - run 30 ----
+//
+// D3DERR_NOTAVAILABLE is the documented answer for an unsupported query type, and it is the path
+// UE3 follows on hardware without occlusion query support. This build takes it straight into a
+// crash between the splash screens and the main menu - consistent with the unchecked-NULL-from-a-
+// factory habit already on record for Raven's code in ENGINE_NOTES.
+//
+// So do not take the feature away. Mode 1 lets every query be created and used exactly as the
+// engine expects, and only changes the ANSWER: GetData reports a large pixel count, so nothing is
+// ever judged occluded. Same experiment, none of the risk - the engine's control flow is
+// untouched and only the culling decision changes.
+//
+// The device's query vtable is shared by every query it creates, so patching GetData once covers
+// all of them; the type check inside the hook keeps D3DQUERYTYPE_EVENT fences (which UE3 uses for
+// frame pacing) reading their true values.
+//
+// Ini-switchable rather than a hotkey, because queries are created during startup.
+//   0 = normal
+//   1 = queries answer "fully visible", so nothing is ever culled as occluded   <- the test
+//   2 = refuse to create them  ** CRASHES THIS BUILD, kept only so it is not retried **
+int g_occlusionMode = 0;
+int g_occlusionForced = 0;
+
+// Defined further down with the other d3d9 plumbing; needed here to patch the query vtable.
+void* PatchVTable(void* obj, int index, void* repl);
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateQuery)(IDirect3DDevice9*, D3DQUERYTYPE, IDirect3DQuery9**);
-PFN_CreateQuery g_origCreateQuery = nullptr;
+typedef HRESULT (STDMETHODCALLTYPE *PFN_QueryGetData)(IDirect3DQuery9*, void*, DWORD, DWORD);
+PFN_CreateQuery  g_origCreateQuery = nullptr;
+PFN_QueryGetData g_origQueryGetData = nullptr;
+
+// A pixel count large enough that no visibility threshold treats it as occluded.
+const DWORD kPretendVisiblePixels = 0x00010000;
+
+HRESULT STDMETHODCALLTYPE Hook_QueryGetData(IDirect3DQuery9* q, void* data, DWORD size, DWORD flags) {
+    HRESULT hr = g_origQueryGetData(q, data, size, flags);
+    // S_FALSE means "not ready yet" and carries no data - only rewrite a completed result.
+    if (g_occlusionMode == 1 && hr == S_OK && data && size >= sizeof(DWORD) &&
+        q->GetType() == D3DQUERYTYPE_OCCLUSION) {
+        *reinterpret_cast<DWORD*>(data) = kPretendVisiblePixels;
+        ++g_occlusionForced;
+    }
+    return hr;
+}
 
 HRESULT STDMETHODCALLTYPE Hook_CreateQuery(IDirect3DDevice9* dev, D3DQUERYTYPE type,
                                            IDirect3DQuery9** out) {
-    if (g_killOcclusionQueries && type == D3DQUERYTYPE_OCCLUSION) {
-        // D3DERR_NOTAVAILABLE is the documented "this device does not support that query type"
-        // answer, and the one UE3's support probe is written to handle.
-        if (++g_occlusionQueriesRefused == 1)
-            Log("occlusion queries REFUSED (ini) - UE3 should fall back to no occlusion culling");
+    if (g_occlusionMode == 2 && type == D3DQUERYTYPE_OCCLUSION) {
         if (out) *out = nullptr;
         return D3DERR_NOTAVAILABLE;
     }
-    return g_origCreateQuery(dev, type, out);
+    HRESULT hr = g_origCreateQuery(dev, type, out);
+    // Patch GetData on the first real query we see. One patch covers every query from this
+    // device, since they all share a vtable.
+    if (g_occlusionMode == 1 && SUCCEEDED(hr) && out && *out && !g_origQueryGetData) {
+        g_origQueryGetData = (PFN_QueryGetData)PatchVTable(*out, 7, (void*)&Hook_QueryGetData);
+        Log("occlusion queries will report FULLY VISIBLE (GetData patched, orig=%p)",
+            (void*)g_origQueryGetData);
+        if (!g_origQueryGetData) { Log("*** GetData patch failed - occlusion test inactive ***");
+                                   g_occlusionMode = 0; }
+    }
+    return hr;
 }
 
 // Refresh the camera position the detector substitutes. Runs once per frame in Present.
@@ -2731,6 +2774,15 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // Settles the run-26 theory rather than leaving it inferred. If this never appears
             // while the user-pointer hooks are on, those calls do NOT come from another thread
             // and the guard is costing us the very draws we hooked them to catch.
+            if (g_occlusionMode == 1) {
+                static bool saidOcclusion = false;
+                if (!saidOcclusion && g_occlusionForced > 0) {
+                    saidOcclusion = true;
+                    Log("    occlusion results are being overridden to FULLY VISIBLE (%d so far)."
+                        " If the vanishing objects are solid now, query readback is the mechanism.",
+                        g_occlusionForced);
+                }
+            }
             if (g_userPtrHookLevel >= 2) {
                 static bool saidOffThread = false, saidOnThread = false;
                 if (g_upOffThread && !saidOffThread) {
@@ -2882,7 +2934,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     return g_origPresent(s, a, b, c, d);
 }
 
-void* PatchVTable(void* obj, int index, void* repl) {
+void* PatchVTable(void* obj, int index, void* repl) {   // forward-declared up by Hook_CreateQuery
     void** vt = *reinterpret_cast<void***>(obj);
     DWORD old = 0;
     if (!VirtualProtect(&vt[index], sizeof(void*), PAGE_READWRITE, &old)) return nullptr;
@@ -2957,9 +3009,12 @@ void LoadIniSettings() {
     // round trip through me.
     // See the note above Hook_CreateQuery. Off by default: this removes a feature the engine
     // expects to have, so it is a measurement, not a setting.
-    g_killOcclusionQueries = GetPrivateProfileIntA("Render", "DisableOcclusionQueries", 0, path) != 0;
-    Log("ini: DisableOcclusionQueries=%d%s", g_killOcclusionQueries ? 1 : 0,
-        g_killOcclusionQueries ? "  <-- occlusion culling is being taken away from the engine" : "");
+    g_occlusionMode = GetPrivateProfileIntA("Render", "DisableOcclusionQueries", 0, path);
+    if (g_occlusionMode < 0 || g_occlusionMode > 2) g_occlusionMode = 0;
+    Log("ini: DisableOcclusionQueries=%d (%s)", g_occlusionMode,
+        g_occlusionMode == 0 ? "normal" :
+        g_occlusionMode == 1 ? "queries answer FULLY VISIBLE - nothing culled as occluded"
+                             : "refuse to create - WARNING, this crashed the game in run 30");
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;
@@ -3007,9 +3062,9 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         // 118 = CreateQuery, the last method on IDirect3DDevice9. Counted forward from
         // SetVertexShaderConstantF at 94, which is independently confirmed working.
         g_origCreateQuery = (PFN_CreateQuery)PatchVTable(*out, 118, (void*)&Hook_CreateQuery);
-        if (!g_origCreateQuery && g_killOcclusionQueries) {
+        if (!g_origCreateQuery && g_occlusionMode) {
             Log("*** CreateQuery patch FAILED - leaving occlusion queries alone ***");
-            g_killOcclusionQueries = false;
+            g_occlusionMode = 0;
         }
         Log("Present + SetVertexShaderConstantF + Draw + SetRenderTarget hooks installed.");
         Log("F7 find the matrix | F1 TRUE stereo | F12 alternate-eye | F10 6-DOF | F9 head tracking");
