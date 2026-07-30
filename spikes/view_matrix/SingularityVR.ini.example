@@ -18,7 +18,7 @@
 ; 1 = hooked (default)   0 = left alone
 
 [Render]
-HookUserPointerDraws=1
+HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------
 ; There is deliberately no resolution setting.

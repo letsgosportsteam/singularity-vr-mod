@@ -1769,6 +1769,28 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     });
 }
 
+// ---- ⚠️ the run-24/25 startup hang was file I/O in a draw hook ----
+//
+// The previous attempt logged "first user-pointer draw seen" gated on `g_drawsUP == 1`. But that
+// counter is RESET EVERY FRAME for the perf line, so the condition was true once per frame, not
+// once ever - the log shows it 119 times. Every one of those did a full fopen/fwrite/fclose from
+// inside a draw call.
+//
+// That is almost certainly the hang, and the reason is that it is the ONLY behavioural difference
+// between these two hooks and the DrawPrimitive/DrawIndexedPrimitive hooks that have worked all
+// along: those never log. Per-frame synchronous file I/O inside a draw call - on a path UE3 may
+// well be driving from its movie-playback thread during splash screens, while our Log() also takes
+// a critical section - is exactly the kind of thing that stalls startup.
+//
+// Lesson: a diagnostic that is cheap "once" is not cheap if the thing gating it resets. Anything
+// logging from the hot path needs a one-shot that cannot be reset by unrelated bookkeeping.
+void NoteFirstUserPtrDraw(const char* which) {
+    static bool logged = false;      // genuinely once per process, not once per frame
+    if (logged) return;
+    logged = true;
+    Log("first user-pointer draw seen (%s)", which);
+}
+
 // ---- the OTHER two draw entry points (run 24) ----
 //
 // Only DrawPrimitive and DrawIndexedPrimitive were hooked. D3D9 has two more, the user-pointer
@@ -1786,9 +1808,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
     if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
     ++g_drawsUP;
-    // Prove the hook is entered at all, and how early. If startup stalls again, the presence or
-    // absence of this line says whether we ever got here - which the last attempt could not tell.
-    if (g_drawsUP == 1) Log("first user-pointer draw seen (DrawPrimitiveUP)");
+    NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
 
@@ -1798,7 +1818,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
                                                 const void* vtxData, UINT vtxStride) {
     if (!g_origDrawIndexedPrimUP) return D3DERR_INVALIDCALL;
     ++g_drawsUP;
-    if (g_drawsUP == 1) Log("first user-pointer draw seen (DrawIndexedPrimitiveUP)");
+    NoteFirstUserPtrDraw("DrawIndexedPrimitiveUP");
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
