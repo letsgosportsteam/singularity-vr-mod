@@ -61,15 +61,21 @@ remaining on the list is planned work rather than a bug.
 With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
 debugging.
 
-1. **Resolution — now the only real ladder rung left, and D3D9Ex is part of it.** Run 32 removed
-   performance as a standalone problem (the game does ~110 fps; the deficit was SSW). What remains
-   is that per-eye is 1280×1440 against the headset's 2496×2688. Two coupled pieces:
-   **(a)** the `GetCommandLineW` detour to inject `-ResX`/`-ResY` (designed, not implemented, must
-   fail safe), and the 4096 cap to bisect — try `-ResX=4096`, then `-ResY=4200`;
-   **(b)** the **D3D9Ex zero-copy path**, which at 1440p would be a nicety but at 4K is mandatory —
-   the CPU round-trip is ~4.2 ms today and projects to ~9.5 ms at 2160p, more than a whole 120 Hz
-   frame. Do (a) first: it produces the resolution at which (b) can be measured rather than
-   projected.
+1. **The D3D9Ex zero-copy path — now the single highest-value item, and measured rather than
+   assumed.** At 4096×2160 the CPU round-trip is **~12.5 ms of a ~16 ms frame** while the actual
+   rendering is 2–4 ms (run 33). Removing it is worth roughly **60 → 120+ fps** at the resolution
+   the project actually wants. Needs the `D3DPOOL_MANAGED` → `DEFAULT` wrapper (10,454 allocations,
+   five resource types). This is the same work run 31 cancelled on SSW-confounded data.
+2. **Per-eye render targets (Stage 4B) — promoted from "worth one measurement" to mandatory.**
+   Run 33 settled the cap at 4096, so side-by-side tops out at 2048 per eye against 2688 wanted.
+   **Parity is arithmetically unreachable** in a single side-by-side frame. This is also the fix
+   for the seam, post-processing bleed and occlusion-box remapping, so it collapses four open items
+   into one. Cost to check first: a render-target *and* depth-stencil swap per draw, ~2,400/frame.
+3. **`GetCommandLineW` detour** to inject `-ResX`/`-ResY` from the headset's reported size, so the
+   manual command line goes away. Designed, not implemented; must fail safe or the game will not
+   launch.
+4. **Vertical culling shortfall** — 98° rendered against the engine's 51.1° (run 33). Revisit the
+   headroom removed in run 28; **PAGE UP** walks it.
 2. **Resolution.** Per-eye is currently 1280×1440 against the headset's 2496×2688. Needs the
    command-line detour (design already written up under *How resolution will work*), and probably
    per-eye render targets given the ~4096 cap.
@@ -127,7 +133,7 @@ system settings, which the command line does and a `CreateDevice` override does 
 | Colours — sRGB | ✅ done |
 | **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
 | **Stereo — per-eye offset for real depth** | ✅ **done** — true native stereo by draw-call duplication; eyes align, depth is correct, and the vanishing objects are fixed (run 30, occlusion query readback) |
-| FOV / aspect match | 🔧 projection is VR-correct and forced; **render resolution not yet matched** to the headset (needs 4992×2688, currently refused — see the 4096 cap item) |
+| FOV / aspect match | 🔧 projection is VR-correct and forced; **resolution cannot be matched in the current design** — the cap is 4096 (run 33), giving 2048 per eye against 2688 wanted. Needs per-eye render targets |
 | Performance | ❌ **plan cancelled by measurement (run 31)** — the CPU round-trip is 3% of the frame, so D3D9Ex + the MANAGED wrapper is not worth writing. Real cause not yet identified; a missed 72 Hz deadline is the leading hypothesis |
 | Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
 
@@ -143,7 +149,8 @@ remaining issues are draw-path coverage.
 | Headset wants | **2496×2688 per eye** → 4992 wide for side-by-side |
 | Per eye at 2560×1440 | 1280×1440 — 51% of the panel |
 | Per eye at 3840×2160 | 1920×2160 — 77% of the panel |
-| Resolution cap | 3840×2160 accepted, 4992×2688 refused (likely 4096) |
+| Resolution cap | **4096 confirmed** (run 33) — 4096×2160 accepted and the scene targets followed; 4992 refused. Classic D3D9 max texture dimension |
+| Per eye at 4096×2160 | **2048×2160 — 76% linear of the 2688×2880 wanted.** Side-by-side needs 5376 wide, so parity is impossible without per-eye targets |
 | Frame rate | **105–118 fps** at 1440p, true stereo, SSW **off**, 120 Hz (run 32). The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
 | Frame copy (round-trip) | ~4.2 ms of an ~8.9 ms frame at 1440p — ~0.9 ms memcpy + ~3.3 ms readback stall |
 | Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
@@ -478,6 +485,93 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
+
+## 🧱 Run 33: 4096 works, and it proves side-by-side can NEVER reach parity
+
+`-ResX=4096 -ResY=2160 -windowed` was **accepted**, and the engine followed it properly — the
+render-target census shows the scene targets themselves at 4096×2160, not just the backbuffer:
+
+```
+render-target census (draws this second, scene is 4096x2160; one row per SURFACE):
+287C5F40   4096x2160  A16B16G16R16F   21363 draws  <- SPLIT
+287C6080   4096x2160  A8R8G8B8         8729 draws  <- SPLIT
+```
+
+So `-ResX` reaches UE3's system settings exactly as run 14 predicted, and **4096 is not refused**.
+With 4992 refused earlier, the cap is 4096 — the classic D3D9 maximum texture dimension, landing
+exactly where the leading hypothesis said it would.
+
+### ⛔ The arithmetic that kills the current design
+
+| | value |
+|---|---|
+| Frame | 4096 × 2160 (the maximum obtainable) |
+| **Per eye** | **2048 × 2160** |
+| Headset wants (this session) | **2688 × 2880** per eye |
+| Side-by-side would need | **5376** wide — 1.3× over the cap |
+| Delivered | **76% linear, 58% of the pixels** |
+
+**That is why it is not sharp, and it is not a bug.** 76% of the panel's angular resolution is
+precisely the "soft but not broken" band. Nor is it fixable by asking for more: side-by-side needs
+5376 px of width and cannot have more than 4096, so **parity is arithmetically impossible in the
+current one-frame design, at any setting.** Stacking vertically is worse (2688 × 5760).
+
+**Per-eye render targets are therefore mandatory, not preferable** — Stage 4B in the list below, and
+the "Remove the resolution cap" item can be closed: the cap is real, it is 4096, and the way past it
+is not a bigger frame.
+
+Note also that "headset wants" moved from 2496×2688 to **2688×2880** when the Virtual Desktop
+settings changed. That is the design working as intended — the target follows the runtime's own
+render-scale rather than being fixed — but it means the number must be read from the log per
+session, never hardcoded.
+
+### 🚀 And the frame copy is now 75–80% of the frame — D3D9Ex is the top item
+
+This is the measurement run 32 could only project. At 4096×2160 the round-trip stops being
+expensive and starts being the entire frame:
+
+```
+frame budget: xrWaitFrame 0.09 + copy 13.42 + our work 2.58 = 16.10 ms
+frame budget: xrWaitFrame 0.08 + copy 12.82 + our work 2.41 = 15.29 ms
+perf: 60.4 fps (16.57 ms/frame) | draws/frame peak 154, split 154
+```
+
+| Resolution | copy | our work | total | fps |
+|---|---|---|---|---|
+| 2560×1440 | 4.2 ms | 3.7 ms | 8.9 ms | ~110 |
+| **4096×2160** | **~12.5 ms** | **~2.5 ms** | ~16 ms | **~60** |
+
+**The actual rendering costs 2–4 ms.** Everything else is shuttling pixels through the CPU. The GPU
+is barely working and the frame rate halved anyway.
+
+So the zero-copy path is worth roughly **60 fps → 120+** at this resolution, not the ~1 fps run 31
+claimed. Run 32 re-scoped D3D9Ex as "the resolution enabler rather than a frame-rate fix"; this
+measures it, and the case is far stronger than the one it originally had. **It is now the single
+highest-value item in the project.**
+
+### ⚠️ Vertical culling shortfall, and it is not small
+
+```
+worst engine VERTICAL cull, from the ARRIVING MATRIX (ground truth): 51.1 deg vs 98.0 deg rendered
+engine's own matrix on arrival: 84.4 x 51.1 deg
+after forcing, the matrix measures 95.0 x 98.0 deg (want 95.0 x 98.0)
+```
+
+We render **98° vertical**; the engine culls against **51.1°**. Geometry outside its frustum is
+never submitted, so the top and bottom of the view can be missing objects. Run 28 removed the
+culling headroom on the grounds that the shortfall "is not happening" — against the arriving matrix
+as ground truth, at this aspect ratio, it plainly is. Not necessarily the same finding run 28
+refuted (that was about the *flicker*), but the headroom control was retired on this evidence and
+that should be revisited. Cheap to test: **PAGE UP** walks it.
+
+### ⬜ Minor: a third scene-sized surface is being split
+
+```
+287C6480   4096x2160  other   240 draws  <- SPLIT
+^ 3 distinct SCENE-SIZED surfaces are being split. Only the LDR and HDR scene colour targets should be
+```
+
+The instrument is flagging its own suspicion. 240 draws a frame going somewhere unidentified.
 
 ## 🚨 Run 32: SSW was halving the frame rate. The real number is ~110 fps.
 
@@ -1356,19 +1450,15 @@ stays documented above as the fallback if this path stalls again.
 
 ## Other known work, roughly by value
 
-- **⬜ Remove the resolution cap, so the full headset resolution is actually reachable.**
-  What we know: **3840×2160 is accepted**, **4992×2688 is refused** — the engine silently falls back
-  to 2560×1440 (run 18). The headset wants **2496×2688 per eye**, so side-by-side needs 4992 wide.
+- **✅ RESOLVED (run 33): the cap is 4096, and it makes per-eye render targets mandatory.**
+  `-ResX=4096 -ResY=2160` is accepted and the scene targets follow it; 4992 is refused. That is the
+  classic D3D9 maximum texture dimension, exactly as hypothesised.
 
-  Leading hypothesis: a **4096** limit, which is the classic D3D9-era maximum render-target
-  dimension. 3840 is under it, 4992 is over. Cheap to test by bisecting — try `-ResX=4096` then
-  `-ResY=4200` — and worth doing before assuming anything.
-
-  If 4096 is a hard cap it has an architectural consequence worth facing early: side-by-side in one
-  frame can never reach parity, because per eye it tops out around 2048 wide against the 2496
-  needed (~82%). Reaching true parity would then require **per-eye render targets** rather than two
-  halves of one — which means render-target switching, and touches the same area as the D3D9Ex work
-  below. Stacking the eyes vertically does not help either: 2496×5376 is further over the limit.
+  The architectural consequence is now fact rather than risk: per eye tops out at **2048** against
+  the **2688** the headset wants, so side-by-side delivers **76% linear / 58% of the pixels** and
+  cannot be made to deliver more. Stacking vertically is worse. **Reaching parity requires per-eye
+  render targets**, which is Stage 4B — promoted from optional to required, and now the fix for the
+  seam, post-processing bleed and occlusion boxes as well.
 
 - **Performance — the D3D9Ex + MANAGED wrapper. Reinstated by run 32, but re-scoped.** Not a frame
   rate fix: the game already does ~110 fps at 1440p. It is the **resolution enabler** — the CPU
