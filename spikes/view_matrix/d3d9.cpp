@@ -428,10 +428,43 @@ float g_forcedTanX = 0.0f, g_forcedTanY = 0.0f;   // read back AFTER the edit, t
 // mip selection and mesh LOD from projected screen size - so telling it the field is 158 deg
 // makes everything read as far away, which is a plausible cause of the texture flicker still
 // being reported. PAGE UP cycles this so the trade can be measured instead of argued about.
-const float kFovHeadroomSteps[] = { 2.5f, 1.75f, 1.30f, 1.0f };
-const int   kFovHeadroomCount = 4;
+// ---- run 28: the headroom was buying nothing and costing everything ----
+//
+// 2.5 was chosen in run 9 to cover a VERTICAL CULLING SHORTFALL. Run 28 measured whether that
+// shortfall is actually occurring, from the engine's own arriving matrix rather than from the
+// mCurrentPOV proxy, and it is not:
+//
+//     engine's own matrix on arrival: 147.4 x 125.1 deg   (we render 98.0 vertical)
+//                                     150.8 x 130.2 deg
+//                                     153.8 x 135.0 deg
+//
+// The engine culls 112-135 deg vertical against our 98. Covered, every frame, with margin. The
+// 51.1 deg reading that suggested otherwise came from a pre-gameplay frame.
+//
+// Meanwhile the cost is severe and measured: asking 157.9 deg is x2.43 native, which makes
+// everything project ~8x smaller than the engine was tuned for. UE3 picks draw distance and mesh
+// LOD from projected screen size, so objects cull about 8x closer than vanilla - which is
+// precisely the control run 21 ran: in the unmodified game those objects are visible from much
+// further away.
+//
+// So the ladder now runs DOWNWARD from 1.0. The interesting direction is toward native, and these
+// steps span the inflation range end to end at 100% render:
+//
+//     headroom  ask     inflation  objects project
+//        2.50   157.9     x2.43      8.0x smaller
+//        1.00   127.8     x1.97      3.2x smaller
+//        0.70   110.0     x1.69      2.2x smaller
+//        0.50    91.3     x1.40      1.6x smaller
+//        0.35    71.1     x1.09      1.0x  <- native LOD, no distortion at all
+//
+// Walk it down until either the artifacts stop (the mechanism is confirmed and the operating
+// point is found) or the ground-truth culling line starts reporting SHORTFALL and the edges of
+// the view begin dropping out. Those are the two ends of a real trade, and for the first time
+// both ends are instrumented.
+const float kFovHeadroomSteps[] = { 1.0f, 0.70f, 0.50f, 0.35f, 1.30f, 1.75f, 2.5f };
+const int   kFovHeadroomCount = 7;
 int   g_fovHeadroomStep = 0;
-float kFovHeadroom = 2.5f;
+float kFovHeadroom = 1.0f;
 
 // How much of the headset's field of view we actually render, as a fraction of its half-angle.
 //
@@ -2188,6 +2221,10 @@ void ApplyVrFov() {
     // The request to the engine is deliberately wider: it now governs only culling.
     float askDeg = 2.0f * atanf(tanf(vHalf) * aspect * kFovHeadroom) * 57.2957795f;
     if (askDeg > 170.0f) askDeg = 170.0f;
+    // The headroom now goes below 1.0, and PAGE DOWN scales vHalf on top of it, so the two
+    // together can drive this under the 30 deg floor the sanity check above enforces on the
+    // un-headroomed value. 40 deg is below the game's own 65 and still a legal field.
+    if (askDeg < 40.0f) askDeg = 40.0f;
     hFovDeg = askDeg;
 
     // ---- read BEFORE writing: does our value survive the engine's own camera update? ----
