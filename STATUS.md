@@ -1,6 +1,47 @@
 # STATUS — session handoff
 
-Last updated **2026-07-29**. Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-07-29** (end of run 26). Read this first, then `ENGINE_NOTES.md`.
+
+## TL;DR — where we stand
+
+**Working and wearable.** Head tracking, 6-DOF, correct colours, a VR-correct projection, and
+**true native stereo** with real per-eye parallax. The stereo mechanism is validated: the eyes line
+up, depth reads correctly, and it holds ~37 fps at 2560×1440 / ~28 at 3840×2160.
+
+**The one open defect:** some objects flicker or vanish — a chest, a locker door, a corpse. The
+mechanism is understood (see *the seam*, below); what remains is that not every draw path can be
+caught. Everything else on the list is planned work rather than a bug.
+
+### If you are picking this up cold, read these three things
+
+1. **The seam.** In true stereo the frame is side by side, left half → left eye. Any geometry that
+   reaches the frame *without* being remapped into an eye-half keeps full-frame coordinates — and
+   the centre of the frame **is** the seam, so a head-on object is clipped out of *both* halves and
+   disappears. Three separate causes have fed into this one mechanism.
+2. **Draw-path coverage is the unsolved half.** Catching every route geometry takes to the GPU is
+   what keeps failing. `DrawPrimitiveUP`/`DrawIndexedPrimitiveUP` are the currently-known gap.
+3. **Those calls come from a different thread.** UE3 runs splash movies on their own thread; any
+   shared write from that path collapses throughput and looks like a hang. The hooks now stay inert
+   unless on the Present thread. This cost three blocked launches — do not touch that path without
+   the guard.
+
+### Next session, in order
+
+1. **`HookUserPointerDraws=3`** in `SingularityVR.ini` — one attempt with the new thread guard. If
+   it hangs, set 0 and move on; the chest is cosmetic.
+2. **Performance: the D3D9Ex + `D3DPOOL_MANAGED` wrapper.** Well understood, does not touch the draw
+   path, and it is what gates the resolution/sharpness work actually wanted. **Start here if step 1
+   fails.**
+3. **Per-eye render targets** instead of two halves of one frame. Removes the seam class entirely
+   rather than chasing draw paths, and overlaps the D3D9Ex work.
+
+### Method note earned the hard way this session
+
+**Five theories about the flicker were wrong, each killed by the diagnostic built to test it.** What
+finally worked was *elimination* — turning one intervention off at a time — not another mechanism.
+Reach for that sooner. Equally: three of those wrong theories assumed a single-threaded draw path,
+and a bisection ladder driven from the ini (no rebuild per test) settled in three launches what
+guessing had not in three sessions.
 
 ## How resolution will work in the shipped mod (design, run 17)
 
@@ -33,13 +74,27 @@ system settings, which the command line does and a `CreateDevice` override does 
 | Head-tracked image in the headset | ✅ done |
 | Colours — sRGB | ✅ done |
 | **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
-| **Stereo — per-eye offset for real depth** | 🔧 **working, artifacts remaining** — true native stereo by draw-call duplication; one-eye ground textures fixed run 12, texture flicker open |
-| FOV / aspect match | 🔧 projection is VR-correct and forced; **render resolution not yet matched** to the headset |
-| Performance — CPU round-trip → D3D9Ex + MANAGED wrapper | ⬜ not started, still planned |
+| **Stereo — per-eye offset for real depth** | 🔧 **working, artifacts remaining** — true native stereo by draw-call duplication; eyes align and depth is correct. One-eye ground textures fixed (run 12). Objects vanishing at the seam still open |
+| FOV / aspect match | 🔧 projection is VR-correct and forced; **render resolution not yet matched** to the headset (needs 4992×2688, currently refused — see the 4096 cap item) |
+| Performance — CPU round-trip → D3D9Ex + MANAGED wrapper | ⬜ not started, **now the gating item** |
 | Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
 
 So: **6-DOF is solved**, and stereo is *working* rather than done — the mechanism is right and the
-remaining issues are graphical.
+remaining issues are draw-path coverage.
+
+### Measured, so it does not have to be re-derived
+
+| Quantity | Value |
+|---|---|
+| View matrix | `c0`, **ROW** storage, **translated-world** space |
+| Eye separation | 3.32 UU = 6.3 cm (correct IPD), stable |
+| Headset wants | **2496×2688 per eye** → 4992 wide for side-by-side |
+| Per eye at 2560×1440 | 1280×1440 — 51% of the panel |
+| Per eye at 3840×2160 | 1920×2160 — 77% of the panel |
+| Resolution cap | 3840×2160 accepted, 4992×2688 refused (likely 4096) |
+| Frame rate | ~37 fps at 1440p, ~28 at 4K, floor ~13 |
+| Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
+| Scene targets | 2× scene-sized (A8R8G8B8 + A16B16G16R16F), shadow map 512×512 R32F |
 
 ## Where the project is
 

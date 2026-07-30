@@ -1,27 +1,29 @@
 ; Singularity VR mod - settings
 ;
 ; ---------------------------------------------------------------------------
-; HookUserPointerDraws - a BISECTION LADDER, not an on/off switch.
+; HookUserPointerDraws
 ;
-; Hooking DrawPrimitiveUP / DrawIndexedPrimitiveUP stops the game reaching its
-; menus, and three explanations for that have now been wrong (bad vtable slot,
-; bad signature, file I/O in the hook). Slot and signature are both since
-; confirmed exact against d3d9.h, so the cause is still unknown.
+; UE3 submits dynamic geometry (particles, decals, sprites) through
+; DrawPrimitiveUP / DrawIndexedPrimitiveUP. Those draws are not split per eye,
+; so a centred one lands on the seam between the eye halves and disappears -
+; the suspected cause of the chest and similar objects vanishing.
 ;
-; Each level adds back exactly one thing. Launch once per level; whichever level
-; FIRST fails to reach the menus names the culprit.
+; Hooking them stopped the game reaching its menus. A bisection found why:
+; level 1 (patch installed, forward immediately) works, level 2 (identical plus
+; a single counter increment) does not. These calls arrive on a DIFFERENT THREAD
+; from the render loop - UE3 plays splash movies on its own thread - so any
+; shared write on that path is ruinously expensive, and D3D state changes from
+; it would be invalid regardless.
 ;
-;   0 = not hooked at all                    <- known good, safe default
-;   1 = hooked, forwards immediately          (does the patch alone break it?)
-;   2 = level 1 plus a counter                (does touching our globals break it?)
-;   3 = full per-eye treatment                (does the duplication path break it?)
+; The hooks now stay completely inert unless called on the thread that drives
+; Present. Level 3 is worth one attempt with that guard in place.
 ;
-; If a level hangs, set it back to 0 and relaunch. No rebuild needed.
+;   0 = not hooked                 <- safe default
+;   1 = hooked, forwards immediately
+;   2 = level 1 plus a counter
+;   3 = full per-eye treatment
 ;
-; Why bother: those draws are how UE3 submits dynamic geometry (particles,
-; decals, sprites). They are never split per eye, so a centred one lands on the
-; seam between the eye halves and disappears - the suspected cause of the chest
-; and similar objects vanishing.
+; If it hangs, set back to 0 and relaunch. No rebuild needed.
 ; ---------------------------------------------------------------------------
 
 [Render]
