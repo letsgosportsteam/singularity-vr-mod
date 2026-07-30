@@ -1,24 +1,24 @@
 ; Singularity VR mod - settings
 ;
-; [Render] ResX / ResY force the game's backbuffer size.
+; NOTE: there is deliberately no resolution setting here.
 ;
-; With true stereo (F1) the frame is side by side, so each eye gets ResX/2 x ResY.
-; The headset wants roughly 2496x2688 per eye, so matching it means ResX ~= 4992.
+; Forcing the D3D9 backbuffer size does NOT raise UE3's render resolution. The
+; engine allocates its scene render targets from its own configured resolution,
+; so overriding the backbuffer only desynchronises the two - the engine keeps
+; rendering at its old size into a larger buffer, and stereo switches itself off
+; because the scene target no longer matches. Tried in run 14; it broke badly.
 ;
-; Why this matters: at the default 2560x1440 each eye is only 1280x1440, which is
-; about 14 pixels per degree at full FOV against the headset's ~25. That
-; undersampling, upscaled to fill the eye, is what makes textures shimmer.
+; To change the render resolution, use the game's own VIDEO OPTIONS menu. That
+; makes the engine allocate its scene targets at the new size, which is what
+; actually raises the per-eye pixel density.
 ;
-; Cost: the frame copy is still a CPU round-trip, so pixels are expensive until
-; the D3D9Ex zero-copy path lands. Expect the frame rate to drop as this goes up.
+; Why you'd want to: with true stereo each eye gets half the width, so at
+; 2560x1440 an eye sees only 1280x1440 - roughly 14 pixels per degree at full
+; FOV, against the headset's ~25. That undersampling is what makes textures
+; shimmer. Raising the game's resolution is the fix; narrowing the FOV
+; (PAGE DOWN) is only a workaround that trades field of view for sharpness.
 ;
-; Suggested ladder - try these in order and watch both sharpness and fps:
-;   3200x1800   per eye 1600x1800   ~1.6x the pixels
-;   3840x2160   per eye 1920x2160   ~2.3x
-;   4992x2688   per eye 2496x2688   ~3.6x, matches the headset
-;
-; Set both to 0 (or delete them) to leave the game's own resolution alone.
+; Expect the frame rate to fall as resolution rises - the frame copy is still a
+; CPU round-trip. That is the next thing to fix (D3D9Ex zero-copy).
 
 [Render]
-ResX=3840
-ResY=2160

@@ -230,24 +230,33 @@ the engine's culling (79.9° vertical at headroom 1.0) already comfortably cover
 Headroom genuinely could not matter in that configuration, so "no difference" was not evidence
 about headroom at all. The instructions caused that.
 
-### Resolution override (new): `SingularityVR.ini` beside the DLL
+### ❌ Run 14: forcing the BACKBUFFER does not raise UE3's render resolution
 
-```ini
-[Render]
-ResX=3840
-ResY=2160
+Tried, and it broke stereo outright. The census was unambiguous:
+
+```
+render-target census (scene is 3840x2160):
+     2560x1440  A8R8G8B8       7103 draws  left alone
+     2560x1440  A16B16G16R16F 19946 draws  left alone
 ```
 
-Forces the backbuffer at `CreateDevice`, falling back to the game's own parameters if the mode is
-refused. Side-by-side means each eye gets `ResX/2 × ResY`. Ladder to try:
+**Zero draws split.** UE3 allocates its scene render targets from its *own* configured resolution,
+not from the backbuffer. Overriding the backbuffer only desynchronised the two: the engine kept
+rendering 2560×1440 into a 3840×2160 buffer, our scene test (which compares the bound target to the
+backbuffer) stopped matching, and duplication silently switched itself off. Slicing a mono
+2560×1440 image out of a 3840-wide buffer hands the right eye 640 px of picture and 1280 px of
+black — exactly the reported symptom, and the cull band measured that black to the pixel
+(`right=1280 of 3840`).
 
-| ResX×ResY | Per eye | Pixels vs now |
-|---|---|---|
-| 3200×1800 | 1600×1800 | ~1.6× |
-| 3840×2160 | 1920×2160 | ~2.3× |
-| 4992×2688 | 2496×2688 | ~3.6× — matches the headset |
+**Correct route:** change resolution in the game's **video options**, which makes the engine
+allocate scene targets at the new size and keeps backbuffer and scene consistent. There is no game
+ini to edit — Singularity keeps video settings in its binary `.ue3profile`.
 
-This is also the first piece of the shipped-mod ini that mode selection will live in.
+The override has been removed rather than left as a disabled option, since it cannot work. The ini
+stays for the mode selection the shipped mod needs.
+
+**Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
+silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
 ### ⚠️ Still open: texture flicker while walking
 
@@ -448,13 +457,12 @@ Toggle with **F6**.
 **Decision taken: continue with true native stereo** (draw-call duplication). Depth reprojection
 stays documented above as the fallback if this path stalls again.
 
-1. **Test the resolution ladder** in `SingularityVR.ini`, at **100%** render FOV (PAGE DOWN back to
-   100%). The prediction: at 3840×2160 the shimmer at full FOV should look roughly like 70% did at
-   2560×1440, because per-eye px/deg becomes 21.0 — nearly identical to the 20.5 that felt good.
-   That is a quantitative prediction, so it either lands or the resolution theory is wrong too.
-   Expect fps to fall; that is the CPU round-trip, and it is the point.
-2. **Then the D3D9Ex zero-copy path.** Now unambiguously the gating item: matching the headset means
-   ~49 MB per frame each way over the CPU, which is not viable. Everything else waits on it.
+1. **Raise resolution in the game's video options** (not the ini), to 3840×2160 if offered, with
+   render FOV back at **100%** (PAGE DOWN twice from 70%). Prediction: per-eye becomes 1920×2160 =
+   21.0 px/deg, nearly the 20.5 that felt good at 70%, so shimmer at *full* FOV should look about
+   like 70% did. Quantitative, so it either lands or the sampling theory is wrong too.
+2. **Then the D3D9Ex zero-copy path.** Unambiguously the gating item now: matching the headset means
+   ~49 MB per frame each way over the CPU. Everything else waits on it.
 2. **Then performance**, which is now the gating item rather than a later nicety. Two reasons it
    has been promoted: the frame copy scales with pixels, so matching the headset's resolution
    multiplies its cost; and the fps distribution is bimodal (median ~70, floor ~13), which is the
