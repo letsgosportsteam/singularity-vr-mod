@@ -70,6 +70,17 @@ CRITICAL_SECTION g_lock;
 char g_logPath[MAX_PATH] = {};
 bool g_logReady = false;
 
+// ---- ⚠️ truncating on attach destroys the run you are comparing against (run 31) ----
+//
+// Any measurement worth making here is an A/B across launches - two ini settings, two runs, two
+// numbers. Truncating at attach means launch B erases launch A, so by the time you have the
+// second number you no longer have the first. Run 31 lost two of its three tests to exactly
+// that, and the loss is silent: the file looks complete, it is simply the wrong run.
+//
+// So the previous logs are rotated rather than overwritten. Three back is enough for the
+// three-launch comparisons this project actually runs.
+const int kLogKeep = 3;
+
 void LogInit() {
     InitializeCriticalSection(&g_lock);
     char base[MAX_PATH] = {};
@@ -77,6 +88,15 @@ void LogInit() {
         strcat_s(base, "\\SingularityVR");
         CreateDirectoryA(base, nullptr);
         sprintf_s(g_logPath, "%s\\view_matrix.log", base);
+        // Oldest first, so nothing is overwritten before it has been moved along.
+        char from[MAX_PATH], to[MAX_PATH];
+        for (int i = kLogKeep; i >= 1; --i) {
+            sprintf_s(to, "%s\\view_matrix.prev%d.log", base, i);
+            if (i == 1) sprintf_s(from, "%s", g_logPath);
+            else        sprintf_s(from, "%s\\view_matrix.prev%d.log", base, i - 1);
+            DeleteFileA(to);
+            MoveFileA(from, to);        // fails harmlessly when the run does not exist yet
+        }
         FILE* f = nullptr;
         if (fopen_s(&f, g_logPath, "w") == 0 && f) fclose(f);
         g_logReady = true;
@@ -1139,6 +1159,19 @@ int     g_framesSubmitted = 0;
 double g_msGRTD = 0.0, g_msLockCopy = 0.0, g_msUpload = 0.0;   // summed over the perf window
 int    g_copyFrames = 0;
 
+// ---- and the other half of the frame, which turned out to be all of it (run 31) ----
+//
+// xrWaitFrame blocks until the compositor is ready for the next frame. That is the whole point
+// of it - it is how an OpenXR app is paced to the display - but it means a frame spent waiting
+// there is a frame that finished its work early and is now idle. Time inside it is NOT our cost,
+// and every ms attributed to it is a ms that optimising our own code cannot recover.
+//
+// Without this split, "residual" lumps genuine work together with deliberate idling, and the two
+// point at opposite conclusions.
+double g_msWaitFrame = 0.0;
+int    g_waitFrames = 0;
+double g_displayPeriodMs = 0.0;   // from XrFrameState, so the pacing target is measured not guessed
+
 inline LARGE_INTEGER Now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
 
 inline double MsSince(const LARGE_INTEGER& t0) {
@@ -1442,7 +1475,19 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
     if (!g_xrRunning) return;
 
     XrFrameState fs{ XR_TYPE_FRAME_STATE };
+    LARGE_INTEGER tWait = Now();
     if (XR_FAILED(xrWaitFrame(g_xrSession, nullptr, &fs))) return;
+    g_msWaitFrame += MsSince(tWait);
+    ++g_waitFrames;
+    // The pacing target, measured rather than assumed. A frame time that sits at an exact
+    // multiple of this is the signature of missing the deadline and waiting out a whole extra
+    // display period - a very different problem from being uniformly slow, and the fix for it
+    // is to get under the period rather than to shave a few percent off anything.
+    if (g_displayPeriodMs == 0.0 && fs.predictedDisplayPeriod > 0) {
+        g_displayPeriodMs = double(fs.predictedDisplayPeriod) / 1.0e6;   // ns -> ms
+        Log("headset display period %.2f ms (%.1f Hz) - frame times at 2x this are a missed deadline",
+            g_displayPeriodMs, 1000.0 / g_displayPeriodMs);
+    }
     xrBeginFrame(g_xrSession, nullptr);
 
     XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
@@ -2929,14 +2974,28 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 const double rb = g_msGRTD / g_copyFrames;
                 const double lc = g_msLockCopy / g_copyFrames;
                 const double up = g_msUpload / g_copyFrames;
+                const double wf = g_waitFrames ? g_msWaitFrame / g_waitFrames : 0.0;
+                const double copy = rb + lc + up;
                 Log("    frame copy [%s]: readback %.2f + lock/memcpy %.2f + upload %.2f"
-                    " = %.2f ms of %.2f (%.0f%%), residual %.2f ms",
+                    " = %.2f ms of %.2f (%.0f%%)",
                     g_copyMode == 1 ? "immediate" : "pipelined", rb, lc, up,
-                    rb + lc + up, ms, ms > 0 ? 100.0 * (rb + lc + up) / ms : 0.0,
-                    ms - (rb + lc + up));
+                    copy, ms, ms > 0 ? 100.0 * copy / ms : 0.0);
+                // The split that decides where any further effort goes. Time in xrWaitFrame is
+                // the app sitting idle waiting for the compositor, so it is not ours to optimise;
+                // "our work" is. Chasing the copy or the draw count while xrWaitFrame holds most
+                // of the frame would be optimising the part that is already free.
+                Log("    frame budget: xrWaitFrame %.2f (idle, waiting on the compositor)"
+                    " + copy %.2f + our work %.2f = %.2f ms%s",
+                    wf, copy, ms - wf - copy, ms,
+                    (g_displayPeriodMs > 0.0)
+                        ? (ms > g_displayPeriodMs * 1.6
+                               ? "   <-- ~2x the display period: a MISSED DEADLINE, not slow code"
+                               : "   <-- within one display period")
+                        : "");
             }
             g_msGRTD = g_msLockCopy = g_msUpload = 0.0;
             g_copyFrames = 0;
+            g_msWaitFrame = 0.0; g_waitFrames = 0;
             // The identification counters are the point of this run. c0 carries one matrix per
             // frame, so a rejection is a whole-frame event - no forced projection and no split for
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame

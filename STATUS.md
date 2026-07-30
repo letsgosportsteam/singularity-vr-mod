@@ -1,6 +1,13 @@
 # STATUS — session handoff
 
-Last updated **2026-07-30** (run 31 built, not yet run). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES.md`.
+
+> # ❌ THE D3D9Ex PERFORMANCE PLAN IS CANCELLED (run 31)
+>
+> The frame copy was measured for the first time and it is **0.88 ms of a 28 ms frame — 3%**. The
+> D3D9Ex + `D3DPOOL_MANAGED` wrapper, this project's top performance item since spike 2, exists to
+> remove that. It was worth about **1 fps**. Draw calls are not the bottleneck either: 4.5× fewer of
+> them changed nothing. Whatever costs 27 ms has never been looked at. See **Run 31**.
 
 > # ✅ THE FLICKER IS SOLVED (run 30)
 >
@@ -44,16 +51,13 @@ remaining on the list is planned work rather than a bug.
 With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
 debugging.
 
-1. **Performance — the D3D9Ex + `D3DPOOL_MANAGED` wrapper.** Now unambiguously the gating item.
-   The frame copy is a full CPU round-trip (~14 MB each way at 1440p) and the fps distribution is
-   bimodal, the signature of a CPU-bound stall. It also gates everything below, since matching the
-   headset's resolution multiplies the copy cost ~3.6×.
-   **Run 31 built the measurement this decision needs and it has not been read yet** — see below.
-   Do not start the wrapper before reading it; it is a large job justified by an assumption that
-   has never been tested.
-   **Re-measure the occlusion override at the same time** — it is currently free only because
-   the frame copy hides it, and ~7,600 draw calls a frame will not stay free. The residual figure
-   in the new perf line is the meter for it. See *Better fixes* under run 30.
+1. **Performance — find where the frame actually goes.** ~~D3D9Ex + `D3DPOOL_MANAGED` wrapper.~~
+   **Cancelled by measurement (run 31): the frame copy is 3% of the frame and the wrapper would buy
+   ~1 fps.** Draw calls are not the cost either — 4.5× fewer of them changed nothing. The next step
+   is to read the new `frame budget` line, which separates time spent *idle in `xrWaitFrame`* from
+   time spent working. Leading hypothesis: frame times sit at almost exactly 2× a 72 Hz display
+   period, which is a **missed deadline**, not slow code — and getting under one period would double
+   the frame rate rather than shave a few percent off it.
 2. **Resolution.** Per-eye is currently 1280×1440 against the headset's 2496×2688. Needs the
    command-line detour (design already written up under *How resolution will work*), and probably
    per-eye render targets given the ~4096 cap.
@@ -112,7 +116,7 @@ system settings, which the command line does and a `CreateDevice` override does 
 | **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
 | **Stereo — per-eye offset for real depth** | ✅ **done** — true native stereo by draw-call duplication; eyes align, depth is correct, and the vanishing objects are fixed (run 30, occlusion query readback) |
 | FOV / aspect match | 🔧 projection is VR-correct and forced; **render resolution not yet matched** to the headset (needs 4992×2688, currently refused — see the 4096 cap item) |
-| Performance — CPU round-trip → D3D9Ex + MANAGED wrapper | ⬜ not started, **now the gating item** |
+| Performance | ❌ **plan cancelled by measurement (run 31)** — the CPU round-trip is 3% of the frame, so D3D9Ex + the MANAGED wrapper is not worth writing. Real cause not yet identified; a missed 72 Hz deadline is the leading hypothesis |
 | Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
 
 So: **6-DOF is solved**, and stereo is *working* rather than done — the mechanism is right and the
@@ -462,7 +466,109 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-## 🔬 Run 31: the frame copy, instrumented — built, NOT YET RUN
+## ❌ Run 31 RESULT: the frame copy is 3% of the frame. The D3D9Ex plan is dead.
+
+**The project's number-one performance item for thirty runs was aimed at the wrong thing.** The
+frame copy was measured for the first time, and it is not the bottleneck. It is not close.
+
+```
+frame copy [pipelined]: readback 0.00 + lock/memcpy 0.88 + upload 0.00 = 0.88 ms of 28.38 (3%)
+```
+
+Stable across the whole session — 0.87–1.21 ms against 24–44 ms frames, never above 4%.
+
+| Phase | Cost | What it means |
+|---|---|---|
+| `readback` | **0.00 ms** | `GetRenderTargetData` returns immediately. The transfer is not blocking us at all. |
+| `lock/memcpy` | **0.88 ms** | ~14 MB of pure CPU bandwidth. About right for the size, and D3D9Ex would not remove it anyway. |
+| `upload` | **0.00 ms** | `CopyResource` is a deferred GPU command; it costs no CPU time. |
+
+**So the D3D9Ex + `D3DPOOL_MANAGED` wrapper should not be written.** Its entire purpose is to
+remove a cost that measures 0.88 ms out of 28. Best case it takes the frame from 28.4 ms to 27.5 —
+**35.2 fps to 36.4 fps** — in exchange for wrapping 10,454 MANAGED allocations behind COM proxies
+for five resource types, with a failure mode of "the game will not start". It is not worth it, and
+it was never going to be; nobody had measured.
+
+The one indirect signal it rested on — the bimodal fps distribution from run 12, median ~70 and
+floor ~13 — is real but was over-read. A CPU-bound stall was one explanation for it. It was not
+the only one, and it was never tested against another.
+
+### ✅ And draw calls are not the bottleneck either — the run-30 sequencing worry is answered
+
+Test C ran with `OcclusionQueryMode=2`, so the engine's own occlusion culling was live. That is
+the A/B run 30 asked for, from the opposite direction:
+
+| | draws/frame | frame rate |
+|---|---|---|
+| Run 30, override ON (queries forced visible) | 2272–3809 | 37–40 fps |
+| **Run 31 test C, override OFF (engine culling live)** | **403–1351** | **31–38 fps** |
+
+**Roughly 4.5× fewer draw calls, and the frame rate did not improve.** Slightly worse, if anything.
+
+This settles the *"do NOT do this before the D3D9Ex work"* caution under run 30. The concern was
+that ~7,600 draw calls a frame were only free because the frame copy hid them, and would start
+costing once the copy was gone. They are not hidden by anything — they are simply free on this
+hardware. The occlusion override can stay as it is, and *Better fixes* under run 30 drops from
+"required after D3D9Ex" to "optional tidying, no measured payoff".
+
+Incidentally the same run re-confirmed run 30 by reproduction: with mode 2 the vanishing objects
+came back in full force, on one ini setting. The flicker now has a switch.
+
+### ✅ Also confirmed healthy, for the first time with numbers
+
+```
+draws/frame peak 868, split 865 (865 with parallax, 0 flat), offscreen 8,
+mono-fallback 0, user-ptr 0, frames with NO identification 0 [TRUE STEREO ON]
+```
+
+**Matrix identification is not failing at all** — zero frames lost it, zero mono fallbacks, and
+100% of split draws got real parallax rather than being drawn flat. The whole Stage 4 rationale
+was that identification failure was a live fragility. On this evidence it is not one today, which
+demotes Stage 4 from "the structural fix" to a resolution/quality project, exactly as the run-27
+note anticipated.
+
+### ⬜ So where does the other 97% go? Leading hypothesis: a missed display deadline
+
+The residual is ~27 ms and it is neither the copy nor the draw calls. The suspicious detail is
+its value. Frame times cluster hard around **27.8 ms**, and **2 × 13.89 ms = 27.78 ms**, which is
+exactly two frames at **72 Hz** — a common Virtual Desktop rate.
+
+That is the signature of *just missing* the compositor's deadline and having to wait out a whole
+extra display period, and it is a completely different problem from being uniformly slow:
+
+- If it is a missed deadline, real work is somewhere between 13.9 and 27.8 ms, and **shaving 0.9 ms
+  off the copy would do nothing** — but getting under 13.9 ms would **double** the frame rate to 72.
+  That also explains the bimodal distribution far better than a CPU stall does: frames land either
+  side of one deadline.
+- If it is not, the work genuinely takes 27 ms and the question is what in it does.
+
+`xrWaitFrame` blocks until the compositor is ready, so time spent there is the app **idle**, not
+the app working — and until now it was lumped into the residual, where idling and real work are
+indistinguishable and point at opposite conclusions.
+
+**This build instruments it.** `xrWaitFrame` is timed separately, and `XrFrameState::predictedDisplayPeriod`
+is logged so the pacing target is measured rather than inferred from arithmetic:
+
+```
+headset display period 13.89 ms (72.0 Hz) - frame times at 2x this are a missed deadline
+frame budget: xrWaitFrame 12.40 (idle, waiting on the compositor) + copy 0.88 + our work 15.10 = 28.38 ms
+```
+
+### ⚠️ The log truncated on attach, and it cost two of the three tests
+
+Tests A and B (`FrameCopyMode` pipelined vs immediate) **are gone** — each launch truncated the
+previous run's log, so by the time the third number existed the first two did not. The failure is
+silent: the file looks complete, it is just the wrong run. Every measurement this project makes is
+an A/B across launches, so this was going to happen eventually.
+
+Logs now rotate three deep: `view_matrix.log`, `view_matrix.prev1.log` … `prev3.log`.
+
+Still unresolved as a result: whether pipelining is what made `readback` read 0.00, or whether it
+always did. It does not change the D3D9Ex verdict either way — the total is 3% regardless — but it
+decides whether to keep `FrameCopyMode=0` and its one frame of latency or drop back to immediate
+and get that latency back for free.
+
+## 🔬 Run 31: the frame copy, instrumented — the reasoning that led here
 
 The performance plan of record is "upgrade the device to D3D9Ex, wrap `D3DPOOL_MANAGED`, share the
 surface with D3D11, done". That is a **large** job: spike 2 measured **10,454 MANAGED allocations**
@@ -1158,13 +1264,12 @@ stays documented above as the fallback if this path stalls again.
   halves of one — which means render-target switching, and touches the same area as the D3D9Ex work
   below. Stacking the eyes vertically does not help either: 2496×5376 is further over the limit.
 
-- **Performance — now the gating item, not a later nicety.** The frame copy is a full CPU
-  round-trip (~14 MB each way at 2560×1440). The fast path needs the game's device upgraded to
-  D3D9Ex, which needs a `D3DPOOL_MANAGED` → `DEFAULT` wrapper (**10,454** allocations measured in
-  spike 2). Two measurements promote it: the run-12 fps distribution is **bimodal — median ~70,
-  floor ~13** across 66 samples, which is the signature of a CPU-bound stall rather than GPU load
-  (draw-call duplication doubled GPU work and barely moved the median); and matching the headset's
-  resolution multiplies the copy cost by ~3.6×, so it blocks that too.
+- **~~Performance — the D3D9Ex + MANAGED wrapper.~~ ❌ Cancelled by run 31.** The frame copy was
+  finally measured and it is **0.88 ms of a 28 ms frame — 3%**. The wrapper exists to remove that,
+  so it is worth about **1 fps** for 10,454 wrapped allocations across five resource types. The
+  bimodal fps distribution that promoted it (run 12, median ~70, floor ~13) is real but was
+  over-read as a CPU stall; frames landing either side of a display deadline produce the same shape.
+  Kept here because the *reasoning* is worth not repeating, not because the work is pending.
 - **FOV / aspect mismatch** — game renders 16:9, per-eye view is ~2496×2688.
 - **Head-look vs aim are coupled** — `PlayerController.Rotation` drives both view and fire trace.
 - **Menus are inert** — intended; they need OpenXR *input* (controllers, thumbsticks, laser
@@ -1174,6 +1279,14 @@ stays documented above as the fallback if this path stalls again.
 
 ## Method notes that earned their keep
 
+- **Measure the thing before building what the measurement justifies.** "The frame copy is the
+  bottleneck" survived thirty runs and became the top-priority work item without anyone timing it.
+  It was 3%. The instrument that settled it took an afternoon; the wrapper it cancelled would have
+  taken weeks and could not have worked. The same applies to the fps distribution that promoted it
+  — one indirect signal, one explanation offered, never tested against a second.
+- **Rotate logs that are truncated on attach.** Every measurement here is an A/B across launches,
+  so a log that truncates destroys the run being compared against — silently, since the file still
+  looks complete. Run 31 lost two of three tests that way.
 - **Audit the instruments before proposing another mechanism.** Six theories died on their own
   diagnostics; the seventh was found only after run 27 checked whether the diagnostics could
   report anything at all. Three could not: `remapKnown` was `const bool ... = true`, the perf
