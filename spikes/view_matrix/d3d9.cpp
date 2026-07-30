@@ -1536,8 +1536,16 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
 typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrim)(IDirect3DDevice9*, D3DPRIMITIVETYPE,
                                                          INT, UINT, UINT, UINT, UINT);
-PFN_DrawPrim        g_origDrawPrim = nullptr;
-PFN_DrawIndexedPrim g_origDrawIndexedPrim = nullptr;
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawPrimUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT,
+                                                    const void*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_DrawIndexedPrimUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE,
+                                                           UINT, UINT, UINT, const void*,
+                                                           D3DFORMAT, const void*, UINT);
+PFN_DrawPrim           g_origDrawPrim = nullptr;
+PFN_DrawIndexedPrim    g_origDrawIndexedPrim = nullptr;
+PFN_DrawPrimUP         g_origDrawPrimUP = nullptr;
+PFN_DrawIndexedPrimUP  g_origDrawIndexedPrimUP = nullptr;
+int g_drawsUP = 0;           // how many draws came through the user-pointer forms
 
 // ---- only split draws aimed at the SCENE, never at offscreen targets (run 9) ----
 //
@@ -1757,6 +1765,36 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                                                UINT startIndex, UINT primCount) {
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
+    });
+}
+
+// ---- the OTHER two draw entry points (run 24) ----
+//
+// Only DrawPrimitive and DrawIndexedPrimitive were hooked. D3D9 has two more, the user-pointer
+// forms, and UE3 uses them for dynamic geometry - particles, decals, sprites, anything built on the
+// CPU each frame rather than living in a static vertex buffer.
+//
+// Anything drawn through them was never split, so it kept FULL-FRAME coordinates. The centre of the
+// frame is the seam between the eye halves, so a centred object drawn this way lands exactly there
+// and is effectively invisible, while an off-centre one survives in one half. Same seam mechanism as
+// run 23, different cause: not "we chose not to split it" but "we never saw it at all".
+//
+// The mono-fallback count showing 0 is what pointed here: the camera matrix was live and everything
+// we HOOKED was being split correctly, so whatever was vanishing had to be a draw we never saw.
+HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
+                                          UINT primCount, const void* vtxData, UINT vtxStride) {
+    ++g_drawsUP;
+    return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
+}
+
+HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
+                                                UINT minVtxIndex, UINT numVertices, UINT primCount,
+                                                const void* idxData, D3DFORMAT idxFormat,
+                                                const void* vtxData, UINT vtxStride) {
+    ++g_drawsUP;
+    return StereoPair(dev, [&] {
+        return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
+                                       idxData, idxFormat, vtxData, vtxStride);
     });
 }
 
@@ -2127,7 +2165,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     {
         static LARGE_INTEGER freq{}, last{};
         static int frames = 0; static double accum = 0.0;
-        static int dupPeak = 0, totPeak = 0, offsetPeak = 0, offscreenPeak = 0, monoPeak = 0;
+        static int dupPeak = 0, totPeak = 0, offsetPeak = 0, offscreenPeak = 0, monoPeak = 0, upPeak = 0;
         if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
         if (last.QuadPart) accum += double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
@@ -2137,6 +2175,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (g_drawsDupedOffset > offsetPeak) offsetPeak = g_drawsDupedOffset;
         if (g_drawsOffscreen > offscreenPeak) offscreenPeak = g_drawsOffscreen;
         if (g_drawsMonoFallback > monoPeak) monoPeak = g_drawsMonoFallback;
+        if (g_drawsUP > upPeak) upPeak = g_drawsUP;
         if (++frames >= 120) {
             // "duplicated" is every draw split across both eye halves; "with offset" is the
             // subset that also got true parallax. The gap between them is drawn flat/mono in
@@ -2148,7 +2187,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             Log("perf: %.1f fps (%.2f ms/frame) | draws/frame peak %d, split %d (%d with"
                 " parallax, %d flat), offscreen %d, mono-fallback %d%s",
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
-                offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak,
+                offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak, upPeak,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
             if (InterlockedCompareExchange(&g_dupDraws, 0, 0)) {
                 // Stereo silently doing nothing is the worst failure mode there is - run 14 lost
@@ -2171,7 +2210,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 g_camMatValidPeak = 0;
                 ReportRenderTargets();
             }
-            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0; monoPeak = 0;
+            frames = 0; accum = 0.0; dupPeak = 0; totPeak = 0; offsetPeak = 0; offscreenPeak = 0; monoPeak = 0; upPeak = 0;
         }
     }
 
@@ -2195,7 +2234,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
     g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
-    g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0; g_drawsOffscreen = 0; g_drawsMonoFallback = 0;
+    g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0; g_drawsOffscreen = 0; g_drawsMonoFallback = 0; g_drawsUP = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.
@@ -2340,6 +2379,10 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         // 81 = DrawPrimitive, 82 = DrawIndexedPrimitive - the two the scene passes use.
         g_origDrawPrim        = (PFN_DrawPrim)PatchVTable(*out, 81, (void*)&Hook_DrawPrim);
         g_origDrawIndexedPrim = (PFN_DrawIndexedPrim)PatchVTable(*out, 82, (void*)&Hook_DrawIndexedPrim);
+        // 83/84 = the user-pointer draw forms. UE3 uses them for dynamic geometry, and leaving them
+        // unhooked meant those draws were never split - see the note on Hook_DrawPrimUP.
+        g_origDrawPrimUP        = (PFN_DrawPrimUP)PatchVTable(*out, 83, (void*)&Hook_DrawPrimUP);
+        g_origDrawIndexedPrimUP = (PFN_DrawIndexedPrimUP)PatchVTable(*out, 84, (void*)&Hook_DrawIndexedPrimUP);
         // 37 = SetRenderTarget, so draws aimed at shadow maps can be told apart from scene draws.
         g_origSetRenderTarget = (PFN_SetRenderTarget)PatchVTable(*out, 37, (void*)&Hook_SetRenderTarget);
         Log("Present + SetVertexShaderConstantF + Draw + SetRenderTarget hooks installed.");
