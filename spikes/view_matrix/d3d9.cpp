@@ -441,8 +441,19 @@ float kFovHeadroom = 2.5f;
 // The submitted OpenXR frustum is derived from the same numbers, so narrowing this stays
 // geometrically honest - the image simply subtends less of the eye, with black beyond it, rather
 // than being wrong.
-const float kRenderFovSteps[] = { 1.0f, 0.85f, 0.70f };
-const int   kRenderFovCount = 3;
+// The 0.40 step exists purely as a DECISIVE TEST, not as a playable setting.
+//
+// The culling theory says the flicker happens because our rendered frustum is taller than the
+// engine's culling frustum, so geometry is culled before a draw call exists. The engine's worst
+// observed case is 65 deg horizontal at 16:9, which is only ~39.4 deg VERTICAL. At 0.40 we render
+// 49 * 0.40 * 2 = 39.2 deg vertical - just inside that worst case, so no shortfall can occur on any
+// frame.
+//
+// Which makes it falsifiable: if the flicker vanishes completely at 0.40, culling is the cause. If
+// it persists, culling is innocent and the last three theories were all wrong. It will look like a
+// narrow letterbox and be unplayable - that is fine, it is a measurement.
+const float kRenderFovSteps[] = { 1.0f, 0.85f, 0.70f, 0.55f, 0.40f };
+const int   kRenderFovCount = 5;
 int   g_renderFovStep = 0;
 float g_renderFovScale = 1.0f;
 
@@ -2024,7 +2035,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     if (kPgDn && !pPgDn) {
         g_renderFovStep = (g_renderFovStep + 1) % kRenderFovCount;
         g_renderFovScale = kRenderFovSteps[g_renderFovStep];
-        Log("PAGE DOWN: rendering %.0f%% of the headset's field of view", g_renderFovScale * 100.0f);
+        Log("PAGE DOWN: rendering %.0f%% of the headset's field of view%s",
+            g_renderFovScale * 100.0f,
+            g_renderFovScale < 0.45f
+                ? "  <-- CULLING TEST: no shortfall is possible here. If the flicker survives"
+                  " this, culling is not the cause." : "");
     }
     pPgDn = kPgDn;
 

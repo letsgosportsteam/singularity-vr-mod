@@ -361,7 +361,37 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-### ⚠️ Still open: texture flicker while walking
+### ⚠️ THE long-running open issue: objects and textures flickering
+
+Distinct from the one-eye ground-texture bug (fixed run 12, still fixed). Objects pop in and out —
+a chest, a locker door, a corpse, textures generally — worst when looked at directly.
+
+**Three theories have now been wrong**, which is worth recording as a caution:
+
+| Theory | Killed by |
+|---|---|
+| Shadow maps corrupted by splitting | Only 11 draws of ~1,640 were offscreen; excluding them changed nothing |
+| Characters use a second matrix register | Register count measured **1, ever** |
+| FOV reset happens at the camera-update seam | Re-asserting there corrected ~0.06/frame and made the 10th-percentile FOV *worse* |
+
+The surviving theory is the **vertical culling shortfall**: the engine's FOV is horizontal at 16:9,
+so its vertical culling frustum is far smaller than its headline number, and it dips to the game's
+65° default (~39° vertical) while we render 98°. Geometry in that gap is culled before a draw call
+exists, so nothing downstream can recover it.
+
+**A decisive test now exists rather than another guess.** PAGE DOWN gained two steps (55%, **40%**).
+At 40% we render 39.2° vertical — just inside the engine's *worst observed* case, so no shortfall is
+possible on any frame:
+
+- **Flicker vanishes at 40%** → culling confirmed; the fix is finding what resets the FOV (needs a
+  hardware write breakpoint on the FOV field, the same tool that found the rotation source after
+  seven failed guesses).
+- **Flicker persists at 40%** → culling is innocent too, all four theories are dead, and the next
+  move is instrumenting the draw stream directly instead of theorising.
+
+40% is a narrow letterbox and unplayable. That is fine; it is a measurement, not a setting.
+
+### ⚠️ Also open: texture flicker while walking
 
 Distinct from the one-eye bug and still present. Prime suspect is now the **culling headroom
 itself**: UE3 derives texture-streaming mip selection *and* mesh LOD from projected screen size, so
