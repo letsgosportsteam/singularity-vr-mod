@@ -92,24 +92,58 @@ OcclusionQueryMode=0
 ; (frame time minus the copy). Read it before touching anything else.
 ;
 ;   0 = pipelined: issue this frame's readback, consume the one from last
-;       frame, so the transfer has a frame of GPU work to hide behind.
-;       Costs one frame of latency.                                <- default
-;   1 = immediate: capture and consume in the same Present. The behaviour
-;       every run up to 30 measured.
+;       frame. Costs one frame of latency. MEASURED SLOWER - see below.
+;   1 = immediate: capture and consume in the same Present.        <- default
 ;
-; Run both in one session and compare the "readback" figure. If pipelining
-; collapses it, the stall was the pipeline drain and a large part of the
-; D3D9Ex win is already banked. If it does not move, the readback is a real
-; transfer cost and D3D9Ex is worth the work.
+; ---- run 32 measured this, and pipelining lost ----
 ;
-; The latency is handled honestly: each captured frame carries the eye, head
-; pose and projection it was actually drawn with, and those are what get
-; submitted. Do not "simplify" that by reading the live pose at submit time -
-; handing the compositor a fresh pose for a stale image makes reprojection
-; correct towards a position the frame never rendered from, which reads as
-; swim rather than as lag.
+;     draws   pipelined            immediate
+;       367   107.0 fps (9.34ms)   109.7 fps (9.12ms)
+;       444   111.0 fps (9.01ms)   111.3 fps (8.98ms)
+;       138   114.5 fps (8.74ms)   117.5 fps (8.51ms)
+;
+; Immediate is equal or better every time AND has no added latency, so it is
+; the default. Mode 0 is kept only so the result can be reproduced.
+;
+; The interesting part is WHY. Pipelining did not remove the readback stall,
+; it relocated it - pipelined reports copy 0.89ms + "our work" 9.4ms, immediate
+; reports copy 4.2ms + "our work" 3.7ms, same total. Issuing
+; GetRenderTargetData without locking its result lets the call return at once,
+; so the phase timer sees nothing, but the driver still owes the transfer and
+; it surfaces later inside work that is not broken out. Moving a stall out of
+; an instrument's view is not an optimisation.
+;
+; The latency in mode 0 is handled honestly: each captured frame carries the
+; eye, head pose and projection it was actually drawn with, and those are what
+; get submitted. Do not "simplify" that by reading the live pose at submit
+; time - handing the compositor a fresh pose for a stale image makes
+; reprojection correct towards a position the frame never rendered from, which
+; reads as swim rather than as lag.
 ; ---------------------------------------------------------------------------
-FrameCopyMode=0
+FrameCopyMode=1
+
+; ---------------------------------------------------------------------------
+; 🚨 BEFORE TRUSTING ANY PERFORMANCE NUMBER: TURN OFF SSW
+;
+; Virtual Desktop's Synchronous Spacewarp (and Meta's ASW) pins the application
+; at HALF the headset refresh rate on purpose and synthesises the frames in
+; between. Nothing in the log looks wrong when it is on - the timings are
+; honest, the frame itself is synthetic.
+;
+; It cost this project thirty runs. Every frame-rate figure recorded before run
+; 32 - "~37 fps at 1440p", the bimodal distribution, the CPU-bound-stall
+; diagnosis, and run 31's decision to cancel the D3D9Ex work - was measured
+; through that halving. With SSW off at 120 Hz the same build runs at 105-118
+; fps and there was no performance problem at all.
+;
+; The build now logs the display period on the first frame and warns when the
+; frame time sits at ~2x it. Check for that line before reading anything else:
+;
+;   headset display period 8.33 ms (120.0 Hz)
+;   *** frame time is 2.00x the display period. SUSPECT SSW/ASW ... ***
+;
+; Record the refresh rate and the SSW setting next to any number worth keeping.
+; ---------------------------------------------------------------------------
 
 ; ---------------------------------------------------------------------------
 ; There is deliberately no resolution setting here.

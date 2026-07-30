@@ -2,12 +2,22 @@
 
 Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES.md`.
 
-> # ❌ THE D3D9Ex PERFORMANCE PLAN IS CANCELLED (run 31)
+> # 🚨 THE GAME RUNS AT ~110 FPS. EVERY PERFORMANCE NUMBER BEFORE RUN 32 WAS WRONG.
 >
-> The frame copy was measured for the first time and it is **0.88 ms of a 28 ms frame — 3%**. The
-> D3D9Ex + `D3DPOOL_MANAGED` wrapper, this project's top performance item since spike 2, exists to
-> remove that. It was worth about **1 fps**. Draw calls are not the bottleneck either: 4.5× fewer of
-> them changed nothing. Whatever costs 27 ms has never been looked at. See **Run 31**.
+> **The "37–40 fps" this project has recorded for thirty runs was Virtual Desktop's Synchronous
+> Spacewarp**, which pins the app at *half* the headset refresh on purpose and synthesises the
+> frames in between. With SSW off and the headset at 120 Hz, the same build runs at **105–118 fps
+> (8.5–9.6 ms/frame)**. There was no performance problem to solve.
+>
+> Every historical measurement here — the bimodal distribution, the "CPU-bound stall", run 31's
+> conclusions — was taken through that halving and must be re-derived before it is trusted. See
+> **Run 32**.
+
+> # ⚠️ Run 31's verdict is RETRACTED
+>
+> Run 31 concluded "the frame copy is 3% of the frame, cancel the D3D9Ex plan". That was measured
+> under SSW: 0.88 ms of a frame padded out to 27.8 ms. **Unconfounded it is ~4.2 ms of an ~8.9 ms
+> frame — closer to half.** The D3D9Ex work is back on the table. See **Run 32**.
 
 > # ✅ THE FLICKER IS SOLVED (run 30)
 >
@@ -51,13 +61,15 @@ remaining on the list is planned work rather than a bug.
 With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
 debugging.
 
-1. **Performance — find where the frame actually goes.** ~~D3D9Ex + `D3DPOOL_MANAGED` wrapper.~~
-   **Cancelled by measurement (run 31): the frame copy is 3% of the frame and the wrapper would buy
-   ~1 fps.** Draw calls are not the cost either — 4.5× fewer of them changed nothing. The next step
-   is to read the new `frame budget` line, which separates time spent *idle in `xrWaitFrame`* from
-   time spent working. Leading hypothesis: frame times sit at almost exactly 2× a 72 Hz display
-   period, which is a **missed deadline**, not slow code — and getting under one period would double
-   the frame rate rather than shave a few percent off it.
+1. **Resolution — now the only real ladder rung left, and D3D9Ex is part of it.** Run 32 removed
+   performance as a standalone problem (the game does ~110 fps; the deficit was SSW). What remains
+   is that per-eye is 1280×1440 against the headset's 2496×2688. Two coupled pieces:
+   **(a)** the `GetCommandLineW` detour to inject `-ResX`/`-ResY` (designed, not implemented, must
+   fail safe), and the 4096 cap to bisect — try `-ResX=4096`, then `-ResY=4200`;
+   **(b)** the **D3D9Ex zero-copy path**, which at 1440p would be a nicety but at 4K is mandatory —
+   the CPU round-trip is ~4.2 ms today and projects to ~9.5 ms at 2160p, more than a whole 120 Hz
+   frame. Do (a) first: it produces the resolution at which (b) can be measured rather than
+   projected.
 2. **Resolution.** Per-eye is currently 1280×1440 against the headset's 2496×2688. Needs the
    command-line detour (design already written up under *How resolution will work*), and probably
    per-eye render targets given the ~4096 cap.
@@ -132,7 +144,8 @@ remaining issues are draw-path coverage.
 | Per eye at 2560×1440 | 1280×1440 — 51% of the panel |
 | Per eye at 3840×2160 | 1920×2160 — 77% of the panel |
 | Resolution cap | 3840×2160 accepted, 4992×2688 refused (likely 4096) |
-| Frame rate | ~37 fps at 1440p, ~28 at 4K, floor ~13 |
+| Frame rate | **105–118 fps** at 1440p, true stereo, SSW **off**, 120 Hz (run 32). The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
+| Frame copy (round-trip) | ~4.2 ms of an ~8.9 ms frame at 1440p — ~0.9 ms memcpy + ~3.3 ms readback stall |
 | Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
 | Scene targets | 2× scene-sized (A8R8G8B8 + A16B16G16R16F), shadow map 512×512 R32F |
 
@@ -466,7 +479,100 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-## ❌ Run 31 RESULT: the frame copy is 3% of the frame. The D3D9Ex plan is dead.
+## 🚨 Run 32: SSW was halving the frame rate. The real number is ~110 fps.
+
+**The user spotted this, not the instruments.** Virtual Desktop's Synchronous Spacewarp was on for
+every previous run. SSW pins the application at **half** the display refresh and generates the
+intermediate frames itself — so a build capable of 110 fps reports 36, by design, and nothing in
+the log looks wrong. With SSW off and the headset set to 120 Hz:
+
+```
+perf: 117.5 fps (8.51 ms/frame) | draws/frame peak 138, split 138 (138 with parallax, 0 flat)
+perf: 111.3 fps (8.98 ms/frame) | draws/frame peak 444, split 444
+perf: 106.1 fps (9.43 ms/frame) | draws/frame peak 891, split 883
+```
+
+**105–118 fps in true stereo at 2560×1440.** The performance problem this project has been
+organising itself around for thirty runs did not exist. It was a headset setting.
+
+### What this invalidates
+
+Everything numeric taken before run 32, including run 31's own conclusions:
+
+| Claim | Status |
+|---|---|
+| "~37 fps at 1440p, ~28 at 4K, floor ~13" | ❌ measured through SSW — re-derive |
+| "fps distribution is bimodal → CPU-bound stall" | ❌ frames either side of an SSW halving look identical |
+| Run 31: "frame copy is 3% → cancel D3D9Ex" | ❌ **retracted** — 0.88 ms only looked small against a 27.8 ms padded frame |
+| Run 31: "4.5× fewer draw calls changed nothing" | ❌ **retracted** — both sides were pinned at the SSW cap, so the comparison could not have shown a difference |
+
+The run-31 *method* was right and the instrument is what caught it — but an instrument that
+measures the frame honestly still reports a fiction if the frame itself is being synthesised.
+
+### ✅ The `FrameCopyMode` A/B, on clean data: pipelining LOSES
+
+Matched by scene, so the draw counts are comparable:
+
+| draws | pipelined (mode 0) | immediate (mode 1) |
+|---|---|---|
+| 367 | 107.0 fps (9.34 ms) | **109.7 fps (9.12 ms)** |
+| 444 | 111.0 fps (9.01 ms) | **111.3 fps (8.98 ms)** |
+| 138 | 114.5 fps (8.74 ms) | **117.5 fps (8.51 ms)** |
+
+Immediate is equal or better every time, *and* it does not cost a frame of latency. **The default
+is now `FrameCopyMode=1`.**
+
+The phase split says why, and it is the more useful finding: **pipelining did not remove the
+readback stall, it relocated it.**
+
+```
+pipelined:  copy 0.89 ms + our work 9.4 ms
+immediate:  copy 4.2  ms + our work 3.7 ms      <- same total
+```
+
+Issuing `GetRenderTargetData` without locking its result lets the call return immediately, so the
+phase timer sees nothing — but the driver still owes the transfer, and it surfaces later inside
+work the instrument does not break out. **Moving a stall out of an instrument's view is not an
+optimisation**, and it is a failure mode any future phase timing here should be read against.
+
+### ✅ So how expensive IS the round-trip? ~4.2 ms of an ~8.9 ms frame
+
+That is the number run 31 was trying to get and got wrong. Nearly half the frame, and it splits
+into ~0.9 ms of genuine memcpy bandwidth plus ~3.3 ms of readback stall.
+
+**This puts D3D9Ex back on the table — but with a much sharper justification than it ever had.**
+It is not a general fps fix; the game already clears 120 Hz-ish at 1440p. It is specifically the
+**enabler for the resolution work**, because the copy scales with pixel count:
+
+| Resolution | pixels vs 1440p | projected copy |
+|---|---|---|
+| 2560×1440 (today) | 1.0× | ~4.2 ms of an 8.9 ms frame |
+| 3840×2160 | 2.25× | **~9.5 ms — exceeds the entire 8.33 ms budget on its own** |
+| 4992×2688 (headset native) | 3.6× | hopeless |
+
+So the sequencing inverts. The round-trip is affordable at today's resolution and **fatal at the
+one the project actually wants**. Matching the headset needs the zero-copy path; it is not
+optional there, and it was never really about frame rate.
+
+### ⚠️ Test-environment discipline, now mandatory for any measurement
+
+SSW off, and the headset refresh recorded in the run notes. The build now logs
+`predictedDisplayPeriod` on the first frame, and warns when frame time sits at ~2× it:
+
+```
+headset display period 8.33 ms (120.0 Hz)
+*** frame time is 2.00x the display period. SUSPECT SSW/ASW ... Turn it OFF before trusting
+    ANY number in this log. ***
+```
+
+That check would have caught this three runs ago. It is cheap and it is now permanent.
+
+## ~~❌ Run 31 RESULT: the frame copy is 3% of the frame. The D3D9Ex plan is dead.~~ (RETRACTED — see run 32)
+
+> **Retracted in full by run 32.** Everything below was measured with SSW halving the frame rate,
+> which padded frames to 27.8 ms and made a 0.88 ms copy look like 3%. Kept, unedited, because the
+> *reasoning* was sound and only the input was corrupt — and because "the instrument was honest and
+> the answer was still wrong" is the most useful thing in this file.
 
 **The project's number-one performance item for thirty runs was aimed at the wrong thing.** The
 frame copy was measured for the first time, and it is not the bottleneck. It is not close.
@@ -1264,12 +1370,12 @@ stays documented above as the fallback if this path stalls again.
   halves of one — which means render-target switching, and touches the same area as the D3D9Ex work
   below. Stacking the eyes vertically does not help either: 2496×5376 is further over the limit.
 
-- **~~Performance — the D3D9Ex + MANAGED wrapper.~~ ❌ Cancelled by run 31.** The frame copy was
-  finally measured and it is **0.88 ms of a 28 ms frame — 3%**. The wrapper exists to remove that,
-  so it is worth about **1 fps** for 10,454 wrapped allocations across five resource types. The
-  bimodal fps distribution that promoted it (run 12, median ~70, floor ~13) is real but was
-  over-read as a CPU stall; frames landing either side of a display deadline produce the same shape.
-  Kept here because the *reasoning* is worth not repeating, not because the work is pending.
+- **Performance — the D3D9Ex + MANAGED wrapper. Reinstated by run 32, but re-scoped.** Not a frame
+  rate fix: the game already does ~110 fps at 1440p. It is the **resolution enabler** — the CPU
+  round-trip costs ~4.2 ms of an ~8.9 ms frame today and scales with pixels, so at 3840×2160 it
+  projects to ~9.5 ms, more than an entire 120 Hz frame. Still 10,454 MANAGED allocations to wrap
+  across five resource types. Do it when the resolution work needs it, measured at that resolution,
+  not before.
 - **FOV / aspect mismatch** — game renders 16:9, per-eye view is ~2496×2688.
 - **Head-look vs aim are coupled** — `PlayerController.Rotation` drives both view and fire trace.
 - **Menus are inert** — intended; they need OpenXR *input* (controllers, thumbsticks, laser
@@ -1279,11 +1385,20 @@ stays documented above as the fallback if this path stalls again.
 
 ## Method notes that earned their keep
 
+- **Validate the test environment before trusting the instrument.** SSW halved every frame-rate
+  number this project recorded for thirty runs, and nothing in the log looked wrong — the timings
+  were honest, the frame itself was synthetic. Run 31 built a correct instrument, measured
+  carefully, and drew a confident conclusion that was wrong at the input. **A measurement is only
+  as good as the thing being measured is real.** Check pacing, refresh, reprojection and frame
+  generation *first*, and record them next to the numbers.
 - **Measure the thing before building what the measurement justifies.** "The frame copy is the
   bottleneck" survived thirty runs and became the top-priority work item without anyone timing it.
-  It was 3%. The instrument that settled it took an afternoon; the wrapper it cancelled would have
-  taken weeks and could not have worked. The same applies to the fps distribution that promoted it
-  — one indirect signal, one explanation offered, never tested against a second.
+  That instinct was right — but see above, because the first attempt to act on it still produced a
+  wrong answer, and being right about *method* did not save it.
+- **A stall that leaves your instrument has not left your frame.** Pipelining the readback took the
+  copy phase from 4.2 ms to 0.89 ms and moved every one of those milliseconds into unmeasured work,
+  for no net gain. Any phase timing that improves while the total does not has probably relocated a
+  cost rather than removed one.
 - **Rotate logs that are truncated on attach.** Every measurement here is an A/B across launches,
   so a log that truncates destroys the run being compared against — silently, since the file still
   looks complete. Run 31 lost two of three tests that way.

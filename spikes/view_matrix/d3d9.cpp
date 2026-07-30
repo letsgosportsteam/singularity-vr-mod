@@ -1212,7 +1212,27 @@ struct CopySlot {
 };
 CopySlot g_slot[kCopySlots];
 int g_slotCur = 0;
-int g_copyMode = 0;                      // 0 = pipelined, 1 = immediate (pre-run-31 ordering)
+
+// ---- ⚠️ measured run 32: pipelining LOSES. Immediate is the default. ----
+//
+// Matched by scene (same draw counts, both at 120 Hz with SSW off):
+//
+//     draws   pipelined            immediate
+//       367   107.0 fps (9.34ms)   109.7 fps (9.12ms)
+//       444   111.0 fps (9.01ms)   111.3 fps (8.98ms)
+//       138   114.5 fps (8.74ms)   117.5 fps (8.51ms)
+//
+// Immediate is equal or slightly faster every time, and it does not cost a frame of latency.
+//
+// The phase split says why, and it is worth understanding before anyone tries this again:
+// pipelining did not remove the readback stall, it RELOCATED it. Pipelined reports copy 0.89 ms
+// and "our work" 9.4 ms; immediate reports copy 4.2 ms and "our work" 3.7 ms. Same total. Issuing
+// GetRenderTargetData without locking its result lets the call return immediately, so the phase
+// timer sees nothing - but the driver still has to do the transfer, and it surfaces later inside
+// work we do not measure. Moving a stall out of an instrument's view is not an optimisation.
+//
+// Numbers kept stable rather than renumbered, so old logs and STATUS entries still read correctly.
+int g_copyMode = 1;                      // 0 = pipelined, 1 = immediate  <- default, measured
 
 // Create the XR swapchain lazily, sized to the game's backbuffer - we are pasting the game's
 // own image, so matching its dimensions avoids any rescale on the way in.
@@ -2985,13 +3005,36 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 // "our work" is. Chasing the copy or the draw count while xrWaitFrame holds most
                 // of the frame would be optimising the part that is already free.
                 Log("    frame budget: xrWaitFrame %.2f (idle, waiting on the compositor)"
-                    " + copy %.2f + our work %.2f = %.2f ms%s",
+                    " + copy %.2f + our work %.2f = %.2f ms (%.0f%% of the %.2f ms display period)",
                     wf, copy, ms - wf - copy, ms,
-                    (g_displayPeriodMs > 0.0)
-                        ? (ms > g_displayPeriodMs * 1.6
-                               ? "   <-- ~2x the display period: a MISSED DEADLINE, not slow code"
-                               : "   <-- within one display period")
-                        : "");
+                    g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
+                    g_displayPeriodMs);
+                // ---- ⚠️ the check that should have existed before run 31 ----
+                //
+                // Run 31 measured 28 ms frames, concluded the app was missing a 72 Hz deadline,
+                // and cancelled the D3D9Ex work on the strength of it. The real cause was
+                // Synchronous Spacewarp: SSW pins the app at HALF the display rate on purpose
+                // and synthesises the frames in between. With it off the same build runs at
+                // 105-118 fps. Every performance number this project recorded before run 32 was
+                // taken through that halving, which is why the frame copy looked like 3% - it was
+                // 0.9 ms of a frame that had been padded out to 27.8 ms.
+                //
+                // A frame time sitting at a clean 2x the display period is the signature. It can
+                // also be a genuine deadline miss, but SSW is far commoner and costs nothing to
+                // rule out, so it is named first.
+                if (g_displayPeriodMs > 0.0) {
+                    const double mult = ms / g_displayPeriodMs;
+                    if (mult > 1.85 && mult < 2.15) {
+                        static int warned = 0;
+                        if (warned < 3) {
+                            ++warned;
+                            Log("    *** frame time is %.2fx the display period. SUSPECT SSW/ASW"
+                                " (Virtual Desktop 'Synchronous Spacewarp', Meta 'ASW') - it pins"
+                                " the app to half the refresh rate deliberately. Turn it OFF"
+                                " before trusting ANY number in this log. ***", mult);
+                        }
+                    }
+                }
             }
             g_msGRTD = g_msLockCopy = g_msUpload = 0.0;
             g_copyFrames = 0;
@@ -3258,7 +3301,7 @@ void LoadIniSettings() {
     // ordering on paper, but "on paper" is exactly what has been wrong six times in this project,
     // so the old ordering stays one relaunch away and the log prints the phase breakdown for
     // whichever is running.
-    g_copyMode = GetPrivateProfileIntA("Render", "FrameCopyMode", 0, path);
+    g_copyMode = GetPrivateProfileIntA("Render", "FrameCopyMode", 1, path);
     if (g_copyMode < 0 || g_copyMode > 1) g_copyMode = 0;
     Log("ini: FrameCopyMode=%d (%s)", g_copyMode,
         g_copyMode == 0 ? "pipelined - read back the frame captured last time, one frame of latency"
