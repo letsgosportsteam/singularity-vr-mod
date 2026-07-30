@@ -1108,7 +1108,6 @@ int   g_lockUploads = 0, g_lockRejects = 0;      // per frame, reset in Present
 int   g_framesNoIdent = 0;                       // per report window: frames that lost it entirely
 float g_bestRejectDot = -2.0f;                   // per report window
 
-IDirect3DSurface9* g_sysmemSurf = nullptr;   // D3D9 SYSTEMMEM copy target
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
 UINT g_srcW = 0, g_srcH = 0;
 D3DFORMAT g_srcFmt = D3DFMT_UNKNOWN;
@@ -1117,6 +1116,70 @@ XrPosef g_eyePose[2]{};
 XrFovf  g_eyeFov[2]{};
 bool    g_haveEyes = false;
 int     g_framesSubmitted = 0;
+
+// ---------------------------------------------------------------- the frame copy, measured
+//
+// "The frame copy is a full CPU round-trip" has been this project's performance headline since
+// spike 2, and it has never once been broken down. It is three separate costs with three
+// different fixes, and only one of them is the one D3D9Ex addresses:
+//
+//   GetRenderTargetData   GPU -> system memory. D3D9 has no asynchronous readback, so this
+//                         blocks; and it is issued at Present, when the GPU queue is deepest,
+//                         so it pays for a full pipeline drain on top of the transfer itself.
+//   lock + memcpy         system memory -> the D3D11 upload texture. Pure CPU bandwidth,
+//                         ~14 MB at 1440p, and nothing about D3D9Ex makes it cheaper.
+//   upload + CopyResource CPU -> GPU again, into the XR swapchain image.
+//
+// This matters for sequencing. The D3D9Ex + D3DPOOL_MANAGED wrapper is a large, invasive piece
+// of work - 10,454 MANAGED allocations were measured in spike 2, every one of which needs a
+// backing store we own - and it is justified by the assumption that the readback dominates.
+// That assumption has never been tested. If the drain is the cost, deferring the readback by a
+// frame recovers most of it for almost nothing. If the memcpy is the cost, D3D9Ex would not
+// have helped at all. Measure first, then spend.
+double g_msGRTD = 0.0, g_msLockCopy = 0.0, g_msUpload = 0.0;   // summed over the perf window
+int    g_copyFrames = 0;
+
+inline LARGE_INTEGER Now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
+
+inline double MsSince(const LARGE_INTEGER& t0) {
+    static LARGE_INTEGER freq{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    return double(now.QuadPart - t0.QuadPart) * 1000.0 / double(freq.QuadPart);
+}
+
+// ---- pipelining the readback, and why the pose has to travel with the pixels ----
+//
+// Issuing GetRenderTargetData and locking its result in the same breath is the worst available
+// ordering: the CPU waits for the GPU to finish everything queued, and then waits again for the
+// transfer. With two slots we issue this frame's readback and consume the one issued last
+// frame, so the transfer has a whole frame of GPU work to hide behind.
+//
+// Whether the driver actually lets it overlap is precisely what the phase timings above will
+// say, which is why this is a switch rather than simply the new behaviour. `FrameCopyMode=1`
+// restores the old ordering for an A/B in the same session.
+//
+// The price is one frame of latency, and it is paid honestly rather than ignored: each slot
+// carries the eye, the head pose and the projection its pixels were actually drawn with, and
+// those are what get submitted. Handing the compositor a fresh pose for a stale image is how
+// reprojection turns latency into visible swim - the image would be corrected towards a
+// position the frame never rendered from.
+const int kCopySlots = 2;
+
+struct CopySlot {
+    IDirect3DSurface9* surf = nullptr;   // D3D9 SYSTEMMEM copy target
+    bool    pending = false;             // holds pixels captured but not yet consumed
+    int     eye = 0;                     // g_renderEye at capture (alternate-eye mode)
+    bool    stereo = false;              // alternate-eye active for this frame
+    bool    dup = false;                 // draw duplication active for this frame
+    XrPosef pose[2]{};                   // where the head was when these pixels were drawn
+    XrFovf  fov[2]{};
+    bool    useDerived = false;
+    XrFovf  derived{};
+};
+CopySlot g_slot[kCopySlots];
+int g_slotCur = 0;
+int g_copyMode = 0;                      // 0 = pipelined, 1 = immediate (pre-run-31 ordering)
 
 // Create the XR swapchain lazily, sized to the game's backbuffer - we are pasting the game's
 // own image, so matching its dimensions avoids any rescale on the way in.
@@ -1180,18 +1243,24 @@ bool EnsureSwapchain(UINT w, UINT h) {
     return true;
 }
 
-// D3D9 SYSTEMMEM surface + matching CPU-writable D3D11 texture, both sized to the backbuffer.
+// D3D9 SYSTEMMEM surfaces + matching CPU-writable D3D11 texture, all sized to the backbuffer.
 bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
-    if (g_sysmemSurf && g_uploadTex && w == g_srcW && h == g_srcH && fmt == g_srcFmt) return true;
-    if (g_sysmemSurf) { g_sysmemSurf->Release(); g_sysmemSurf = nullptr; }
+    if (g_slot[0].surf && g_uploadTex && w == g_srcW && h == g_srcH && fmt == g_srcFmt) return true;
+    for (int i = 0; i < kCopySlots; ++i) {
+        if (g_slot[i].surf) { g_slot[i].surf->Release(); g_slot[i].surf = nullptr; }
+        g_slot[i].pending = false;
+    }
+    g_slotCur = 0;
     if (g_uploadTex)  { g_uploadTex->Release();  g_uploadTex = nullptr; }
 
     // GetRenderTargetData demands identical size AND format on both surfaces. Take the format
     // from the backbuffer rather than assuming: this build reports 21 = D3DFMT_A8R8G8B8, and
     // hardcoding X8R8G8B8 (22) is what made the call return D3DERR_INVALIDCALL.
-    if (FAILED(dev->CreateOffscreenPlainSurface(w, h, fmt, D3DPOOL_SYSTEMMEM,
-                                                &g_sysmemSurf, nullptr))) {
-        Log("CreateOffscreenPlainSurface failed for fmt=%d", (int)fmt); return false;
+    for (int i = 0; i < kCopySlots; ++i) {
+        if (FAILED(dev->CreateOffscreenPlainSurface(w, h, fmt, D3DPOOL_SYSTEMMEM,
+                                                    &g_slot[i].surf, nullptr))) {
+            Log("CreateOffscreenPlainSurface %d failed for fmt=%d", i, (int)fmt); return false;
+        }
     }
     D3D11_TEXTURE2D_DESC td{};
     td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
@@ -1204,7 +1273,8 @@ bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
         Log("CreateTexture2D(upload) failed"); return false;
     }
     g_srcW = w; g_srcH = h; g_srcFmt = fmt;
-    Log("copy resources ready for %ux%u fmt=%d", w, h, (int)fmt);
+    Log("copy resources ready for %ux%u fmt=%d (%d readback slots, %s)", w, h, (int)fmt,
+        kCopySlots, g_copyMode == 1 ? "immediate" : "pipelined one frame");
     return true;
 }
 
@@ -1272,14 +1342,22 @@ void MeasureCullBand(const uint8_t* bits, int pitch, UINT w, UINT h) {
 
 // Pull the game's finished frame across to D3D11. This is the expensive part: a full
 // GPU->CPU readback followed by a CPU->GPU upload, roughly 14 MB each way at 2560x1440.
-bool CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
+//
+// Returns the slot whose pixels now sit in g_uploadTex, or nullptr if there is nothing to submit.
+// In pipelined mode the very first frame returns nullptr because nothing has been captured yet -
+// that is normal startup, not a failure.
+const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
     IDirect3DSurface9* back = nullptr;
-    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) return false;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) return nullptr;
     D3DSURFACE_DESC sd{};
     back->GetDesc(&sd);
-    if (!EnsureCopyResources(dev, sd.Width, sd.Height, sd.Format)) { back->Release(); return false; }
+    if (!EnsureCopyResources(dev, sd.Width, sd.Height, sd.Format)) { back->Release(); return nullptr; }
 
-    HRESULT hr = dev->GetRenderTargetData(back, g_sysmemSurf);
+    CopySlot& cap = g_slot[g_slotCur];
+
+    LARGE_INTEGER t0 = Now();
+    HRESULT hr = dev->GetRenderTargetData(back, cap.surf);
+    g_msGRTD += MsSince(t0);
     back->Release();
     if (FAILED(hr)) {
         static bool once = false;
@@ -1288,23 +1366,67 @@ bool CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
                 hr, sd.Width, sd.Height, (int)sd.Format, (int)sd.MultiSampleType);
             once = true;
         }
-        return false;
+        return nullptr;
     }
 
+    // Stamp the slot with the state its pixels were drawn under. Everything the submission needs
+    // is captured here, at the moment of capture, so a frame consumed later cannot be submitted
+    // with a pose or a projection it was never rendered from.
+    cap.pending = true;
+    cap.stereo  = InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
+    cap.dup     = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    // The backbuffer just read was drawn with the offset chosen at the END of the previous frame,
+    // so it belongs to g_renderEye - not to whichever eye is about to be switched to.
+    cap.eye     = cap.stereo ? g_renderEye : 0;
+    for (int i = 0; i < 2; ++i) {
+        cap.pose[i] = cap.stereo ? g_renderPose[i] : g_eyePose[i];
+        cap.fov[i]  = g_eyeFov[i];
+    }
+    // Submit the frustum we FORCED, not the one we observed. Following the observation was the
+    // run-5 flicker: the engine's FOV drifts between our writes, so a submitted frustum that
+    // tracked it inherited every wobble.
+    cap.useDerived = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
+                     g_targetTanX > 0.0f && g_targetTanY > 0.0f;
+    if (cap.useDerived) {
+        cap.derived.angleLeft  = -atanf(g_targetTanX);
+        cap.derived.angleRight =  atanf(g_targetTanX);
+        cap.derived.angleUp    =  atanf(g_targetTanY);
+        cap.derived.angleDown  = -atanf(g_targetTanY);
+    }
+
+    // Which slot we consume is the entire difference between the two modes.
+    const int consumeIdx = (g_copyMode == 1) ? g_slotCur : (g_slotCur + 1) % kCopySlots;
+    g_slotCur = (g_slotCur + 1) % kCopySlots;
+
+    CopySlot& use = g_slot[consumeIdx];
+    if (!use.pending) return nullptr;          // pipelined, first frame - nothing captured yet
+
+    t0 = Now();
     D3DLOCKED_RECT lr{};
-    if (FAILED(g_sysmemSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return false;
+    if (FAILED(use.surf->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return nullptr;
     D3D11_MAPPED_SUBRESOURCE ms{};
     if (FAILED(g_ctx11->Map(g_uploadTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
-        g_sysmemSurf->UnlockRect(); return false;
+        use.surf->UnlockRect(); return nullptr;
     }
     const uint8_t* s = static_cast<const uint8_t*>(lr.pBits);
     uint8_t* d = static_cast<uint8_t*>(ms.pData);
     const size_t rowBytes = (size_t)g_srcW * 4;
-    for (UINT y = 0; y < g_srcH; ++y) memcpy(d + (size_t)y * ms.RowPitch, s + (size_t)y * lr.Pitch, rowBytes);
+    // One memcpy when both pitches are tight, which they usually are. 1440 separate row copies
+    // per frame is pure call overhead when the memory is contiguous on both sides.
+    if ((size_t)lr.Pitch == rowBytes && (size_t)ms.RowPitch == rowBytes) {
+        memcpy(d, s, rowBytes * g_srcH);
+    } else {
+        for (UINT y = 0; y < g_srcH; ++y)
+            memcpy(d + (size_t)y * ms.RowPitch, s + (size_t)y * lr.Pitch, rowBytes);
+    }
     MeasureCullBand(s, lr.Pitch, g_srcW, g_srcH);
     g_ctx11->Unmap(g_uploadTex, 0);
-    g_sysmemSurf->UnlockRect();
-    return true;
+    use.surf->UnlockRect();
+    g_msLockCopy += MsSince(t0);
+    ++g_copyFrames;
+
+    use.pending = false;
+    return &use;
 }
 
 const float kRadToUU = 65536.0f / 6.2831853f;
@@ -1465,13 +1587,15 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
     const XrCompositionLayerBaseHeader* layers[1] = { nullptr };
     uint32_t layerCount = 0;
 
-    if (fs.shouldRender && g_haveEyes && gameDev && CopyBackbufferToD3D11(gameDev)
-        && EnsureSwapchain(g_srcW, g_srcH)) {
-        const bool stereo = InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
-        // The backbuffer we are about to copy was drawn with the offset chosen at the END of
-        // the previous frame, so it belongs to g_renderEye - not to whichever eye we are about
-        // to switch to.
-        const int filled = stereo ? g_renderEye : 0;
+    const CopySlot* frame = (fs.shouldRender && g_haveEyes && gameDev)
+                          ? CopyBackbufferToD3D11(gameDev) : nullptr;
+
+    if (frame && EnsureSwapchain(g_srcW, g_srcH)) {
+        // Every one of these was captured with the pixels, not read live. In pipelined mode the
+        // image is a frame old, and reading `g_stereo` or `g_eyePose` here would describe the
+        // frame being drawn now rather than the one being submitted.
+        const bool stereo = frame->stereo;
+        const int filled = frame->eye;
 
         uint32_t idx = 0;
         XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1479,11 +1603,13 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
             wi.timeout = XR_INFINITE_DURATION;
             if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain[filled], &wi))) {
+                LARGE_INTEGER tUp = Now();
                 g_ctx11->CopyResource(g_scImages[filled][idx], g_uploadTex);
+                g_msUpload += MsSince(tUp);
                 XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
                 xrReleaseSwapchainImage(g_swapchain[filled], &ri);
                 g_eyeFilled[filled] = true;
-                if (!stereo) { g_renderPose[0] = g_eyePose[0]; g_renderPose[1] = g_eyePose[1]; }
+                if (!stereo) { g_renderPose[0] = frame->pose[0]; g_renderPose[1] = frame->pose[1]; }
 
                 // Both eyes reference the SAME image - this is the MonoTracked rung, not
                 // stereo. It reads as depth-free but correctly oriented, because the game
@@ -1495,26 +1621,17 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 // observation was the flicker: the engine's FOV drifts between our writes, so
                 // a submitted frustum that tracked it inherited every wobble. Forcing the
                 // matrix and submitting the same constant means the two agree by construction.
-                bool useDerived = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
-                                  g_targetTanX > 0.0f && g_targetTanY > 0.0f;
-                XrFovf derived{};
-                if (useDerived) {
-                    derived.angleLeft  = -atanf(g_targetTanX);
-                    derived.angleRight =  atanf(g_targetTanX);
-                    derived.angleUp    =  atanf(g_targetTanY);
-                    derived.angleDown  = -atanf(g_targetTanY);
-                }
                 // In mono both eyes reference the one filled swapchain, as before. In stereo
                 // each eye gets its own, submitted with the pose its image was actually
                 // rendered from - which for the eye not drawn this frame is a frame old. That
                 // stale pose is the honest one: telling the compositor where the image really
                 // came from lets it reproject correctly instead of mismatching the two eyes.
-                const bool dupNow = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+                const bool dupNow = frame->dup;
                 for (int i = 0; i < 2; ++i) {
                     const int src = stereo ? i : 0;
                     projViews[i] = { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
-                    projViews[i].pose = stereo ? g_renderPose[i] : g_eyePose[i];
-                    projViews[i].fov  = useDerived ? derived : g_eyeFov[i];
+                    projViews[i].pose = frame->pose[i];
+                    projViews[i].fov  = frame->useDerived ? frame->derived : frame->fov[i];
                     projViews[i].subImage.swapchain = g_swapchain[src];
                     if (dupNow) {
                         // Both eyes live in one image, side by side. Hand each eye its half by
@@ -2797,6 +2914,29 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
                 offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak, upPeak, g_framesNoIdent,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
+            // ---- the frame copy, broken into its three phases (run 31) ----
+            //
+            // This is the number that decides whether the D3D9Ex + MANAGED-pool wrapper is worth
+            // writing. Only `readback` is the part D3D9Ex removes; lock/memcpy and upload survive
+            // it untouched. If the residual - everything that is NOT the copy - dominates, then
+            // the bottleneck was never the round-trip and the whole plan needs rethinking.
+            //
+            // The residual is also the meter for re-measuring the occlusion override: draw
+            // submission lives in it, so running OcclusionQueryMode=1 against 2 and comparing
+            // residuals prices ~7,600 draw calls a frame directly, without timing each one.
+            if (g_copyFrames) {
+                const double ms = (accum * 1000.0) / frames;
+                const double rb = g_msGRTD / g_copyFrames;
+                const double lc = g_msLockCopy / g_copyFrames;
+                const double up = g_msUpload / g_copyFrames;
+                Log("    frame copy [%s]: readback %.2f + lock/memcpy %.2f + upload %.2f"
+                    " = %.2f ms of %.2f (%.0f%%), residual %.2f ms",
+                    g_copyMode == 1 ? "immediate" : "pipelined", rb, lc, up,
+                    rb + lc + up, ms, ms > 0 ? 100.0 * (rb + lc + up) / ms : 0.0,
+                    ms - (rb + lc + up));
+            }
+            g_msGRTD = g_msLockCopy = g_msUpload = 0.0;
+            g_copyFrames = 0;
             // The identification counters are the point of this run. c0 carries one matrix per
             // frame, so a rejection is a whole-frame event - no forced projection and no split for
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
@@ -3054,6 +3194,16 @@ void LoadIniSettings() {
         g_occlusionMode == 1 ? "always report visible" :
         g_occlusionMode == 2 ? "never override - the engine's own occlusion culling stays live"
                              : "refuse to create - WARNING, this crashed the game in run 30");
+
+    // The A/B for the readback ordering. Pipelined is the default because it is the better
+    // ordering on paper, but "on paper" is exactly what has been wrong six times in this project,
+    // so the old ordering stays one relaunch away and the log prints the phase breakdown for
+    // whichever is running.
+    g_copyMode = GetPrivateProfileIntA("Render", "FrameCopyMode", 0, path);
+    if (g_copyMode < 0 || g_copyMode > 1) g_copyMode = 0;
+    Log("ini: FrameCopyMode=%d (%s)", g_copyMode,
+        g_copyMode == 0 ? "pipelined - read back the frame captured last time, one frame of latency"
+                        : "immediate - capture and consume in the same Present (pre-run-31)");
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;

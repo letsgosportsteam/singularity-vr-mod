@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-07-30** (end of run 27). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-07-30** (run 31 built, not yet run). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ THE FLICKER IS SOLVED (run 30)
 >
@@ -48,9 +48,12 @@ debugging.
    The frame copy is a full CPU round-trip (~14 MB each way at 1440p) and the fps distribution is
    bimodal, the signature of a CPU-bound stall. It also gates everything below, since matching the
    headset's resolution multiplies the copy cost ~3.6×.
-   **Re-measure the occlusion override immediately afterwards** — it is currently free only because
-   the frame copy hides it, and ~7,600 draw calls a frame will not stay free. See *Better fixes*
-   under run 30.
+   **Run 31 built the measurement this decision needs and it has not been read yet** — see below.
+   Do not start the wrapper before reading it; it is a large job justified by an assumption that
+   has never been tested.
+   **Re-measure the occlusion override at the same time** — it is currently free only because
+   the frame copy hides it, and ~7,600 draw calls a frame will not stay free. The residual figure
+   in the new perf line is the meter for it. See *Better fixes* under run 30.
 2. **Resolution.** Per-eye is currently 1280×1440 against the headset's 2496×2688. Needs the
    command-line detour (design already written up under *How resolution will work*), and probably
    per-eye render targets given the ~4096 cap.
@@ -458,6 +461,71 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
+
+## 🔬 Run 31: the frame copy, instrumented — built, NOT YET RUN
+
+The performance plan of record is "upgrade the device to D3D9Ex, wrap `D3DPOOL_MANAGED`, share the
+surface with D3D11, done". That is a **large** job: spike 2 measured **10,454 MANAGED allocations**
+in one session, and D3D9Ex rejects the pool outright, so every one of them needs a `DEFAULT`
+resource plus a staging copy we own, behind COM wrappers for five resource types, with unwrapping
+at every device entry point that takes a resource. It is worth doing if the readback is the cost.
+
+**Nothing has ever checked that it is.** "The frame copy is the bottleneck" has been repeated since
+spike 2 on the strength of one indirect signal — the bimodal fps distribution — and the copy is
+three costs, not one:
+
+| Phase | What it is | Does D3D9Ex remove it? |
+|---|---|---|
+| `readback` | `GetRenderTargetData`, GPU → system memory | **yes** — this is the whole point |
+| `lock/memcpy` | system memory → the D3D11 upload texture, ~14 MB at 1440p | no |
+| `upload` | CPU → GPU again, into the XR swapchain image | no |
+
+So this run builds the discriminator instead of the wrapper. Two changes:
+
+**1. Phase timings in the per-second perf line.** Reports all three phases plus the **residual**
+(frame time minus the copy). If the residual dominates, the round-trip was never the bottleneck and
+the whole performance plan needs rethinking before a line of wrapper code is written.
+
+```
+frame copy [pipelined]: readback 0.00 + lock/memcpy 0.00 + upload 0.00 = 0.00 ms of 0.00 (0%), residual 0.00 ms
+```
+
+**2. `FrameCopyMode` — pipelined readback, and the A/B that prices it.** D3D9 has no asynchronous
+readback, and the current code issues `GetRenderTargetData` and locks its result in the same
+breath, at `Present`, when the GPU queue is deepest. That pays for a full pipeline drain *and* the
+transfer. Mode 0 (new default) issues this frame's readback and consumes the one issued last frame,
+giving the transfer a frame of GPU work to hide behind. Mode 1 restores the old ordering.
+
+**This is the cheap half of the D3D9Ex win, testable in one run.** If pipelining collapses the
+`readback` figure, the stall was the drain and a large part of the benefit is already banked
+without the wrapper. If it does not move, the readback is a real transfer cost and the wrapper is
+justified — with a number behind it rather than an assumption.
+
+Also folded in: a single `memcpy` when both pitches are tight, replacing 1440 per-row calls.
+
+### The latency, and the trap in it
+
+Pipelining costs one frame of latency — the submitted image is a frame old. That is handled by
+**capturing the eye, head pose and projection with the pixels** and submitting those, rather than
+reading the live values when the frame surfaces. This is not fussiness. Handing the compositor a
+*fresh* pose for a *stale* image makes it reproject towards a position the frame was never rendered
+from, which reads as **swim** — an artefact that is both worse than lag and much harder to diagnose.
+The submission block now reads `frame->pose` / `frame->dup` / `frame->stereo` throughout; do not
+"simplify" it back to the globals.
+
+A side benefit: toggling F1 mid-session can no longer submit a duplicated frame with mono eye rects
+(or the reverse) for one frame, because the rect choice now travels with the image it describes.
+
+### ⬜ What has to happen next, in order
+
+1. **Read the perf line in both modes** (one launch each, `FrameCopyMode=0` then `1`).
+2. **Then** decide on the wrapper. The three outcomes: readback dominates and pipelining fixes it →
+   most of the win is banked, wrapper drops down the list; readback dominates and pipelining does
+   not move it → write the wrapper, now justified by measurement; residual dominates → stop, the
+   bottleneck is elsewhere and everything above is mis-aimed.
+3. **Re-measure the occlusion override in the same session** — `OcclusionQueryMode=1` against `2`,
+   comparing **residuals**. Draw submission lives in the residual, so that difference prices ~7,600
+   draw calls a frame directly, without timing each one.
 
 ## ✅ Run 30: SOLVED — it was occlusion query readback
 
