@@ -974,6 +974,30 @@ volatile LONG g_dupDraws = 0;
 volatile LONG g_eyeDebug = 0;        // 0 = both halves, 1 = left half only, 2 = right half only
 volatile LONG g_swapEyes = 0;        // reverse which half feeds which eye
 
+// ---- HOME: the scissor kill-switch, and why it is decisive (run 28) ----
+//
+// After run 27 the numbers say every scene draw is split, every one is parallaxed, identification
+// never lapses and only the two real scene targets are touched - and objects still vanish. Two
+// mechanisms survive that, and they differ in one respect that no counter here can see:
+//
+//   * the object IS drawn, and our scissor clips it away, because we could not remap its
+//     transform and it therefore still holds full-frame coordinates. The centre of the frame is
+//     the seam, so a head-on object is discarded in BOTH halves.
+//   * the object is NEVER drawn, because the engine culled it. Measured and real: its own
+//     arriving matrix carries 51.1 deg vertical while we render 98.0.
+//
+// Turning the scissor off separates them in one keypress. Geometry we DID remap is unaffected -
+// the clip-space remap already places it inside its half, so the scissor was never what put it
+// there. Geometry we did NOT remap reappears, spanning the full frame and duplicated, which is
+// wrong-looking but unmistakable.
+//
+//   object comes back -> it was being drawn and we clipped it. Draw classification is the fix.
+//   object stays gone -> no draw call ever existed. Culling is the fix.
+//
+// This is the discriminator the last six theories all lacked: they argued about which mechanism
+// it was without any test that could tell drawn-then-clipped from never-drawn.
+volatile LONG g_noScissor = 0;
+
 float g_eyeDeltaUU[3] = {0,0,0};     // left eye -> right eye, in game world units
 bool  g_camMatrixBound = false;      // is the camera's view matrix the one currently set?
 
@@ -1901,11 +1925,15 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     const bool haveParallax = ed2 > 0.01f;      // 0.1 UU ~ 2 mm; a real IPD is 3-4 UU
 
     // Save the scissor state so the game's own setup is restored untouched.
+    // HOME suppresses the scissor entirely - see the note by g_noScissor for what that decides.
+    const bool useScissor = !InterlockedCompareExchange(&g_noScissor, 0, 0);
     RECT  oldRect{};
     DWORD oldScissorOn = FALSE;
-    dev->GetScissorRect(&oldRect);
-    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissorOn);
-    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+    if (useScissor) {
+        dev->GetScissorRect(&oldRect);
+        dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissorOn);
+        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+    }
 
     float mat[16];
     HRESULT hr = S_OK;
@@ -1913,7 +1941,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     if (dbg != 2) {
         RECT lr = { (LONG)full.X, (LONG)full.Y,
                     (LONG)full.X + halfW, (LONG)(full.Y + full.Height) };
-        dev->SetScissorRect(&lr);
+        if (useScissor) dev->SetScissorRect(&lr);
         for (int i = 0; i < nSlots; ++i) {
             const CamMatSlot& cs = g_camMats[slots[i]];
             memcpy(mat, cs.m, sizeof(mat));
@@ -1926,7 +1954,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     if (dbg != 1) {
         RECT rr = { (LONG)full.X + halfW, (LONG)full.Y,
                     (LONG)(full.X + full.Width), (LONG)(full.Y + full.Height) };
-        dev->SetScissorRect(&rr);
+        if (useScissor) dev->SetScissorRect(&rr);
         for (int i = 0; i < nSlots; ++i) {
             const CamMatSlot& cs = g_camMats[slots[i]];
             memcpy(mat, cs.m, sizeof(mat));
@@ -1943,8 +1971,10 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     // Put back exactly what the engine had set, for every register we disturbed.
     for (int i = 0; i < nSlots; ++i)
         g_origSetVSConstF(dev, g_camMats[slots[i]].reg, g_camMats[slots[i]].m, 4);
-    dev->SetScissorRect(&oldRect);
-    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissorOn);
+    if (useScissor) {
+        dev->SetScissorRect(&oldRect);
+        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissorOn);
+    }
     ++g_drawsDuped;
     if (haveParallax) ++g_drawsDupedOffset;
     return hr;
@@ -2440,6 +2470,21 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     }
     pPgDn = kPgDn;
 
+    // HOME: suppress the scissor. The one test that separates "drawn, then clipped by us" from
+    // "never drawn at all" - see the note by g_noScissor.
+    static bool pHome = false;
+    bool kHome = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+    if (kHome && !pHome) {
+        LONG was = InterlockedCompareExchange(&g_noScissor, 0, 0);
+        InterlockedExchange(&g_noScissor, was ? 0 : 1);
+        Log("HOME: eye-half scissor %s", was ? "ON (normal)"
+            : "OFF  <-- DECISIVE TEST. Geometry we remapped is unaffected. Geometry we could NOT"
+              " remap now REAPPEARS, full-frame and duplicated. If the vanishing object comes"
+              " back, it was being drawn and we were clipping it - the fix is draw"
+              " classification. If it stays gone, no draw call ever existed - the fix is culling.");
+    }
+    pHome = kHome;
+
     // DELETE: reverse the mapping, so a confirmed swap can be fixed and verified immediately.
     static bool pDel = false;
     bool kDel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
@@ -2577,10 +2622,22 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     Log("*** WARNING: TRUE STEREO is ON but NOTHING was split (%d draws seen)."
                         " The scene target does not match the backbuffer %ux%u - stereo is"
                         " inactive. ***", totPeak, g_srcW, g_srcH);
-                // Decisive for the run-18 theory. If this only ever reads 1, characters do NOT
-                // take their view-projection from a second register and the vanishing-monster
-                // explanation is wrong - so the number is worth stating plainly either way.
-                Log("camera matrices tracked: %d register(s) live at once (of %d ever seen)",
+                // ---- ⚠️ this line is NOT evidence about the run-18 theory (found run 28) ----
+                //
+                // It was recorded in STATUS as refuting it: "register count measured 1, ever".
+                // But the modify path only ever caches g_lockedReg, so g_camMats can hold at most
+                // one entry by construction. This counter cannot report anything else, and the
+                // theory it supposedly killed was never tested. Third tautological diagnostic in
+                // this file, after `remapKnown = true` and the perf line's swallowed argument.
+                //
+                // Worse, the scan cannot settle it either. It finds VIEW matrices by requiring the
+                // camera to transform to w ~ 0. A pre-composed LOCAL-TO-CLIP matrix puts w at the
+                // object's distance, not zero, so it can never pass - geometry drawn that way is
+                // invisible to every instrument here, gets scissored while still holding
+                // full-frame coordinates, and disappears at the seam. HOME is the test for it.
+                Log("registers cached for the draw hook: %d live (of %d ever). NB this is capped"
+                    " at 1 by construction - it says nothing about whether other registers carry"
+                    " view-projections. Use F7 for that, and HOME for the composed-matrix case.",
                     g_camMatValidPeak, g_camMatUsed);
                 for (int s = 0; s < g_camMatUsed; ++s)
                     Log("    c%-3u %s %s", g_camMats[s].reg,
