@@ -499,10 +499,16 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-## ✅ Run 42: SOLVED — a second view-projection at `vs c13` is never remapped
+## ✅ Run 42: the shadow bug — a second view-projection at `vs c13` is never remapped
 
-**The run-18 "vanishing monster" theory was right all along, and the counter that twice "refuted"
-it could only ever report 1.**
+> ⚠️ **Correction, recorded because it was written down wrong first.** This was initially filed as
+> vindicating the run-18 "vanishing monster" theory. **It is not.** Objects vanishing — the monster
+> among them — was **occlusion query readback, solved in run 30**. That symptom is closed and this
+> is a different one: geometry that renders correctly but whose *shadow* is mis-projected and split
+> across the seam. Conflating the two muddies a question run 30 already answered.
+>
+> What survives the correction is the measured evidence below, which stands on its own and never
+> needed the run-18 story.
 
 Three pieces of evidence, and they agree:
 
@@ -529,12 +535,17 @@ dump is a long run of bone matrices. Skinned meshes ride the second matrix.
 So: geometry driven by `c13` keeps full-frame coordinates, gets scissored anyway, and lands split
 across the seam. More shadow casters under the light means more of it visible at once.
 
-### Why this hid for twenty runs
+### Why the single-register limit went unnoticed
 
-The perf line reported `registers cached: 1` and that was twice written into STATUS as evidence
-against the theory. **It is a tautology** — the cache can only ever hold `g_lockedReg`. Run 28
-caught this and annotated the line; nothing followed up. Fourth tautological diagnostic in this
-file, after `remapKnown = true`, the perf line's swallowed argument, and the census `<- SPLIT` label.
+The perf line reported `registers cached: 1`, which reads like a measurement of how many
+view-projections the engine uses. **It is a tautology** — the cache can only ever hold
+`g_lockedReg`, so the number is 1 by construction regardless of what the engine does. Run 28 caught
+this and annotated the line; nothing followed up. Fourth tautological diagnostic in this file, after
+`remapKnown = true`, the perf line's swallowed argument, and the census `<- SPLIT` label.
+
+(Run 28's annotation framed this around the run-18 *vanishing* theory. That framing is now moot —
+vanishing objects were occlusion queries, closed in run 30 — but the point about the counter being
+incapable of reporting anything but 1 stands, and is what matters here.)
 
 The F7 scan cannot settle it either: it identifies view matrices by requiring the camera to
 transform to `w ≈ 0`, and only keeps the best single hit.
