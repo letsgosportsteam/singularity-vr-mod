@@ -185,6 +185,53 @@ ExtraCamReg=-1
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------
+; HeadRoll   -- the third rotation axis, finally written
+;
+; F9 drove pitch and yaw only. Roll was never written anywhere, so tilting your
+; head sideways left the horizon glued to the headset - the last missing piece
+; of a real head pose.
+;
+; It does NOT go through the engine's rotation. The detour owns pitch, yaw needs
+; a direct write to the controller, and UE3 zeroes camera roll in several
+; places - three seams to fight for an angle we already own outright, since the
+; view matrix is ours by the time it reaches the GPU. Roll is applied there, as
+; a rotation of clip x/y, after the forced projection and before the per-eye
+; half-frame remap.
+;
+; ---- why the compositor does not already do this ----
+;
+; The submitted projection layer carries the head's full orientation, roll
+; included, so it looks like the runtime should be rotating the image for us. It
+; does not: a projection layer is reprojected by the DELTA between the pose we
+; claim and the pose the display is at. Claim a rolled pose for an unrolled
+; render while the head is at that same roll, the delta is zero, and the image
+; is presented straight - exactly the symptom. Baking roll into the render is
+; what makes the claimed pose true.
+;
+; Costs nothing measurable: about 16 multiply-adds on the camera-matrix uploads
+; only, and it allocates nothing. Confirmed in the headset at up to 43 degrees
+; of tilt with no corner dropout.
+;
+; NUMPAD1 toggles it live. NUMPAD2 flips the sign. The default of -1 was
+; MEASURED - +1 tilted the horizon the wrong way - and it is the third axis
+; where OpenXR's handedness comes out negative against the game's, which is what
+; F4 and F5 exist for on pitch and yaw.
+;
+; The maths is verified as arithmetic rather than by eye: spikes/roll_math
+; asserts the rotation is exact, does not shear despite tanX != tanY, and
+; composes with the eye remap. Run .\spikes\roll_math\build.ps1 - no game and no
+; headset needed.
+;
+; Known interaction, not yet a problem: the engine culls with an UNROLLED
+; frustum, so a rolled view's corners reach outside it. Nothing was observed at
+; 43 degrees; PAGE UP is the lever if it ever shows up.
+;
+;   1 = tilting your head tilts the view                           <- default
+;   0 = off, the horizon stays locked to the headset
+; ---------------------------------------------------------------------------
+HeadRoll=1
+
+; ---------------------------------------------------------------------------
 ; OcclusionQueryMode   -- THIS IS THE FIX FOR THE VANISHING OBJECTS (run 30)
 ;
 ; UE3 draws a bounding box per primitive inside an occlusion query, reads the

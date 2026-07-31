@@ -40,6 +40,27 @@ Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES
 >
 > Seven mechanisms were eliminated by direct test before this one landed. See **Run 30**.
 
+> # ✅ Head roll is in. Tilting your head tilts the view.
+>
+> The last axis of the head pose that was never written anywhere. Applied in the **view matrix**,
+> not the engine's rotation — and it could *not* be left to the compositor, which is the trap: a
+> projection layer is reprojected by the **delta** between the pose we claim and the pose the
+> display is at, so claiming a rolled pose for an unrolled render cancels out exactly.
+> **NUMPAD1** toggles, **NUMPAD2** flips the sign. Costs nothing measurable and allocates nothing.
+> Maths verified as arithmetic before any headset run — `.\spikes\roll_math\build.ps1`.
+
+> # ⚠️ Method note that cost a whole afternoon: gating a diagnostic's WORK is not gating its COST.
+>
+> The Stage 4B probe (since reverted) allocated a scene-sized render target **and** depth-stencil —
+> **~70 MB at 4096×2160** — in `EnsureCopyResources`, unconditionally, behind a hotkey that had to
+> be pressed for them to be touched at all. Every run paid it from the first frame.
+>
+> Worse was the diagnosis. Hours went into bisecting commits while **the machine itself was
+> degrading**: the identical `fa02fb1` binary ran at **32–38%** of windows over 15 ms at midday and
+> **4%** the same evening after the machine rested, with "our work" halving 11.02 → 5.80 ms. The
+> cheap control — rename `d3d9.dll` and run the game unmodded — was not tried until after half a
+> dozen sessions had been burned on code. **Validate the environment before bisecting yourself.**
+
 ## TL;DR — where we stand
 
 **Working and wearable.** Head tracking, 6-DOF, correct colours, a VR-correct projection, and
@@ -202,7 +223,8 @@ stereo (draw duplication) · **F12** alternate-eye stereo ·
 **INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment ·
 **PAGE UP** cycle culling headroom (now runs *down* from 1.0) · **PAGE DOWN** cycle how much of
 the headset's FOV we render · **HOME** scissor off (drawn-then-clipped vs never-drawn) ·
-**END** clip out everything driven by the tracked register (remapped vs unremapped).
+**END** clip out everything driven by the tracked register (remapped vs unremapped) ·
+**NUMPAD1** head roll on/off · **NUMPAD2** flip the roll sign.
 
 **Do not press F12 after F1.** F1 clears alternate-eye, but F12 does *not* clear duplication, so
 that order leaves both stereo modes running at once. F12 before F1 is harmless and pointless.

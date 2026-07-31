@@ -568,6 +568,10 @@ float g_capTanMin = 1e9f, g_capTanMax = -1e9f;
 // badly (mCurrentPOV read 157.9 while the matrix the engine actually built carried 80.7 x 51.1).
 float g_capTanYMin = 1e9f;
 int   g_injCount = 0;
+// Draws whose matrix actually received a roll. Reported next to the peak angle so "roll is on"
+// and "roll reached the GPU" stay separate claims - every counter in this project that could only
+// report the good case has eventually misled someone.
+int   g_rollApplied = 0;
 
 // The projection scales, from the x and y columns. See ClipW for how the conventions differ.
 inline void ProjTangents(const Reg4* r, int conv, float* tanX, float* tanY) {
@@ -865,6 +869,69 @@ void ApplyEyeRemap(Reg4* r, int conv, float s) {
         r[0].y = 0.5f * r[0].y + s * r[3].y;
         r[0].z = 0.5f * r[0].z + s * r[3].z;
         r[0].w = 0.5f * r[0].w + s * r[3].w;
+    }
+}
+
+// ---- head ROLL, applied in clip space ----
+//
+// Roll was the last axis of the head pose never written anywhere: F9 drove pitch and yaw only, so
+// tilting your head sideways left the horizon glued to the headset instead of staying level.
+//
+// It does NOT go through the engine's FRotator. The detour owns pitch, yaw needs a direct write to
+// the controller, and UE3 zeroes camera roll in several places - three seams to fight for an angle
+// we already own outright, because the view matrix is ours by the time it reaches the GPU.
+//
+// ⚠️ And it CANNOT be left to the compositor, which is the trap here. The submitted projection
+// layer already carries the head's full orientation, roll included, so it looks like the runtime
+// should be rotating the image for us. It does not: a projection layer is reprojected by the
+// DELTA between the pose we claim and the pose the display is at. Claim a rolled pose for an
+// unrolled render while the head is at that same roll, the delta is zero, and the image is
+// presented straight - which is exactly the reported symptom. Baking roll into the render is what
+// makes the claimed pose true, and the two then agree by construction.
+//
+// Roll about the view's forward axis is a rotation of clip x/y, but the frustum is NOT square -
+// tanX and tanY differ, and under duplication tanX is the half-width per-eye value. Rotating the
+// raw clip columns would shear. So convert to the symmetric view-space direction, rotate, convert
+// back:
+//
+//     x_v = clip.x * tanX,  y_v = clip.y * tanY      (view-space direction, aspect removed)
+//     rotate by theta
+//     clip.x' = x_v' / tanX,  clip.y' = y_v' / tanY
+//
+// which collapses to a mix of the two columns with the aspect ratio as the cross term.
+//
+// Order matters twice over, and both are satisfied by applying this in Hook_SetVSConstF right
+// after ApplyProjection:
+//
+//   * AFTER the forced projection, so the tangents read here are the frustum the eye actually
+//     sees rather than whatever the engine happened to send.
+//   * BEFORE ApplyEyeRemap, which squashes clip x by half. Rolling after that squash would mix a
+//     halved x with a full y and tilt by the wrong angle.
+//
+// It composes with ApplyOffset in either order: an offset is a pre-multiplication in world space,
+// a roll is a post-multiplication in clip space, so they commute. The eye separation needs no
+// special handling either - g_eyeDeltaUU is derived from the two real eye POSITIONS, which already
+// swing about the head as it tilts.
+void ApplyRoll(Reg4* r, int conv, float rollRad, float tanX, float tanY) {
+    if (rollRad == 0.0f) return;
+    if (!(tanX > 1e-6f && tanY > 1e-6f)) return;
+    const float cs = cosf(rollRad), sn = sinf(rollRad);
+    const float xy = (tanY / tanX) * sn;    // how much clip y feeds into clip x
+    const float yx = (tanX / tanY) * sn;
+    if (conv == CONV_ROW) {
+        // The x column is r[0..3].x, the y column r[0..3].y - the same layout ApplyProjection scales.
+        for (int i = 0; i < 4; ++i) {
+            const float x = r[i].x, y = r[i].y;
+            r[i].x = cs * x - xy * y;
+            r[i].y = yx * x + cs * y;
+        }
+    } else {
+        // Register 0 IS the x row, register 1 the y row.
+        for (int k = 0; k < 4; ++k) {
+            const float x = (&r[0].x)[k], y = (&r[1].x)[k];
+            (&r[0].x)[k] = cs * x - xy * y;
+            (&r[1].x)[k] = yx * x + cs * y;
+        }
     }
 }
 
@@ -1493,6 +1560,10 @@ bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
             Log("ZeroCopy requested but the device is not D3D9Ex - needs D3D9ExMode=1. Using the CPU copy."); }
     }
 
+    // ⚠️ NOTHING ELSE GETS ALLOCATED HERE WITHOUT BEING USED. The Stage 4B probe created a
+    // scene-sized render target AND depth-stencil at this point - ~70 MB at 4096x2160 - gated
+    // behind a hotkey that had to be pressed for them to be touched at all. Every run paid the
+    // allocation from the first frame. Gating a diagnostic's WORK is not gating its COST.
     g_srcW = w; g_srcH = h; g_srcFmt = fmt;
     Log("copy resources ready for %ux%u fmt=%d (%d readback slots, %s, %s)", w, h, (int)fmt,
         kCopySlots, g_copyMode == 1 ? "immediate" : "pipelined one frame",
@@ -1745,6 +1816,24 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
 
 const float kRadToUU = 65536.0f / 6.2831853f;
 int   g_yawSign = -1, g_pitchSign = 1;
+
+// ---- head roll ----
+//
+// Kept in RADIANS, not UU: it never reaches an FRotator. See ApplyRoll for why the engine's
+// rotation is the wrong place for this and the view matrix is the right one.
+//
+// Deliberately ABSOLUTE, with no recentre baseline. Yaw is anchored to whatever the game's yaw was
+// when we recentred because the game's yaw is arbitrary; roll is not - the runtime measures it
+// against gravity, and level head should mean level horizon. Anchoring it would bake a permanent
+// tilt in whenever someone recentred with their head at an angle.
+volatile LONG g_rollOn = 1;      // ini HeadRoll, NUMPAD1 - rides with head tracking
+// -1, MEASURED in run 49: +1 tilted the horizon the wrong way in the headset and NUMPAD2 fixed it.
+// Third axis, third time the handedness between OpenXR's frame and the game's has come out
+// negative - g_yawSign is -1 for the same reason. Kept as a variable, and NUMPAD2 kept, because
+// the next runtime or headset is not obliged to agree.
+int   g_rollSign = -1;           // NUMPAD2 - the same escape hatch F4/F5 give pitch and yaw
+float g_wantRollRad = 0.0f;
+float g_maxRollDeg = 0.0f;       // largest magnitude seen this report window
 bool  g_haveCentre = false;
 float g_centreYaw = 0.0f;
 int32_t g_baseYaw = 0;
@@ -1792,6 +1881,11 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         float pitchRad = asinf(sinp);
         float yawRad = atan2f(2.0f * (q.w * q.y + q.z * q.x),
                               1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        // The third angle of the same Y-X-Z decomposition the two above come from, so all three
+        // are consistent with each other rather than three separately-derived conventions.
+        // OpenXR is Y-up with forward at -Z, so roll is the rotation about Z.
+        float rollRad = atan2f(2.0f * (q.w * q.z + q.x * q.y),
+                               1.0f - 2.0f * (q.x * q.x + q.z * q.z));
         // Anchor to the GAME's current yaw, not our own previous output. Seeding from
         // g_wantYaw (initially 0) made enabling snap the view to world yaw 0.
         if (!g_haveCentre) {
@@ -1902,9 +1996,19 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         g_wantYaw   = g_baseYaw + (int32_t)(g_yawSign * dYaw * kRadToUU);
         g_haveWant  = true;
 
+        // Roll rides with head tracking, so it stops when F9 does and the matrix path has one
+        // flag to read rather than two. Written unconditionally when off so a stale angle can
+        // never survive a toggle.
+        g_wantRollRad = (InterlockedCompareExchange(&g_rollOn, 0, 0) &&
+                         InterlockedCompareExchange(&g_enabled, 0, 0))
+                        ? g_rollSign * rollRad : 0.0f;
+        const float rollDeg = fabsf(g_wantRollRad) * 57.2957795f;
+        if (rollDeg > g_maxRollDeg) g_maxRollDeg = rollDeg;
+
         if (++g_tick % 180 == 0)
-            Log("head pitch %.1f yaw %.1f -> want pitch %d yaw %d (hook hits %d)",
-                pitchRad*57.2958f, yawRad*57.2958f, g_wantPitch, g_wantYaw, g_hookHits);
+            Log("head pitch %.1f yaw %.1f roll %.1f -> want pitch %d yaw %d roll %.1f deg (hook hits %d)",
+                pitchRad*57.2958f, yawRad*57.2958f, rollRad*57.2958f,
+                g_wantPitch, g_wantYaw, g_wantRollRad*57.2958f, g_hookHits);
     }
 
     // ---- copy the game's frame into the swapchain and submit it ----
@@ -2111,7 +2215,11 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     }
     const bool forceProj = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
                            g_targetTanX > 0.0f && g_targetTanY > 0.0f;
-    const bool modify = inject || forceProj || dup;
+    // Roll has to be able to pull us onto the modify path by itself. With F9 alone - no 6-DOF, no
+    // duplication, no forced projection - `inject` is false and none of the others are set, so
+    // without this a head tilt would silently do nothing in plain mono head tracking.
+    const bool rollNow = fabsf(g_wantRollRad) > 1e-5f;
+    const bool modify = inject || forceProj || dup || rollNow;
 
     // The SCAN genuinely needs a live camera position - its world-position probes are meaningless
     // without one, and it is the only thing here that reads g_camPos at all.
@@ -2215,6 +2323,17 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
             // engine's drift and says nothing about whether our forcing arithmetic is right.
             // Reading it back after the edit closes that loop.
             ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
+        }
+        // Roll goes here and nowhere else: after the projection has been forced, so the tangents
+        // below describe the frustum the eye really sees (under duplication g_targetTanX is
+        // already the half-width per-eye value), and before StereoPair's ApplyEyeRemap squashes
+        // clip x. Measured from the matrix rather than taken from g_targetTan*, so it stays
+        // correct on the F6-off path too, where the engine's own projection is still in there.
+        if (rollNow) {
+            float rtx = 0.0f, rty = 0.0f;
+            ProjTangents(m, c, &rtx, &rty);
+            ApplyRoll(m, c, g_wantRollRad, rtx, rty);
+            ++g_rollApplied;
         }
         // END: collapse everything this register drives, so whatever survives on screen is
         // geometry we do not remap. Applied before the cache below, so the draw hook's per-eye
@@ -3664,6 +3783,12 @@ void ApplyVrFov() {
             g_capTanMin < 1e8f ? 2.0f * atanf(g_capTanMin) * 57.2957795f : 0.0f,
             g_capTanMax > 0    ? 2.0f * atanf(g_capTanMax) * 57.2957795f : 0.0f,
             g_injCount);
+        Log("    head roll: %s, peak %.1f deg this window, %d draw matrix(es) rolled%s",
+            InterlockedCompareExchange(&g_rollOn, 0, 0) ? "ON" : "OFF",
+            g_maxRollDeg, g_rollApplied,
+            (g_maxRollDeg > 1.0f && g_rollApplied == 0)
+                ? "  <-- TILTED BUT NOTHING ROLLED - the matrix path is not being reached" : "");
+        g_maxRollDeg = 0.0f; g_rollApplied = 0;
         povMin = 1e9f; povMax = -1e9f;
     }
 }
@@ -3847,6 +3972,28 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             was ? "restored" : "DROPPED - if the decal artefact disappears, that surface is the pass");
     }
     pNum0 = kNum0;
+
+    // NUMPAD1 / NUMPAD2: head roll on-off and its sign. On the numpad rather than an F-key
+    // because F1-F12 are all spoken for, and NUMPAD0 already set the precedent.
+    //
+    // The sign flip is not laziness - F4 and F5 exist for exactly this reason on pitch and yaw.
+    // Handedness between OpenXR's frame and the game's has been guessed wrong on both of the
+    // other two axes, and a wrong roll sign looks plausible until you tilt far enough to notice
+    // the horizon going the wrong way. One keypress settles it in the headset.
+    static bool pNum1 = false, pNum2 = false;
+    bool kNum1 = (GetAsyncKeyState(VK_NUMPAD1) & 0x8000) != 0;
+    bool kNum2 = (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) != 0;
+    if (kNum1 && !pNum1) {
+        LONG was = InterlockedCompareExchange(&g_rollOn, 0, 0);
+        InterlockedExchange(&g_rollOn, was ? 0 : 1);
+        Log("NUMPAD1: head roll %s", was ? "OFF (horizon locked to the headset, as before)" : "ON");
+    }
+    if (kNum2 && !pNum2) {
+        g_rollSign = -g_rollSign;
+        Log("NUMPAD2: roll sign %+d - tilt your head and check which way the horizon goes",
+            g_rollSign);
+    }
+    pNum1 = kNum1; pNum2 = kNum2;
 
     // BACKSPACE: the whole mod on or off in one key. See SetVrMode.
     static bool pBack = false;
@@ -4471,6 +4618,16 @@ void LoadIniSettings() {
     Log("ini: ExtraCamReg=%d (%s)", g_extraCamReg,
         g_extraCamReg < 0 ? "off - only the scan-locked register is remapped"
                           : "also remap this register per eye (shadow-seam test)");
+
+    // On by default: a head tilt that does not tilt the view is a comfort problem, not a feature,
+    // and the whole cost is two multiply-adds on the ~50 constant uploads a frame that carry the
+    // camera. Switchable mainly so it can be A/B'd against a build without it.
+    LONG rollIni = GetPrivateProfileIntA("Render", "HeadRoll", 1, path);
+    if (rollIni < 0 || rollIni > 1) rollIni = 1;
+    InterlockedExchange(&g_rollOn, rollIni);
+    Log("ini: HeadRoll=%ld (%s)", rollIni,
+        rollIni ? "tilting your head tilts the view - NUMPAD1 toggles, NUMPAD2 flips the sign"
+                : "off - the horizon stays locked to the headset");
 
     g_splitColourOnly = GetPrivateProfileIntA("Render", "SplitColourTargetsOnly", 0, path);
     if (g_splitColourOnly < 0 || g_splitColourOnly > 1) g_splitColourOnly = 0;
