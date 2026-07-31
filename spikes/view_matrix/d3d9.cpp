@@ -3984,6 +3984,25 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 static int poolReports = 0;
                 if (poolReports < 3) { ++poolReports; ReportPoolTranslation(); }
             }
+            // ---- which registers are actually being remapped (run 42) ----
+            //
+            // The shadow-pass dump showed a SECOND view-projection at vs c13: same projection
+            // columns as c0-c3, but a world-space translation (c16 = 5179, -1738, 26024) where
+            // c3 is translated-world and small. If the shadow geometry rides on c13 and only c0
+            // is remapped, that geometry keeps full-frame coordinates and spills across the seam -
+            // which is the reported symptom exactly.
+            //
+            // The detector is supposed to track every register holding a camera matrix, so this
+            // may already be covered. Printing the register numbers settles it without another
+            // theory: if 13 is absent, that is the bug.
+            {
+                char regs[128] = {}; int n = 0;
+                for (int s = 0; s < g_camMatUsed && n < 100; ++s)
+                    n += sprintf_s(regs + n, sizeof(regs) - n, "%sc%u%s",
+                                   n ? " " : "", g_camMats[s].reg, g_camMats[s].valid ? "" : "(stale)");
+                Log("    camera matrix registers tracked: %s (peak live in a frame %d)",
+                    n ? regs : "none", g_camMatValidPeak);
+            }
             // The identification counters are the point of this run. c0 carries one matrix per
             // frame, so a rejection is a whole-frame event - no forced projection and no split for
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
