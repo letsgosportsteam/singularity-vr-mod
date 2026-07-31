@@ -1,4 +1,4 @@
-// view_matrix - Singularity VR mod, spike 9
+﻿// view_matrix - Singularity VR mod, spike 9
 //
 // GOES AFTER THE ONE BLOCKING PROBLEM: camera POSITION, which gates both stereo (a per-eye
 // offset IS a position offset) and 6-DOF.
@@ -75,7 +75,7 @@ bool g_logReady = false;
 CRITICAL_SECTION g_stageLock;
 bool g_stageLockReady = false;
 
-// ---- ⚠️ truncating on attach destroys the run you are comparing against (run 31) ----
+// ---- âš ï¸ truncating on attach destroys the run you are comparing against (run 31) ----
 //
 // Any measurement worth making here is an A/B across launches - two ini settings, two runs, two
 // numbers. Truncating at attach means launch B erases launch A, so by the time you have the
@@ -235,7 +235,7 @@ const int CAM_POV_FOV      = 0x0438;   // mCurrentPOV FOV - proven to steer the 
 const int CAM_DESIRED_FOV  = 0x0470;   // mDesiredPOV FOV, the interpolation target
 const int CAM_CURRENT_FOV  = 0x0490;   // mCurrentFOV
 
-// ---- ⚠️ a FAILED scan is enormously expensive, and it repeats every frame (run 35) ----
+// ---- âš ï¸ a FAILED scan is enormously expensive, and it repeats every frame (run 35) ----
 //
 // Both finders cache their object and return instantly while it stays valid. That hides how bad
 // the miss path is: it walks every entry in GObjects - tens of thousands in UE3 - calling
@@ -1214,7 +1214,7 @@ double g_msWaitFrame = 0.0;
 int    g_waitFrames = 0;
 double g_displayPeriodMs = 0.0;   // from XrFrameState, so the pacing target is measured not guessed
 
-// ---- ⚠️ the copy timing conflates two costs, and only one of them D3D9Ex removes ----
+// ---- âš ï¸ the copy timing conflates two costs, and only one of them D3D9Ex removes ----
 //
 // GetRenderTargetData does not just transfer - it SYNCHRONISES. The call cannot return until the
 // GPU has finished rendering the frame, so the time attributed to `copy` is:
@@ -1288,7 +1288,7 @@ struct CopySlot {
 CopySlot g_slot[kCopySlots];
 int g_slotCur = 0;
 
-// ---- ⚠️ measured run 32: pipelining LOSES. Immediate is the default. ----
+// ---- âš ï¸ measured run 32: pipelining LOSES. Immediate is the default. ----
 //
 // Matched by scene (same draw counts, both at 120 Hz with SSW off):
 //
@@ -1635,7 +1635,7 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
             g_msGpuWait += MsSince(tf);
             ++g_gpuWaitFrames;
         }
-        // ---- ⚠️ no pipelining here, and it is not an oversight ----
+        // ---- âš ï¸ no pipelining here, and it is not an oversight ----
         //
         // FrameCopyMode's ring exists because a sysmem readback can be deferred a frame. There is
         // exactly ONE shared render target, and StretchRect has just overwritten it with THIS
@@ -1703,7 +1703,7 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
     CopySlot& use = g_slot[consumeIdx];
     if (!use.pending) return nullptr;          // pipelined, first frame - nothing captured yet
 
-    // ---- ⚠️ LockRect is where the transfer actually surfaces (run 35) ----
+    // ---- âš ï¸ LockRect is where the transfer actually surfaces (run 35) ----
     //
     // GetRenderTargetData times at 0.00 ms once the GPU fence is paid, which does NOT mean the
     // transfer is free - the driver defers it, and LockRect is what blocks until the DMA lands.
@@ -2428,7 +2428,7 @@ void ReportRenderTargets() {
     int sceneSurfaces = 0;
     for (int i = 0; i < g_rtSeenCount; ++i) {
         if (!g_rtSeen[i].draws) continue;
-        // ---- ⚠️ this label used to lie, and it lied about the exact surface under suspicion ----
+        // ---- âš ï¸ this label used to lie, and it lied about the exact surface under suspicion ----
         //
         // It was computed from size equality alone, so with SplitColourTargetsOnly=1 the G16R16
         // target still printed "<- SPLIT" while it was in fact being left alone. A census that
@@ -2515,7 +2515,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
         --g_dumpShadowConsts;
         Log("--- constants for a draw into the EXCLUDED scene-sized target (%s) ---",
             FmtName(g_rtSeen[g_rtCurrent].fmt));
-        // ---- ⚠️ ScreenPositionScaleBias is NOT the bug here, worked through in run 42 ----
+        // ---- âš ï¸ ScreenPositionScaleBias is NOT the bug here, worked through in run 42 ----
         //
         // ps c1 = (0.5, -0.5, 0.50023, 0.50012) is exactly UE3's ScreenPositionScaleBias - the
         // constant Stage 4A predicted, confirmed by arithmetic against 4096x2160. But patching it
@@ -2686,7 +2686,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     });
 }
 
-// ---- ⚠️ the run-24/25 startup hang was file I/O in a draw hook ----
+// ---- âš ï¸ the run-24/25 startup hang was file I/O in a draw hook ----
 //
 // The previous attempt logged "first user-pointer draw seen" gated on `g_drawsUP == 1`. But that
 // counter is RESET EVERY FRAME for the perf line, so the condition was true once per frame, not
@@ -2787,9 +2787,18 @@ void NoteFirstUserPtrDraw(const char* which) {
 // Tunable from the ini rather than fixed, because "2" is an assumption about UE3's quad and the
 // point of this run is to stop assuming things.
 int g_userPtrMinPrims = 3;   // ini UserPtrMinPrims: split only draws with at least this many prims
-int g_drawsUPQuad = 0;       // how many were passed through as fullscreen quads
+int g_drawsUPQuad = 0;       // passed through as fullscreen quads, cumulative over the window
+int g_drawsUPSplit = 0;      // given the per-eye treatment, same units
+int g_upHist[6] = {};        // primitive-count histogram: 1, 2, 3-4, 5-8, 9-16, 17+
 
-inline bool UserPtrQuad(UINT primCount) { return (int)primCount < g_userPtrMinPrims; }
+inline bool UserPtrQuad(UINT primCount) {
+    const int b = primCount <= 1 ? 0 : primCount == 2 ? 1 : primCount <= 4 ? 2
+                : primCount <= 8 ? 3 : primCount <= 16 ? 4 : 5;
+    ++g_upHist[b];
+    const bool quad = (int)primCount < g_userPtrMinPrims;
+    if (quad) ++g_drawsUPQuad; else ++g_drawsUPSplit;
+    return quad;
+}
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
@@ -2798,7 +2807,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     if (UserPtrInert()) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     ++g_drawsUP;
     if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
-    if (UserPtrQuad(primCount)) { ++g_drawsUPQuad; return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
+    if (UserPtrQuad(primCount)) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
@@ -2816,7 +2825,6 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     if (UserPtrQuad(primCount)) {
-        ++g_drawsUPQuad;
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     }
@@ -2843,7 +2851,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
 // the feature - a supported configuration, not an unexplored one. If the objects come back, the
 // mechanism is named. If nothing changes, it is ruled out for good.
 //
-// ---- ⚠️ mode 2 (refuse to create) CRASHES this build - run 30 ----
+// ---- âš ï¸ mode 2 (refuse to create) CRASHES this build - run 30 ----
 //
 // D3DERR_NOTAVAILABLE is the documented answer for an unsupported query type, and it is the path
 // UE3 follows on hardware without occlusion query support. This build takes it straight into a
@@ -2859,7 +2867,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
 // all of them; the type check inside the hook keeps D3DQUERYTYPE_EVENT fences (which UE3 uses for
 // frame pacing) reading their true values.
 //
-// ---- ✅ CONFIRMED run 30: this was the flicker, after seven eliminated mechanisms ----
+// ---- âœ… CONFIRMED run 30: this was the flicker, after seven eliminated mechanisms ----
 //
 // With results forced to "visible", draws per frame went from ~1000 to 2100-3800 and every
 // reported object came back solid. The engine was discarding 50-70% of its own draw calls as
@@ -3167,7 +3175,7 @@ ULONG STDMETHODCALLTYPE Hook_TexRelease(IUnknown* self) {
     return n;
 }
 
-// ---- ⚠️ the known gap, instrumented rather than hoped about ----
+// ---- âš ï¸ the known gap, instrumented rather than hoped about ----
 //
 // Redirection only covers Lock on the TEXTURE. An engine can instead call GetSurfaceLevel and lock
 // the returned IDirect3DSurface9, which bypasses all of this - and locking a surface belonging to
@@ -3941,7 +3949,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // live camera matrix, so they are drawn once instead of being scissored into a half
             // they were never remapped into. A high or spiky count means the camera slot is going
             // invalid often, which costs parallax on those objects even though they now appear.
-            // ---- ⚠️ THIS LINE IS WHY THE USER-POINTER HOOKS "HUNG" (found run 27) ----
+            // ---- âš ï¸ THIS LINE IS WHY THE USER-POINTER HOOKS "HUNG" (found run 27) ----
             //
             // It had nine conversions and TEN arguments: upPeak was missing its %d, so %s
             // consumed an int and formatted it as a char*. The evidence is in every log from
@@ -4011,7 +4019,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     Log("    *** GObjects walk cost %.2f ms this window - the camera or controller"
                         " is ABSENT, so the cache cannot warm and the full scan repeats. Expected"
                         " in menus and during level load; should be ~0 in gameplay. ***", eng);
-                // ---- ⚠️ the SSW check, and the correction it needed one run later ----
+                // ---- âš ï¸ the SSW check, and the correction it needed one run later ----
                 //
                 // Run 31 measured 28 ms frames, concluded the app was missing a 72 Hz deadline,
                 // and cancelled the D3D9Ex work on the strength of it. The real cause was
@@ -4087,11 +4095,25 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // The detector is supposed to track every register holding a camera matrix, so this
             // may already be covered. Printing the register numbers settles it without another
             // theory: if 13 is absent, that is the bug.
-            if (g_userPtrHookLevel >= 3)
-                Log("    user-pointer draws: %d split per eye, %d passed through as fullscreen"
-                    " quads (threshold %d prims)", upPeak - g_drawsUPQuad, g_drawsUPQuad,
-                    g_userPtrMinPrims);
-            g_drawsUPQuad = 0;
+            // ---- âš ï¸ this line reported nonsense first time out (run 46) ----
+            //
+            // It subtracted a per-WINDOW cumulative from a per-FRAME peak and printed negative
+            // counts. Both figures are cumulative over the window now. Sixth diagnostic in this
+            // file to report something other than reality; the recurring cause is a counter's
+            // units not matching the one it is combined with.
+            if (g_userPtrHookLevel >= 3) {
+                Log("    user-pointer draws this window: %d split per eye, %d passed through as"
+                    " fullscreen quads (threshold %d prims)",
+                    g_drawsUPSplit, g_drawsUPQuad, g_userPtrMinPrims);
+                // The threshold is only meaningful if the two populations actually separate. If
+                // decals are themselves 2-triangle quads - which UE3 decals often are - then no
+                // primitive count can tell them from a post-process quad and this whole approach
+                // is dead. The histogram says which world we are in.
+                Log("    user-pointer primitive counts: 1:%d  2:%d  3-4:%d  5-8:%d  9-16:%d  17+:%d",
+                    g_upHist[0], g_upHist[1], g_upHist[2], g_upHist[3], g_upHist[4], g_upHist[5]);
+            }
+            g_drawsUPQuad = 0; g_drawsUPSplit = 0;
+            for (int h = 0; h < 6; ++h) g_upHist[h] = 0;
             if (InterlockedCompareExchange(&g_skipExtraTarget, 0, 0))
                 Log("    NUMPAD0 ACTIVE: %d draws to the scene-sized non-colour target dropped"
                     " this window", g_drawsSkipped);
@@ -4149,7 +4171,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     Log("*** WARNING: TRUE STEREO is ON but NOTHING was split (%d draws seen)."
                         " The scene target does not match the backbuffer %ux%u - stereo is"
                         " inactive. ***", totPeak, g_srcW, g_srcH);
-                // ---- ⚠️ this line is NOT evidence about the run-18 theory (found run 28) ----
+                // ---- âš ï¸ this line is NOT evidence about the run-18 theory (found run 28) ----
                 //
                 // It was recorded in STATUS as refuting it: "register count measured 1, ever".
                 // But the modify path only ever caches g_lockedReg, so g_camMats can hold at most
@@ -4293,7 +4315,7 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateDevice)(IDirect3D9*, UINT, D3DDEVT
 PFN_CreateDevice g_origCreateDevice = nullptr;
 volatile LONG g_patched = 0;
 
-// ---- ⚠️ forcing the BACKBUFFER size does NOT raise UE3's render resolution ----
+// ---- âš ï¸ forcing the BACKBUFFER size does NOT raise UE3's render resolution ----
 //
 // Tried in run 14 and it broke stereo completely. The census told the story:
 //
@@ -4474,7 +4496,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
     if (SUCCEEDED(hr) && out && *out && InterlockedExchange(&g_patched, 1) == 0) {
         g_gameDev = *out;
 
-        // ---- ⚠️ is the 4096 cap actually the HARDWARE's? Nobody has ever asked ----
+        // ---- âš ï¸ is the 4096 cap actually the HARDWARE's? Nobody has ever asked ----
         //
         // Run 33 found -ResX=4096 accepted and 4992 refused, and attributed it to the classic
         // D3D9-era 4096 maximum texture dimension. That was a hypothesis. It is also the entire
