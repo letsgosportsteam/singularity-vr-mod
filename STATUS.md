@@ -186,8 +186,13 @@ crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
 
-In gameplay: **F9** head tracking · **F10** 6-DOF head position · **F1** true stereo
-(draw duplication) · **F12** alternate-eye stereo ·
+**VR mode is ON from the first frame** (run 36) — head tracking, 6-DOF and true stereo, no
+keypresses needed. **BACKSPACE toggles the whole set**, and "off" is the plain game (the forced
+projection goes with it, since a mono image at 98° looks broken rather than standard). The old cold
+start is `StartInVrMode=0`.
+
+Individual toggles, still there: **F9** head tracking · **F10** 6-DOF head position · **F1** true
+stereo (draw duplication) · **F12** alternate-eye stereo ·
 **F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
 **F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount ·
 **INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment ·
@@ -489,6 +494,38 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
+
+## ✅ Run 36: the freeze is fixed, and VR mode is on by default
+
+### The GObjects backoff worked
+
+```
+frame budget: ... + GObjects walk 0.03 + our work 5.76 = 15.09 ms
+perf: 66.3 fps (15.09 ms/frame)
+```
+
+**0.03–0.04 ms in gameplay**, against the ~70 ms/frame it was contributing during the freeze. One
+transition window still shows 6.99 ms with the warning firing correctly — that is the backoff doing
+its job (≈4 scans/sec instead of 60) rather than the problem returning. Gameplay is now **57–66 fps**
+at 4096×2160, slightly up.
+
+### VR mode on by default, BACKSPACE to leave it
+
+F9 + F10 + F1 were never really three features; they are the mod. Requiring three keypresses to
+reach the working state was a leftover from when each was a separate experiment. All three now
+default on, and **BACKSPACE** toggles the set.
+
+"Off" restores the plain game — including dropping the forced projection, which is only correct
+while duplication is splitting the frame. Leaving it on would give a mono view stretched to 98°,
+which looks broken rather than standard. Alternate-eye is cleared too, so the toggle can never
+produce the both-stereo-modes-at-once state that F12-after-F1 does.
+
+BACKSPACE because F1–F12 are all taken and it is large enough to find **by feel while wearing the
+headset**, which is the whole point of a panic switch.
+
+⚠️ **This means the main menu is now rendered with the frame split, which has never been tried.**
+If it comes out unreadable, BACKSPACE clears it without relaunching; `StartInVrMode=0` makes the
+cold start permanent.
 
 ## ✅ Run 35: the round-trip IS the frame, and the menu freeze is a GObjects scan
 
