@@ -496,6 +496,75 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## 🔨 Run 38: the D3DPOOL_MANAGED wrapper — BUILT, not yet run (`D3D9ExMode=1`)
+
+The zero-copy prerequisite, justified by run 35's measurement (~9.4 ms of a ~16 ms frame
+recoverable, GPU idle at 2–4 ms). **Off by default** — it replaces the resource management of a
+shipping engine, so its failure mode is "the game does not start" and it stays one relaunch from off.
+
+### What it does
+
+| Resource | Count (spike 2) | Treatment |
+|---|---|---|
+| Vertex + index buffers | **7,149** | **Pool swap only.** D3D9 permits `Lock()` on a DEFAULT buffer — it stalls, but these are locked once at load, not per frame. Two thirds of the problem needs no machinery. |
+| Textures / cube / volume | **3,305** | **Pool swap + SYSTEMMEM shadow.** `LockRect` on a DEFAULT texture genuinely fails, so these need the system copy MANAGED used to keep. |
+
+The game is handed the **real DEFAULT texture**, with `Lock`/`Unlock` redirected to a shadow and
+`UpdateTexture` uploading on unlock after a write.
+
+**What makes this safe rather than merely possible: D3D9Ex does not lose `D3DPOOL_DEFAULT`
+resources on `Reset`.** On a plain device this translation would mean rebuilding every resource on
+every device-lost event. That single Ex behaviour is what removes the biggest objection.
+
+### Why vtable patching, not COM proxies
+
+The obvious implementation is a wrapper class per resource type — which also means unwrapping at
+every device entry point that accepts a resource (`SetTexture`, `SetStreamSource`, `SetIndices`,
+`StretchRect`, …), where one missed site is a crash.
+
+Patching the vtable avoids all of it: the game holds the genuine DEFAULT texture, so every device
+call consuming it works untouched, and only `Lock`/`Unlock`/`Release` are intercepted. D3D9
+resources of a type share one vtable, so a single patch covers every instance — the same trick
+already proven here on `IDirect3DQuery9::GetData` for the run-30 occlusion fix. Cost: the patch is
+global, so locks on textures we did *not* translate land in the hook too and take a side-table miss.
+
+**All slots verified against the SDK header**, by an enumeration that reproduces every slot this
+project already relies on (Present 17, SetRenderTarget 37, DrawPrimitive 81,
+SetVertexShaderConstantF 94, CreateQuery 118). New: `CreateTexture` 23, `CreateVolumeTexture` 24,
+`CreateCubeTexture` 25, `CreateVertexBuffer` 26, `CreateIndexBuffer` 27, `UpdateTexture` 31;
+texture `LockRect` 19 / `UnlockRect` 20 / `GetSurfaceLevel` 18; buffer `Lock` 11 / `Unlock` 12.
+
+### ⚠️ This is STAGE 1 — deliberately no zero-copy yet
+
+It changes **only how resources are allocated**. The frame is still delivered by the old CPU copy,
+so **if it works the game should look and perform exactly as before.** That is the entire point: it
+separates "does the wrapper work" from "does zero-copy work". Doing both at once would mean a
+failure could not be attributed to either. Stage 2 switches the frame path.
+
+### ⬜ The known gap, instrumented rather than hoped about
+
+Redirection covers `Lock` on the **texture**. An engine can instead call `GetSurfaceLevel` and lock
+the returned surface, bypassing all of it — and locking a surface of a DEFAULT texture fails, so
+the upload would silently do nothing and the texture would render as uninitialised VRAM.
+
+Hooking surface `Lock` is not a clean fix (surfaces from textures share a vtable with render-target
+and depth surfaces, and the shadow's surfaces need pairing level by level). So before building
+that, **find out whether UE3 takes the path at all**: `GetSurfaceLevel-on-shadowed` counts it. Zero
+means the gap is theoretical. Climbing means that is the next piece of work — and the reason any
+textures look wrong.
+
+### What to read in the log
+
+```
+D3D9Ex pool translation: 3276 textures, 26 cube, 3 volume, 6258 vertex buf, 891 index buf
+  | shadows 3305 (~NNN MB), shadow failures 0, create failures 0, GetSurfaceLevel-on-shadowed 0
+```
+
+Counts should land near spike 2's census. Anything far below means allocations are escaping
+translation; any failure count above zero, or `GetSurfaceLevel-on-shadowed` climbing, names the
+problem directly. `~NNN MB` is worth watching in a 32-bit process — though MANAGED kept a system
+copy too, so this should be roughly a wash rather than new pressure.
+
 ## ↩️ Run 37: run 36's default-on reverted — BACKSPACE stays, the cold start doesn't change
 
 Run 36 made VR mode start active, on the reasoning that F9/F10/F1 are the mod rather than three

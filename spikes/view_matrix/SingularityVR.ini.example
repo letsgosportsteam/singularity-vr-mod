@@ -45,6 +45,53 @@
 ; the same three keys; it changes nothing about how the game looks on launch.
 ; ---------------------------------------------------------------------------
 
+; ---------------------------------------------------------------------------
+; D3D9ExMode   -- the zero-copy prerequisite (run 38). OFF until proven.
+;
+; OpenXR has no D3D9 binding, so every frame must reach D3D11. Doing that
+; without the CPU round-trip needs a SHARED SURFACE, which needs a D3D9Ex
+; device, and D3D9Ex rejects D3DPOOL_MANAGED - which UE3 uses for essentially
+; everything (spike 2: 10,454 MANAGED allocations against 47 DEFAULT).
+;
+; So this upgrades the device to Ex and translates the pool:
+;
+;   vertex + index buffers (7,149)   pool swap only. D3D9 allows Lock() on a
+;                                    DEFAULT buffer - it stalls, but these are
+;                                    locked once at load, not per frame.
+;   textures/cube/volume (3,305)     pool swap PLUS a SYSTEMMEM shadow, because
+;                                    LockRect on a DEFAULT texture genuinely
+;                                    fails. The game is handed the DEFAULT
+;                                    texture and its Lock/Unlock are redirected
+;                                    to the shadow, which is uploaded with
+;                                    UpdateTexture when unlocked after a write.
+;
+; What makes this safe rather than merely possible: D3D9Ex does NOT lose
+; D3DPOOL_DEFAULT resources on Reset. On a plain device this translation would
+; mean rebuilding every resource on every device-lost event.
+;
+; THIS IS STAGE 1. It changes only how resources are allocated - the frame is
+; still delivered by the old CPU copy, so if it works the game should look and
+; perform EXACTLY as before. That is the point: it isolates "does the wrapper
+; work" from "does zero-copy work". Stage 2 switches the frame path.
+;
+; What to check in the log:
+;
+;   D3D9Ex pool translation: 3276 textures, 26 cube, 3 volume, 6258 vertex buf,
+;     891 index buf | shadows 3305 (~NNN MB), shadow failures 0,
+;     create failures 0, GetSurfaceLevel-on-shadowed 0
+;
+; Counts should land near spike 2's census. Any "failures" above zero, or
+; GetSurfaceLevel-on-shadowed climbing, names the problem directly - the last
+; one is the known gap: the engine locking a surface instead of the texture
+; would bypass the shadow entirely.
+;
+;   0 = plain D3D9, MANAGED untouched - the known-good path       <- default
+;   1 = D3D9Ex + pool translation
+;
+; If the game fails to start, set this back to 0. No rebuild needed.
+; ---------------------------------------------------------------------------
+D3D9ExMode=0
+
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------

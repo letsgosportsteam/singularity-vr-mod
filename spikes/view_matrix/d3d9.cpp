@@ -70,6 +70,11 @@ CRITICAL_SECTION g_lock;
 char g_logPath[MAX_PATH] = {};
 bool g_logReady = false;
 
+// Declared up here only so LogInit can initialise it alongside g_lock - it belongs to the
+// D3D9Ex / D3DPOOL_MANAGED shadow table far below, and guards that table's entries.
+CRITICAL_SECTION g_stageLock;
+bool g_stageLockReady = false;
+
 // ---- ⚠️ truncating on attach destroys the run you are comparing against (run 31) ----
 //
 // Any measurement worth making here is an A/B across launches - two ini settings, two runs, two
@@ -83,6 +88,8 @@ const int kLogKeep = 3;
 
 void LogInit() {
     InitializeCriticalSection(&g_lock);
+    InitializeCriticalSection(&g_stageLock);   // guards the MANAGED->DEFAULT shadow table
+    g_stageLockReady = true;
     char base[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, base))) {
         strcat_s(base, "\\SingularityVR");
@@ -2586,6 +2593,479 @@ HRESULT STDMETHODCALLTYPE Hook_CreateQuery(IDirect3DDevice9* dev, D3DQUERYTYPE t
     return hr;
 }
 
+// ================================================================ D3D9Ex + D3DPOOL_MANAGED
+//
+// Why this exists: OpenXR has no D3D9 graphics binding, so every frame has to reach D3D11. Doing
+// that without a CPU round-trip needs a SHARED SURFACE, shared surfaces need a D3D9**Ex** device,
+// and D3D9Ex rejects D3DPOOL_MANAGED outright (spike 1: D3DERR_INVALIDCALL). Spike 2 counted
+// 10,454 MANAGED allocations in one session against 47 DEFAULT, so handing UE3 an Ex device
+// unmodified fails nearly every resource creation at startup.
+//
+// So the pool has to be translated, and whatever MANAGED was providing has to be provided by us.
+// MANAGED gives the application three things:
+//
+//   1. Lock() works at any time, because there is a system-memory copy behind the resource
+//   2. that copy is uploaded to VRAM automatically
+//   3. it survives device loss
+//
+// (3) is free here, and it is the reason this is safe rather than merely possible: **D3D9Ex does
+// not lose D3DPOOL_DEFAULT resources on Reset.** That is one of the headline differences of Ex,
+// and it removes what would otherwise be the biggest objection to this whole approach - on a plain
+// D3D9 device, translating MANAGED to DEFAULT would mean rebuilding every resource on every
+// device-lost event.
+//
+// (1) and (2) split by resource type, and the split is what keeps this tractable:
+//
+//   VERTEX / INDEX BUFFERS (7,149 of the 10,454) - **pool swap only, no shadow copy.**
+//     D3D9 permits Lock() on a DEFAULT vertex or index buffer. It stalls the pipeline for a
+//     static one, which is why it is discouraged, but it is legal and it is correct - and these
+//     are locked once at load, not per frame. Two thirds of the problem needs no machinery at all.
+//
+//   TEXTURES / CUBE / VOLUME (3,305) - **pool swap + SYSTEMMEM shadow.**
+//     LockRect on a DEFAULT texture genuinely fails (only D3DUSAGE_DYNAMIC textures can be
+//     locked), so these need the system-memory copy MANAGED used to keep. We create the DEFAULT
+//     texture the game renders from, create a SYSTEMMEM shadow alongside it, hand the game the
+//     DEFAULT one, and redirect its Lock/Unlock to the shadow - uploading with UpdateTexture when
+//     the shadow is unlocked after being written.
+//
+// ---- why vtable patching rather than COM proxy objects ----
+//
+// The obvious implementation is a wrapper class per resource type, forwarding every method. That
+// also means unwrapping at every device entry point that accepts a resource - SetTexture,
+// SetStreamSource, SetIndices, UpdateTexture, StretchRect, GetTexture - and one missed site is a
+// crash.
+//
+// Patching the vtable avoids all of it. The game is handed the REAL DEFAULT texture, so every
+// device call that consumes it works untouched; only Lock/Unlock/Release are intercepted. And
+// D3D9 resources of a type share one vtable, so a single patch covers every texture the device
+// will ever create - exactly the trick already proven here on IDirect3DQuery9::GetData for the
+// run-30 occlusion fix.
+//
+// The cost is that the patch is global: Lock on a texture we did NOT translate lands in our hook
+// too. That is a side-table miss and an immediate forward, which is why the table lookup has to be
+// cheap rather than convenient.
+//
+// ---- vtable slots, verified against the SDK header rather than remembered ----
+//
+// Extracted from d3d9.h by enumerating each interface's STDMETHOD declarations in order. The same
+// extraction reproduces every slot this project already relies on - Present 17, SetRenderTarget
+// 37, DrawPrimitive 81, SetVertexShaderConstantF 94, CreateQuery 118 - so the ones below are
+// confirmed by the same method that the working hooks vouch for.
+//
+//   IDirect3DDevice9        CreateTexture 23, CreateVolumeTexture 24, CreateCubeTexture 25,
+//                           CreateVertexBuffer 26, CreateIndexBuffer 27, UpdateTexture 31
+//   IDirect3DTexture9       LockRect 19, UnlockRect 20
+//   IDirect3DCubeTexture9   LockRect 19, UnlockRect 20
+//   IDirect3DVolumeTexture9 LockBox  19, UnlockBox  20
+//   IDirect3DVertexBuffer9  Lock 11, Unlock 12
+//   IDirect3DIndexBuffer9   Lock 11, Unlock 12
+//   IUnknown                Release 2
+//
+// Off by default. This replaces the resource management of a shipping engine; it is one relaunch
+// away from off precisely because the failure mode is "the game does not start".
+int  g_d3d9ExMode = 0;                 // ini D3D9ExMode: 0 = plain D3D9 (default), 1 = Ex + translate
+bool g_deviceIsEx = false;             // did we actually end up with an Ex device
+IDirect3D9Ex*     g_d3d9ex = nullptr;  // kept so CreateDevice can call CreateDeviceEx
+IDirect3DDevice9* g_gameDev = nullptr; // for UpdateTexture
+
+LONG g_xlatTex = 0, g_xlatVB = 0, g_xlatIB = 0, g_xlatCube = 0, g_xlatVol = 0;
+LONG g_stageCount = 0, g_stageFailed = 0, g_xlatFailed = 0;
+double g_stageMB = 0.0;
+
+// ---- the side table: DEFAULT resource -> its SYSTEMMEM shadow ----
+//
+// Open addressing with linear probing, fixed size, no allocation. Sized ~5x the 3,305 textures
+// spike 2 counted so the table stays sparse and probes stay short - this is consulted on every
+// texture Lock in the process, including ones we never translated.
+struct StageEntry {
+    IDirect3DBaseTexture9* key;    // what the game holds (DEFAULT)
+    IDirect3DBaseTexture9* shadow; // what it actually locks (SYSTEMMEM)
+    bool  dirty;                   // written since the last upload
+};
+const int kStageSlots = 16384;                 // power of two
+StageEntry g_stageTab[kStageSlots];
+// g_stageLock / g_stageLockReady are declared beside g_lock at the top so LogInit can initialise
+// both in one place.
+
+inline int StageHash(const void* p) {
+    // Pointers are at least 16-byte aligned in practice; drop the dead low bits before masking.
+    return (int)(((uintptr_t)p >> 4) & (kStageSlots - 1));
+}
+
+void StageAdd(IDirect3DBaseTexture9* key, IDirect3DBaseTexture9* shadow) {
+    EnterCriticalSection(&g_stageLock);
+    int i = StageHash(key);
+    for (int n = 0; n < kStageSlots; ++n) {
+        StageEntry& e = g_stageTab[i];
+        if (!e.key || e.key == key) {
+            e.key = key; e.shadow = shadow; e.dirty = false;
+            LeaveCriticalSection(&g_stageLock);
+            return;
+        }
+        i = (i + 1) & (kStageSlots - 1);
+    }
+    LeaveCriticalSection(&g_stageLock);
+    Log("*** staging table FULL at %d entries - texture %p left unshadowed ***", kStageSlots, (void*)key);
+}
+
+StageEntry* StageFind(IDirect3DBaseTexture9* key) {
+    int i = StageHash(key);
+    for (int n = 0; n < kStageSlots; ++n) {
+        StageEntry& e = g_stageTab[i];
+        if (!e.key) return nullptr;          // empty slot ends the probe chain
+        if (e.key == key) return &e;
+        i = (i + 1) & (kStageSlots - 1);
+    }
+    return nullptr;
+}
+
+// Tombstone-free removal is wrong with linear probing, so removed slots keep a dead marker: the
+// key is cleared but the chain is preserved by leaving `shadow` set to a sentinel. Simpler here to
+// just leave the entry with a null key AND rehash nothing - textures are created far more often
+// than destroyed during load, and the table is sized 5x. Accepting a slow leak of dead slots is
+// safer than getting probe-chain repair subtly wrong.
+void StageRemove(IDirect3DBaseTexture9* key) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(key);
+    if (e) {
+        if (e->shadow) e->shadow->Release();
+        e->shadow = nullptr;
+        e->dirty = false;
+        // Key deliberately left in place as a tombstone so probe chains through this slot survive.
+        // StageFind still matches it, but the null shadow makes every path treat it as absent.
+    }
+    LeaveCriticalSection(&g_stageLock);
+}
+
+// Rough, for the log only. The point is to notice if shadows become a memory problem in a 32-bit
+// process, not to be exact. MANAGED kept a system copy too, so this should be roughly a wash.
+double ApproxTexMB(UINT w, UINT h, UINT levels, D3DFORMAT fmt) {
+    double bpp = 4.0;
+    switch ((DWORD)fmt) {
+        case MAKEFOURCC('D','X','T','1'): bpp = 0.5; break;
+        case MAKEFOURCC('D','X','T','2'): case MAKEFOURCC('D','X','T','3'):
+        case MAKEFOURCC('D','X','T','4'): case MAKEFOURCC('D','X','T','5'): bpp = 1.0; break;
+        case D3DFMT_A8: case D3DFMT_L8: bpp = 1.0; break;
+        case D3DFMT_R5G6B5: case D3DFMT_A1R5G5B5: case D3DFMT_A8L8: bpp = 2.0; break;
+        default: break;
+    }
+    double base = (double)w * h * bpp;
+    double total = (levels <= 1) ? base : base * 1.34;   // full mip chain converges on 4/3
+    return total / (1024.0 * 1024.0);
+}
+
+// ---- Lock/Unlock redirection ----
+typedef HRESULT (STDMETHODCALLTYPE *PFN_TexLockRect)(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_TexUnlockRect)(IDirect3DTexture9*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CubeLockRect)(IDirect3DCubeTexture9*, D3DCUBEMAP_FACES, UINT, D3DLOCKED_RECT*, const RECT*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CubeUnlockRect)(IDirect3DCubeTexture9*, D3DCUBEMAP_FACES, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_VolLockBox)(IDirect3DVolumeTexture9*, UINT, D3DLOCKED_BOX*, const D3DBOX*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_VolUnlockBox)(IDirect3DVolumeTexture9*, UINT);
+typedef ULONG   (STDMETHODCALLTYPE *PFN_Release)(IUnknown*);
+
+PFN_TexLockRect    g_origTexLock = nullptr;
+PFN_TexUnlockRect  g_origTexUnlock = nullptr;
+PFN_Release        g_origTexRelease = nullptr;
+PFN_CubeLockRect   g_origCubeLock = nullptr;
+PFN_CubeUnlockRect g_origCubeUnlock = nullptr;
+PFN_Release        g_origCubeRelease = nullptr;
+PFN_VolLockBox     g_origVolLock = nullptr;
+PFN_VolUnlockBox   g_origVolUnlock = nullptr;
+PFN_Release        g_origVolRelease = nullptr;
+
+// Push the shadow's newly-dirtied regions up to the DEFAULT resource. SYSTEMMEM textures track
+// dirty rects themselves across LockRect, and UpdateTexture clears them as it copies, so calling
+// this per unlock moves only what that unlock touched rather than the whole chain each time.
+inline void FlushShadow(StageEntry* e) {
+    if (!e || !e->shadow || !e->dirty || !g_gameDev) return;
+    HRESULT hr = g_gameDev->UpdateTexture(e->shadow, e->key);
+    e->dirty = false;
+    if (FAILED(hr)) {
+        static int once = 0;
+        if (once < 5) { ++once; Log("UpdateTexture failed hr=0x%08lX for %p", hr, (void*)e->key); }
+    }
+}
+
+HRESULT STDMETHODCALLTYPE Hook_TexLockRect(IDirect3DTexture9* self, UINT level, D3DLOCKED_RECT* out,
+                                           const RECT* rect, DWORD flags) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(self);
+    IDirect3DTexture9* shadow = (e && e->shadow) ? (IDirect3DTexture9*)e->shadow : nullptr;
+    if (shadow && !(flags & D3DLOCK_READONLY)) e->dirty = true;
+    LeaveCriticalSection(&g_stageLock);
+    if (!shadow) return g_origTexLock(self, level, out, rect, flags);   // not ours - forward
+    return g_origTexLock(shadow, level, out, rect, flags);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_TexUnlockRect(IDirect3DTexture9* self, UINT level) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(self);
+    IDirect3DTexture9* shadow = (e && e->shadow) ? (IDirect3DTexture9*)e->shadow : nullptr;
+    HRESULT hr = shadow ? g_origTexUnlock(shadow, level) : S_OK;
+    if (shadow) FlushShadow(e);
+    LeaveCriticalSection(&g_stageLock);
+    if (!shadow) return g_origTexUnlock(self, level);
+    return hr;
+}
+
+ULONG STDMETHODCALLTYPE Hook_TexRelease(IUnknown* self) {
+    ULONG n = g_origTexRelease(self);
+    // Only once the object is actually gone. The pointer is used as a key here, never dereferenced.
+    if (n == 0) StageRemove((IDirect3DBaseTexture9*)self);
+    return n;
+}
+
+// ---- ⚠️ the known gap, instrumented rather than hoped about ----
+//
+// Redirection only covers Lock on the TEXTURE. An engine can instead call GetSurfaceLevel and lock
+// the returned IDirect3DSurface9, which bypasses all of this - and locking a surface belonging to
+// a DEFAULT texture fails, so the upload would silently do nothing and the texture would render as
+// whatever uninitialised VRAM it was given.
+//
+// Hooking surface Lock is not a clean fix: surfaces from textures share a vtable with render-target
+// and depth surfaces, and the shadow's surfaces would need pairing level by level. Before building
+// that, find out whether UE3 takes this path at all. If this counter stays at zero the gap is
+// theoretical; if it climbs, that is the next piece of work and the reason any textures look wrong.
+typedef HRESULT (STDMETHODCALLTYPE *PFN_TexGetSurfaceLevel)(IDirect3DTexture9*, UINT, IDirect3DSurface9**);
+PFN_TexGetSurfaceLevel g_origTexGetSurfaceLevel = nullptr;
+LONG g_surfLevelOnShadowed = 0;
+
+HRESULT STDMETHODCALLTYPE Hook_TexGetSurfaceLevel(IDirect3DTexture9* self, UINT level,
+                                                  IDirect3DSurface9** out) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(self);
+    const bool shadowed = (e && e->shadow);
+    LeaveCriticalSection(&g_stageLock);
+    if (shadowed) {
+        LONG n = InterlockedIncrement(&g_surfLevelOnShadowed);
+        if (n <= 3)
+            Log("*** GetSurfaceLevel on a SHADOWED texture (#%ld) - if the engine LOCKS this"
+                " surface the write bypasses the shadow and fails on DEFAULT. This is the known"
+                " gap in the wrapper; suspect it first if textures look wrong. ***", n);
+    }
+    return g_origTexGetSurfaceLevel(self, level, out);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CubeLockRect(IDirect3DCubeTexture9* self, D3DCUBEMAP_FACES face,
+                                            UINT level, D3DLOCKED_RECT* out, const RECT* rect, DWORD flags) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(self);
+    IDirect3DCubeTexture9* shadow = (e && e->shadow) ? (IDirect3DCubeTexture9*)e->shadow : nullptr;
+    if (shadow && !(flags & D3DLOCK_READONLY)) e->dirty = true;
+    LeaveCriticalSection(&g_stageLock);
+    if (!shadow) return g_origCubeLock(self, face, level, out, rect, flags);
+    return g_origCubeLock(shadow, face, level, out, rect, flags);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CubeUnlockRect(IDirect3DCubeTexture9* self, D3DCUBEMAP_FACES face, UINT level) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(self);
+    IDirect3DCubeTexture9* shadow = (e && e->shadow) ? (IDirect3DCubeTexture9*)e->shadow : nullptr;
+    HRESULT hr = shadow ? g_origCubeUnlock(shadow, face, level) : S_OK;
+    if (shadow) FlushShadow(e);
+    LeaveCriticalSection(&g_stageLock);
+    if (!shadow) return g_origCubeUnlock(self, face, level);
+    return hr;
+}
+
+ULONG STDMETHODCALLTYPE Hook_CubeRelease(IUnknown* self) {
+    ULONG n = g_origCubeRelease(self);
+    if (n == 0) StageRemove((IDirect3DBaseTexture9*)self);
+    return n;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_VolLockBox(IDirect3DVolumeTexture9* self, UINT level,
+                                          D3DLOCKED_BOX* out, const D3DBOX* box, DWORD flags) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(self);
+    IDirect3DVolumeTexture9* shadow = (e && e->shadow) ? (IDirect3DVolumeTexture9*)e->shadow : nullptr;
+    if (shadow && !(flags & D3DLOCK_READONLY)) e->dirty = true;
+    LeaveCriticalSection(&g_stageLock);
+    if (!shadow) return g_origVolLock(self, level, out, box, flags);
+    return g_origVolLock(shadow, level, out, box, flags);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_VolUnlockBox(IDirect3DVolumeTexture9* self, UINT level) {
+    EnterCriticalSection(&g_stageLock);
+    StageEntry* e = StageFind(self);
+    IDirect3DVolumeTexture9* shadow = (e && e->shadow) ? (IDirect3DVolumeTexture9*)e->shadow : nullptr;
+    HRESULT hr = shadow ? g_origVolUnlock(shadow, level) : S_OK;
+    if (shadow) FlushShadow(e);
+    LeaveCriticalSection(&g_stageLock);
+    if (!shadow) return g_origVolUnlock(self, level);
+    return hr;
+}
+
+ULONG STDMETHODCALLTYPE Hook_VolRelease(IUnknown* self) {
+    ULONG n = g_origVolRelease(self);
+    if (n == 0) StageRemove((IDirect3DBaseTexture9*)self);
+    return n;
+}
+
+// ---- the Create* hooks ----
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateVolumeTexture)(IDirect3DDevice9*, UINT, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DVolumeTexture9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateCubeTexture)(IDirect3DDevice9*, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DCubeTexture9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateVertexBuffer)(IDirect3DDevice9*, UINT, DWORD, DWORD, D3DPOOL, IDirect3DVertexBuffer9**, HANDLE*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateIndexBuffer)(IDirect3DDevice9*, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DIndexBuffer9**, HANDLE*);
+
+PFN_CreateTexture       g_origCreateTexture = nullptr;
+PFN_CreateVolumeTexture g_origCreateVolumeTexture = nullptr;
+PFN_CreateCubeTexture   g_origCreateCubeTexture = nullptr;
+PFN_CreateVertexBuffer  g_origCreateVertexBuffer = nullptr;
+PFN_CreateIndexBuffer   g_origCreateIndexBuffer = nullptr;
+
+// D3DUSAGE_DYNAMIC never legally coexists with MANAGED, and a DEFAULT texture that IS dynamic can
+// be locked directly - so a translated texture only needs a shadow when it is not dynamic.
+inline bool NeedsShadow(DWORD usage) { return (usage & D3DUSAGE_DYNAMIC) == 0; }
+
+// Defined below - the vtable for a resource type can only be patched once an instance exists, so
+// each Create* hook arms its own type on first success.
+void PatchTextureVTableOnce(IDirect3DTexture9* t);
+void PatchCubeVTableOnce(IDirect3DCubeTexture9* t);
+void PatchVolVTableOnce(IDirect3DVolumeTexture9* t);
+
+HRESULT STDMETHODCALLTYPE Hook_CreateTexture(IDirect3DDevice9* dev, UINT w, UINT h, UINT levels,
+                                             DWORD usage, D3DFORMAT fmt, D3DPOOL pool,
+                                             IDirect3DTexture9** out, HANDLE* share) {
+    if (!g_deviceIsEx || pool != D3DPOOL_MANAGED)
+        return g_origCreateTexture(dev, w, h, levels, usage, fmt, pool, out, share);
+
+    HRESULT hr = g_origCreateTexture(dev, w, h, levels, usage, fmt, D3DPOOL_DEFAULT, out, share);
+    if (FAILED(hr) || !out || !*out) {
+        InterlockedIncrement(&g_xlatFailed);
+        static int once = 0;
+        if (once < 5) { ++once; Log("CreateTexture DEFAULT failed hr=0x%08lX (%ux%u lv=%u usage=0x%lX fmt=%d)",
+                                    hr, w, h, levels, usage, (int)fmt); }
+        return hr;
+    }
+    InterlockedIncrement(&g_xlatTex);
+    PatchTextureVTableOnce(*out);
+    if (!NeedsShadow(usage)) return hr;
+
+    // Take the level count from the texture that was actually created rather than from `levels`,
+    // which is 0 for "full chain" and 1 under D3DUSAGE_AUTOGENMIPMAP.
+    const UINT realLevels = (*out)->GetLevelCount();
+    IDirect3DTexture9* shadow = nullptr;
+    HRESULT hs = g_origCreateTexture(dev, w, h, realLevels, 0, fmt, D3DPOOL_SYSTEMMEM, &shadow, nullptr);
+    if (FAILED(hs) || !shadow) {
+        InterlockedIncrement(&g_stageFailed);
+        static int once = 0;
+        if (once < 5) { ++once; Log("shadow CreateTexture failed hr=0x%08lX (%ux%u lv=%u fmt=%d)"
+                                    " - this texture will not be lockable", hs, w, h, realLevels, (int)fmt); }
+        return hr;   // the DEFAULT texture is still valid; only Lock will misbehave
+    }
+    StageAdd(*out, shadow);
+    InterlockedIncrement(&g_stageCount);
+    g_stageMB += ApproxTexMB(w, h, realLevels, fmt);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CreateCubeTexture(IDirect3DDevice9* dev, UINT edge, UINT levels,
+                                                 DWORD usage, D3DFORMAT fmt, D3DPOOL pool,
+                                                 IDirect3DCubeTexture9** out, HANDLE* share) {
+    if (!g_deviceIsEx || pool != D3DPOOL_MANAGED)
+        return g_origCreateCubeTexture(dev, edge, levels, usage, fmt, pool, out, share);
+
+    HRESULT hr = g_origCreateCubeTexture(dev, edge, levels, usage, fmt, D3DPOOL_DEFAULT, out, share);
+    if (FAILED(hr) || !out || !*out) { InterlockedIncrement(&g_xlatFailed); return hr; }
+    InterlockedIncrement(&g_xlatCube);
+    PatchCubeVTableOnce(*out);
+    if (!NeedsShadow(usage)) return hr;
+
+    const UINT realLevels = (*out)->GetLevelCount();
+    IDirect3DCubeTexture9* shadow = nullptr;
+    if (SUCCEEDED(g_origCreateCubeTexture(dev, edge, realLevels, 0, fmt, D3DPOOL_SYSTEMMEM, &shadow, nullptr))
+        && shadow) {
+        StageAdd(*out, shadow);
+        InterlockedIncrement(&g_stageCount);
+        g_stageMB += ApproxTexMB(edge, edge, realLevels, fmt) * 6.0;
+    } else {
+        InterlockedIncrement(&g_stageFailed);
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CreateVolumeTexture(IDirect3DDevice9* dev, UINT w, UINT h, UINT depth,
+                                                   UINT levels, DWORD usage, D3DFORMAT fmt, D3DPOOL pool,
+                                                   IDirect3DVolumeTexture9** out, HANDLE* share) {
+    if (!g_deviceIsEx || pool != D3DPOOL_MANAGED)
+        return g_origCreateVolumeTexture(dev, w, h, depth, levels, usage, fmt, pool, out, share);
+
+    HRESULT hr = g_origCreateVolumeTexture(dev, w, h, depth, levels, usage, fmt, D3DPOOL_DEFAULT, out, share);
+    if (FAILED(hr) || !out || !*out) { InterlockedIncrement(&g_xlatFailed); return hr; }
+    InterlockedIncrement(&g_xlatVol);
+    PatchVolVTableOnce(*out);
+    if (!NeedsShadow(usage)) return hr;
+
+    const UINT realLevels = (*out)->GetLevelCount();
+    IDirect3DVolumeTexture9* shadow = nullptr;
+    if (SUCCEEDED(g_origCreateVolumeTexture(dev, w, h, depth, realLevels, 0, fmt, D3DPOOL_SYSTEMMEM, &shadow, nullptr))
+        && shadow) {
+        StageAdd(*out, shadow);
+        InterlockedIncrement(&g_stageCount);
+        g_stageMB += ApproxTexMB(w, h, realLevels, fmt) * depth;
+    } else {
+        InterlockedIncrement(&g_stageFailed);
+    }
+    return hr;
+}
+
+// Buffers need no shadow - see the header comment. Pool swap only.
+HRESULT STDMETHODCALLTYPE Hook_CreateVertexBuffer(IDirect3DDevice9* dev, UINT len, DWORD usage,
+                                                  DWORD fvf, D3DPOOL pool,
+                                                  IDirect3DVertexBuffer9** out, HANDLE* share) {
+    if (g_deviceIsEx && pool == D3DPOOL_MANAGED) { pool = D3DPOOL_DEFAULT; InterlockedIncrement(&g_xlatVB); }
+    return g_origCreateVertexBuffer(dev, len, usage, fvf, pool, out, share);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CreateIndexBuffer(IDirect3DDevice9* dev, UINT len, DWORD usage,
+                                                 D3DFORMAT fmt, D3DPOOL pool,
+                                                 IDirect3DIndexBuffer9** out, HANDLE* share) {
+    if (g_deviceIsEx && pool == D3DPOOL_MANAGED) { pool = D3DPOOL_DEFAULT; InterlockedIncrement(&g_xlatIB); }
+    return g_origCreateIndexBuffer(dev, len, usage, fmt, pool, out, share);
+}
+
+// Resource vtables can only be patched once an instance of that type exists, so each Create* hook
+// arms its own type the first time it succeeds. One patch covers every instance from the device.
+void PatchTextureVTableOnce(IDirect3DTexture9* t) {
+    static LONG done = 0;
+    if (!t || InterlockedExchange(&done, 1)) return;
+    g_origTexLock    = (PFN_TexLockRect)PatchVTable(t, 19, (void*)&Hook_TexLockRect);
+    g_origTexUnlock  = (PFN_TexUnlockRect)PatchVTable(t, 20, (void*)&Hook_TexUnlockRect);
+    g_origTexRelease = (PFN_Release)PatchVTable(t, 2, (void*)&Hook_TexRelease);
+    g_origTexGetSurfaceLevel = (PFN_TexGetSurfaceLevel)PatchVTable(t, 18, (void*)&Hook_TexGetSurfaceLevel);
+    Log("texture vtable patched (LockRect=%p UnlockRect=%p Release=%p GetSurfaceLevel=%p)",
+        (void*)g_origTexLock, (void*)g_origTexUnlock, (void*)g_origTexRelease,
+        (void*)g_origTexGetSurfaceLevel);
+}
+
+void PatchCubeVTableOnce(IDirect3DCubeTexture9* t) {
+    static LONG done = 0;
+    if (!t || InterlockedExchange(&done, 1)) return;
+    g_origCubeLock    = (PFN_CubeLockRect)PatchVTable(t, 19, (void*)&Hook_CubeLockRect);
+    g_origCubeUnlock  = (PFN_CubeUnlockRect)PatchVTable(t, 20, (void*)&Hook_CubeUnlockRect);
+    g_origCubeRelease = (PFN_Release)PatchVTable(t, 2, (void*)&Hook_CubeRelease);
+    Log("cube texture vtable patched");
+}
+
+void PatchVolVTableOnce(IDirect3DVolumeTexture9* t) {
+    static LONG done = 0;
+    if (!t || InterlockedExchange(&done, 1)) return;
+    g_origVolLock    = (PFN_VolLockBox)PatchVTable(t, 19, (void*)&Hook_VolLockBox);
+    g_origVolUnlock  = (PFN_VolUnlockBox)PatchVTable(t, 20, (void*)&Hook_VolUnlockBox);
+    g_origVolRelease = (PFN_Release)PatchVTable(t, 2, (void*)&Hook_VolRelease);
+    Log("volume texture vtable patched");
+}
+
+void ReportPoolTranslation() {
+    Log("D3D9Ex pool translation: %ld textures, %ld cube, %ld volume, %ld vertex buf, %ld index buf"
+        " | shadows %ld (~%.0f MB), shadow failures %ld, create failures %ld,"
+        " GetSurfaceLevel-on-shadowed %ld",
+        g_xlatTex, g_xlatCube, g_xlatVol, g_xlatVB, g_xlatIB,
+        g_stageCount, g_stageMB, g_stageFailed, g_xlatFailed, g_surfLevelOnShadowed);
+}
+
 // Refresh the camera position the detector substitutes. Runs once per frame in Present.
 void RefreshCameraPosition() {
     // FindCamera is cheap once it has a live instance cached - it just revalidates the
@@ -3225,6 +3705,13 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             g_msWaitFrame = 0.0; g_waitFrames = 0;
             g_msGpuWait = 0.0; g_gpuWaitFrames = 0;
             g_msEngineObjects = 0.0; g_engineObjectFrames = 0;
+            // Once, after the level has loaded and the counts have stopped moving. The comparison
+            // that matters is against spike 2's census: 3,276 textures / 6,258 VB / 891 IB / 26
+            // cube / 3 volume. Numbers far below that mean allocations are escaping translation.
+            if (g_deviceIsEx) {
+                static int poolReports = 0;
+                if (poolReports < 3) { ++poolReports; ReportPoolTranslation(); }
+            }
             // The identification counters are the point of this run. c0 carries one matrix per
             // frame, so a rejection is a whole-frame event - no forced projection and no split for
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
@@ -3455,6 +3942,15 @@ void LoadIniSettings() {
         Log("     render resolution, it only desynchronises it. Use the in-game video options.");
     }
 
+    // The zero-copy prerequisite. OFF by default: this replaces the resource management of a
+    // shipping engine, so its failure mode is "the game does not start" and it must be one
+    // relaunch away from off. See the big comment above Hook_CreateTexture.
+    g_d3d9ExMode = GetPrivateProfileIntA("Render", "D3D9ExMode", 0, path);
+    if (g_d3d9ExMode < 0 || g_d3d9ExMode > 1) g_d3d9ExMode = 0;
+    Log("ini: D3D9ExMode=%d (%s)", g_d3d9ExMode,
+        g_d3d9ExMode ? "upgrade the device to D3D9Ex and translate D3DPOOL_MANAGED -> DEFAULT"
+                     : "plain D3D9, MANAGED left alone - the known-good path");
+
     // Escape hatch. Hooking the user-pointer draw calls stopped the game reaching its menus once
     // (run 24), and the cause is still unexplained - the vtable indices are confirmed correct
     // against d3d9.h, and the hooks are pass-through until F1 is pressed, so nothing they DO can
@@ -3515,8 +4011,61 @@ void LoadIniSettings() {
 HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYPE t, HWND w, DWORD f,
                                             D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
     LoadIniSettings();
-    HRESULT hr = g_origCreateDevice(self, ad, t, w, f, pp, out);
+
+    HRESULT hr;
+    if (g_d3d9ExMode && g_d3d9ex) {
+        // CreateDeviceEx wants a D3DDISPLAYMODEEX for exclusive fullscreen and NULL for windowed.
+        // The dev command line uses -windowed, but a fullscreen launch must not be left to chance.
+        D3DDISPLAYMODEEX dm{ sizeof(D3DDISPLAYMODEEX) };
+        D3DDISPLAYMODEEX* dmp = nullptr;
+        if (pp && !pp->Windowed) {
+            dm.Width  = pp->BackBufferWidth;
+            dm.Height = pp->BackBufferHeight;
+            dm.RefreshRate = pp->FullScreen_RefreshRateInHz;
+            dm.Format = pp->BackBufferFormat;
+            dm.ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
+            dmp = &dm;
+        }
+        IDirect3DDevice9Ex* devEx = nullptr;
+        hr = g_d3d9ex->CreateDeviceEx(ad, t, w, f, pp, dmp, &devEx);
+        if (SUCCEEDED(hr) && devEx) {
+            *out = devEx;                  // IDirect3DDevice9Ex derives from IDirect3DDevice9
+            g_deviceIsEx = true;
+            Log("*** D3D9Ex device created - D3DPOOL_MANAGED will be translated to DEFAULT ***");
+            Log("    (Ex does not lose DEFAULT resources on Reset, which is what makes this safe)");
+        } else {
+            // Fall back rather than take the game down with us. Without Ex the pool translation
+            // must stay off too, or every MANAGED allocation would be silently changed for no
+            // reason - g_deviceIsEx gates all of it.
+            Log("*** CreateDeviceEx FAILED hr=0x%08lX - falling back to a plain D3D9 device ***", hr);
+            Log("    set D3D9ExMode=0 to stop trying; the mod runs normally on the CPU copy path");
+            hr = g_origCreateDevice(self, ad, t, w, f, pp, out);
+        }
+    } else {
+        hr = g_origCreateDevice(self, ad, t, w, f, pp, out);
+    }
+
     if (SUCCEEDED(hr) && out && *out && InterlockedExchange(&g_patched, 1) == 0) {
+        g_gameDev = *out;
+        if (g_deviceIsEx) {
+            // 23/24/25/26/27, verified against d3d9.h by the same enumeration that reproduces
+            // Present 17, SetRenderTarget 37, DrawPrimitive 81 and SetVertexShaderConstantF 94.
+            g_origCreateTexture       = (PFN_CreateTexture)PatchVTable(*out, 23, (void*)&Hook_CreateTexture);
+            g_origCreateVolumeTexture = (PFN_CreateVolumeTexture)PatchVTable(*out, 24, (void*)&Hook_CreateVolumeTexture);
+            g_origCreateCubeTexture   = (PFN_CreateCubeTexture)PatchVTable(*out, 25, (void*)&Hook_CreateCubeTexture);
+            g_origCreateVertexBuffer  = (PFN_CreateVertexBuffer)PatchVTable(*out, 26, (void*)&Hook_CreateVertexBuffer);
+            g_origCreateIndexBuffer   = (PFN_CreateIndexBuffer)PatchVTable(*out, 27, (void*)&Hook_CreateIndexBuffer);
+            const bool allOk = g_origCreateTexture && g_origCreateVolumeTexture && g_origCreateCubeTexture
+                            && g_origCreateVertexBuffer && g_origCreateIndexBuffer;
+            if (!allOk) {
+                // A null original means forwarding would jump through a null pointer on the very
+                // first allocation. Nothing can be salvaged from a partial patch here.
+                Log("*** a Create* patch FAILED - disabling pool translation to stay safe ***");
+                g_deviceIsEx = false;
+            } else {
+                Log("resource creation hooks installed (CreateTexture/Volume/Cube/VB/IB)");
+            }
+        }
         g_origPresent = (PFN_Present)PatchVTable(*out, 17, (void*)&Hook_Present);
         // Slot 94 = SetVertexShaderConstantF. Present at 17 already proved this vtable
         // indexing against the real interface, so 94 needs no separate verification.
@@ -3593,7 +4142,28 @@ bool LoadReal() {
 extern "C" {
 IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
     if (!p_C9) return nullptr;
-    IDirect3D9* d3d = p_C9(sdk);
+    // The ini has to be read HERE, not in CreateDevice as everything else is: the choice between
+    // a plain and an Ex factory object is made before the device exists, and it cannot be revised
+    // afterwards.
+    LoadIniSettings();
+
+    IDirect3D9* d3d = nullptr;
+    if (g_d3d9ExMode && p_C9Ex) {
+        IDirect3D9Ex* ex = nullptr;
+        HRESULT hr = p_C9Ex(sdk, &ex);
+        if (SUCCEEDED(hr) && ex) {
+            // Spike 1 verified an IDirect3D9Ex* is usable as a plain IDirect3D9* - it derives from
+            // it, so the game never has to know. CreateDevice at slot 16 is at the same offset in
+            // both vtables for the same reason.
+            g_d3d9ex = ex;
+            d3d = ex;
+            Log("Direct3DCreate9Ex succeeded - handing the game an Ex factory");
+        } else {
+            Log("Direct3DCreate9Ex FAILED hr=0x%08lX - using plain D3D9", hr);
+            g_d3d9ExMode = 0;
+        }
+    }
+    if (!d3d) d3d = p_C9(sdk);
     if (d3d) g_origCreateDevice = (PFN_CreateDevice)PatchVTable(d3d, 16, (void*)&Hook_CreateDevice);
     return d3d;
 }
