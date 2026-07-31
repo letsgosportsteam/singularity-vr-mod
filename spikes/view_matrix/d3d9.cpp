@@ -2267,6 +2267,9 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWOR
 PFN_SetRenderTarget g_origSetRenderTarget = nullptr;
 volatile LONG g_rtIsScene = 1;
 int g_splitColourOnly = 0;    // ini SplitColourTargetsOnly - see the note in Hook_SetRenderTarget
+// One-shot budget for the shadow-pass constant dump. Only fires while SplitColourTargetsOnly=1,
+// because that is what routes those draws down the excluded path where they can be caught.
+volatile LONG g_dumpShadowConsts = 0;
 
 // ---- render-target census (run 11) ----
 //
@@ -2386,11 +2389,22 @@ void ReportRenderTargets() {
     int sceneSurfaces = 0;
     for (int i = 0; i < g_rtSeenCount; ++i) {
         if (!g_rtSeen[i].draws) continue;
-        bool isScene = (g_rtSeen[i].w == g_srcW && g_rtSeen[i].h == g_srcH);
-        if (isScene) ++sceneSurfaces;
+        // ---- ⚠️ this label used to lie, and it lied about the exact surface under suspicion ----
+        //
+        // It was computed from size equality alone, so with SplitColourTargetsOnly=1 the G16R16
+        // target still printed "<- SPLIT" while it was in fact being left alone. A census that
+        // reports the rule instead of the decision is worse than no census: run 40 nearly
+        // concluded the switch had not worked from this line.
+        const bool sceneSized = (g_rtSeen[i].w == g_srcW && g_rtSeen[i].h == g_srcH);
+        const bool colourFmt = (g_rtSeen[i].fmt == D3DFMT_A8R8G8B8 ||
+                                g_rtSeen[i].fmt == D3DFMT_X8R8G8B8 ||
+                                g_rtSeen[i].fmt == D3DFMT_A16B16G16R16F);
+        const bool isScene = sceneSized && (!g_splitColourOnly || colourFmt);
+        if (sceneSized) ++sceneSurfaces;
         Log("    %p  %5ux%-5u %-14s %6d draws  %s", (void*)g_rtSeen[i].surf,
             g_rtSeen[i].w, g_rtSeen[i].h,
-            FmtName(g_rtSeen[i].fmt), g_rtSeen[i].draws, isScene ? "<- SPLIT" : "left alone");
+            FmtName(g_rtSeen[i].fmt), g_rtSeen[i].draws,
+            isScene ? "<- SPLIT" : (sceneSized ? "<- scene-sized, EXCLUDED by ini" : "left alone"));
         g_rtSeen[i].draws = 0;
     }
     // The scene test is size equality, so every one of these is being split. Two is expected
@@ -2438,6 +2452,42 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     if (!InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
     // Never split a draw aimed at a shadow map or other offscreen target - see the note on
     // Hook_SetRenderTarget for what that corrupts.
+    // ---- run 41: dump the constants of the shadow pass, now that it is down to ~2 draws ----
+    //
+    // The G16R16 scene-sized target takes ~240 draws a SECOND - about 2 a frame - and excluding it
+    // from splitting moved the artefact from one eye to both, which is exactly what a fullscreen
+    // pass does when it stops being remapped. So it is implicated, and the haystack is two draws
+    // rather than nineteen hundred.
+    //
+    // What we are looking for is the constant that maps clip space to a texture coordinate.
+    // Stage 4A predicted its signature precisely: derived from the render-target size, so near
+    // (0.5, -0.5, 0.5+halfpixel, 0.5+halfpixel). A shader sampling the scene with that constant
+    // built for the FULL target reads the wrong half once we remap geometry into halves - which is
+    // the whole mechanism. Finding it is the same job the F7 scan did for the view matrix, on a
+    // far smaller search space.
+    //
+    // Read rather than hooked: GetPixelShaderConstantF needs no patch, and this runs a handful of
+    // times total.
+    if (g_dumpShadowConsts > 0 && InterlockedCompareExchange(&g_rtIsScene, 0, 0) == 0 &&
+        // Bound against the ARRAY size, not just g_rtSeenCount - the existing draw counter at the
+        // top of this function uses `< 16` for the same reason, and /analyze is right to insist.
+        g_rtCurrent >= 0 && g_rtCurrent < 16 &&
+        g_rtSeen[g_rtCurrent].w == g_srcW && g_rtSeen[g_rtCurrent].h == g_srcH) {
+        --g_dumpShadowConsts;
+        Log("--- constants for a draw into the EXCLUDED scene-sized target (%s) ---",
+            FmtName(g_rtSeen[g_rtCurrent].fmt));
+        float c[4];
+        for (UINT r = 0; r < 32; ++r) {
+            if (FAILED(dev->GetPixelShaderConstantF(r, c, 1))) break;
+            if (c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 0.0f) continue;
+            // Flag anything shaped like a half-scale/half-bias screen mapping.
+            const bool looksLikeScaleBias =
+                (fabsf(fabsf(c[0]) - 0.5f) < 0.02f && fabsf(fabsf(c[1]) - 0.5f) < 0.02f) ||
+                (fabsf(c[2] - 0.5f) < 0.02f && fabsf(c[3] - 0.5f) < 0.02f);
+            Log("    ps c%-2u = (%9.5f, %9.5f, %9.5f, %9.5f)%s", r, c[0], c[1], c[2], c[3],
+                looksLikeScaleBias ? "   <-- SCREEN SCALE/BIAS SHAPE" : "");
+        }
+    }
     if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) { ++g_drawsOffscreen; return draw(); }
 
     D3DVIEWPORT9 full{};
@@ -4194,6 +4244,9 @@ void LoadIniSettings() {
     // nothing - the pair is the A/B: D3D9ExMode=1/ZeroCopy=0 against D3D9ExMode=1/ZeroCopy=1.
     g_splitColourOnly = GetPrivateProfileIntA("Render", "SplitColourTargetsOnly", 0, path);
     if (g_splitColourOnly < 0 || g_splitColourOnly > 1) g_splitColourOnly = 0;
+    // Dump a handful of draws' worth of constants from the excluded target, then stop. Costs
+    // nothing after the budget is spent, and the log stays readable.
+    if (g_splitColourOnly) InterlockedExchange(&g_dumpShadowConsts, 4);
     Log("ini: SplitColourTargetsOnly=%d (%s)", g_splitColourOnly,
         g_splitColourOnly ? "split ONLY the two scene colour targets - excludes the third,"
                             " unidentified scene-sized surface (shadow test)"

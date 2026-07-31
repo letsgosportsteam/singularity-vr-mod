@@ -499,6 +499,66 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## 🔎 Run 41: the shadow surface is `G16R16`, and the census label was lying
+
+### The mystery target has a name
+
+```
+2A39E220   4096x2160  G16R16   240 draws  <- SPLIT
+```
+
+`FmtName` had been falling through to the literal string `"other"`, hiding the identity of the one
+surface under suspicion. It is **`G16R16`** — a two-channel 16-bit scene-sized target, exactly the
+shape of a shadow/light attenuation accumulation buffer.
+
+**240 draws is per SECOND, not per frame** — at ~115 fps that is **~2 draws per frame**, a
+fullscreen pass. Confirmed by the counters: `SplitColourTargetsOnly=1` moved `offscreen` from 0 to
+**2** and `split` from 138 to 136.
+
+### ⚠️ The census label was reporting the RULE, not the DECISION
+
+With the exclusion active, the census *still* printed `<- SPLIT` for `G16R16`, because `isScene`
+was recomputed from size equality instead of from what actually happened. Run 41 nearly concluded
+the switch had not worked from that line alone. Now fixed — it prints `<- scene-sized, EXCLUDED by
+ini` when that is the truth.
+
+That is the third instrument in this project found reporting something other than reality (after
+`remapKnown` being a compile-time `true` and the perf line's `(null)`). **Check what the diagnostic
+actually measures before believing it.**
+
+### ✅ The surface IS implicated — and the artefact's behaviour says so
+
+Excluding it moved the artefact **from one eye to both eyes at once**, which is precisely what a
+fullscreen pass does when it stops being remapped: split → placed per-eye (wrong in one), unsplit →
+drawn once at full-frame coordinates spanning both halves. The reported "different eye on different
+runs, same light source, different spots" is consistent with a view-dependent reconstruction error
+rather than a fixed per-eye bug.
+
+### ✅ Performance did NOT regress — the perceived hit is not in the data
+
+| run | median fps | mean | min | max |
+|---|---|---|---|---|
+| Run 39 (zero-copy) | 110.0 | 106.5 | 27.2 | 120.2 |
+| caps run | 109.3 | 102.7 | 26.9 | 118.8 |
+| Run 41 A (`Split=0`) | 111.1 | 104.5 | 12.6 | 120.2 |
+| **Run 41 B (`Split=1`)** | **112.0** | 104.5 | 26.9 | 118.4 |
+
+Medians flat across all four; the run *with* the change has the highest. What is real is the
+**variance** — every run including run 39 has occasional dips to 12–27 fps during level loads and
+heavy scenes. That is pre-existing and unrelated to these changes.
+
+### ⬜ Next: dump the constants, now that the haystack is two draws
+
+The fix for this class is known in principle (Stage 4A): find the constant mapping clip space to a
+texture coordinate and patch it per half. Its signature was predicted precisely — derived from the
+render-target size, so near `(0.5, −0.5, 0.5+½px, 0.5+½px)`.
+
+With the pass narrowed to ~2 draws a frame, that is now a small search. The build dumps pixel-shader
+constants `c0..c31` for the first few draws into the excluded target and flags anything with a
+half-scale/half-bias shape. Read via `GetPixelShaderConstantF` — no hook needed.
+
+**Fixing it properly also fixes the post-processing bleed**, which is the same mechanism.
+
 ## ❌ Run 40: the 4096 cap is UE3's, NOT the GPU's — run 33's conclusion is RETRACTED
 
 ```
