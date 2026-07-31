@@ -61,13 +61,11 @@ remaining on the list is planned work rather than a bug.
 With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
 debugging.
 
-1. **Read the `round-trip split` line before writing any wrapper.** (One launch, 4K, `GpuFenceProbe=1`.)
-   At 4096×2160 the copy measures ~12.5 ms of a ~16 ms frame, but `GetRenderTargetData` *synchronises*
-   as well as transfers, so an unknown part of that is GPU rendering the wrapper cannot recover
-   (run 34). Estimate is ~7 ms recoverable / ~5 ms GPU wait → **~60 → ~100 fps**, but that is
-   arithmetic, not measurement. **If `RECOVERABLE` comes back small, do not write the wrapper.**
-2. **Then the D3D9Ex zero-copy path**, if the split justifies it — `D3DPOOL_MANAGED` → `DEFAULT`
-   for 10,454 allocations. Cheaper than the "COM proxies for five resource types" framing suggests:
+1. **The D3D9Ex zero-copy path — justified by measurement (run 35), and now the top item.**
+   At 4096×2160: **~9.4 ms of a ~16 ms frame is recoverable round-trip; only 2–4 ms is GPU
+   rendering.** The zero-copy ceiling is ~6.5 ms/frame, comfortably past 120 Hz. Needs
+   `D3DPOOL_MANAGED` → `DEFAULT` for 10,454 allocations. Cheaper than the "COM proxies for five
+   resource types" framing suggests:
    D3D9 resources of a type share a vtable, so one `PatchVTable` on `LockRect`/`UnlockRect` covers
    every texture from that device — the exact trick already proven on `IDirect3DQuery9::GetData`
    for the run-30 occlusion fix. Wrapper state becomes a side table keyed on the resource pointer,
@@ -491,6 +489,74 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
+
+## ✅ Run 35: the round-trip IS the frame, and the menu freeze is a GObjects scan
+
+### The split, measured — and it beats the estimate
+
+```
+round-trip split: gpu wait 1.99 ms (rendering - NOT recoverable)
+  | transfer 9.37 + memcpy ... = 9.37 ms RECOVERABLE
+frame budget: xrWaitFrame 0.21 + copy 9.51 + our work 6.15 = 15.87 ms
+```
+
+| | run 34 estimate | **measured** |
+|---|---|---|
+| GPU wait (not recoverable) | ~5 ms | **2–4 ms** |
+| Recoverable round-trip | ~7 ms | **~9.4 ms** |
+| Zero-copy ceiling | ~100 fps | **~6.5 ms/frame, comfortably past 120 Hz** |
+
+**The sanity check passed**: total frame time is 15.7–16.5 ms, unchanged from run 33's 15.2–17.9,
+so the fence relocated the wait without distorting the frame. (Contrast `FrameCopyMode`, which
+failed exactly that test.)
+
+So at 4096×2160 the CPU round-trip is **~60% of the frame and the GPU is nearly idle** — 2–4 ms of
+actual rendering. **The wrapper is justified.** This is the first time that claim has had a
+measurement under it rather than an assumption.
+
+### ⚠️ But the breakdown was mislabelled, and the correction matters
+
+`GetRenderTargetData` timed at **0.00 ms**, which does not mean the transfer is free — the driver
+**defers** it, and `LockRect` is what blocks until the DMA lands. Timing lock and memcpy as one
+bucket therefore reported ~7 ms of *bus transfer* as *"memcpy"*. Both are removed by a zero-copy
+path so the RECOVERABLE total stands, but the two have entirely different fixes and should never
+have shared a bucket. Now split: `readback + lock(DMA lands) + memcpy + upload`.
+
+This is the same failure mode as the pipelining lesson, one level down: **a phase timer that
+attributes a cost to the wrong bucket is as misleading as one that loses it.**
+
+### 🐛 The menu freeze: `FindCamera()` rescans all of GObjects, every frame
+
+Reported as "froze for a few seconds" before pressing F1 and again when quitting. The log shows it
+is **not** the copy — that stays normal at ~8.9 ms — it is `our work`:
+
+```
+xrWaitFrame 5.67 + copy 8.87 + our work 82.00 = 96.53 ms   (10.4 fps)
+xrWaitFrame 4.36 + copy 9.04 + our work 69.39 = 82.80 ms   (12.1 fps)
+```
+
+`FindCamera()` and `FindController()` cache their object and return instantly while it is valid,
+which hides how expensive the miss path is: it walks **every entry in GObjects** — tens of
+thousands — calling `Readable()` two or three times per object, and `Readable()` is `VirtualQuery`,
+a **kernel transition**. Hundreds of thousands of syscalls per frame.
+
+It costs nothing while the object exists. When it does **not** exist the cache can never warm, so
+the full walk repeats every single frame — and "does not exist" is exactly the **main menu, level
+load, and quitting**. Precisely where the freeze was seen.
+
+**Fixed** by arming a 250 ms backoff on a failed scan (`ScanAllowed`). Acquisition is delayed by at
+most that once the object appears, which is imperceptible; the menu cost drops ~15×. The walk is
+now timed and broken out of `our work`, with a warning when it exceeds 2 ms, so this cannot hide
+again.
+
+Not a regression from the fence probe — large `our work` spikes are visible in run 32 and 33 logs
+too (26–35 ms). It was simply never attributed, because nothing measured it.
+
+### Also hardened
+
+The fence spin is now **bounded at 100 ms**. An unbounded spin on a query that never signals — lost
+device, driver hiccup — would wedge the game with no way out but Task Manager, and this is a
+measurement, not a feature.
 
 ## ⚠️ Run 34: the ~60 fps at 4K is real, and the "12.5 ms copy" is NOT all recoverable
 

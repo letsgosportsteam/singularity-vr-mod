@@ -228,10 +228,38 @@ const int CAM_POV_FOV      = 0x0438;   // mCurrentPOV FOV - proven to steer the 
 const int CAM_DESIRED_FOV  = 0x0470;   // mDesiredPOV FOV, the interpolation target
 const int CAM_CURRENT_FOV  = 0x0490;   // mCurrentFOV
 
+// ---- ⚠️ a FAILED scan is enormously expensive, and it repeats every frame (run 35) ----
+//
+// Both finders cache their object and return instantly while it stays valid. That hides how bad
+// the miss path is: it walks every entry in GObjects - tens of thousands in UE3 - calling
+// Readable() two or three times per object, and Readable() is VirtualQuery, a kernel transition.
+// Hundreds of thousands of syscalls, per frame.
+//
+// It only costs anything when the object is ABSENT, because then the cache can never warm and the
+// full walk runs again every single frame. Absent is exactly: main menu, level load, and quitting.
+// Which is precisely where the game was reported freezing for seconds at a time, with "our work"
+// measured at 69-82 ms a frame against a normal 6.
+//
+// So a failed scan arms a backoff. Acquisition is delayed by at most this long once the object
+// does appear, which is imperceptible, and the menu cost drops by ~15x.
+const ULONGLONG kFailedScanBackoffMs = 250;
+
+inline bool ScanAllowed(ULONGLONG& gate) {
+    const ULONGLONG now = GetTickCount64();
+    if (now < gate) return false;
+    // Armed up front rather than on the failure path, so every early `return 0` below is covered
+    // without having to find them all. The success path never reaches here again anyway - the
+    // cache short-circuits above it.
+    gate = now + kFailedScanBackoffMs;
+    return true;
+}
+
 uintptr_t FindController() {
     if (g_controller && g_ctlClass && Readable((void*)g_controller, 0x600) &&
         *reinterpret_cast<uintptr_t*>(g_controller + OBJ_CLASS) == g_ctlClass) return g_controller;
     g_controller = 0;
+    static ULONGLONG s_gate = 0;
+    if (!ScanAllowed(s_gate)) return 0;
     if (!Readable((void*)kGObjectsTArray, 12)) return 0;
     uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
     int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
@@ -267,6 +295,8 @@ uintptr_t FindCamera() {
     if (g_camera && g_camClass && Readable((void*)g_camera, 0x700) &&
         *reinterpret_cast<uintptr_t*>(g_camera + OBJ_CLASS) == g_camClass) return g_camera;
     g_camera = 0;
+    static ULONGLONG s_gate = 0;
+    if (!ScanAllowed(s_gate)) return 0;
     if (!Readable((void*)kGObjectsTArray, 12)) return 0;
     uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
     int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
@@ -1156,7 +1186,7 @@ int     g_framesSubmitted = 0;
 // That assumption has never been tested. If the drain is the cost, deferring the readback by a
 // frame recovers most of it for almost nothing. If the memcpy is the cost, D3D9Ex would not
 // have helped at all. Measure first, then spend.
-double g_msGRTD = 0.0, g_msLockCopy = 0.0, g_msUpload = 0.0;   // summed over the perf window
+double g_msGRTD = 0.0, g_msLock = 0.0, g_msLockCopy = 0.0, g_msUpload = 0.0;   // over the perf window
 int    g_copyFrames = 0;
 
 // ---- and the other half of the frame, which turned out to be all of it (run 31) ----
@@ -1195,6 +1225,11 @@ double g_displayPeriodMs = 0.0;   // from XrFrameState, so the pacing target is 
 // moves the wait somewhere it can be timed. Total frame time should be unchanged, and if it is
 // not, this probe is lying (see the pipelining lesson: a stall that leaves the instrument has not
 // left the frame).
+// The GObjects walks (FindCamera / FindController), which are free on a cache hit and brutal on a
+// miss. Broken out of "our work" so a menu stall can be attributed rather than guessed at.
+double g_msEngineObjects = 0.0;
+int    g_engineObjectFrames = 0;
+
 IDirect3DQuery9* g_gpuFence = nullptr;
 double g_msGpuWait = 0.0;
 int    g_gpuWaitFrames = 0;
@@ -1453,7 +1488,14 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
         LARGE_INTEGER tf = Now();
         BOOL done = FALSE;
         // D3DGETDATA_FLUSH so the command buffer is actually submitted rather than sat on.
-        while (g_gpuFence->GetData(&done, sizeof(done), D3DGETDATA_FLUSH) == S_FALSE) { YieldProcessor(); }
+        //
+        // Bounded. An unbounded spin on a query that never completes - a lost device, a driver
+        // hiccup - would wedge the game with no way out but the task manager, and this is a
+        // measurement, not a feature. Bailing early only costs one frame's accuracy.
+        while (g_gpuFence->GetData(&done, sizeof(done), D3DGETDATA_FLUSH) == S_FALSE) {
+            if (MsSince(tf) > 100.0) { Log("GPU fence did not signal within 100 ms - abandoning the wait"); break; }
+            YieldProcessor();
+        }
         g_msGpuWait += MsSince(tf);
         ++g_gpuWaitFrames;
     }
@@ -1504,9 +1546,20 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
     CopySlot& use = g_slot[consumeIdx];
     if (!use.pending) return nullptr;          // pipelined, first frame - nothing captured yet
 
-    t0 = Now();
+    // ---- ⚠️ LockRect is where the transfer actually surfaces (run 35) ----
+    //
+    // GetRenderTargetData times at 0.00 ms once the GPU fence is paid, which does NOT mean the
+    // transfer is free - the driver defers it, and LockRect is what blocks until the DMA lands.
+    // Timing lock and memcpy as one bucket therefore labelled ~7 ms of GPU->CPU transfer as
+    // "memcpy", which is wrong in a way that matters: memcpy is CPU bandwidth and transfer is bus
+    // latency, and they have different fixes. Both are removed by a zero-copy path, so the
+    // RECOVERABLE total was right even while its breakdown was not.
+    LARGE_INTEGER tLock = Now();
     D3DLOCKED_RECT lr{};
     if (FAILED(use.surf->LockRect(&lr, nullptr, D3DLOCK_READONLY))) return nullptr;
+    g_msLock += MsSince(tLock);
+
+    t0 = Now();
     D3D11_MAPPED_SUBRESOURCE ms{};
     if (FAILED(g_ctx11->Map(g_uploadTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
         use.surf->UnlockRect(); return nullptr;
@@ -2966,8 +3019,15 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // The camera position the detector substitutes must be this frame's, read before any of
     // the frame's draw calls - which is exactly what Present-time refresh gives us, since the
     // constants for the frame about to be presented were uploaded just before we got here.
-    RefreshCameraPosition();
-    ApplyVrFov();
+    // Timed because "our work" hit 69-82 ms a frame in menus (run 34) with the copy behaving
+    // normally, and both of these walk GObjects on a cache miss. Naming the cost beats assuming it.
+    {
+        LARGE_INTEGER tEng = Now();
+        RefreshCameraPosition();
+        ApplyVrFov();
+        g_msEngineObjects += MsSince(tEng);
+        ++g_engineObjectFrames;
+    }
     // "Can a 2010 game afford twice the draw calls" is the whole question this spike exists to
     // answer, so measure it rather than reasoning about it. Frame time is wall clock between
     // Presents, averaged over a second.
@@ -3042,24 +3102,32 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (g_copyFrames) {
                 const double ms = (accum * 1000.0) / frames;
                 const double rb = g_msGRTD / g_copyFrames;
+                const double lk = g_msLock / g_copyFrames;
                 const double lc = g_msLockCopy / g_copyFrames;
                 const double up = g_msUpload / g_copyFrames;
                 const double wf = g_waitFrames ? g_msWaitFrame / g_waitFrames : 0.0;
                 const double gw = g_gpuWaitFrames ? g_msGpuWait / g_gpuWaitFrames : 0.0;
-                const double copy = rb + lc + up;
-                Log("    frame copy [%s]: readback %.2f + lock/memcpy %.2f + upload %.2f"
-                    " = %.2f ms of %.2f (%.0f%%)",
-                    g_copyMode == 1 ? "immediate" : "pipelined", rb, lc, up,
+                const double copy = rb + lk + lc + up;
+                Log("    frame copy [%s]: readback %.2f + lock(DMA lands) %.2f + memcpy %.2f"
+                    " + upload %.2f = %.2f ms of %.2f (%.0f%%)",
+                    g_copyMode == 1 ? "immediate" : "pipelined", rb, lk, lc, up,
                     copy, ms, ms > 0 ? 100.0 * copy / ms : 0.0);
                 // The split that decides where any further effort goes. Time in xrWaitFrame is
                 // the app sitting idle waiting for the compositor, so it is not ours to optimise;
                 // "our work" is. Chasing the copy or the draw count while xrWaitFrame holds most
                 // of the frame would be optimising the part that is already free.
-                Log("    frame budget: xrWaitFrame %.2f (idle, waiting on the compositor)"
-                    " + copy %.2f + our work %.2f = %.2f ms (%.0f%% of the %.2f ms display period)",
-                    wf, copy, ms - wf - copy, ms,
+                const double eng = g_engineObjectFrames ? g_msEngineObjects / g_engineObjectFrames : 0.0;
+                Log("    frame budget: xrWaitFrame %.2f (idle) + copy %.2f + GObjects walk %.2f"
+                    " + our work %.2f = %.2f ms (%.0f%% of the %.2f ms display period)",
+                    wf, copy, eng, ms - wf - copy - eng, ms,
                     g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
                     g_displayPeriodMs);
+                // A cached hit is microseconds; anything here in milliseconds means the object is
+                // absent and the full scan is repeating, which is the menu/level-load freeze.
+                if (eng > 2.0)
+                    Log("    *** GObjects walk cost %.2f ms this window - the camera or controller"
+                        " is ABSENT, so the cache cannot warm and the full scan repeats. Expected"
+                        " in menus and during level load; should be ~0 in gameplay. ***", eng);
                 // ---- ⚠️ the SSW check, and the correction it needed one run later ----
                 //
                 // Run 31 measured 28 ms frames, concluded the app was missing a 72 Hz deadline,
@@ -3109,14 +3177,15 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     Log("    round-trip split: gpu wait %.2f ms (rendering - NOT recoverable)"
                         " | transfer %.2f + memcpy %.2f + upload %.2f = %.2f ms RECOVERABLE"
                         " -> zero-copy ceiling %.2f ms/frame (%.0f fps)",
-                        gw, rb, lc, up, recoverable,
+                        gw, rb + lk, lc, up, recoverable,
                         ms - recoverable, (ms - recoverable) > 0 ? 1000.0 / (ms - recoverable) : 0.0);
                 }
             }
-            g_msGRTD = g_msLockCopy = g_msUpload = 0.0;
+            g_msGRTD = g_msLock = g_msLockCopy = g_msUpload = 0.0;
             g_copyFrames = 0;
             g_msWaitFrame = 0.0; g_waitFrames = 0;
             g_msGpuWait = 0.0; g_gpuWaitFrames = 0;
+            g_msEngineObjects = 0.0; g_engineObjectFrames = 0;
             // The identification counters are the point of this run. c0 carries one matrix per
             // frame, so a rejection is a whole-frame event - no forced projection and no split for
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
