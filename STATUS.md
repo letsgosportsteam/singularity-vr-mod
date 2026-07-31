@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-07-31** (end of run 49). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES.md`.
 
 > # 🚀 ZERO-COPY LANDED (run 39): 4096×2160 runs at ~115 fps, up from ~60.
 >
@@ -40,27 +40,6 @@ Last updated **2026-07-31** (end of run 49). Read this first, then `ENGINE_NOTES
 >
 > Seven mechanisms were eliminated by direct test before this one landed. See **Run 30**.
 
-> # 🆕 Run 49: head roll landed, and Stage 4B finally has its measurement built
->
-> **Roll is written.** Tilting your head now tilts the view — the last axis of the head pose that
-> was never driven anywhere. It goes into the **view matrix**, not the engine's rotation, and the
-> maths is verified as arithmetic before any headset run (`spikes/roll_math`, `.\build.ps1`).
-> **NUMPAD1** toggles, **NUMPAD2** flips the sign.
->
-> **⛔ Stage 4B is MEASURED (run 50) and it does not fit — build Stage 4A instead.** Render-target
-> switching costs **~5 ms of work** for 2,822 binds a frame. Idle collapses **3.09 → 0.17 ms** and
-> the app falls off the 120 Hz deadline. The **~19 ms** estimate that blocked this for eight runs
-> was wrong by 4×, and the answer is *still* no — while run 40 had already removed *resolution* as
-> a reason to want it, so it would buy correctness only.
->
-> **Stage 4A gets the same three fixes** — seam, post-processing bleed, occlusion boxes — **for one
-> patched constant**, and run 41 already found it: `ps c1 = (0.5, -0.5, 0.50023, 0.50012)`.
->
-> ⚠️ **And the cheap version of that probe measured nothing.** Level 1 binds away and back with no
-> draw between; D3D9 applies state lazily, so the driver collapsed it — 2,576 binds a frame for
-> +0.36 ms. Level 2 forces the bind with a 1×1 `Clear`. Had level 2 not been built, this would have
-> been the eighth tautological instrument in this file.
-
 ## TL;DR — where we stand
 
 **Working and wearable.** Head tracking, 6-DOF, correct colours, a VR-correct projection, and
@@ -94,17 +73,11 @@ debugging.
    display-bound with 4+ ms idle. Turn it on with `D3D9ExMode=1` + `ZeroCopy=1`.
    **Remaining follow-ups, both small:** confirm no tearing by eye, and consider raising the 100 ms
    fence bound that fired once during a level load.
-2. **⛔ Per-eye render targets (Stage 4B) — MEASURED (run 50) and it does not fit. Do Stage 4A.**
-   ~5 ms of work for 2,822 render-target binds a frame; idle collapses 3.09 → 0.17 ms and the app
-   falls off the 120 Hz deadline. The ~19 ms estimate that blocked this for eight runs was wrong by
-   4×, but the answer is still no. And run 40 already removed *resolution* as a reason to want it,
-   so it would buy correctness only.
-   **Stage 4A gets the same three fixes for one patched constant** — viewport split plus per-half
-   `ScreenPositionScaleBias`, and run 41 already found that constant exactly
-   (`ps c1 = (0.5, -0.5, 0.50023, 0.50012)`). This is the next real piece of work.
-3. **Raise the resolution by defeating UE3's own validation**, not by rebuilding the render path.
-   `GetDeviceCaps` reports 16384×16384, so the hardware allows the 5376×2880 side-by-side target
-   full per-eye parity needs; what refuses 4992 is the engine.
+2. **Per-eye render targets (Stage 4B) — promoted from "worth one measurement" to mandatory.**
+   Run 33 settled the cap at 4096, so side-by-side tops out at 2048 per eye against 2688 wanted.
+   **Parity is arithmetically unreachable** in a single side-by-side frame. This is also the fix
+   for the seam, post-processing bleed and occlusion-box remapping, so it collapses four open items
+   into one. Cost to check first: a render-target *and* depth-stencil swap per draw, ~2,400/frame.
 3. **`GetCommandLineW` detour** to inject `-ResX`/`-ResY` from the headset's reported size, so the
    manual command line goes away. Designed, not implemented; must fail safe or the game will not
    launch.
@@ -115,9 +88,8 @@ debugging.
    per-eye render targets given the ~4096 cap.
 3. **Controller input and menus.** Untouched — needs OpenXR input. Same work unlocks
    motion-controller aiming.
-4. **✅ DONE — head roll (run 49).** Applied in the view matrix, on by default, **NUMPAD1** toggles
-   and **NUMPAD2** flips the sign. Needs one headset run to confirm the sign and to watch for
-   corner dropout — the engine still culls with an unrolled frustum.
+4. **Head roll.** F9 drives pitch and yaw only; `r->roll` is never written, so tilting your head
+   sideways does not tilt the view. Small job, and it is felt in VR without being easy to name.
 
 Two loose threads worth keeping visible, neither blocking:
 
@@ -230,9 +202,7 @@ stereo (draw duplication) · **F12** alternate-eye stereo ·
 **INSERT** blank one eye half (mapping test) · **DELETE** swap eye/half assignment ·
 **PAGE UP** cycle culling headroom (now runs *down* from 1.0) · **PAGE DOWN** cycle how much of
 the headset's FOV we render · **HOME** scissor off (drawn-then-clipped vs never-drawn) ·
-**END** clip out everything driven by the tracked register (remapped vs unremapped) ·
-**NUMPAD1** head roll on/off · **NUMPAD2** flip the roll sign ·
-**NUMPAD3** render-target switch probe (Stage 4B's cost, image unchanged).
+**END** clip out everything driven by the tracked register (remapped vs unremapped).
 
 **Do not press F12 after F1.** F1 clears alternate-eye, but F12 does *not* clear duplication, so
 that order leaves both stereo modes running at once. F12 before F1 is harmless and pointless.
@@ -528,200 +498,6 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
-
-## ✅ Run 49: head roll, and the instrument that decides Stage 4B
-
-Two independent pieces. Neither has been in the headset yet — see *The test* at the end.
-
-### Head roll — the last unwritten axis
-
-F9 drove pitch and yaw. `r->roll` was never written, so tilting your head left the horizon glued to
-the headset. It is now applied **in the view matrix**, and the choice of location is the whole
-result.
-
-**Why not the engine's rotation.** The detour owns pitch, yaw already needs a direct write to the
-controller, and UE3 zeroes camera roll in several places. Three seams to fight for an angle we
-already own outright, because by the time the matrix reaches the GPU it is ours.
-
-**⚠️ And why the compositor does not already do it — this is the trap.** The submitted projection
-layer has always carried the head's full orientation, roll included, so it looks like the runtime
-should be rotating the image for us. It does not: a projection layer is reprojected by the **delta**
-between the pose we claim and the pose the display is at. Claim a rolled pose for an unrolled render
-while the head is at that same roll, the delta is zero, and the image is presented straight — which
-is *exactly* the reported symptom. Baking roll into the render is what makes the claimed pose true,
-and the two then agree by construction. **Nothing on the submit side needed changing**, which is
-also why this looked for a while like it might already work.
-
-**Where it goes in the pipeline**, and both constraints are satisfied by one placement — in
-`Hook_SetVSConstF`, immediately after `ApplyProjection`:
-
-| Constraint | Why |
-|---|---|
-| **After** the forced projection | The tangents read there are the frustum the eye really sees. Under duplication `g_targetTanX` is already the half-width per-eye value. |
-| **Before** `ApplyEyeRemap` | That squashes clip x by half. Rolling afterwards would mix a halved x with a full y and tilt by the wrong angle. |
-
-It commutes with `ApplyOffset` (a world-space pre-multiplication against a clip-space
-post-multiplication), and the eye separation needs no special handling at all: `g_eyeDeltaUU` comes
-from the two real eye **positions**, which already swing about the head as it tilts.
-
-**The frustum is not square**, so this is not a plain rotation of clip x/y — `tanX ≠ tanY`, and under
-duplication `tanX` is the half-width value. Rotating the raw columns would *shear as it rotates*.
-The maths converts to the symmetric view-space direction, rotates, and converts back.
-
-### The maths is verified as arithmetic, not by eye
-
-`spikes/roll_math` — `.\build.ps1`, no game and no headset. It asserts the rotation is exact, that
-the magnitude is preserved (the shear case above), that it composes with the eye remap, that zero
-roll is bit-exact, and that a square frustum degenerates to a pure NDC rotation. Both storage
-conventions. **All pass.**
-
-It deliberately does **not** assert the absolute sign. That is a handedness question between
-OpenXR's frame and the game's, and this project has guessed it wrong on *both* of the other two
-axes — which is what F4 and F5 are for. **NUMPAD2** settles it in one keypress.
-
-### 🎯 Stage 4B: the measurement that has been missing for eight runs
-
-Stage 4B has been "worth one measurement before ruling out" since run 33, and **the measurement was
-never taken**. Every cost figure in this file is arithmetic on an *assumed* per-switch cost —
-"~3,800 switches, even at an optimistic 5 µs that is ~19 ms against an 8.3 ms budget". A guess with
-a multiplication after it.
-
-That is the same shape as three claims this project has already had to retract: the SSW frame rates,
-the "3% frame copy", and the 4096 cap that run 33 blamed on the GPU and run 40 measured at 16384.
-
-**NUMPAD3** swaps the render target and depth-stencil away to a scratch pair and straight back, once
-per draw — exactly the two `SetRenderTarget` + two `SetDepthStencilSurface` Stage 4B would issue for
-that draw's two eyes, at the real draw count, with the real interleaving, against the real driver.
-
-Because it swaps **back**, every draw lands where it always did and **the image is pixel-identical**.
-Any frame-time delta is switching cost and nothing else. Cost and correctness are fully separated,
-which is what makes one keypress a valid A/B — and toggling live beats two launches, which is two
-different scenes, positions and streaming states.
-
-| delta | verdict |
-|---|---|
-| under ~1 ms | affordable — build Stage 4B |
-| 1–3 ms | affordable only if the resolution work pays for itself first |
-| over ~4 ms | dead in this design; run 39's 4+ ms of idle does not cover it |
-
-**⚠️ It is a LOWER BOUND, not the price.** Stage 4B also pays for two full-size targets instead of
-one — double the pixel fill and bandwidth once each eye is full resolution — plus compositing them
-into the submitted frame. If the floor already blows the budget, that settles it with no further
-work.
-
-### ⚠️ Stage 4B's justification has changed, and the TL;DR above was stale
-
-Run 33 concluded per-eye targets were **mandatory** because side-by-side could never reach parity
-against a 4096 cap. **Run 40 retracted the premise** — `GetDeviceCaps` reports 16384×16384, and what
-refuses 4992 is **UE3's own resolution validation**. That retraction never propagated into the
-"Next session" list, which has been calling Stage 4B mandatory on resolution grounds for eight runs.
-Corrected now.
-
-**Resolution is no longer a reason to want Stage 4B.** Its remaining case is *correctness* — the
-seam, post-processing bleed, occlusion-box remapping. And the cheaper route to the pixels is
-defeating UE3's resolution validation, not rebuilding the render path.
-
-### Method note
-
-Both halves of this run are the same move: **the expensive plan deserves the cheap check first.**
-Roll got a 150-line arithmetic test that runs in a second and caught nothing — but would have caught
-a shear, and a shear is exactly the failure that reads as "roughly working" in a headset until you
-tilt far enough. Stage 4B got a keypress instead of a rewrite. Neither needed the headset to build.
-
-### ✅ RESULT (run 50): roll works, and Stage 4B is priced at last
-
-**Roll: confirmed working, sign was wrong, now fixed.** 3,000–4,000 draw matrices rolled per window
-at tilts up to 43°. `g_rollSign` defaulted to `+1` and tilted the horizon the wrong way; **`-1` is
-now the default** and the second run needed no correction. Third axis, third time OpenXR's
-handedness has come out negative against the game's — `g_yawSign` is `-1` for the same reason.
-
-**Roll costs nothing.** The two largest tilts in run 49 (41°, 43°) sit next to the *fastest* frames
-of that run (8.45 ms, 118 fps). No corner dropout was reported at 43° either, so the unrolled
-culling frustum has enough slack in practice.
-
-#### 🎯 The RT-switch measurement, and level 1 was measuring nothing
-
-Four phases in one run, same scene, draw counts within 8% of each other (1396 / 1513 / 1488):
-
-| phase | frame time (median) | "our work" | idle (`xrWaitFrame`) |
-|---|---|---|---|
-| **off** (control) | 8.70 ms | 5.54 ms | 3.09 ms |
-| **L1** bind away and back | 8.65 ms | 5.90 ms | 2.65 ms |
-| **L2** bind + forced 1×1 `Clear` | **10.71 ms** | **10.49 ms** | **0.17 ms** |
-| off (control, after) | 8.65 ms | — | — |
-
-**Level 1 measured nothing, exactly as predicted.** 2,576 `SetRenderTarget` + 2,576
-`SetDepthStencilSurface` per frame for **+0.36 ms** — D3D9 applies render state lazily, so a bind
-immediately followed by a rebind is collapsed to one bind at the next draw. Had level 2 not been
-built, this run would have concluded "render-target switches are free" and it would have been the
-eighth tautological instrument in this file.
-
-**Level 2 is the real number: +4.95 ms of work** for 1,411 switch pairs/frame (2,822 `SetRT` +
-2,822 `SetDS`) — about **3.5 µs per pair**.
-
-#### ⛔ Verdict: Stage 4B does not fit, but it is not the disaster the estimate claimed
-
-The estimate that blocked this for eight runs said **~19 ms**. It is **~5 ms**. Wrong by 4×, and
-wrong in the direction that mattered — but the answer is still no:
-
-- Frame time only rose **+2.01 ms** because **2.9 ms of existing idle absorbed the rest**. Idle went
-  from 3.09 ms to **0.17 ms** — the headroom run 39 won is entirely consumed.
-- Work at 10.49 ms against an **8.33 ms** display period means the app can no longer make the
-  120 Hz deadline at all. ~93 fps, with every frame late.
-
-Bracket the number honestly, because it is wrong in both directions: **L2 overstates** (Stage 4B
-binds and then issues a draw it was going to issue anyway — the `Clear`, the two `SetViewport`s and
-the `SetScissorRect` are the probe's own overhead), and **L2 understates** (Stage 4B also pays for
-two full-size targets — double pixel fill and bandwidth at full per-eye resolution — plus the
-composite). The flush is the dominant term and it is genuine either way.
-
-#### ➡️ Recommendation: build Stage 4A instead, and the constant is already found
-
-Stage 4B would now be spent **purely on correctness** — run 40 removed resolution as a reason to
-want it. Paying a quarter of the frame budget and all of the idle headroom for the seam,
-post-processing bleed and occlusion boxes is a bad trade **when Stage 4A fixes the same three things
-for the price of one patched constant**:
-
-- Place each eye with the **viewport**, which applies to every draw whether or not its matrix was
-  identified — so geometry can never be lost at the seam, and the whole identification dependency
-  goes away.
-- Patch UE3's `ScreenPositionScaleBias` per half, which is the one thing that broke last time
-  viewport splitting was tried (run 11).
-- **Run 41 already found that constant exactly:** `ps c1 = (0.5, -0.5, 0.50023, 0.50012)` at
-  4096×2160. It was ruled out as the *decal* cause, correctly — but it is precisely the constant
-  Stage 4A needs to patch, and it is sitting in the log already identified.
-
-Cost: a handful of `SetPixelShaderConstantF` calls per eye against 2,822 render-target binds.
-
-#### The slowdowns reported in run 49 were environmental
-
-Run 49 showed 23 of 72 windows over 15 ms, with spikes to 88 ms. **Not the probe** (30% hitch rate
-with it off, 37% on; the worst was probe-off), **not roll** (the 68 ms frame was at 1.5° roll),
-**not the copy** (0.00 ms), **not the GObjects walk** (0.04 ms), **not the GPU** (1.16 ms wait).
-All of it landed in CPU-side "our work" at normal draw counts.
-
-Run 50, same build and same ini, was clean — max 9.87 ms across 53 control windows. So run 49's
-hitching was the session, not the code. The standing hypothesis remains UE3's texture streaming: the
-log shows `FOV inflation vs native 65 deg: x2.01 -> objects project 3.4x smaller`, and UE3 picks
-streaming mip levels from projected screen size. **PAGE UP** walks the headroom if anyone wants to
-confirm it.
-
-### ⬜ The original test procedure (kept for method)
-
-Roll and the probe are independent; do roll first, since the probe needs a steady scene.
-
-1. **BACKSPACE** — VR mode on.
-2. Tilt your head side to side. **The horizon should stay level.** If it tilts the *wrong* way,
-   press **NUMPAD2** once and tilt again.
-3. With your head tilted ~30°, look around. **Watch the corners** for geometry dropping out — the
-   engine still culls with an unrolled frustum, and **PAGE UP** is the headroom lever if it does.
-4. **NUMPAD1** turns roll off, for a direct comparison against the old behaviour.
-5. Now stand still, facing something ordinary. Wait for a `perf:` line.
-6. **NUMPAD3**. Wait for the next `perf:` line.
-7. Compare the two `ms/frame` figures. **That difference is Stage 4B's floor.**
-
-The `RT-switch probe` line prints in both states, so the control condition is in the log next to
-the measurement rather than remembered.
 
 ## 🛑 Run 48: user-pointer draws ruled out too. STOPPING — the workaround is the answer.
 
