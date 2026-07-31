@@ -499,6 +499,50 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## 🛑 Run 48: user-pointer draws ruled out too. STOPPING — the workaround is the answer.
+
+`UserPtrQuadByVertex=1` classified correctly and the counts prove it:
+
+```
+user-pointer draws this window: 3590 split per eye, 1975 passed through as fullscreen quads
+```
+
+Passed-through count barely moved (1975 vs 1989 under the count-only rule), which means **every
+2-primitive draw has its first vertex in NDC** — that bucket is entirely fullscreen quads, with no
+decals hiding in it. Meanwhile 3,590–7,350 draws per window *were* being split per eye.
+
+**So the user-pointer draws are being handled correctly and the decals are still wrong.** Valid
+test, negative result. That closes the last live theory.
+
+### What is ruled out, with evidence
+
+| theory | how it died |
+|---|---|
+| Shadows | there is no shadow setting; **"High Quality Decals" off** removes it (run 44) |
+| `G16R16` scene-sized target | NUMPAD0 dropped every draw to it — **no change** (run 45) |
+| `ScreenPositionScaleBias` (`ps c1`) | found and confirmed exactly, but a scissored fullscreen quad is already self-consistent with it (run 41) |
+| Second view-projection at `vs c13` | remapping it stretched geometry and left decals untouched (run 43) |
+| Unhooked user-pointer draws | hooked and split correctly, decals unchanged (run 48) |
+
+### The answer that works
+
+**Turn "High Quality Decals" off in the in-game video options.** Zero cost, no rebuild, removes the
+only known visual defect. `HookUserPointerDraws=0` is restored as the shipped setting — level 3 cost
+real performance (mean 104 → 94 fps, floor 27 → 17) and bought nothing.
+
+### ⬜ If anyone resumes this
+
+The remaining untried approach is to identify the decal draw **by its shader or texture** rather
+than by geometry or render target — hook `SetPixelShader`/`SetTexture`, find what is bound uniquely
+during a decal, and treat those draws specially. That is a bigger instrument than anything built so
+far and the payoff is one cosmetic effect.
+
+Two things worth knowing before starting: the artefact is **view-dependent** (same light, different
+position each run, different eye depending on where the player stands), which still points at
+screen-space reconstruction rather than object placement; and **every counter in this file reports
+only the draws our hooks see**, so any new diagnostic must be checked for that failure mode first —
+it has now caused seven wrong conclusions here.
+
 ## ❌ Run 45: `G16R16` is NOT the decal pass — and the real candidate was in plain sight
 
 NUMPAD0 dropped every draw to that surface and **the artefact did not change.** So the surface that
