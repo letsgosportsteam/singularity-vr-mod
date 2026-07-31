@@ -186,12 +186,13 @@ crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
 
-**VR mode is ON from the first frame** (run 36) — head tracking, 6-DOF and true stereo, no
-keypresses needed. **BACKSPACE toggles the whole set**, and "off" is the plain game (the forced
-projection goes with it, since a mono image at 98° looks broken rather than standard). The old cold
-start is `StartInVrMode=0`.
+**Cold start is flat**, as always. **BACKSPACE reaches head tracking + 6-DOF + true stereo in one
+press** instead of three (run 37 reverted run 36's default-on, which rendered the untested main
+menu split from launch — BACKSPACE gets the same one-key convenience without changing what the
+game looks like before you press anything). BACKSPACE again drops back to flat, dropping the
+forced projection with it — a mono image stretched to 98° looks broken rather than standard.
 
-Individual toggles, still there: **F9** head tracking · **F10** 6-DOF head position · **F1** true
+Individual toggles, unchanged: **F9** head tracking · **F10** 6-DOF head position · **F1** true
 stereo (draw duplication) · **F12** alternate-eye stereo ·
 **F6** VR-correct projection · **F8** recentre · **F5/F4** flip yaw/pitch sign ·
 **F7** scan for the view matrix · **F3** constant offset probe · **F11** offset amount ·
@@ -495,7 +496,16 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-## ✅ Run 36: the freeze is fixed, and VR mode is on by default
+## ↩️ Run 37: run 36's default-on reverted — BACKSPACE stays, the cold start doesn't change
+
+Run 36 made VR mode start active, on the reasoning that F9/F10/F1 are the mod rather than three
+optional experiments. Reverted: that also meant the main menu was rendered frame-split for the
+first time ever, completely untested, on every launch. **The cold start is flat again** — same as
+every run before 36. **BACKSPACE still reaches the working state in one press**, which was the
+part actually worth keeping; it now does that without changing what the game looks like before the
+first key is pressed. `g_enabled`, `g_sixDof`, `g_dupDraws` are back to their original `0` defaults.
+
+## ✅ Run 36: the freeze is fixed, and VR mode was briefly on by default
 
 ### The GObjects backoff worked
 
@@ -509,11 +519,12 @@ transition window still shows 6.99 ms with the warning firing correctly — that
 its job (≈4 scans/sec instead of 60) rather than the problem returning. Gameplay is now **57–66 fps**
 at 4096×2160, slightly up.
 
-### VR mode on by default, BACKSPACE to leave it
+### BACKSPACE: one press instead of three (default-on itself reverted in run 37)
 
 F9 + F10 + F1 were never really three features; they are the mod. Requiring three keypresses to
-reach the working state was a leftover from when each was a separate experiment. All three now
-default on, and **BACKSPACE** toggles the set.
+reach the working state was a leftover from when each was a separate experiment, so **BACKSPACE**
+now toggles all three (plus the forced projection) as one set. **Run 37 reverted making this the
+cold start** — see above — but the toggle itself stands.
 
 "Off" restores the plain game — including dropping the forced projection, which is only correct
 while duplication is splitting the frame. Leaving it on would give a mono view stretched to 98°,
@@ -521,11 +532,7 @@ which looks broken rather than standard. Alternate-eye is cleared too, so the to
 produce the both-stereo-modes-at-once state that F12-after-F1 does.
 
 BACKSPACE because F1–F12 are all taken and it is large enough to find **by feel while wearing the
-headset**, which is the whole point of a panic switch.
-
-⚠️ **This means the main menu is now rendered with the frame split, which has never been tried.**
-If it comes out unreadable, BACKSPACE clears it without relaunching; `StartInVrMode=0` makes the
-cold start permanent.
+headset**.
 
 ## ✅ Run 35: the round-trip IS the frame, and the menu freeze is a GObjects scan
 

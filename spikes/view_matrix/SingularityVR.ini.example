@@ -39,27 +39,11 @@
 [Render]
 
 ; ---------------------------------------------------------------------------
-; StartInVrMode
-;
-; Head tracking (F9), 6-DOF (F10) and true stereo (F1) are active from the first
-; frame. They were never really three features - they are the mod - and needing
-; three keypresses to reach the working state was a leftover from when each was
-; a separate experiment.
-;
-; BACKSPACE toggles the whole set at runtime. "Off" is the plain game: no
-; tracking, no offset, mono, and the engine's own projection back. The forced
-; per-eye frustum goes with it, because it is only correct while duplication is
-; splitting the frame - a mono view stretched to 98 degrees looks broken rather
-; than standard.
-;
-; NOTE this also means the MAIN MENU is now rendered with the frame split, which
-; has not been tried before. If it is unreadable, press BACKSPACE - no relaunch
-; needed - or set this to 0 to make the flat cold start permanent.
-;
-;   1 = start in VR mode                                          <- default
-;   0 = start flat; press F9/F10/F1 or BACKSPACE to enable
+; The cold start is flat, as always - no head tracking, no 6-DOF, mono. Press
+; F9, F10 and F1 individually as before, OR press BACKSPACE once for all three
+; at once (and again to drop back to flat). BACKSPACE is just a shortcut for
+; the same three keys; it changes nothing about how the game looks on launch.
 ; ---------------------------------------------------------------------------
-StartInVrMode=1
 
 HookUserPointerDraws=0
 

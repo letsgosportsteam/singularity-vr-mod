@@ -139,7 +139,7 @@ PFN_CalcViewRotation g_origCalcViewRotation = nullptr;
 
 struct FVec3 { float x, y, z; };
 
-volatile LONG g_enabled = 1;      // head tracking - on by default (run 36), see g_dupDraws
+volatile LONG g_enabled = 0;      // head tracking - cold start is flat; BACKSPACE = all three at once
 volatile LONG g_constTest = 0;    // constant-pitch proof
 const int32_t kConstPitch = 8000; // ~44 degrees up - unmissable
 
@@ -403,7 +403,7 @@ float g_offsetUU = 300.0f;
 // UE3 scale is 16 units per foot, so 1 UU is 1.905 cm and a metre is 52.5 UU. If head movement
 // comes out feeling too large or too small in game, this is the number to adjust.
 const float kMetresToUU = 52.5f;
-volatile LONG g_sixDof = 1;        // F10 - on by default (run 36), see g_dupDraws
+volatile LONG g_sixDof = 0;        // F10 - cold start is flat; BACKSPACE = all three at once
 float g_hmdOffset[3] = {0,0,0};    // game-world offset from the recentre point, in UU
 float g_centrePos[3] = {0,0,0};    // headset position captured at recentre, in XR metres
 bool  g_haveCentrePos = false;
@@ -1040,11 +1040,9 @@ bool    g_eyeFilled[2] = { false, false };
 // properly); the visible compromise is that they carry no depth/stereo cue, not that they are
 // missing or wrong-side. That is a smaller problem than the one this used to have - see the
 // comment on StereoPair for what that was.
-// Default ON, with head tracking and 6-DOF, as of run 36. These three are the mod - starting with
-// them off meant three keypresses before anything worked, which made sense while each was an
-// experiment and stopped making sense once all three were load-bearing. StartInVrMode=0 restores
-// the old cold start, and BACKSPACE toggles the whole set at runtime.
-volatile LONG g_dupDraws = 1;
+// Cold start is flat, as before - see SetVrMode / BACKSPACE for the one-key way to reach head
+// tracking + 6-DOF + true stereo without three separate presses.
+volatile LONG g_dupDraws = 0;
 
 // ---- diagnostics for "visible in one eye only" (run 9) ----
 //
@@ -2866,16 +2864,18 @@ void InstallViewHook() {
 // ---------------------------------------------------------------- VR mode, as one switch
 //
 // F9 (head tracking), F10 (6-DOF) and F1 (true stereo) are not really three features, they are the
-// mod. Requiring three keypresses to reach the working state was a development artefact from when
-// each was a separate experiment.
+// mod - but the cold start stays flat (unchanged, run 37 reverted the default-on tried in run 36),
+// because starting in VR mode meant the game's own main menu was rendered split for the first
+// time ever, untested. BACKSPACE reaches the working state in one press instead of three, without
+// changing what the game looks like on launch.
 //
-// So they default ON and BACKSPACE toggles the set. "Off" means the plain game: no head tracking,
-// no positional offset, one mono image, and the engine's own projection restored - because the
-// forced per-eye frustum is only correct while duplication is splitting the frame, and leaving it
-// on would give a mono view stretched to 98 degrees, which looks broken rather than standard.
+// "Off" means the plain game: no head tracking, no positional offset, one mono image, and the
+// engine's own projection restored - because the forced per-eye frustum is only correct while
+// duplication is splitting the frame, and leaving it on would give a mono view stretched to 98
+// degrees, which looks broken rather than standard.
 //
 // BACKSPACE because every F-key F1-F12 is taken, and it is large enough to find by feel while
-// wearing a headset - which is the entire point of a panic switch.
+// wearing a headset - which is the entire point of a one-press switch.
 void SetVrMode(bool on) {
     InterlockedExchange(&g_enabled,      on ? 1 : 0);
     InterlockedExchange(&g_sixDof,       on ? 1 : 0);
@@ -3497,21 +3497,6 @@ void LoadIniSettings() {
     // zero-copy path could remove, and the whole case for the MANAGED wrapper turns on which of
     // the two the 12.5 ms at 4K actually is. Switchable because it forces the GPU sync slightly
     // earlier than the driver would, and that should be provable as harmless rather than assumed.
-    // Head tracking + 6-DOF + true stereo are on from the first frame (run 36). That includes the
-    // MAIN MENU, which has never been rendered with the frame split before - if it comes out
-    // unreadable, BACKSPACE clears it without a relaunch, and this setting makes the cold start
-    // permanent.
-    if (!GetPrivateProfileIntA("Render", "StartInVrMode", 1, path)) {
-        InterlockedExchange(&g_enabled, 0);
-        InterlockedExchange(&g_sixDof, 0);
-        InterlockedExchange(&g_dupDraws, 0);
-        InterlockedExchange(&g_vrProjection, 0);
-        Log("ini: StartInVrMode=0 - starting flat; F9/F10/F1 or BACKSPACE to enable");
-    } else {
-        Log("ini: StartInVrMode=1 - head tracking, 6-DOF and true stereo active from the first"
-            " frame. BACKSPACE toggles the whole set.");
-    }
-
     g_gpuFenceMode = GetPrivateProfileIntA("Render", "GpuFenceProbe", 1, path);
     if (g_gpuFenceMode < 0 || g_gpuFenceMode > 1) g_gpuFenceMode = 1;
     Log("ini: GpuFenceProbe=%d (%s)", g_gpuFenceMode,
