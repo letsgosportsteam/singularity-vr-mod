@@ -499,6 +499,52 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## 🎯 Run 44: it is NOT shadows — it is DECALS. Found by the user, not the instruments.
+
+**There is no "dynamic shadows" setting in this game. Turning off "High Quality Decals" makes the
+artefact disappear.**
+
+That reframes everything, and it fits every measurement already taken. UE3's high-quality decals
+are **deferred projected decals**: they reconstruct world position from the scene depth buffer and
+project a texture onto it.
+
+| observation | explained by |
+|---|---|
+| Wrong position, differently per eye | reads depth rendered with our **remapped** projection, reconstructs with an **unremapped** inverse |
+| Lands on the gun and arm | whatever depth is in front of the projector receives it |
+| Goes wild when a monster is under the light | more surfaces receiving projections |
+| ~2 fullscreen draws/frame into scene-sized `G16R16` | a deferred projection pass, not geometry |
+| Looks like a shadow | a dark projected texture *is* what a decal looks like |
+
+It also explains **why run 43 failed**: the decal pass is not transformed by a view matrix at all,
+so remapping `vs c13` could never have moved it. That negative result was correct and is now
+understood rather than merely recorded.
+
+### ✅ There is a working answer today
+
+**Turn off "High Quality Decals" in the in-game video options.** Zero cost, no rebuild, no mod
+change — and it removes the only known visual defect. That is the shipping answer unless someone
+later wants decals back.
+
+### ⬜ If it is picked up again, the target is now specific
+
+Not "find the shadow bug" but: **find the constant the decal pass uses to reconstruct world
+position from depth, and remap it per eye.** Everything needed to resume:
+
+- The pass writes to the scene-sized **`G16R16`** target, ~2 draws/frame — `SplitColourTargetsOnly=1`
+  routes it down the excluded path where the existing constant dump catches it
+- `ps c1` is UE3's **`ScreenPositionScaleBias`**, confirmed exactly — correct as-is for a scissored
+  fullscreen quad, so *not* the one to patch
+- The reconstruction constant was **not** in `ps c0..c63` or `vs c0..c95` in any obvious matrix form,
+  which is itself a clue: it may be composed into the decal's own projection matrix per draw
+- **Zero-cost confirmation next run:** with `SplitColourTargetsOnly=1`, compare the census with
+  High Quality Decals on vs off. If the `G16R16` rows vanish with the setting off, the target is
+  confirmed as the decal pass with no extra instrumentation at all.
+
+**Method note:** four runs of instrumentation narrowed this to the right surface and the right
+mechanism but never to the right *name* — the user found that by toggling a game setting. Worth
+remembering that the game's own options are a diagnostic, and a cheap one.
+
 ## ❌ Run 43: remapping `vs c13` FAILED — and the shadow theory is weakened
 
 `ExtraCamReg=13` was the first actual fix attempt. Result: **geometry stretched to the edge of the
