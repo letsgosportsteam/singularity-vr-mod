@@ -2306,6 +2306,9 @@ int g_splitColourOnly = 0;    // ini SplitColourTargetsOnly - see the note in Ho
 // One-shot budget for the shadow-pass constant dump. Only fires while SplitColourTargetsOnly=1,
 // because that is what routes those draws down the excluded path where they can be caught.
 volatile LONG g_dumpShadowConsts = 0;
+// NUMPAD0 - drop draws to the scene-sized non-colour target, to prove whether it is the decal pass.
+volatile LONG g_skipExtraTarget = 0;
+int g_drawsSkipped = 0;
 
 // ---- render-target census (run 11) ----
 //
@@ -2548,6 +2551,23 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
             if (c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 0.0f) continue;
             Log("    vs c%-2u = (%10.4f, %10.4f, %10.4f, %10.4f)", r, c[0], c[1], c[2], c[3]);
         }
+    }
+    // ---- NUMPAD0: drop every draw aimed at the scene-sized NON-colour target (run 44) ----
+    //
+    // The artefact is decals, not shadows - it vanishes with "High Quality Decals" off. What is
+    // still unproven is whether the G16R16 scene-sized surface IS that decal pass. The census can
+    // only show correlation; this shows causation. Skip those draws entirely and look:
+    //
+    //   artefact GONE      -> G16R16 is the decal pass, and that is where to patch
+    //   artefact REMAINS   -> decals are ordinary scene draws and this surface is something else
+    //
+    // Either answer redirects the work, and it costs one keypress rather than a run each way.
+    if (InterlockedCompareExchange(&g_skipExtraTarget, 0, 0) &&
+        InterlockedCompareExchange(&g_rtIsScene, 0, 0) == 0 &&
+        g_rtCurrent >= 0 && g_rtCurrent < 16 &&
+        g_rtSeen[g_rtCurrent].w == g_srcW && g_rtSeen[g_rtCurrent].h == g_srcH) {
+        ++g_drawsSkipped;
+        return S_OK;
     }
     if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) { ++g_drawsOffscreen; return draw(); }
 
@@ -3730,6 +3750,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      Log("F1: draw-call duplication (TRUE stereo) %s", was?"OFF":"ON"); }
     p1 = k1;
 
+    // NUMPAD0: drop draws to the scene-sized non-colour target. See the note in StereoPair.
+    static bool pNum0 = false;
+    bool kNum0 = (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0;
+    if (kNum0 && !pNum0) {
+        LONG was = InterlockedCompareExchange(&g_skipExtraTarget, 0, 0);
+        InterlockedExchange(&g_skipExtraTarget, was ? 0 : 1);
+        Log("NUMPAD0: draws to the scene-sized non-colour target %s",
+            was ? "restored" : "DROPPED - if the decal artefact disappears, that surface is the pass");
+    }
+    pNum0 = kNum0;
+
     // BACKSPACE: the whole mod on or off in one key. See SetVrMode.
     static bool pBack = false;
     bool kBack = (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
@@ -4031,6 +4062,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // The detector is supposed to track every register holding a camera matrix, so this
             // may already be covered. Printing the register numbers settles it without another
             // theory: if 13 is absent, that is the bug.
+            if (InterlockedCompareExchange(&g_skipExtraTarget, 0, 0))
+                Log("    NUMPAD0 ACTIVE: %d draws to the scene-sized non-colour target dropped"
+                    " this window", g_drawsSkipped);
+            g_drawsSkipped = 0;
             {
                 char regs[128] = {}; int n = 0;
                 for (int s = 0; s < g_camMatUsed && n < 100; ++s)
