@@ -92,6 +92,39 @@
 ; ---------------------------------------------------------------------------
 D3D9ExMode=0
 
+; ---------------------------------------------------------------------------
+; ZeroCopy   -- stage 2: what the D3D9Ex upgrade was FOR (run 39)
+;
+; Only takes effect when D3D9ExMode=1 - a shared surface cannot be created on a
+; plain D3D9 device - so leaving this at 1 changes nothing on its own.
+;
+;   before   GetRenderTargetData (GPU->sysmem, blocks) + LockRect (DMA lands)
+;            + memcpy 35 MB + Map + CopyResource        ~9.8 ms at 4096x2160
+;   after    StretchRect backbuffer -> shared RT (GPU->GPU)
+;            + CopyResource shared -> XR swapchain      target: under 1 ms
+;
+; The frame never touches the CPU. Spike 1 proved every link in a 32-bit
+; process: a D3D9Ex texture with a shared handle, opened by D3D11's
+; OpenSharedResource, pixels intact.
+;
+; Synchronisation is the only genuinely new problem. D3D9 has no counterpart to
+; D3D11's keyed mutex, so nothing makes the D3D11 read wait for the D3D9 write.
+; A D3DQUERYTYPE_EVENT fence issued AFTER the StretchRect and waited on before
+; the D3D11 copy is what spike 1 used and what is used here. That wait is not
+; new overhead - run 35 measured it at 2-4 ms of genuine rendering, and a frame
+; cannot be shown before it is drawn. What disappears is the ~9.4 ms of
+; transfer and memcpy piled on top.
+;
+; The A/B is D3D9ExMode=1 with ZeroCopy=0 against ZeroCopy=1.
+;
+; Note the cull-band diagnostic goes inert under zero-copy - there are no
+; CPU-readable pixels any more. Set ZeroCopy=0 if you need to measure it.
+;
+;   1 = shared surface, GPU->GPU                                  <- default
+;   0 = CPU round-trip through system memory
+; ---------------------------------------------------------------------------
+ZeroCopy=1
+
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------

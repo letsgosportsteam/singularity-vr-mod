@@ -1306,6 +1306,46 @@ int g_slotCur = 0;
 // Numbers kept stable rather than renumbered, so old logs and STATUS entries still read correctly.
 int g_copyMode = 1;                      // 0 = pipelined, 1 = immediate  <- default, measured
 
+// ---------------------------------------------------------------- STAGE 2: the zero-copy path
+//
+// What the whole D3D9Ex exercise was for. Instead of dragging the frame through system memory:
+//
+//   now      GetRenderTargetData (GPU->sysmem, blocks) + LockRect (DMA lands) + memcpy 35 MB
+//            + Map + CopyResource                                        ~9.8 ms at 4096x2160
+//   stage 2  StretchRect backbuffer -> shared RT (GPU->GPU)
+//            + CopyResource shared -> XR swapchain (GPU->GPU)            target: well under 1 ms
+//
+// The frame never touches the CPU. Spike 1 proved every link of this in a 32-bit process: a
+// D3D9Ex texture created with a shared handle, opened by ID3D11Device::OpenSharedResource, with
+// the pixels arriving intact.
+//
+// ---- synchronisation, which is the only genuinely new problem ----
+//
+// D3D9 has no counterpart to D3D11's keyed mutex, so nothing makes the D3D11 read wait for the
+// D3D9 write. A D3DQUERYTYPE_EVENT fence issued AFTER the StretchRect and waited on before the
+// D3D11 copy is what spike 1 used, and it is what is used here.
+//
+// Note the fence moves relative to the CPU path. There it is issued BEFORE the readback and
+// measures "GPU finished the frame". Here it must come AFTER the StretchRect is queued, so the
+// one wait covers both the frame and the copy into the shared target.
+//
+// That wait is not overhead we are adding - run 35 measured it at 2-4 ms and it is genuine
+// rendering time. The frame cannot be shown before it has been drawn. What disappears is the
+// ~9.4 ms of transfer and memcpy stacked on top of it.
+// Set when CreateDeviceEx succeeds, down in the D3DPOOL_MANAGED section. Declared up here because
+// the frame path needs it well before that code appears, and because zero-copy is meaningless
+// without it: a shared surface cannot be created on a plain D3D9 device.
+bool g_deviceIsEx = false;
+
+int g_zeroCopy = 1;                      // ini ZeroCopy - only ever active when the device is Ex
+bool g_zeroCopyActive = false;           // resolved at resource-creation time, per resolution
+
+HANDLE              g_sharedHandle = nullptr;
+IDirect3DTexture9*  g_sharedTex9   = nullptr;   // D3DUSAGE_RENDERTARGET, DEFAULT, shared
+IDirect3DSurface9*  g_sharedSurf9  = nullptr;   // its level 0, the StretchRect destination
+ID3D11Texture2D*    g_sharedTex11  = nullptr;   // the same memory, opened by D3D11
+ID3D11Texture2D*    g_frameSrc11   = nullptr;   // what the submit block copies into the swapchain
+
 // Create the XR swapchain lazily, sized to the game's backbuffer - we are pasting the game's
 // own image, so matching its dimensions avoids any rescale on the way in.
 bool EnsureSwapchain(UINT w, UINT h) {
@@ -1406,9 +1446,54 @@ bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
         }
     }
 
+    // ---- the shared render target: the whole point of the D3D9Ex upgrade ----
+    //
+    // Created at the backbuffer's own format so StretchRect needs no conversion, one mip level and
+    // DEFAULT pool because that is all a shared surface may be, and with a non-null pSharedHandle,
+    // which is the part a plain D3D9 device refuses (spike 1 confirmed the refusal).
+    //
+    // This passes through our own Hook_CreateTexture untouched - the pool is already DEFAULT, so
+    // the MANAGED branch is never taken.
+    if (g_sharedSurf9) { g_sharedSurf9->Release(); g_sharedSurf9 = nullptr; }
+    if (g_sharedTex9)  { g_sharedTex9->Release();  g_sharedTex9 = nullptr; }
+    if (g_sharedTex11) { g_sharedTex11->Release(); g_sharedTex11 = nullptr; }
+    g_sharedHandle = nullptr;
+    g_zeroCopyActive = false;
+
+    if (g_zeroCopy && g_deviceIsEx) {
+        HRESULT hr = dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT,
+                                        &g_sharedTex9, &g_sharedHandle);
+        if (FAILED(hr) || !g_sharedTex9 || !g_sharedHandle) {
+            Log("*** shared render target creation FAILED hr=0x%08lX - falling back to the CPU copy ***", hr);
+        } else if (FAILED(g_sharedTex9->GetSurfaceLevel(0, &g_sharedSurf9)) || !g_sharedSurf9) {
+            Log("*** GetSurfaceLevel on the shared RT failed - falling back to the CPU copy ***");
+        } else if (FAILED(g_dev11->OpenSharedResource(g_sharedHandle, __uuidof(ID3D11Texture2D),
+                                                      (void**)&g_sharedTex11)) || !g_sharedTex11) {
+            Log("*** OpenSharedResource FAILED - D3D11 could not open the D3D9 texture,"
+                " falling back to the CPU copy ***");
+        } else {
+            D3D11_TEXTURE2D_DESC sd{};
+            g_sharedTex11->GetDesc(&sd);
+            g_zeroCopyActive = true;
+            Log("*** ZERO-COPY ACTIVE: shared RT %ux%u, D3D11 sees fmt=%d - the frame no longer"
+                " touches the CPU ***", sd.Width, sd.Height, (int)sd.Format);
+        }
+        if (!g_zeroCopyActive) {
+            if (g_sharedSurf9) { g_sharedSurf9->Release(); g_sharedSurf9 = nullptr; }
+            if (g_sharedTex9)  { g_sharedTex9->Release();  g_sharedTex9 = nullptr; }
+            if (g_sharedTex11) { g_sharedTex11->Release(); g_sharedTex11 = nullptr; }
+            g_sharedHandle = nullptr;
+        }
+    } else if (g_zeroCopy && !g_deviceIsEx) {
+        static bool said = false;
+        if (!said) { said = true;
+            Log("ZeroCopy requested but the device is not D3D9Ex - needs D3D9ExMode=1. Using the CPU copy."); }
+    }
+
     g_srcW = w; g_srcH = h; g_srcFmt = fmt;
-    Log("copy resources ready for %ux%u fmt=%d (%d readback slots, %s)", w, h, (int)fmt,
-        kCopySlots, g_copyMode == 1 ? "immediate" : "pipelined one frame");
+    Log("copy resources ready for %ux%u fmt=%d (%d readback slots, %s, %s)", w, h, (int)fmt,
+        kCopySlots, g_copyMode == 1 ? "immediate" : "pipelined one frame",
+        g_zeroCopyActive ? "ZERO-COPY" : "CPU round-trip");
     return true;
 }
 
@@ -1474,8 +1559,36 @@ void MeasureCullBand(const uint8_t* bits, int pitch, UINT w, UINT h) {
     }
 }
 
-// Pull the game's finished frame across to D3D11. This is the expensive part: a full
-// GPU->CPU readback followed by a CPU->GPU upload, roughly 14 MB each way at 2560x1440.
+// Stamp the slot with the state its pixels were drawn under. Everything the submission needs is
+// captured at the moment of capture, so a frame consumed later cannot be submitted with a pose or
+// a projection it was never rendered from. Shared by both the CPU and zero-copy paths - the two
+// must never disagree about what a captured frame means.
+void StampCaptureState(CopySlot& cap) {
+    cap.stereo = InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
+    cap.dup    = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    // The backbuffer just captured was drawn with the offset chosen at the END of the previous
+    // frame, so it belongs to g_renderEye - not to whichever eye is about to be switched to.
+    cap.eye    = cap.stereo ? g_renderEye : 0;
+    for (int i = 0; i < 2; ++i) {
+        cap.pose[i] = cap.stereo ? g_renderPose[i] : g_eyePose[i];
+        cap.fov[i]  = g_eyeFov[i];
+    }
+    // Submit the frustum we FORCED, not the one we observed. Following the observation was the
+    // run-5 flicker: the engine's FOV drifts between our writes, so a submitted frustum that
+    // tracked it inherited every wobble.
+    cap.useDerived = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
+                     g_targetTanX > 0.0f && g_targetTanY > 0.0f;
+    if (cap.useDerived) {
+        cap.derived.angleLeft  = -atanf(g_targetTanX);
+        cap.derived.angleRight =  atanf(g_targetTanX);
+        cap.derived.angleUp    =  atanf(g_targetTanY);
+        cap.derived.angleDown  = -atanf(g_targetTanY);
+    }
+}
+
+// Pull the game's finished frame across to D3D11. On the CPU path this is the expensive part: a
+// full GPU->CPU readback followed by a CPU->GPU upload, ~14 MB each way at 1440p and ~35 MB at 4K.
+// Under zero-copy it is two GPU-side copies and a fence.
 //
 // Returns the slot whose pixels now sit in g_uploadTex, or nullptr if there is nothing to submit.
 // In pipelined mode the very first frame returns nullptr because nothing has been captured yet -
@@ -1488,6 +1601,60 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
     if (!EnsureCopyResources(dev, sd.Width, sd.Height, sd.Format)) { back->Release(); return nullptr; }
 
     CopySlot& cap = g_slot[g_slotCur];
+
+    // ---- zero-copy: the frame goes GPU -> GPU and never enters system memory ----
+    if (g_zeroCopyActive && g_sharedSurf9) {
+        LARGE_INTEGER tS = Now();
+        // Same size, same format, no filtering. Queued, not executed - the fence below is what
+        // makes it safe for D3D11 to read.
+        HRESULT hrS = dev->StretchRect(back, nullptr, g_sharedSurf9, nullptr, D3DTEXF_NONE);
+        back->Release();
+        g_msGRTD += MsSince(tS);
+        if (FAILED(hrS)) {
+            static bool once = false;
+            if (!once) { once = true;
+                Log("*** StretchRect to the shared RT failed hr=0x%08lX - dropping to the CPU copy"
+                    " for the rest of this session ***", hrS); }
+            g_zeroCopyActive = false;
+            return nullptr;
+        }
+        // The fence goes AFTER the copy is queued, not before it as on the CPU path: this one wait
+        // has to cover the frame being drawn AND the StretchRect landing, because D3D9 offers
+        // nothing like a keyed mutex to make the D3D11 read wait on its own.
+        if (g_gpuFence) {
+            g_gpuFence->Issue(D3DISSUE_END);
+            LARGE_INTEGER tf = Now();
+            BOOL done = FALSE;
+            while (g_gpuFence->GetData(&done, sizeof(done), D3DGETDATA_FLUSH) == S_FALSE) {
+                if (MsSince(tf) > 100.0) { Log("GPU fence did not signal within 100 ms - abandoning the wait"); break; }
+                YieldProcessor();
+            }
+            g_msGpuWait += MsSince(tf);
+            ++g_gpuWaitFrames;
+        }
+        // ---- ⚠️ no pipelining here, and it is not an oversight ----
+        //
+        // FrameCopyMode's ring exists because a sysmem readback can be deferred a frame. There is
+        // exactly ONE shared render target, and StretchRect has just overwritten it with THIS
+        // frame - so consuming an older slot's metadata would submit these pixels with the
+        // previous frame's pose. That is the reprojection-swim failure the capture stamping exists
+        // to prevent, arrived at from the opposite direction.
+        //
+        // A dedicated slot rather than the ring, so the two paths cannot interfere if the mode is
+        // switched mid-session.
+        static CopySlot zc;
+        StampCaptureState(zc);
+        zc.pending = false;
+        g_frameSrc11 = g_sharedTex11;
+        ++g_copyFrames;
+        // MeasureCullBand is unavailable here by construction - there are no CPU-readable pixels
+        // any more. Said once so a missing diagnostic is never mistaken for a zero reading.
+        static bool saidBand = false;
+        if (!saidBand) { saidBand = true;
+            Log("note: the cull-band measurement is inert under zero-copy - the frame is never"
+                " mapped to the CPU. Set ZeroCopy=0 to measure it."); }
+        return &zc;
+    }
 
     // Pay the GPU sync here, where it can be measured, instead of anonymously inside
     // GetRenderTargetData. See the note on g_gpuFence: this is the number the D3D9Ex decision
@@ -1523,30 +1690,8 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
         return nullptr;
     }
 
-    // Stamp the slot with the state its pixels were drawn under. Everything the submission needs
-    // is captured here, at the moment of capture, so a frame consumed later cannot be submitted
-    // with a pose or a projection it was never rendered from.
+    StampCaptureState(cap);
     cap.pending = true;
-    cap.stereo  = InterlockedCompareExchange(&g_stereo, 0, 0) != 0;
-    cap.dup     = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
-    // The backbuffer just read was drawn with the offset chosen at the END of the previous frame,
-    // so it belongs to g_renderEye - not to whichever eye is about to be switched to.
-    cap.eye     = cap.stereo ? g_renderEye : 0;
-    for (int i = 0; i < 2; ++i) {
-        cap.pose[i] = cap.stereo ? g_renderPose[i] : g_eyePose[i];
-        cap.fov[i]  = g_eyeFov[i];
-    }
-    // Submit the frustum we FORCED, not the one we observed. Following the observation was the
-    // run-5 flicker: the engine's FOV drifts between our writes, so a submitted frustum that
-    // tracked it inherited every wobble.
-    cap.useDerived = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
-                     g_targetTanX > 0.0f && g_targetTanY > 0.0f;
-    if (cap.useDerived) {
-        cap.derived.angleLeft  = -atanf(g_targetTanX);
-        cap.derived.angleRight =  atanf(g_targetTanX);
-        cap.derived.angleUp    =  atanf(g_targetTanY);
-        cap.derived.angleDown  = -atanf(g_targetTanY);
-    }
 
     // Which slot we consume is the entire difference between the two modes.
     const int consumeIdx = (g_copyMode == 1) ? g_slotCur : (g_slotCur + 1) % kCopySlots;
@@ -1591,6 +1736,7 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
     ++g_copyFrames;
 
     use.pending = false;
+    g_frameSrc11 = g_uploadTex;
     return &use;
 }
 
@@ -1780,8 +1926,11 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
             wi.timeout = XR_INFINITE_DURATION;
             if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchain[filled], &wi))) {
+                // Either the CPU-uploaded staging texture or, under zero-copy, the shared surface
+                // the GPU already wrote - both are D3D11 textures of a compatible type group, so
+                // the copy into the swapchain image is identical either way.
                 LARGE_INTEGER tUp = Now();
-                g_ctx11->CopyResource(g_scImages[filled][idx], g_uploadTex);
+                if (g_frameSrc11) g_ctx11->CopyResource(g_scImages[filled][idx], g_frameSrc11);
                 g_msUpload += MsSince(tUp);
                 XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
                 xrReleaseSwapchainImage(g_swapchain[filled], &ri);
@@ -2664,7 +2813,8 @@ HRESULT STDMETHODCALLTYPE Hook_CreateQuery(IDirect3DDevice9* dev, D3DQUERYTYPE t
 // Off by default. This replaces the resource management of a shipping engine; it is one relaunch
 // away from off precisely because the failure mode is "the game does not start".
 int  g_d3d9ExMode = 0;                 // ini D3D9ExMode: 0 = plain D3D9 (default), 1 = Ex + translate
-bool g_deviceIsEx = false;             // did we actually end up with an Ex device
+// g_deviceIsEx ("did we actually end up with an Ex device") is declared up beside the zero-copy
+// globals - the frame path consults it long before this section appears.
 IDirect3D9Ex*     g_d3d9ex = nullptr;  // kept so CreateDevice can call CreateDeviceEx
 IDirect3DDevice9* g_gameDev = nullptr; // for UpdateTexture
 
@@ -3627,9 +3777,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 const double wf = g_waitFrames ? g_msWaitFrame / g_waitFrames : 0.0;
                 const double gw = g_gpuWaitFrames ? g_msGpuWait / g_gpuWaitFrames : 0.0;
                 const double copy = rb + lk + lc + up;
-                Log("    frame copy [%s]: readback %.2f + lock(DMA lands) %.2f + memcpy %.2f"
+                Log("    frame copy [%s]: %s %.2f + lock(DMA lands) %.2f + memcpy %.2f"
                     " + upload %.2f = %.2f ms of %.2f (%.0f%%)",
-                    g_copyMode == 1 ? "immediate" : "pipelined", rb, lk, lc, up,
+                    g_zeroCopyActive ? "ZERO-COPY" : (g_copyMode == 1 ? "immediate" : "pipelined"),
+                    g_zeroCopyActive ? "StretchRect" : "readback", rb, lk, lc, up,
                     copy, ms, ms > 0 ? 100.0 * copy / ms : 0.0);
                 // The split that decides where any further effort goes. Time in xrWaitFrame is
                 // the app sitting idle waiting for the compositor, so it is not ours to optimise;
@@ -3993,6 +4144,14 @@ void LoadIniSettings() {
     // zero-copy path could remove, and the whole case for the MANAGED wrapper turns on which of
     // the two the 12.5 ms at 4K actually is. Switchable because it forces the GPU sync slightly
     // earlier than the driver would, and that should be provable as harmless rather than assumed.
+    // Stage 2. Only ever active on an Ex device, so leaving this at 1 with D3D9ExMode=0 changes
+    // nothing - the pair is the A/B: D3D9ExMode=1/ZeroCopy=0 against D3D9ExMode=1/ZeroCopy=1.
+    g_zeroCopy = GetPrivateProfileIntA("Render", "ZeroCopy", 1, path);
+    if (g_zeroCopy < 0 || g_zeroCopy > 1) g_zeroCopy = 1;
+    Log("ini: ZeroCopy=%d (%s)", g_zeroCopy,
+        g_zeroCopy ? "shared surface, GPU->GPU - needs D3D9ExMode=1 to take effect"
+                   : "CPU round-trip through system memory");
+
     g_gpuFenceMode = GetPrivateProfileIntA("Render", "GpuFenceProbe", 1, path);
     if (g_gpuFenceMode < 0 || g_gpuFenceMode > 1) g_gpuFenceMode = 1;
     Log("ini: GpuFenceProbe=%d (%s)", g_gpuFenceMode,

@@ -496,6 +496,57 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## 🔨 Run 39: Stage 2, the zero-copy frame path — BUILT, not yet run (`ZeroCopy=1`)
+
+What the whole D3D9Ex exercise was for. Requires `D3D9ExMode=1`; on a plain device a shared surface
+cannot be created, so `ZeroCopy=1` alone changes nothing.
+
+| | path | cost at 4096×2160 |
+|---|---|---|
+| before | `GetRenderTargetData` → `LockRect` → `memcpy` 35 MB → `Map` → `CopyResource` | **~9.8 ms** |
+| after | `StretchRect` backbuffer → shared RT, then `CopyResource` → XR swapchain | **target < 1 ms** |
+
+Both copies are GPU-side. **The frame never touches the CPU.** Spike 1 proved every link of this in
+a 32-bit process — a D3D9Ex texture created with a shared handle, opened by
+`ID3D11Device::OpenSharedResource`, pixels arriving intact.
+
+### Synchronisation — the only genuinely new problem
+
+D3D9 has no counterpart to D3D11's keyed mutex, so nothing makes the D3D11 read wait for the D3D9
+write. A `D3DQUERYTYPE_EVENT` fence issued **after** the `StretchRect` and waited on before the
+D3D11 copy is what spike 1 used, and what is used here.
+
+Note the fence **moves** relative to the CPU path. There it is issued *before* the readback and
+measures "GPU finished the frame". Here it must come *after* the `StretchRect` is queued, so one
+wait covers both the frame being drawn and the copy into the shared target.
+
+That wait is not overhead being added — run 35 measured it at 2–4 ms and it is genuine rendering
+time; a frame cannot be shown before it is drawn. What disappears is the ~9.4 ms of transfer and
+memcpy stacked on top of it.
+
+### ⚠️ No pipelining under zero-copy, deliberately
+
+`FrameCopyMode`'s two-slot ring exists because a sysmem readback can be deferred a frame. There is
+exactly **one** shared render target, and `StretchRect` has just overwritten it with *this* frame —
+so consuming an older slot's metadata would submit these pixels with the previous frame's pose.
+That is the reprojection-swim failure the capture stamping exists to prevent, reached from the
+opposite direction. The zero-copy path uses its own dedicated slot and always consumes immediately.
+
+### Also inert under zero-copy: the cull-band measurement
+
+There are no CPU-readable pixels any more, by construction. Logged once so a missing diagnostic is
+never mistaken for a zero reading. `ZeroCopy=0` to measure it.
+
+### What to read
+
+```
+*** ZERO-COPY ACTIVE: shared RT 4096x2160, D3D11 sees fmt=87 - the frame no longer touches the CPU ***
+frame copy [ZERO-COPY]: StretchRect 0.30 + lock(DMA lands) 0.00 + memcpy 0.00 + upload 0.05 = 0.35 ms of 6.80 (5%)
+```
+
+Every fallback is logged loudly and drops to the CPU path rather than failing: shared-RT creation,
+`GetSurfaceLevel`, `OpenSharedResource`, and a `StretchRect` that fails at runtime.
+
 ## ✅ Run 38 RESULT: the wrapper works, and the feared gap does not exist
 
 **The game runs correctly on a D3D9Ex device with every MANAGED allocation translated.** Textures
