@@ -499,6 +499,51 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## ❌ Run 45: `G16R16` is NOT the decal pass — and the real candidate was in plain sight
+
+NUMPAD0 dropped every draw to that surface and **the artefact did not change.** So the surface that
+three runs of work were aimed at is unrelated. It was never more than "the only anomalous thing in
+the census", which is exactly the kind of inference that has now been wrong four times here.
+
+### The candidate that was always there: unhooked user-pointer draws
+
+`HookUserPointerDraws=0`, so `DrawPrimitiveUP` / `DrawIndexedPrimitiveUP` are **completely
+unhooked**. Decals are dynamic, CPU-generated geometry — precisely what that path exists for. An
+unhooked draw never reaches `StereoPair`, so it is rendered **once at full-frame coordinates** and
+spans both eye halves.
+
+**That is the reported symptom exactly**: part of the decal in one eye, part in the other.
+
+### ⚠️ Why every instrument said everything was fine
+
+```
+split 367 (367 with parallax, 0 flat), offscreen 0, mono-fallback 0, user-ptr 0
+```
+
+Every one of those counters increments **inside our hooks**. A draw that bypasses the hooks is
+invisible to all of them. `user-ptr 0` does not mean "there are none" — it means "we are not
+looking". `split 367 … 0 flat` says every draw *we saw* was handled perfectly, and says nothing
+about the ones we did not.
+
+Fifth tautological diagnostic, after `remapKnown = true`, the perf line's swallowed argument, the
+census `<- SPLIT` label, and `registers cached: 1`. **The pattern is always the same: a counter that
+can only report the good case.**
+
+Run 30 measured **245–370 user-pointer draws per frame** when these hooks were briefly on. That
+volume of geometry has been rendering mono, at full-frame coordinates, for the entire project.
+
+### ⬜ The test needs no code change at all
+
+`HookUserPointerDraws=3` routes them through `StereoPair`. Known side effect (run 28): level 3 also
+catches `DrawDenormalizedQuad`, the fullscreen post-process quad, and scissoring that produces the
+"rainbow". So:
+
+- **Decals split correctly per eye** → cause confirmed; the remaining work is draw classification,
+  so decals get the treatment and fullscreen quads do not
+- **Decals unchanged** → they do not come through this path either
+- **Rainbow makes it unreadable** → still informative, and it confirms the path carries the
+  fullscreen quads; drop to level 1 or 2 to bisect
+
 ## 🎯 Run 44: it is NOT shadows — it is DECALS. Found by the user, not the instruments.
 
 **There is no "dynamic shadows" setting in this game. Turning off "High Quality Decals" makes the
