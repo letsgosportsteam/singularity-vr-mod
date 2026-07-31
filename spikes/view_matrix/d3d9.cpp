@@ -2818,11 +2818,36 @@ inline void DumpUserPtrVertex(UINT primCount, const void* vtxData, UINT stride, 
         which, primCount, stride, v[0], v[1], v[2], stride >= 16 ? v[3] : 0.0f);
 }
 
-inline bool UserPtrQuad(UINT primCount) {
+// ---- run 47: classify by VERTEX RANGE, not primitive count ----
+//
+// The histogram separated cleanly - 2 prims (1989) against 9+ (3595), nothing between - yet decals
+// stayed broken. The vertex samples say why: the fullscreen quad sits at NDC, v0 = (-0.94, 1.00),
+// and a decal is ALSO two triangles. So the 2-prim bucket holds both, and a count-based threshold
+// passes the whole bucket through unsplit, decals included. The sampler drew two from that bucket
+// and both happened to be the quad, which is how it looked clean.
+//
+// Coordinate range separates them by four orders of magnitude: +-1 for a clip-space quad against
+// +-40000 for world-space geometry. So: a draw is a fullscreen quad only if it is small AND its
+// first vertex is inside NDC. Everything else gets the per-eye split.
+//
+// Cost is a bounds check plus two float compares on memory the game just wrote - microseconds a
+// frame at ~370 draws, which is why this was never a performance question.
+int g_upQuadByVertex = 1;    // ini UserPtrQuadByVertex: 0 = count only (run 46), 1 = count + NDC
+
+inline bool UserPtrQuad(UINT primCount, const void* vtxData, UINT stride) {
     const int b = primCount <= 1 ? 0 : primCount == 2 ? 1 : primCount <= 4 ? 2
                 : primCount <= 8 ? 3 : primCount <= 16 ? 4 : 5;
     ++g_upHist[b];
-    const bool quad = (int)primCount < g_userPtrMinPrims;
+    bool quad = (int)primCount < g_userPtrMinPrims;
+    if (quad && g_upQuadByVertex) {
+        // Small AND in clip space. A 2-triangle decal carries world coordinates and fails this,
+        // so it goes on to be split like any other geometry.
+        quad = false;
+        if (vtxData && stride >= 8 && Readable(vtxData, 8)) {
+            const float* v = static_cast<const float*>(vtxData);
+            if (v[0] > -1.5f && v[0] < 1.5f && v[1] > -1.5f && v[1] < 1.5f) quad = true;
+        }
+    }
     if (quad) ++g_drawsUPQuad; else ++g_drawsUPSplit;
     return quad;
 }
@@ -2835,7 +2860,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     ++g_drawsUP;
     if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     DumpUserPtrVertex(primCount, vtxData, vtxStride, "DrawPrimUP");
-    if (UserPtrQuad(primCount)) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
+    if (UserPtrQuad(primCount, vtxData, vtxStride)) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
@@ -2853,7 +2878,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     DumpUserPtrVertex(primCount, vtxData, vtxStride, "DrawIndexedPrimUP");
-    if (UserPtrQuad(primCount)) {
+    if (UserPtrQuad(primCount, vtxData, vtxStride)) {
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     }
@@ -4475,6 +4500,12 @@ void LoadIniSettings() {
     if (g_userPtrMinPrims < 0 || g_userPtrMinPrims > 1000) g_userPtrMinPrims = 3;
     Log("ini: UserPtrMinPrims=%d (user-pointer draws with fewer primitives pass through unsplit"
         " - they are fullscreen quads)", g_userPtrMinPrims);
+
+    g_upQuadByVertex = GetPrivateProfileIntA("Render", "UserPtrQuadByVertex", 1, path);
+    if (g_upQuadByVertex < 0 || g_upQuadByVertex > 1) g_upQuadByVertex = 1;
+    Log("ini: UserPtrQuadByVertex=%d (%s)", g_upQuadByVertex,
+        g_upQuadByVertex ? "a small draw is only a fullscreen quad if its first vertex is in NDC"
+                         : "primitive count alone - the run-46 behaviour, decals stay unsplit");
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;
