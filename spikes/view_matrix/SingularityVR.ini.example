@@ -154,6 +154,34 @@ ZeroCopy=1
 ; ---------------------------------------------------------------------------
 SplitColourTargetsOnly=0
 
+; ---------------------------------------------------------------------------
+; ExtraCamReg   -- TRIED AND FAILED (run 43). Kept so the result is reproducible.
+;
+; Everything in the matrix path keys off ONE locked register, so exactly one
+; view-projection is ever remapped per eye. Run 42's constant dump found a
+; second one at vs c13 - identical projection columns to c0-c3, but a
+; world-space translation where c3 is translated-world and small.
+;
+; Setting this to 13 remaps it too. Result: geometry stretched to the edge of
+; the screen AND the shadows were unchanged.
+;
+; Both halves are informative. The stretching proves c13 really does drive
+; on-screen vertices - it is not a dead register or a light's transform. But the
+; shadows not moving at all argues c13 is NOT the carrier for the mis-projected
+; shadow geometry, so the shadow's cause is elsewhere.
+;
+; The stretch itself is explainable: the remap assumes c13 shares c0's storage
+; convention and skips ApplyProjection. Either could be wrong, and a world-space
+; matrix may not accept clip-space eye remapping the way a translated-world one
+; does. Sorting that out is its own project.
+;
+;   -1 = off                                                      <- default
+;   13 = also remap vs c13 (reproduces the run-43 failure)
+;
+; If head tracking or geometry ever looks wrong, set this to -1 and relaunch.
+; ---------------------------------------------------------------------------
+ExtraCamReg=-1
+
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------

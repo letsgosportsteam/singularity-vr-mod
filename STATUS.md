@@ -499,7 +499,47 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-## ✅ Run 42: the shadow bug — a second view-projection at `vs c13` is never remapped
+## ❌ Run 43: remapping `vs c13` FAILED — and the shadow theory is weakened
+
+`ExtraCamReg=13` was the first actual fix attempt. Result: **geometry stretched to the edge of the
+screen, and the shadows were still wrong.**
+
+Both halves of that matter, and they point in opposite directions:
+
+**The stretching proves `c13` is real.** Remapping it visibly moved geometry, so it genuinely
+drives on-screen vertices — it is not a dead register or a light's transform. The run-42 dump was
+reading something meaningful.
+
+**But the shadows did not change, which weakens the theory.** If `c13` were the carrier for the
+mis-projected shadow geometry, remapping it should have moved the artefact even if it moved it
+wrongly. It did not. So the shadow's carrier is most likely **something else**, and `c13` is simply
+a second camera matrix that this mod has never remapped — a real finding, but a different one.
+
+**Why the stretch:** the remap was applied with `conv = g_lockedConv`, assuming `c13` shares `c0`'s
+storage convention, and without `ApplyProjection`. Either assumption could be wrong on its own, and
+a world-space matrix may not accept `ApplyEyeRemap`'s clip-space scaling the same way a
+translated-world one does. Chasing that is a project in itself.
+
+Backed out — `ExtraCamReg=-1` is the default and the shipped setting. The switch is kept so the
+result is reproducible rather than folklore.
+
+### ⬜ Recommendation: stop here on shadows
+
+Four runs and a fix attempt have gone into this. What is known:
+
+- The pass writes to a scene-sized **`G16R16`** target, ~2 draws/frame, and is fullscreen
+- `ps c1` is UE3's **`ScreenPositionScaleBias`**, confirmed exactly — but ruled out, since a
+  scissored fullscreen quad is already self-consistent with it
+- The artefact tracks **skinned** casters (monster, arm, gun) and splits across the seam
+- Only **one** register is ever remapped, and remapping the obvious second one does not fix it
+
+The next honest step would be finding which constant the shadow pass actually reconstructs world
+position with — real work, on the most fragile code here, for a **cosmetic** defect on one light.
+Against a mod that otherwise runs true stereo at 4096×2160 and ~115 fps with correct tracking,
+colour, and no vanishing geometry, that is a poor trade. **Disabling dynamic shadows in the
+in-game video options is the reasonable shipping answer** unless this becomes a priority later.
+
+## ⚠️ Run 42: a second view-projection at `vs c13` is never remapped (NOT the shadow cause — see run 43)
 
 > ⚠️ **Correction, recorded because it was written down wrong first.** This was initially filed as
 > vindicating the run-18 "vanishing monster" theory. **It is not.** Objects vanishing — the monster
