@@ -61,11 +61,17 @@ remaining on the list is planned work rather than a bug.
 With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
 debugging.
 
-1. **The D3D9Ex zero-copy path — now the single highest-value item, and measured rather than
-   assumed.** At 4096×2160 the CPU round-trip is **~12.5 ms of a ~16 ms frame** while the actual
-   rendering is 2–4 ms (run 33). Removing it is worth roughly **60 → 120+ fps** at the resolution
-   the project actually wants. Needs the `D3DPOOL_MANAGED` → `DEFAULT` wrapper (10,454 allocations,
-   five resource types). This is the same work run 31 cancelled on SSW-confounded data.
+1. **Read the `round-trip split` line before writing any wrapper.** (One launch, 4K, `GpuFenceProbe=1`.)
+   At 4096×2160 the copy measures ~12.5 ms of a ~16 ms frame, but `GetRenderTargetData` *synchronises*
+   as well as transfers, so an unknown part of that is GPU rendering the wrapper cannot recover
+   (run 34). Estimate is ~7 ms recoverable / ~5 ms GPU wait → **~60 → ~100 fps**, but that is
+   arithmetic, not measurement. **If `RECOVERABLE` comes back small, do not write the wrapper.**
+2. **Then the D3D9Ex zero-copy path**, if the split justifies it — `D3DPOOL_MANAGED` → `DEFAULT`
+   for 10,454 allocations. Cheaper than the "COM proxies for five resource types" framing suggests:
+   D3D9 resources of a type share a vtable, so one `PatchVTable` on `LockRect`/`UnlockRect` covers
+   every texture from that device — the exact trick already proven on `IDirect3DQuery9::GetData`
+   for the run-30 occlusion fix. Wrapper state becomes a side table keyed on the resource pointer,
+   not a proxy object per allocation.
 2. **Per-eye render targets (Stage 4B) — promoted from "worth one measurement" to mandatory.**
    Run 33 settled the cap at 4096, so side-by-side tops out at 2048 per eye against 2688 wanted.
    **Parity is arithmetically unreachable** in a single side-by-side frame. This is also the fix
@@ -485,6 +491,63 @@ stays for the mode selection the shipped mod needs.
 
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
+
+## ⚠️ Run 34: the ~60 fps at 4K is real, and the "12.5 ms copy" is NOT all recoverable
+
+Two corrections to run 33, both mine.
+
+### 1. The SSW warning cried wolf, and the fix was already in the data
+
+Run 33 ran with SSW **off**. The warning fired anyway (`1.91x`, `1.99x`) because it tested frame
+time against the display period and nothing else — and **60 fps against 120 Hz is 2.00× by
+definition.** It would flag any app honestly running at half the refresh.
+
+The discriminator was already being collected: **`xrWaitFrame`**. Under SSW the runtime holds the
+app back, so it finishes early and *blocks* — a large share of the frame is idle. An app that is
+merely slow never idles; it arrives late and `xrWaitFrame` returns at once. Run 33 showed
+`xrWaitFrame 0.1–0.9 ms` of a 16 ms frame: **genuinely busy, not held back.**
+
+The check now requires ~2× period **and** >35% of the frame idle. So **~60 fps at 4096×2160 is the
+true ceiling of this build**, not an artefact.
+
+### 2. `copy` conflates GPU wait with transfer — and only one of them is recoverable
+
+**`GetRenderTargetData` does not merely transfer, it synchronises.** It cannot return until the GPU
+has finished rendering the frame. So the 12.5 ms attributed to `copy` is really:
+
+```
+(wait for the GPU to finish the frame)  +  (the actual GPU->CPU transfer)
+```
+
+**Only the second is what a zero-copy path removes.** The first is real rendering work that would
+still have to be waited for — it would just happen inside the compositor rather than inside us.
+
+This is not a footnote. The entire case for the `D3DPOOL_MANAGED` wrapper rests on which of the two
+that 12.5 ms is, and **the current number cannot tell them apart**:
+
+- mostly transfer → the frame goes 16 ms → ~4 ms, and the wrapper is transformative
+- mostly GPU wait → the wrapper buys almost nothing, and run 31's cancelled verdict was
+  accidentally right for the wrong reason
+
+Back-of-envelope says it is genuinely mixed. At 4096×2160 the frame is 35.4 MB; readback over PCIe
+at ~8 GB/s is ~4.4 ms and the measured memcpy rate (14 MB in 0.89 ms ≈ 15 GB/s) puts the copy at
+~2.3 ms — **so roughly 7 ms recoverable and ~5 ms genuine GPU wait.** That would be ~60 → ~100 fps:
+a large win, but not the 120+ claimed in run 33, and **not** a number worth starting weeks of work
+on while it is still arithmetic.
+
+**So the estimate in run 33 is withdrawn pending measurement.** `GpuFenceProbe` (new, default on)
+issues an EVENT fence and blocks on it *before* the readback, paying the sync where it can be timed:
+
+```
+round-trip split: gpu wait 8.10 ms (rendering - NOT recoverable)
+  | transfer 2.90 + memcpy 2.30 + upload 0.00 = 5.20 ms RECOVERABLE
+  -> zero-copy ceiling 10.80 ms/frame (93 fps)
+```
+
+`RECOVERABLE` is a **ceiling**, not a promise — the compositor still has to consume the shared
+surface. It adds no work, since the wait was happening anyway; it only relocates it somewhere
+visible. **If total frame time moves when this is toggled, the probe is lying** — precisely the
+failure that caught out `FrameCopyMode`, where a stall left the instrument without leaving the frame.
 
 ## 🧱 Run 33: 4096 works, and it proves side-by-side can NEVER reach parity
 

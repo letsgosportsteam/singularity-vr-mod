@@ -1172,6 +1172,34 @@ double g_msWaitFrame = 0.0;
 int    g_waitFrames = 0;
 double g_displayPeriodMs = 0.0;   // from XrFrameState, so the pacing target is measured not guessed
 
+// ---- ⚠️ the copy timing conflates two costs, and only one of them D3D9Ex removes ----
+//
+// GetRenderTargetData does not just transfer - it SYNCHRONISES. The call cannot return until the
+// GPU has finished rendering the frame, so the time attributed to `copy` is:
+//
+//     (wait for the GPU to finish the frame)  +  (the actual GPU->CPU transfer)
+//
+// Only the second is the round-trip. The first is real rendering work that a zero-copy path would
+// still have to wait for - it would simply happen inside the compositor instead of inside us.
+//
+// This matters enormously for the D3D9Ex decision. At 4096x2160 `copy` measures ~12.5 ms. If that
+// is mostly transfer, removing it takes the frame from 16 ms to ~4 and the wrapper is transformative.
+// If it is mostly GPU wait, the wrapper buys almost nothing and run 31's cancelled verdict was
+// accidentally right. The two cannot be told apart from the current number, and the entire case for
+// weeks of wrapper work rests on which it is.
+//
+// So: issue a D3DQUERYTYPE_EVENT fence and block on it FIRST. That wait is the GPU finishing.
+// Whatever GetRenderTargetData costs afterwards is transfer, with the sync already paid.
+//
+// This does not add work - GetRenderTargetData was going to wait for the GPU regardless. It only
+// moves the wait somewhere it can be timed. Total frame time should be unchanged, and if it is
+// not, this probe is lying (see the pipelining lesson: a stall that leaves the instrument has not
+// left the frame).
+IDirect3DQuery9* g_gpuFence = nullptr;
+double g_msGpuWait = 0.0;
+int    g_gpuWaitFrames = 0;
+int    g_gpuFenceMode = 1;        // ini GpuFenceProbe: 1 = split the copy, 0 = leave it alone
+
 inline LARGE_INTEGER Now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
 
 inline double MsSince(const LARGE_INTEGER& t0) {
@@ -1325,6 +1353,15 @@ bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
     if (FAILED(g_dev11->CreateTexture2D(&td, nullptr, &g_uploadTex))) {
         Log("CreateTexture2D(upload) failed"); return false;
     }
+    // One fence, reused. EVENT queries pass straight through Hook_QueryGetData - it only rewrites
+    // D3DQUERYTYPE_OCCLUSION - so this cannot collide with the run-30 override.
+    if (g_gpuFenceMode && !g_gpuFence) {
+        if (FAILED(dev->CreateQuery(D3DQUERYTYPE_EVENT, &g_gpuFence))) {
+            g_gpuFence = nullptr;
+            Log("GPU fence unavailable - copy timing will keep GPU wait and transfer merged");
+        }
+    }
+
     g_srcW = w; g_srcH = h; g_srcFmt = fmt;
     Log("copy resources ready for %ux%u fmt=%d (%d readback slots, %s)", w, h, (int)fmt,
         kCopySlots, g_copyMode == 1 ? "immediate" : "pipelined one frame");
@@ -1407,6 +1444,19 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
     if (!EnsureCopyResources(dev, sd.Width, sd.Height, sd.Format)) { back->Release(); return nullptr; }
 
     CopySlot& cap = g_slot[g_slotCur];
+
+    // Pay the GPU sync here, where it can be measured, instead of anonymously inside
+    // GetRenderTargetData. See the note on g_gpuFence: this is the number the D3D9Ex decision
+    // turns on, because only the transfer half of `copy` is what a zero-copy path removes.
+    if (g_gpuFence) {
+        g_gpuFence->Issue(D3DISSUE_END);
+        LARGE_INTEGER tf = Now();
+        BOOL done = FALSE;
+        // D3DGETDATA_FLUSH so the command buffer is actually submitted rather than sat on.
+        while (g_gpuFence->GetData(&done, sizeof(done), D3DGETDATA_FLUSH) == S_FALSE) { YieldProcessor(); }
+        g_msGpuWait += MsSince(tf);
+        ++g_gpuWaitFrames;
+    }
 
     LARGE_INTEGER t0 = Now();
     HRESULT hr = dev->GetRenderTargetData(back, cap.surf);
@@ -2995,6 +3045,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 const double lc = g_msLockCopy / g_copyFrames;
                 const double up = g_msUpload / g_copyFrames;
                 const double wf = g_waitFrames ? g_msWaitFrame / g_waitFrames : 0.0;
+                const double gw = g_gpuWaitFrames ? g_msGpuWait / g_gpuWaitFrames : 0.0;
                 const double copy = rb + lc + up;
                 Log("    frame copy [%s]: readback %.2f + lock/memcpy %.2f + upload %.2f"
                     " = %.2f ms of %.2f (%.0f%%)",
@@ -3009,7 +3060,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     wf, copy, ms - wf - copy, ms,
                     g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
                     g_displayPeriodMs);
-                // ---- ⚠️ the check that should have existed before run 31 ----
+                // ---- ⚠️ the SSW check, and the correction it needed one run later ----
                 //
                 // Run 31 measured 28 ms frames, concluded the app was missing a 72 Hz deadline,
                 // and cancelled the D3D9Ex work on the strength of it. The real cause was
@@ -3019,26 +3070,53 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 // taken through that halving, which is why the frame copy looked like 3% - it was
                 // 0.9 ms of a frame that had been padded out to 27.8 ms.
                 //
-                // A frame time sitting at a clean 2x the display period is the signature. It can
-                // also be a genuine deadline miss, but SSW is far commoner and costs nothing to
-                // rule out, so it is named first.
+                // ---- but frame time ALONE cannot identify SSW. Corrected run 34. ----
+                //
+                // The first version of this check warned on frame time ~2x the display period and
+                // nothing else. That fires on any app honestly running at half the refresh - 60 fps
+                // against 120 Hz is 2.00x by definition - and it duly cried wolf all through run
+                // 33, which was genuinely CPU-bound at 16 ms with SSW switched off.
+                //
+                // The discriminator is xrWaitFrame, and it was already being collected. Under SSW
+                // the runtime holds the app back, so it finishes early and BLOCKS - a large share
+                // of the frame sits idle in xrWaitFrame. An app that is simply slow does not idle
+                // at all; it arrives late and xrWaitFrame returns immediately.
+                //
+                //   ~2x period AND mostly idle   -> being held back. SSW.
+                //   ~2x period AND barely idle   -> genuinely takes that long. Not SSW.
                 if (g_displayPeriodMs > 0.0) {
                     const double mult = ms / g_displayPeriodMs;
-                    if (mult > 1.85 && mult < 2.15) {
+                    const bool mostlyIdle = ms > 0.0 && (wf / ms) > 0.35;
+                    if (mult > 1.85 && mult < 2.15 && mostlyIdle) {
                         static int warned = 0;
                         if (warned < 3) {
                             ++warned;
-                            Log("    *** frame time is %.2fx the display period. SUSPECT SSW/ASW"
-                                " (Virtual Desktop 'Synchronous Spacewarp', Meta 'ASW') - it pins"
-                                " the app to half the refresh rate deliberately. Turn it OFF"
-                                " before trusting ANY number in this log. ***", mult);
+                            Log("    *** frame time is %.2fx the display period AND %.0f%% of it is"
+                                " idle in xrWaitFrame - the app is being HELD BACK, not running"
+                                " slow. Suspect SSW/ASW (Virtual Desktop 'Synchronous Spacewarp',"
+                                " Meta 'ASW'). Turn it off before trusting these numbers. ***",
+                                mult, 100.0 * wf / ms);
                         }
                     }
+                }
+                // The line the D3D9Ex decision turns on. `gpu wait` is rendering we would still
+                // have to wait for with a zero-copy path; `transfer` + `lock/memcpy` + `upload` is
+                // what it actually deletes. Read the RECOVERABLE figure as the ceiling on what the
+                // MANAGED wrapper can buy - and note it is a ceiling, not a promise, since the
+                // compositor still has to consume the shared surface.
+                if (g_gpuWaitFrames) {
+                    const double recoverable = copy;
+                    Log("    round-trip split: gpu wait %.2f ms (rendering - NOT recoverable)"
+                        " | transfer %.2f + memcpy %.2f + upload %.2f = %.2f ms RECOVERABLE"
+                        " -> zero-copy ceiling %.2f ms/frame (%.0f fps)",
+                        gw, rb, lc, up, recoverable,
+                        ms - recoverable, (ms - recoverable) > 0 ? 1000.0 / (ms - recoverable) : 0.0);
                 }
             }
             g_msGRTD = g_msLockCopy = g_msUpload = 0.0;
             g_copyFrames = 0;
             g_msWaitFrame = 0.0; g_waitFrames = 0;
+            g_msGpuWait = 0.0; g_gpuWaitFrames = 0;
             // The identification counters are the point of this run. c0 carries one matrix per
             // frame, so a rejection is a whole-frame event - no forced projection and no split for
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
@@ -3306,6 +3384,16 @@ void LoadIniSettings() {
     Log("ini: FrameCopyMode=%d (%s)", g_copyMode,
         g_copyMode == 0 ? "pipelined - read back the frame captured last time, one frame of latency"
                         : "immediate - capture and consume in the same Present (pre-run-31)");
+
+    // Splits the round-trip into GPU wait and actual transfer. Only the transfer is what a
+    // zero-copy path could remove, and the whole case for the MANAGED wrapper turns on which of
+    // the two the 12.5 ms at 4K actually is. Switchable because it forces the GPU sync slightly
+    // earlier than the driver would, and that should be provable as harmless rather than assumed.
+    g_gpuFenceMode = GetPrivateProfileIntA("Render", "GpuFenceProbe", 1, path);
+    if (g_gpuFenceMode < 0 || g_gpuFenceMode > 1) g_gpuFenceMode = 1;
+    Log("ini: GpuFenceProbe=%d (%s)", g_gpuFenceMode,
+        g_gpuFenceMode ? "split the copy into gpu-wait vs transfer"
+                       : "off - copy stays a single merged number");
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;

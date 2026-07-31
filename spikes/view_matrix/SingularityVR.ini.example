@@ -123,6 +123,45 @@ OcclusionQueryMode=0
 FrameCopyMode=1
 
 ; ---------------------------------------------------------------------------
+; GpuFenceProbe   -- does the MANAGED wrapper actually buy anything? (run 34)
+;
+; The "copy" figure is NOT all round-trip. GetRenderTargetData does not just
+; transfer, it SYNCHRONISES - it cannot return until the GPU has finished
+; rendering the frame. So the number is really:
+;
+;     (wait for the GPU to finish)  +  (the actual GPU->CPU transfer)
+;
+; Only the second is what a zero-copy D3D9Ex path removes. The first is real
+; rendering work that would still have to be waited for, just inside the
+; compositor instead of inside us.
+;
+; This matters because the entire case for the D3DPOOL_MANAGED wrapper - weeks
+; of work, 10,454 allocations, failure mode "the game will not start" - rests
+; on which of the two the ~12.5 ms at 4096x2160 actually is. They cannot be
+; told apart from a single merged number.
+;
+; With this on, an EVENT fence is issued and waited on BEFORE the readback, so
+; the sync is paid somewhere it can be timed. The log then reports:
+;
+;   round-trip split: gpu wait 8.10 ms (rendering - NOT recoverable)
+;     | transfer 2.90 + memcpy 2.30 + upload 0.00 = 5.20 ms RECOVERABLE
+;     -> zero-copy ceiling 10.80 ms/frame (93 fps)
+;
+; RECOVERABLE is a CEILING on what the wrapper can buy, not a promise - the
+; compositor still has to consume the shared surface.
+;
+; This adds no work; GetRenderTargetData was going to wait for the GPU anyway.
+; It only moves the wait where it can be seen. If total frame time changes when
+; you toggle this, the probe is lying - and that is exactly the failure that
+; caught out FrameCopyMode, where a stall left the instrument without ever
+; leaving the frame.
+;
+;   1 = split gpu wait from transfer                               <- default
+;   0 = off, copy stays one merged number
+; ---------------------------------------------------------------------------
+GpuFenceProbe=1
+
+; ---------------------------------------------------------------------------
 ; 🚨 BEFORE TRUSTING ANY PERFORMANCE NUMBER: TURN OFF SSW
 ;
 ; Virtual Desktop's Synchronous Spacewarp (and Meta's ASW) pins the application
