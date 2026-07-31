@@ -1278,6 +1278,11 @@ int    g_copyFrames = 0;
 // Without this split, "residual" lumps genuine work together with deliberate idling, and the two
 // point at opposite conclusions.
 double g_msWaitFrame = 0.0;
+// xrBeginFrame + xrEndFrame, the frame submission. Broken out of "our work" in run 56 because it is
+// the only part of this mod that talks to the wireless link, and the unmodded game runs clean.
+double g_msXrSubmit = 0.0;
+int    g_xrSubmitFrames = 0;
+double g_msXrSubmitPeak = 0.0;
 int    g_waitFrames = 0;
 double g_displayPeriodMs = 0.0;   // from XrFrameState, so the pacing target is measured not guessed
 
@@ -1858,7 +1863,22 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         Log("headset display period %.2f ms (%.1f Hz) - frame times at 2x this are a missed deadline",
             g_displayPeriodMs, 1000.0 / g_displayPeriodMs);
     }
+    // ---- run 56: xrBeginFrame/xrEndFrame have never been timed, and they are the black box ----
+    //
+    // The frame budget breaks out xrWaitFrame, the copy and the GObjects walk, and calls everything
+    // else "our work". xrEndFrame lives in that remainder - and it is the ONE call in this whole
+    // mod that talks to the wireless link, because for VDXR it triggers encode and transmit.
+    //
+    // That matters because the unmodded game at the same resolution on the same install runs clean,
+    // so whatever costs the seconds-long stalls is ours. Every other candidate has been eliminated
+    // by test: head roll, the reverted probe, the render-scale change, the runtime teardown. The
+    // submission path is what is left, and it has never been separated from the game's own CPU work.
+    //
+    // Timing only. No allocation, no hook, no behaviour change - QueryPerformanceCounter around two
+    // calls that were already being made.
+    LARGE_INTEGER tXrBegin = Now();
     xrBeginFrame(g_xrSession, nullptr);
+    g_msXrSubmit += MsSince(tXrBegin);
 
     XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
     uint32_t n = 0;
@@ -2108,7 +2128,17 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
     fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     fei.layerCount = layerCount;
     fei.layers = layerCount ? layers : nullptr;
+    // The submission itself. For VDXR this is where the composed frame is handed to the runtime to
+    // encode and stream, so a congested link or a backed-up compositor shows up HERE - and until
+    // now it was pooled into "our work" alongside the game's own rendering.
+    LARGE_INTEGER tXrEnd = Now();
     xrEndFrame(g_xrSession, &fei);
+    const double msEnd = MsSince(tXrEnd);
+    g_msXrSubmit += msEnd;
+    // Peak, not just the mean: a one-second average buries a single 200 ms submission among a
+    // hundred fast ones, and one stall that long IS a visible dip.
+    if (msEnd > g_msXrSubmitPeak) g_msXrSubmitPeak = msEnd;
+    ++g_xrSubmitFrames;
 }
 
 // ---------------------------------------------------------------- d3d9 plumbing
@@ -4209,11 +4239,25 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 // "our work" is. Chasing the copy or the draw count while xrWaitFrame holds most
                 // of the frame would be optimising the part that is already free.
                 const double eng = g_engineObjectFrames ? g_msEngineObjects / g_engineObjectFrames : 0.0;
+                // xrBeginFrame + xrEndFrame, split out in run 56. It used to be pooled into "our
+                // work", which is why "our work" has looked like an unexplained game-side stall all
+                // the way through: this is the only call in the mod that reaches the wireless link.
+                const double xs = g_xrSubmitFrames ? g_msXrSubmit / g_xrSubmitFrames : 0.0;
                 Log("    frame budget: xrWaitFrame %.2f (idle) + copy %.2f + GObjects walk %.2f"
-                    " + our work %.2f = %.2f ms (%.0f%% of the %.2f ms display period)",
-                    wf, copy, eng, ms - wf - copy - eng, ms,
+                    " + XR submit %.2f + our work %.2f = %.2f ms (%.0f%% of the %.2f ms display period)",
+                    wf, copy, eng, xs, ms - wf - copy - eng - xs, ms,
                     g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
                     g_displayPeriodMs);
+                // The peak matters more than the mean here. A one-second average hides a single
+                // 200 ms submission among a hundred fast ones, and a stall that long is exactly
+                // what a seconds-long dip is made of.
+                if (xs > 1.0 || g_msXrSubmitPeak > 8.0)
+                    Log("    *** XR submit: mean %.2f ms, WORST SINGLE FRAME %.2f ms."
+                        " This is xrBeginFrame+xrEndFrame - the compositor and the wireless link,"
+                        " NOT the game. If the worst frame is tens of ms, the dips are the"
+                        " streaming path and no change to the render code will help. ***",
+                        xs, g_msXrSubmitPeak);
+                g_msXrSubmit = 0.0; g_xrSubmitFrames = 0; g_msXrSubmitPeak = 0.0;
                 // A cached hit is microseconds; anything here in milliseconds means the object is
                 // absent and the full scan is repeating, which is the menu/level-load freeze.
                 if (eng > 2.0)
