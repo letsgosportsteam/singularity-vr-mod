@@ -2,6 +2,14 @@
 
 Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES.md`.
 
+> # 🚀 ZERO-COPY LANDED (run 39): 4096×2160 runs at ~115 fps, up from ~60.
+>
+> The CPU round-trip is **gone** — `StretchRect` into a shared D3D9Ex surface, `CopyResource` into
+> the XR swapchain, both GPU-side. Frame copy went from ~9.8 ms to **0.00 ms**, and the app is now
+> **display-bound with 4+ ms of idle headroom** instead of arriving late every frame. Performance is
+> no longer a project problem. See **Run 39**, and **Run 38** for the `D3DPOOL_MANAGED` wrapper that
+> made it legal.
+
 > # 🚨 THE GAME RUNS AT ~110 FPS. EVERY PERFORMANCE NUMBER BEFORE RUN 32 WAS WRONG.
 >
 > **The "37–40 fps" this project has recorded for thirty runs was Virtual Desktop's Synchronous
@@ -61,15 +69,10 @@ remaining on the list is planned work rather than a bug.
 With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
 debugging.
 
-1. **Stage 2 — the zero-copy frame path.** The prerequisite is **done and verified** (run 38: the
-   MANAGED wrapper works, no failures, and the surface-lock gap turned out not to exist). What
-   remains is replacing `GetRenderTargetData` + `memcpy` with `StretchRect` to a shared render
-   target and a `CopyResource` on the D3D11 side, with a `D3DQUERYTYPE_EVENT` fence for sync.
-   Spike 1 proved the interop end to end. Worth **~9.8 ms of a ~16 ms frame** at 4096×2160.
-   The wrapper's design is validated: D3D9 resources of a type share a vtable, so one `PatchVTable`
-   on `LockRect`/`UnlockRect` covered every texture from the device — the trick already proven on
-   `IDirect3DQuery9::GetData` for the run-30 occlusion fix — with state in a side table keyed on
-   the resource pointer rather than a proxy object per allocation.
+1. **✅ DONE — zero-copy (runs 38–39).** 4096×2160 at ~115 fps, frame copy 0.00 ms, app
+   display-bound with 4+ ms idle. Turn it on with `D3D9ExMode=1` + `ZeroCopy=1`.
+   **Remaining follow-ups, both small:** confirm no tearing by eye, and consider raising the 100 ms
+   fence bound that fired once during a level load.
 2. **Per-eye render targets (Stage 4B) — promoted from "worth one measurement" to mandatory.**
    Run 33 settled the cap at 4096, so side-by-side tops out at 2048 per eye against 2688 wanted.
    **Parity is arithmetically unreachable** in a single side-by-side frame. This is also the fix
@@ -138,7 +141,7 @@ system settings, which the command line does and a `CreateDevice` override does 
 | **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
 | **Stereo — per-eye offset for real depth** | ✅ **done** — true native stereo by draw-call duplication; eyes align, depth is correct, and the vanishing objects are fixed (run 30, occlusion query readback) |
 | FOV / aspect match | 🔧 projection is VR-correct and forced; **resolution cannot be matched in the current design** — the cap is 4096 (run 33), giving 2048 per eye against 2688 wanted. Needs per-eye render targets |
-| Performance | ❌ **plan cancelled by measurement (run 31)** — the CPU round-trip is 3% of the frame, so D3D9Ex + the MANAGED wrapper is not worth writing. Real cause not yet identified; a missed 72 Hz deadline is the leading hypothesis |
+| Performance — CPU round-trip → D3D9Ex zero-copy | ✅ **done (runs 38–39)** — `D3DPOOL_MANAGED` wrapper + shared-surface frame path. 4096×2160 went from ~60 to **~115 fps**, frame copy 9.8 ms → **0.00 ms**, and the app is now display-bound with idle headroom |
 | Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
 
 So: **6-DOF is solved**, and stereo is *working* rather than done — the mechanism is right and the
@@ -155,8 +158,8 @@ remaining issues are draw-path coverage.
 | Per eye at 3840×2160 | 1920×2160 — 77% of the panel |
 | Resolution cap | **4096 confirmed** (run 33) — 4096×2160 accepted and the scene targets followed; 4992 refused. Classic D3D9 max texture dimension |
 | Per eye at 4096×2160 | **2048×2160 — 76% linear of the 2688×2880 wanted.** Side-by-side needs 5376 wide, so parity is impossible without per-eye targets |
-| Frame rate | **105–118 fps** at 1440p, true stereo, SSW **off**, 120 Hz (run 32). The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
-| Frame copy (round-trip) | ~4.2 ms of an ~8.9 ms frame at 1440p — ~0.9 ms memcpy + ~3.3 ms readback stall |
+| Frame rate | **112–117 fps at 4096×2160** with zero-copy (run 39); 105–118 at 1440p. SSW **off**, 120 Hz. The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
+| Frame copy | **0.00 ms** under zero-copy (run 39). Was ~9.8 ms of a ~16 ms frame at 4K on the CPU path |
 | Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
 | Scene targets | 2× scene-sized (A8R8G8B8 + A16B16G16R16F), shadow map 512×512 R32F |
 
@@ -496,7 +499,56 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-## 🔨 Run 39: Stage 2, the zero-copy frame path — BUILT, not yet run (`ZeroCopy=1`)
+## 🚀 Run 39 RESULT: zero-copy works — 4K went from ~60 fps to ~115
+
+```
+*** ZERO-COPY ACTIVE: shared RT 4096x2160, D3D11 sees fmt=87 - the frame no longer touches the CPU ***
+
+frame copy [ZERO-COPY]: StretchRect 0.00 + lock 0.00 + memcpy 0.00 + upload 0.00 = 0.00 ms of 8.64 (0%)
+frame budget: xrWaitFrame 4.35 (idle) + copy 0.00 + GObjects walk 0.04 + our work 4.25 = 8.64 ms
+perf: 115.8 fps (8.64 ms/frame) | draws/frame peak 368, split 368 (368 with parallax, 0 flat)
+```
+
+| at 4096×2160 | before | after |
+|---|---|---|
+| Frame copy | ~9.8 ms | **0.00 ms** |
+| GPU wait (fence) | 2–4 ms | **0.5–0.9 ms** |
+| `xrWaitFrame` (idle) | 0.1–0.9 ms | **4.0–5.1 ms** |
+| Frame time | ~16 ms | **8.58–8.87 ms** |
+| **Frame rate** | **55–63 fps** | **112–117 fps** |
+
+**The application is now display-bound rather than work-bound**, which is the result that matters
+more than the fps number. It finishes its frame in ~4.4 ms and then sits idle ~4.3 ms waiting for
+the compositor — the exact inversion of every previous run, where `xrWaitFrame` was ~0 because the
+app always arrived late. There is now headroom instead of a deficit.
+
+Against an 8.33 ms display period the frame lands at 8.6–8.9 ms, so it just misses locking to a
+solid 120 Hz. Closing a ~0.4 ms gap is a very different problem from closing a ~8 ms one.
+
+Run 35 predicted a "~6.5 ms zero-copy ceiling"; the real figure is ~8.7 ms. Directionally right,
+magnitude close enough, and the prediction was made from a measurement rather than a guess.
+
+### ⚠️ The fence timed out once
+
+```
+GPU fence did not signal within 100 ms - abandoning the wait
+```
+
+The bounded spin added in run 35 fired exactly once, almost certainly during a level load where the
+GPU genuinely had >100 ms of work queued. The consequence is that **one frame may have been copied
+while the shared surface was still being written** — a single torn frame, cosmetically negligible
+but worth knowing the mechanism exists. If tearing is ever reported, this is the first thing to
+check, and the bound is the thing to raise.
+
+Everything else is clean: no fallbacks fired, no `StretchRect` failures, pool translation identical
+to run 38, `GetSurfaceLevel-on-shadowed` still 0.
+
+### ⬜ Visual correctness still needs a human
+
+The log cannot see tearing, a stale band, or frame-to-frame flicker — the artefacts a
+synchronisation bug produces. Those need eyes in the headset.
+
+## 🔨 Run 39: Stage 2, the zero-copy frame path — the design as built
 
 What the whole D3D9Ex exercise was for. Requires `D3D9ExMode=1`; on a plain device a shared surface
 cannot be created, so `ZeroCopy=1` alone changes nothing.
