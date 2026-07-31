@@ -435,6 +435,9 @@ bool  g_haveCentrePos = false;
 // folds in aspect ratio - we never ask, we just read what came out.
 volatile LONG g_vrProjection = 1;      // on by default: it is the correct behaviour
 UINT  g_lockedReg  = 0;
+// ini ExtraCamReg: a second vertex-shader register to remap alongside the locked one. -1 = off.
+// Run 42 found a view-projection at c13 that nothing was remapping; see the note where it is used.
+int   g_extraCamReg = -1;
 int   g_lockedConv = CONV_ROW;
 bool  g_haveLock   = false;
 // ---- the lock has to be revocable (run 15) ----
@@ -2043,6 +2046,39 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     // Nothing below may touch `data` before this. The verify block used to dereference it three
     // lines above the null check that guards it.
     if (!data || vec4Count < 4) return g_origSetVSConstF(dev, startReg, data, vec4Count);
+
+    // ---- run 43: remap a SECOND view-projection register (ExtraCamReg) ----
+    //
+    // Everything below keys off g_lockedReg, ONE register, so exactly one matrix is ever remapped -
+    // "camera matrix registers tracked: c0 (peak 1)" is 1 by construction, not by measurement.
+    // The run-42 dump found a second view-projection at vs c13: identical projection columns to
+    // c0-c3, but a world-space translation (c16 = 5179, -1738, 26024) where c3 is translated-world
+    // and small. Geometry riding it is never remapped, keeps full-frame coordinates, and its
+    // shadow-pass output lands split across the seam.
+    //
+    // This caches that register's raw uploads into a spare g_camMats slot. Nothing else is needed:
+    // StereoPair already loops over every valid slot applying ApplyOffset + ApplyEyeRemap and
+    // restores the originals afterwards, so one cached slot is the whole fix.
+    //
+    // Deliberately NOT running it through ApplyProjection. The forced VR frustum belongs to the
+    // matrix we identified and verified; this one is only inferred to be a camera matrix from its
+    // shape, and forcing a projection into something that turns out to be a light's transform
+    // would break far more than it fixed. Eye offset and half-frame remap only - the minimum that
+    // could fix the seam split, so a positive result means something specific.
+    if (g_extraCamReg >= 0 && dup &&
+        startReg <= (UINT)g_extraCamReg && (UINT)g_extraCamReg + 4 <= startReg + vec4Count) {
+        const float* src = data + ((UINT)g_extraCamReg - startReg) * 4;
+        int slot = -1;
+        for (int s = 0; s < g_camMatUsed; ++s)
+            if (g_camMats[s].reg == (UINT)g_extraCamReg) { slot = s; break; }
+        if (slot < 0 && g_camMatUsed < kMaxCamMats) slot = g_camMatUsed++;
+        if (slot >= 0) {
+            g_camMats[slot].reg   = (UINT)g_extraCamReg;
+            g_camMats[slot].conv  = g_lockedConv;   // same storage convention as the tracked one
+            g_camMats[slot].valid = true;
+            memcpy(g_camMats[slot].m, src, 16 * sizeof(float));
+        }
+    }
 
     // Cheap always-on capture of the projection the game is really using. Once the matrix has
     // been located we know exactly which register to look at, so this is a bounds check on
@@ -4286,6 +4322,15 @@ void LoadIniSettings() {
     // earlier than the driver would, and that should be provable as harmless rather than assumed.
     // Stage 2. Only ever active on an Ex device, so leaving this at 1 with D3D9ExMode=0 changes
     // nothing - the pair is the A/B: D3D9ExMode=1/ZeroCopy=0 against D3D9ExMode=1/ZeroCopy=1.
+    // -1 = off. 13 is the register run 42 identified. Switchable because this touches the matrix
+    // path, which is the most fragile code here - runs 15, 19, 20 and 27 all broke something in it,
+    // and the failure mode is losing head tracking entirely.
+    g_extraCamReg = GetPrivateProfileIntA("Render", "ExtraCamReg", -1, path);
+    if (g_extraCamReg < -1 || g_extraCamReg > 200) g_extraCamReg = -1;
+    Log("ini: ExtraCamReg=%d (%s)", g_extraCamReg,
+        g_extraCamReg < 0 ? "off - only the scan-locked register is remapped"
+                          : "also remap this register per eye (shadow-seam test)");
+
     g_splitColourOnly = GetPrivateProfileIntA("Render", "SplitColourTargetsOnly", 0, path);
     if (g_splitColourOnly < 0 || g_splitColourOnly > 1) g_splitColourOnly = 0;
     // Dump a handful of draws' worth of constants from the excluded target, then stop. Costs
