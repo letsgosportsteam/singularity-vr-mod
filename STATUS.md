@@ -61,15 +61,15 @@ remaining on the list is planned work rather than a bug.
 With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
 debugging.
 
-1. **The D3D9Ex zero-copy path — justified by measurement (run 35), and now the top item.**
-   At 4096×2160: **~9.4 ms of a ~16 ms frame is recoverable round-trip; only 2–4 ms is GPU
-   rendering.** The zero-copy ceiling is ~6.5 ms/frame, comfortably past 120 Hz. Needs
-   `D3DPOOL_MANAGED` → `DEFAULT` for 10,454 allocations. Cheaper than the "COM proxies for five
-   resource types" framing suggests:
-   D3D9 resources of a type share a vtable, so one `PatchVTable` on `LockRect`/`UnlockRect` covers
-   every texture from that device — the exact trick already proven on `IDirect3DQuery9::GetData`
-   for the run-30 occlusion fix. Wrapper state becomes a side table keyed on the resource pointer,
-   not a proxy object per allocation.
+1. **Stage 2 — the zero-copy frame path.** The prerequisite is **done and verified** (run 38: the
+   MANAGED wrapper works, no failures, and the surface-lock gap turned out not to exist). What
+   remains is replacing `GetRenderTargetData` + `memcpy` with `StretchRect` to a shared render
+   target and a `CopyResource` on the D3D11 side, with a `D3DQUERYTYPE_EVENT` fence for sync.
+   Spike 1 proved the interop end to end. Worth **~9.8 ms of a ~16 ms frame** at 4096×2160.
+   The wrapper's design is validated: D3D9 resources of a type share a vtable, so one `PatchVTable`
+   on `LockRect`/`UnlockRect` covered every texture from the device — the trick already proven on
+   `IDirect3DQuery9::GetData` for the run-30 occlusion fix — with state in a side table keyed on
+   the resource pointer rather than a proxy object per allocation.
 2. **Per-eye render targets (Stage 4B) — promoted from "worth one measurement" to mandatory.**
    Run 33 settled the cap at 4096, so side-by-side tops out at 2048 per eye against 2688 wanted.
    **Parity is arithmetically unreachable** in a single side-by-side frame. This is also the fix
@@ -496,7 +496,67 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
-## 🔨 Run 38: the D3DPOOL_MANAGED wrapper — BUILT, not yet run (`D3D9ExMode=1`)
+## ✅ Run 38 RESULT: the wrapper works, and the feared gap does not exist
+
+**The game runs correctly on a D3D9Ex device with every MANAGED allocation translated.** Textures
+look right. Zero failures of any kind.
+
+```
+Direct3DCreate9Ex succeeded - handing the game an Ex factory
+*** D3D9Ex device created - D3DPOOL_MANAGED will be translated to DEFAULT ***
+resource creation hooks installed (CreateTexture/Volume/Cube/VB/IB)
+texture vtable patched (LockRect=713E5C20 UnlockRect=713E5CC0 Release=7140D240 GetSurfaceLevel=713E2920)
+
+D3D9Ex pool translation: 1053 textures, 18 cube, 1 volume, 2810 vertex buf, 133 index buf
+  | shadows 1072 (~46 MB), shadow failures 0, create failures 0, GetSurfaceLevel-on-shadowed 0
+```
+
+### The three things that mattered, all resolved
+
+**1. `GetSurfaceLevel-on-shadowed 0` — the known gap is not real.** UE3 locks textures directly and
+never goes through a surface, so the level-by-level surface pairing that would have been the next
+piece of work **is not needed at all**. This was the single most likely way the design could have
+been wrong.
+
+**2. Shadow memory is ~46 MB, not the hundreds feared.** A 32-bit address space made this a genuine
+risk. It is a non-issue, and the reasoning holds up: MANAGED kept a system copy too, so this
+replaces that copy rather than adding one.
+
+**3. Nothing escaped translation.** Not just because the counters say so — **an untranslated
+MANAGED allocation would fail outright on an Ex device**, and the game renders correctly. The
+counts sitting below spike 2's census (1,053 textures vs 3,276; 2,810 VB vs 6,258) is session
+length, not leakage: spike 2 walked more of the game than a 60-second sample.
+
+### Performance-neutral, exactly as Stage 1 intended
+
+Both resolutions were run, which is the better test:
+
+| | before the wrapper | with the wrapper |
+|---|---|---|
+| 2560×1440 | 105–118 fps (run 32) | **109–115 fps** |
+| 4096×2160 | 57–66 fps (run 35/36) | **55–63 fps**, copy ~9.8 ms |
+
+Unchanged within noise. That is the correct result: Stage 1 changes only how resources are
+allocated, and the frame still goes through the CPU copy. **The wrapper is not supposed to be
+faster — it is supposed to make the fast path legal.**
+
+### ⬜ Stage 2: the actual zero-copy path
+
+Everything blocking it is now cleared. Spike 1 already proved the interop end to end (D3D9Ex shared
+texture → `ID3D11Device::OpenSharedResource` → pixels intact, 32-bit, no CPU round-trip). What
+replaces the current path:
+
+| now | Stage 2 |
+|---|---|
+| `GetRenderTargetData` (GPU→sysmem, blocks) | `StretchRect` backbuffer → shared RT (GPU→GPU) |
+| `LockRect` (DMA lands) + `memcpy` ~14–35 MB | — gone — |
+| `Map` + `CopyResource` to swapchain | `CopyResource` shared → swapchain (GPU→GPU) |
+
+Sync needs a `D3DQUERYTYPE_EVENT` fence, since D3D9 has no keyed-mutex counterpart — spike 1 used
+exactly that and it worked. Target: the ~9.8 ms copy at 4K drops to well under 1 ms, putting the
+frame near the ~6.5 ms zero-copy ceiling measured in run 35.
+
+## 🔨 Run 38: the D3DPOOL_MANAGED wrapper — the design as built
 
 The zero-copy prerequisite, justified by run 35's measurement (~9.4 ms of a ~16 ms frame
 recoverable, GPU idle at 2–4 ms). **Off by default** — it replaces the resource management of a
