@@ -2476,16 +2476,41 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
         --g_dumpShadowConsts;
         Log("--- constants for a draw into the EXCLUDED scene-sized target (%s) ---",
             FmtName(g_rtSeen[g_rtCurrent].fmt));
+        // ---- ⚠️ ScreenPositionScaleBias is NOT the bug here, worked through in run 42 ----
+        //
+        // ps c1 = (0.5, -0.5, 0.50023, 0.50012) is exactly UE3's ScreenPositionScaleBias - the
+        // constant Stage 4A predicted, confirmed by arithmetic against 4096x2160. But patching it
+        // would BREAK this pass rather than fix it.
+        //
+        // A fullscreen quad spans NDC x in [-1,+1] across the FULL target. Scissored to the left
+        // half, only pixels with NDC x in [-1,0] are written, and UV = ndc*0.5 + 0.500122 puts
+        // those at UV [0, 0.5] - the left half of the source. Already self-consistent. The quad is
+        // not remapped by c0 (its vertex shader never reads the view matrix), so nothing has moved
+        // out from under its UV maths.
+        //
+        // What IS suspect: this pass reads DEPTH and reconstructs world position from it. The
+        // depth was rendered with our REMAPPED projection - clip x halved and shifted per eye -
+        // while the reconstruction constant still describes the original full-frame projection.
+        // Reconstruct with the wrong inverse and every world position lands somewhere else,
+        // differently per eye because the two halves were remapped differently.
+        //
+        // So: look for a MATRIX, in either shader stage, not another scale/bias pair.
         float c[4];
-        for (UINT r = 0; r < 32; ++r) {
+        for (UINT r = 0; r < 64; ++r) {
             if (FAILED(dev->GetPixelShaderConstantF(r, c, 1))) break;
             if (c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 0.0f) continue;
-            // Flag anything shaped like a half-scale/half-bias screen mapping.
-            const bool looksLikeScaleBias =
+            const bool scaleBias =
                 (fabsf(fabsf(c[0]) - 0.5f) < 0.02f && fabsf(fabsf(c[1]) - 0.5f) < 0.02f) ||
                 (fabsf(c[2] - 0.5f) < 0.02f && fabsf(c[3] - 0.5f) < 0.02f);
             Log("    ps c%-2u = (%9.5f, %9.5f, %9.5f, %9.5f)%s", r, c[0], c[1], c[2], c[3],
-                looksLikeScaleBias ? "   <-- SCREEN SCALE/BIAS SHAPE" : "");
+                scaleBias ? "   <-- screen scale/bias (NOT the bug - see note)" : "");
+        }
+        // The reconstruction matrix is more likely here: UE3 puts per-view transforms in vertex
+        // constants, and our own view matrix already lives at vs c0.
+        for (UINT r = 0; r < 96; ++r) {
+            if (FAILED(dev->GetVertexShaderConstantF(r, c, 1))) break;
+            if (c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 0.0f) continue;
+            Log("    vs c%-2u = (%10.4f, %10.4f, %10.4f, %10.4f)", r, c[0], c[1], c[2], c[3]);
         }
     }
     if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) { ++g_drawsOffscreen; return draw(); }
