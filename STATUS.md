@@ -499,6 +499,68 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## ❌ Run 40: the 4096 cap is UE3's, NOT the GPU's — run 33's conclusion is RETRACTED
+
+```
+device caps: MaxTextureWidth=16384 MaxTextureHeight=16384 MaxTextureAspectRatio=16384
+  -> the hardware ALLOWS a 5376x2880 side-by-side target. The 4096 refusal in run 33 was
+     therefore UE3's own limit, NOT the GPU's - per-eye render targets may be unnecessary.
+```
+
+**The GPU supports 16384×16384.** Run 33 concluded "side-by-side can never reach parity, so per-eye
+render targets are mandatory" from a single observation — 4096 accepted, 4992 refused — attributed
+to the classic D3D9 4096 texture limit. That attribution was a hypothesis, and it was wrong.
+
+Nothing had ever called `GetDeviceCaps`. One call retracts the argument for a large architectural
+rewrite. **Full per-eye resolution needs 5376×2880, and the hardware allows it** — what refuses is
+UE3's own resolution validation, which is a far cheaper problem than rebuilding the render path.
+
+This is the third time in this project that a confident conclusion rested on an untested premise
+(after the SSW frame rates and the "3% frame copy"). The pattern is now unmistakable: **the
+expensive plan deserves the cheap check first.**
+
+### ⬜ But per-eye targets are not dead — they just have a different justification
+
+Resolution was the wrong reason. **Correctness** may be the right one — see the shadow bug below.
+Note also that the cost estimate ("~3,200 render-target switches per frame, likely unaffordable")
+still stands: at ~1,900 draws that is ~3,800 switches, and even at an optimistic 5 µs each that is
+~19 ms against an 8.3 ms budget. The 4+ ms of idle won in run 39 does not come close to covering it.
+
+## 🐛 Run 40: shadows appear in ONE eye and are wrong in that eye
+
+Reported with a screenshot: hard-edged geometric shadow shapes that do not match the scene, visible
+in one eye only. The census has been flagging the likely cause for several runs, unread:
+
+```
+render-target census (scene is 4096x2160; one row per SURFACE):
+  2A330540  4096x2160  A16B16G16R16F   9337 draws  <- SPLIT
+  2A330240  4096x2160  A8R8G8B8         740 draws  <- SPLIT
+  2A330840  4096x2160  other            240 draws  <- SPLIT
+^ 3 distinct SCENE-SIZED surfaces are being split. Only the LDR and HDR scene colour targets should be
+```
+
+**The scene test is size equality alone**, so a third scene-sized surface — neither colour target —
+is being split 240 times a frame.
+
+### The mechanism this points at
+
+A screen-space effect that **reconstructs world position from depth** does so with an
+inverse-projection constant we do **not** remap. Feed it depth from geometry we **did** remap and
+the reconstruction lands somewhere else entirely — and differently per eye, because each eye's
+remap differs. That is precisely "the shadow appears in one eye and is wrong in that eye".
+
+It is the same family as the already-known post-processing bleed, and the same problem Stage 4A
+predicted for `ScreenPositionScaleBias`.
+
+### Two changes, both cheap
+
+1. **`other` now names itself.** `FmtName` fell through to the literal string "other" for anything
+   unrecognised, which hid the identity of the exact surface under suspicion. It now decodes FOURCC
+   and prints the numeric `D3DFORMAT` otherwise. A name you cannot read is not a diagnostic.
+2. **`SplitColourTargetsOnly=1`** restricts splitting to the two known scene colour formats,
+   excluding the third surface. If the shadows change, it is implicated; if they do not, the cause
+   is elsewhere. One relaunch either way.
+
 ## 🚀 Run 39 RESULT: zero-copy works — 4K went from ~60 fps to ~115
 
 ```

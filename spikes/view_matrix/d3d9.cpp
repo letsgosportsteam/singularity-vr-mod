@@ -2266,6 +2266,7 @@ int  g_userPtrHookLevel = 0;      // 0 off, 1 patch only, 2 +counter, 3 full - a
 typedef HRESULT (STDMETHODCALLTYPE *PFN_SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
 PFN_SetRenderTarget g_origSetRenderTarget = nullptr;
 volatile LONG g_rtIsScene = 1;
+int g_splitColourOnly = 0;    // ini SplitColourTargetsOnly - see the note in Hook_SetRenderTarget
 
 // ---- render-target census (run 11) ----
 //
@@ -2304,7 +2305,32 @@ const char* FmtName(D3DFORMAT f) {
         case D3DFMT_D24S8:      return "D24S8";
         case D3DFMT_D16:        return "D16";
         case D3DFMT_L8:         return "L8";
-        default:                return "other";
+        case D3DFMT_A8:         return "A8";
+        case D3DFMT_G16R16:     return "G16R16";
+        case D3DFMT_A16B16G16R16: return "A16B16G16R16";
+        case D3DFMT_R16F:       return "R16F";
+        case D3DFMT_G32R32F:    return "G32R32F";
+        case D3DFMT_A32B32G32R32F: return "A32B32G32R32F";
+        case D3DFMT_A8B8G8R8:   return "A8B8G8R8";
+        case D3DFMT_R5G6B5:     return "R5G6B5";
+        case D3DFMT_D24X8:      return "D24X8";
+        case D3DFMT_D32:        return "D32";
+        default: {
+            // "other" was hiding the identity of a scene-sized surface being split 240 times a
+            // frame - the leading suspect for the one-eye shadow corruption. A name we cannot
+            // read is not a diagnostic. FOURCC formats print as their four characters, everything
+            // else as its numeric D3DFORMAT.
+            static char buf[32];
+            const DWORD v = (DWORD)f;
+            if (v > 0x20202020) {
+                sprintf_s(buf, "FOURCC '%c%c%c%c'",
+                          (char)(v & 0xFF), (char)((v >> 8) & 0xFF),
+                          (char)((v >> 16) & 0xFF), (char)((v >> 24) & 0xFF));
+            } else {
+                sprintf_s(buf, "fmt#%lu", (unsigned long)v);
+            }
+            return buf;
+        }
     }
 }
 
@@ -2321,6 +2347,26 @@ HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
             D3DSURFACE_DESC d{};
             if (SUCCEEDED(surf->GetDesc(&d))) {
                 if (g_srcW && g_srcH) scene = (d.Width == g_srcW && d.Height == g_srcH);
+                // ---- the discriminator for the one-eye shadow corruption (run 40) ----
+                //
+                // The scene test above is SIZE EQUALITY ALONE, so every scene-sized surface gets
+                // split - and the census has been flagging a THIRD one for several runs, taking
+                // 240 draws a frame, that is neither of the two colour targets it should be.
+                //
+                // A screen-space effect that reconstructs world position from depth does so with
+                // an inverse-projection constant we do NOT remap. Feed it depth from geometry we
+                // DID remap and the reconstruction lands somewhere else entirely - differently per
+                // eye, since each eye's remap differs. That is exactly "the shadow appears in one
+                // eye and is wrong in that eye".
+                //
+                // This restricts splitting to the two known scene COLOUR formats, which excludes
+                // that third surface. If the shadows change, it is implicated; if they do not, the
+                // cause is elsewhere and this costs one relaunch to find out.
+                if (scene && g_splitColourOnly &&
+                    !(d.Format == D3DFMT_A8R8G8B8 || d.Format == D3DFMT_X8R8G8B8 ||
+                      d.Format == D3DFMT_A16B16G16R16F)) {
+                    scene = false;
+                }
                 for (int i = 0; i < g_rtSeenCount; ++i)
                     if (g_rtSeen[i].surf == surf) { g_rtCurrent = i; break; }
                 if (g_rtCurrent < 0 && g_rtSeenCount < 16) {
@@ -4146,6 +4192,13 @@ void LoadIniSettings() {
     // earlier than the driver would, and that should be provable as harmless rather than assumed.
     // Stage 2. Only ever active on an Ex device, so leaving this at 1 with D3D9ExMode=0 changes
     // nothing - the pair is the A/B: D3D9ExMode=1/ZeroCopy=0 against D3D9ExMode=1/ZeroCopy=1.
+    g_splitColourOnly = GetPrivateProfileIntA("Render", "SplitColourTargetsOnly", 0, path);
+    if (g_splitColourOnly < 0 || g_splitColourOnly > 1) g_splitColourOnly = 0;
+    Log("ini: SplitColourTargetsOnly=%d (%s)", g_splitColourOnly,
+        g_splitColourOnly ? "split ONLY the two scene colour targets - excludes the third,"
+                            " unidentified scene-sized surface (shadow test)"
+                          : "split every scene-sized target, as before");
+
     g_zeroCopy = GetPrivateProfileIntA("Render", "ZeroCopy", 1, path);
     if (g_zeroCopy < 0 || g_zeroCopy > 1) g_zeroCopy = 1;
     Log("ini: ZeroCopy=%d (%s)", g_zeroCopy,

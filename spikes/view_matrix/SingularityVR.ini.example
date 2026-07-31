@@ -125,6 +125,35 @@ D3D9ExMode=0
 ; ---------------------------------------------------------------------------
 ZeroCopy=1
 
+; ---------------------------------------------------------------------------
+; SplitColourTargetsOnly   -- the one-eye shadow test (run 40)
+;
+; Shadows appear in one eye only and are wrong in that eye. The render-target
+; census has been flagging the likely cause for several runs:
+;
+;   2A330540  4096x2160  A16B16G16R16F   9337 draws  <- SPLIT
+;   2A330240  4096x2160  A8R8G8B8         740 draws  <- SPLIT
+;   2A330840  4096x2160  other            240 draws  <- SPLIT
+;   ^ 3 SCENE-SIZED surfaces split. Only the two colour targets should be.
+;
+; The scene test is SIZE EQUALITY alone, so a third scene-sized surface -
+; neither colour target - gets split 240 times a frame.
+;
+; Why that would break shadows specifically: a screen-space effect that
+; reconstructs world position from DEPTH uses an inverse-projection constant we
+; do not remap. Feed it depth from geometry we DID remap and the reconstruction
+; lands somewhere else - differently per eye, since each eye's remap differs.
+; Which is exactly the reported symptom.
+;
+; Setting this to 1 splits only the two known scene colour formats, excluding
+; that third surface. If the shadows change, it is implicated. If they do not,
+; the cause is elsewhere and this cost one relaunch.
+;
+;   0 = split every scene-sized target, as before                 <- default
+;   1 = split only the two scene colour targets
+; ---------------------------------------------------------------------------
+SplitColourTargetsOnly=0
+
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------
