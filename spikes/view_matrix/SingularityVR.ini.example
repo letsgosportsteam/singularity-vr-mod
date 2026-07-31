@@ -185,6 +185,114 @@ ExtraCamReg=-1
 HookUserPointerDraws=0
 
 ; ---------------------------------------------------------------------------
+; HeadRoll   -- the third rotation axis, finally written
+;
+; F9 drove pitch and yaw only. Roll was never written anywhere, so tilting your
+; head sideways left the horizon glued to the headset instead of level - the
+; last missing piece of a real 6-DOF head pose.
+;
+; It does NOT go through the engine's rotation. The detour owns pitch, yaw needs
+; a direct write to the controller, and UE3 zeroes camera roll in several
+; places - three seams to fight for an angle we already own outright, since the
+; view matrix is ours by the time it reaches the GPU. Roll is applied there, as
+; a rotation of clip x/y, after the forced projection and before the per-eye
+; half-frame remap.
+;
+; ---- why the compositor does not already do this ----
+;
+; The submitted projection layer carries the head's full orientation, roll
+; included, so it looks like the runtime should be rotating the image for us. It
+; does not: a projection layer is reprojected by the DELTA between the pose we
+; claim and the pose the display is at. Claim a rolled pose for an unrolled
+; render while the head is at that same roll, the delta is zero, and the image
+; is presented straight - exactly the symptom. Baking roll into the render is
+; what makes the claimed pose true.
+;
+; NUMPAD1 toggles it live. NUMPAD2 flips the sign - the handedness between
+; OpenXR's frame and the game's has been guessed wrong on BOTH other axes
+; (that is what F4 and F5 are for), so check it rather than assume it: tilt your
+; head and see which way the horizon goes.
+;
+; The maths is verified as arithmetic rather than by eye - spikes/roll_math
+; asserts the rotation is exact, does not shear despite tanX != tanY, and
+; composes with the eye remap. Run .\spikes\roll_math\build.ps1.
+;
+; Known interaction, not yet measured: the engine culls with an UNROLLED
+; frustum, so a rolled view's corners reach outside it. The existing culling
+; headroom (PAGE UP) covers small tilts; a large one may drop geometry at the
+; corners. Watch for it before adding headroom that costs LOD everywhere.
+;
+;   1 = tilting your head tilts the view                           <- default
+;   0 = off, the horizon stays locked to the headset
+; ---------------------------------------------------------------------------
+HeadRoll=1
+
+; ---------------------------------------------------------------------------
+; RtSwitchProbe   -- the measurement that decides Stage 4B. Use NUMPAD3 instead.
+;
+; Per-eye render targets ("Stage 4B") would fix the seam, the post-processing
+; bleed and the occlusion-box remapping in one change. They have been blocked
+; on one question for eight runs: what does a render-target switch cost?
+;
+; Nobody has measured it. Every figure in STATUS.md is arithmetic on an assumed
+; per-switch cost - "~3,800 switches, even at an optimistic 5 us that is ~19 ms
+; against an 8.3 ms budget". That is a guess with a multiplication after it, and
+; this project has been wrong three times about exactly that shape of claim:
+; the SSW frame rates, the "3% frame copy", and the 4096 cap run 33 blamed on
+; the GPU and run 40 measured at 16384.
+;
+; ---- what the probe does ----
+;
+; Swaps the render target and depth-stencil AWAY to a scratch pair and straight
+; back, once per draw. That is exactly the two SetRenderTarget + two
+; SetDepthStencilSurface calls Stage 4B would issue for that draw's two eyes,
+; at the real draw count, with the real interleaving, against the real driver.
+;
+; Because it swaps back, every draw still lands where it always did. THE IMAGE
+; IS UNCHANGED. So any frame-time difference is switching cost and nothing else
+; - correctness and cost are separated completely, which is what makes a single
+; keypress a valid A/B.
+;
+; ---- how to read it ----
+;
+; NUMPAD3 toggles it live. Stand still, let a perf line print, press NUMPAD3,
+; let the next one print, compare:
+;
+;   perf: 112.4 fps (8.90 ms/frame) ...
+;       RT-switch probe [off]: 0 swap pair(s) this window, 0/frame ...
+;   perf: ...
+;       RT-switch probe [ON]: 1902 swap pair(s) this window, 1902/frame
+;         = 3804 SetRenderTarget + 3804 SetDepthStencilSurface per frame
+;         <- the image is UNCHANGED; any frame-time delta is Stage 4B's floor
+;
+; Toggling live beats two launches: same scene, same position, same streaming
+; state, seconds apart. Two launches is two different everything, which is what
+; run 32's discipline note is about.
+;
+;   under ~1 ms   Stage 4B is affordable - build it
+;   1-3 ms        affordable only after the resolution work pays for itself
+;   over ~4 ms    Stage 4B is dead in this design; the 4+ ms of idle won in
+;                 run 39 does not cover it
+;
+; ⚠️ This is a LOWER BOUND, not Stage 4B's price. Stage 4B also pays for two
+; full-size targets instead of one - double the pixel fill and bandwidth once
+; each eye is at full resolution - plus compositing them into the submitted
+; frame. If the lower bound already blows the budget, Stage 4B is dead and no
+; further work is needed to know it.
+;
+; ⚠️ And note what run 40 already settled: RESOLUTION is no longer a reason to
+; want Stage 4B. GetDeviceCaps reports MaxTextureWidth/Height = 16384, so the
+; hardware allows the 5376x2880 side-by-side target that full per-eye parity
+; needs. What refuses it is UE3's own resolution validation - a far cheaper
+; problem than rebuilding the render path. Stage 4B's remaining justification
+; is CORRECTNESS (seam, post-processing, occlusion boxes), not pixels.
+;
+;   0 = off; NUMPAD3 toggles it live, which is the better A/B    <- default
+;   1 = on from launch, for comparing a level load or a cold start
+; ---------------------------------------------------------------------------
+RtSwitchProbe=0
+
+; ---------------------------------------------------------------------------
 ; OcclusionQueryMode   -- THIS IS THE FIX FOR THE VANISHING OBJECTS (run 30)
 ;
 ; UE3 draws a bounding box per primitive inside an occlusion query, reads the

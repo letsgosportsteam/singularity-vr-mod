@@ -568,6 +568,10 @@ float g_capTanMin = 1e9f, g_capTanMax = -1e9f;
 // badly (mCurrentPOV read 157.9 while the matrix the engine actually built carried 80.7 x 51.1).
 float g_capTanYMin = 1e9f;
 int   g_injCount = 0;
+// Draws whose matrix actually received a roll. Reported next to the peak angle so "roll is on"
+// and "roll reached the GPU" stay separate claims - every counter in this project that could only
+// report the good case has eventually misled someone.
+int   g_rollApplied = 0;
 
 // The projection scales, from the x and y columns. See ClipW for how the conventions differ.
 inline void ProjTangents(const Reg4* r, int conv, float* tanX, float* tanY) {
@@ -865,6 +869,69 @@ void ApplyEyeRemap(Reg4* r, int conv, float s) {
         r[0].y = 0.5f * r[0].y + s * r[3].y;
         r[0].z = 0.5f * r[0].z + s * r[3].z;
         r[0].w = 0.5f * r[0].w + s * r[3].w;
+    }
+}
+
+// ---- head ROLL, applied in clip space ----
+//
+// Roll was the last axis of the head pose never written anywhere: F9 drove pitch and yaw only, so
+// tilting your head sideways left the horizon glued to the headset instead of staying level.
+//
+// It does NOT go through the engine's FRotator. The detour owns pitch, yaw needs a direct write to
+// the controller, and UE3 zeroes camera roll in several places - three seams to fight for an angle
+// we already own outright, because the view matrix is ours by the time it reaches the GPU.
+//
+// ⚠️ And it CANNOT be left to the compositor, which is the trap here. The submitted projection
+// layer already carries the head's full orientation, roll included, so it looks like the runtime
+// should be rotating the image for us. It does not: a projection layer is reprojected by the
+// DELTA between the pose we claim and the pose the display is at. Claim a rolled pose for an
+// unrolled render while the head is at that same roll, the delta is zero, and the image is
+// presented straight - which is exactly the reported symptom. Baking roll into the render is what
+// makes the claimed pose true, and the two then agree by construction.
+//
+// Roll about the view's forward axis is a rotation of clip x/y, but the frustum is NOT square -
+// tanX and tanY differ, and under duplication tanX is the half-width per-eye value. Rotating the
+// raw clip columns would shear. So convert to the symmetric view-space direction, rotate, convert
+// back:
+//
+//     x_v = clip.x * tanX,  y_v = clip.y * tanY      (view-space direction, aspect removed)
+//     rotate by theta
+//     clip.x' = x_v' / tanX,  clip.y' = y_v' / tanY
+//
+// which collapses to a mix of the two columns with the aspect ratio as the cross term.
+//
+// Order matters twice over, and both are satisfied by applying this in Hook_SetVSConstF right
+// after ApplyProjection:
+//
+//   * AFTER the forced projection, so the tangents read here are the frustum the eye actually
+//     sees rather than whatever the engine happened to send.
+//   * BEFORE ApplyEyeRemap, which squashes clip x by half. Rolling after that squash would mix a
+//     halved x with a full y and tilt by the wrong angle.
+//
+// It composes with ApplyOffset in either order: an offset is a pre-multiplication in world space,
+// a roll is a post-multiplication in clip space, so they commute. The eye separation needs no
+// special handling either - g_eyeDeltaUU is derived from the two real eye POSITIONS, which already
+// swing about the head as it tilts.
+void ApplyRoll(Reg4* r, int conv, float rollRad, float tanX, float tanY) {
+    if (rollRad == 0.0f) return;
+    if (!(tanX > 1e-6f && tanY > 1e-6f)) return;
+    const float cs = cosf(rollRad), sn = sinf(rollRad);
+    const float xy = (tanY / tanX) * sn;    // how much clip y feeds into clip x
+    const float yx = (tanX / tanY) * sn;
+    if (conv == CONV_ROW) {
+        // The x column is r[0..3].x, the y column r[0..3].y - the same layout ApplyProjection scales.
+        for (int i = 0; i < 4; ++i) {
+            const float x = r[i].x, y = r[i].y;
+            r[i].x = cs * x - xy * y;
+            r[i].y = yx * x + cs * y;
+        }
+    } else {
+        // Register 0 IS the x row, register 1 the y row.
+        for (int k = 0; k < 4; ++k) {
+            const float x = (&r[0].x)[k], y = (&r[1].x)[k];
+            (&r[0].x)[k] = cs * x - xy * y;
+            (&r[1].x)[k] = yx * x + cs * y;
+        }
     }
 }
 
@@ -1171,6 +1238,11 @@ int   g_framesNoIdent = 0;                       // per report window: frames th
 float g_bestRejectDot = -2.0f;                   // per report window
 
 ID3D11Texture2D*   g_uploadTex  = nullptr;   // D3D11 side, CPU-writable
+// The scratch pair the render-target switch probe swaps to and back. Created alongside the other
+// copy resources below, because they are sized the same way and die on the same Reset; the probe
+// itself and the reasoning behind it live down by g_rtSwitchProbe.
+IDirect3DSurface9* g_probeRT = nullptr;
+IDirect3DSurface9* g_probeDS = nullptr;
 UINT g_srcW = 0, g_srcH = 0;
 D3DFORMAT g_srcFmt = D3DFMT_UNKNOWN;
 float g_headFovDeg = 0.0f;
@@ -1493,6 +1565,36 @@ bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
             Log("ZeroCopy requested but the device is not D3D9Ex - needs D3D9ExMode=1. Using the CPU copy."); }
     }
 
+    // ---- the scratch pair the render-target switch probe swaps to (NUMPAD3) ----
+    //
+    // Scene-sized so the switch is between surfaces of the size Stage 4B would really use - a tiny
+    // scratch could let the driver take a cheaper path and understate the cost, which is the one
+    // way this measurement could flatter the plan it exists to test.
+    //
+    // Nothing is ever drawn into these. If either fails to create, the probe stays unavailable
+    // rather than half-working: a probe that silently measures nothing is exactly the tautological
+    // instrument that has misled this project seven times.
+    if (g_probeRT) { g_probeRT->Release(); g_probeRT = nullptr; }
+    if (g_probeDS) { g_probeDS->Release(); g_probeDS = nullptr; }
+    {
+        HRESULT hrRT = dev->CreateRenderTarget(w, h, fmt, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                               &g_probeRT, nullptr);
+        HRESULT hrDS = dev->CreateDepthStencilSurface(w, h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0,
+                                                      FALSE, &g_probeDS, nullptr);
+        if (FAILED(hrDS)) {   // not universal; D16 is
+            hrDS = dev->CreateDepthStencilSurface(w, h, D3DFMT_D16, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                                  &g_probeDS, nullptr);
+        }
+        if (FAILED(hrRT) || FAILED(hrDS) || !g_probeRT || !g_probeDS) {
+            Log("RT-switch probe unavailable: CreateRenderTarget=0x%08lX CreateDepthStencilSurface=0x%08lX",
+                hrRT, hrDS);
+            if (g_probeRT) { g_probeRT->Release(); g_probeRT = nullptr; }
+            if (g_probeDS) { g_probeDS->Release(); g_probeDS = nullptr; }
+        } else {
+            Log("RT-switch probe ready (%ux%u scratch pair) - NUMPAD3 toggles it live", w, h);
+        }
+    }
+
     g_srcW = w; g_srcH = h; g_srcFmt = fmt;
     Log("copy resources ready for %ux%u fmt=%d (%d readback slots, %s, %s)", w, h, (int)fmt,
         kCopySlots, g_copyMode == 1 ? "immediate" : "pipelined one frame",
@@ -1745,6 +1847,24 @@ const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
 
 const float kRadToUU = 65536.0f / 6.2831853f;
 int   g_yawSign = -1, g_pitchSign = 1;
+
+// ---- head roll ----
+//
+// Kept in RADIANS, not UU: it never reaches an FRotator. See ApplyRoll for why the engine's
+// rotation is the wrong place for this and the view matrix is the right one.
+//
+// Deliberately ABSOLUTE, with no recentre baseline. Yaw is anchored to whatever the game's yaw was
+// when we recentred because the game's yaw is arbitrary; roll is not - the runtime measures it
+// against gravity, and level head should mean level horizon. Anchoring it would bake a permanent
+// tilt in whenever someone recentred with their head at an angle.
+volatile LONG g_rollOn = 1;      // ini HeadRoll, NUMPAD1 - rides with head tracking
+// -1, MEASURED in run 49: +1 tilted the horizon the wrong way in the headset and NUMPAD2 fixed it.
+// Third axis, third time the handedness between OpenXR's frame and the game's has come out
+// negative - g_yawSign is -1 for the same reason. Kept as a variable, and NUMPAD2 kept, because
+// the next runtime or headset is not obliged to agree.
+int   g_rollSign = -1;           // NUMPAD2 - the same escape hatch F4/F5 give pitch and yaw
+float g_wantRollRad = 0.0f;
+float g_maxRollDeg = 0.0f;       // largest magnitude seen this report window
 bool  g_haveCentre = false;
 float g_centreYaw = 0.0f;
 int32_t g_baseYaw = 0;
@@ -1792,6 +1912,11 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         float pitchRad = asinf(sinp);
         float yawRad = atan2f(2.0f * (q.w * q.y + q.z * q.x),
                               1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        // The third angle of the same Y-X-Z decomposition the two above come from, so all three
+        // are consistent with each other rather than three separately-derived conventions.
+        // OpenXR is Y-up with forward at -Z, so roll is the rotation about Z.
+        float rollRad = atan2f(2.0f * (q.w * q.z + q.x * q.y),
+                               1.0f - 2.0f * (q.x * q.x + q.z * q.z));
         // Anchor to the GAME's current yaw, not our own previous output. Seeding from
         // g_wantYaw (initially 0) made enabling snap the view to world yaw 0.
         if (!g_haveCentre) {
@@ -1902,9 +2027,19 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         g_wantYaw   = g_baseYaw + (int32_t)(g_yawSign * dYaw * kRadToUU);
         g_haveWant  = true;
 
+        // Roll rides with head tracking, so it stops when F9 does and the matrix path has one
+        // flag to read rather than two. Written unconditionally when off so a stale angle can
+        // never survive a toggle.
+        g_wantRollRad = (InterlockedCompareExchange(&g_rollOn, 0, 0) &&
+                         InterlockedCompareExchange(&g_enabled, 0, 0))
+                        ? g_rollSign * rollRad : 0.0f;
+        const float rollDeg = fabsf(g_wantRollRad) * 57.2957795f;
+        if (rollDeg > g_maxRollDeg) g_maxRollDeg = rollDeg;
+
         if (++g_tick % 180 == 0)
-            Log("head pitch %.1f yaw %.1f -> want pitch %d yaw %d (hook hits %d)",
-                pitchRad*57.2958f, yawRad*57.2958f, g_wantPitch, g_wantYaw, g_hookHits);
+            Log("head pitch %.1f yaw %.1f roll %.1f -> want pitch %d yaw %d roll %.1f deg (hook hits %d)",
+                pitchRad*57.2958f, yawRad*57.2958f, rollRad*57.2958f,
+                g_wantPitch, g_wantYaw, g_wantRollRad*57.2958f, g_hookHits);
     }
 
     // ---- copy the game's frame into the swapchain and submit it ----
@@ -2111,7 +2246,11 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     }
     const bool forceProj = InterlockedCompareExchange(&g_vrProjection, 0, 0) != 0 &&
                            g_targetTanX > 0.0f && g_targetTanY > 0.0f;
-    const bool modify = inject || forceProj || dup;
+    // Roll has to be able to pull us onto the modify path by itself. With F9 alone - no 6-DOF, no
+    // duplication, no forced projection - `inject` is false and none of the others are set, so
+    // without this a head tilt would silently do nothing in plain mono head tracking.
+    const bool rollNow = fabsf(g_wantRollRad) > 1e-5f;
+    const bool modify = inject || forceProj || dup || rollNow;
 
     // The SCAN genuinely needs a live camera position - its world-position probes are meaningless
     // without one, and it is the only thing here that reads g_camPos at all.
@@ -2216,6 +2355,17 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
             // Reading it back after the edit closes that loop.
             ProjTangents(m, c, &g_forcedTanX, &g_forcedTanY);
         }
+        // Roll goes here and nowhere else: after the projection has been forced, so the tangents
+        // below describe the frustum the eye really sees (under duplication g_targetTanX is
+        // already the half-width per-eye value), and before StereoPair's ApplyEyeRemap squashes
+        // clip x. Measured from the matrix rather than taken from g_targetTan*, so it stays
+        // correct on the F6-off path too, where the engine's own projection is still in there.
+        if (rollNow) {
+            float rtx = 0.0f, rty = 0.0f;
+            ProjTangents(m, c, &rtx, &rty);
+            ApplyRoll(m, c, g_wantRollRad, rtx, rty);
+            ++g_rollApplied;
+        }
         // END: collapse everything this register drives, so whatever survives on screen is
         // geometry we do not remap. Applied before the cache below, so the draw hook's per-eye
         // copies inherit it too. See the note by g_blankCamMat.
@@ -2310,6 +2460,54 @@ volatile LONG g_dumpShadowConsts = 0;
 volatile LONG g_skipExtraTarget = 0;
 int g_drawsSkipped = 0;
 
+// ---- Stage 4B's gate: what does a render-target switch actually COST? (NUMPAD3) ----
+//
+// Per-eye render targets have been "worth one measurement before ruling out" for eight runs and
+// the measurement has never been taken. Every estimate in STATUS.md is arithmetic on an assumed
+// per-switch cost - "~3,800 switches, even at an optimistic 5 us that is ~19 ms against an 8.3 ms
+// budget". That is a guess with a multiplication after it, and this project has now been wrong
+// three times about exactly that shape of claim: the SSW frame rates, the 3% frame copy, and the
+// 4096 cap that ran 33 attributed to the GPU and run 40 measured at 16384.
+//
+// So: measure it, in situ, before building anything.
+//
+// The probe swaps the render target and depth-stencil AWAY to a scratch pair and immediately back,
+// once per StereoPair call. That is exactly the two SetRenderTarget + two SetDepthStencilSurface
+// calls Stage 4B would issue per draw (one pair per eye), at the real draw count, with the real
+// interleaving, and against the real driver.
+//
+// The point of swapping away and BACK is that every draw still lands where it always did. The
+// frame is pixel-identical with the probe on, so anything the frame time does is switching cost
+// and nothing else. Correctness and cost are separated completely, which is what makes a single
+// keypress a valid A/B.
+//
+// ⚠️ It measures a LOWER BOUND on Stage 4B, not its price. Stage 4B also pays for two full-size
+// targets instead of one (double the pixel fill and bandwidth once each eye is full resolution),
+// plus compositing them into the submitted frame. If the lower bound already blows the budget,
+// Stage 4B is dead and no further work is needed to know it.
+volatile LONG g_rtSwitchProbe = 0;
+// (g_probeRT / g_probeDS, the scratch pair, are declared up with the other copy resources -
+// EnsureCopyResources creates them and sits above this point in the file.)
+//
+// The currently-bound pair, cached so the probe costs no Get calls - those AddRef, and paying two
+// AddRef/Release round trips per draw inside the thing being timed would contaminate the number
+// with cost Stage 4B would never pay. Raw pointers with no reference held: the engine owns a
+// reference for as long as the surface is bound, and these are only ever used to rebind what is
+// bound right now. A NULL depth-stencil is legal and must survive the round trip.
+IDirect3DSurface9* g_curRT = nullptr;
+IDirect3DSurface9* g_curDS = nullptr;
+bool g_curDSKnown = false;
+int  g_rtSwitchPairs = 0;                 // swap pairs issued this report window
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetDepthStencilSurface)(IDirect3DDevice9*, IDirect3DSurface9*);
+PFN_SetDepthStencilSurface g_origSetDepthStencilSurface = nullptr;
+
+HRESULT STDMETHODCALLTYPE Hook_SetDepthStencilSurface(IDirect3DDevice9* dev,
+                                                      IDirect3DSurface9* surf) {
+    HRESULT hr = g_origSetDepthStencilSurface(dev, surf);
+    if (SUCCEEDED(hr)) { g_curDS = surf; g_curDSKnown = true; }
+    return hr;
+}
+
 // ---- render-target census (run 11) ----
 //
 // The size test above caught only 11 draws of ~1640, so shadow maps are NOT being separated by
@@ -2380,6 +2578,7 @@ HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
                                               IDirect3DSurface9* surf) {
     HRESULT hr = g_origSetRenderTarget(dev, idx, surf);
     if (idx == 0) {
+        if (SUCCEEDED(hr)) g_curRT = surf;
         // Before the backbuffer size is known, assume scene - the initial target IS the
         // backbuffer, and refusing to split would silently disable stereo instead of failing
         // in a way anyone would notice.
@@ -2603,6 +2802,59 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     // exactly what "flickering" was. Falling back to one unsplit draw costs that object its
     // parallax for a frame; it does not cost its existence.
     if (nSlots == 0) { ++g_drawsMonoFallback; return draw(); }
+
+    // ---- NUMPAD3: what a render-target switch costs, measured where Stage 4B would pay it ----
+    //
+    // Two SetRenderTarget + two SetDepthStencilSurface per StereoPair call - exactly what per-eye
+    // targets would issue for this draw's two eyes. Away to the scratch pair and straight back, so
+    // the draws below still land on the real target and the frame is unchanged. See the note by
+    // g_rtSwitchProbe for why the current pair is cached rather than fetched.
+    //
+    // Placed after the mono-fallback return so the probe's count tracks the draws Stage 4B would
+    // actually have to switch for, not the ones that bail out above it.
+    //
+    // ⚠️ SetRenderTarget RESETS THE VIEWPORT AND SCISSOR RECT to the full size of the new target.
+    // Without putting them back, the probe would silently change where geometry lands and the
+    // "image is unchanged" guarantee - the entire basis for reading the frame-time delta as pure
+    // switching cost - would be false. `full` was read from the device a few lines above.
+    //
+    // The SetViewport is not contamination: Stage 4B would have to issue exactly the same restore
+    // after every one of its own switches, for the same reason. The SetScissorRect is one call
+    // Stage 4B would not need (with per-eye targets there is no seam to scissor to), so this
+    // overstates the cost by one call in ~3,800 - and for a go/no-go gate, overstating is the safe
+    // direction.
+    //
+    // ---- ⚠️ LEVEL 1 CAN BE OPTIMISED AWAY, WHICH IS WHY LEVEL 2 EXISTS (run 49) ----
+    //
+    // D3D9 drivers apply render state LAZILY - nothing is flushed until a draw needs it. Level 1
+    // binds the scratch pair and rebinds the real pair with no draw in between, which is exactly
+    // the pattern a driver collapses to "bind the real pair" at the next draw. Level 1 measured
+    // ~0 ms for 3,450 switch pairs a frame, and a free result from a probe that can be elided is
+    // precisely the tautological instrument this project has been caught by seven times.
+    //
+    // Level 2 forces the bind to be honoured: a 1x1 viewport and a Clear against the scratch
+    // target. A Clear cannot be reordered past the bind, so the switch is really paid. One pixel
+    // of fill is negligible; what it costs is the flush, which is the thing being measured.
+    //
+    // Read the two together: level 1 ~= level 2 means the switch really is cheap. level 2 >> level
+    // 1 means level 1 was measuring nothing, and level 2 is the real number.
+    const LONG probeLevel = InterlockedCompareExchange(&g_rtSwitchProbe, 0, 0);
+    if (probeLevel && g_probeRT && g_probeDS && g_curRT) {
+        RECT probeScissor{};
+        dev->GetScissorRect(&probeScissor);
+        g_origSetRenderTarget(dev, 0, g_probeRT);
+        if (g_origSetDepthStencilSurface) g_origSetDepthStencilSurface(dev, g_probeDS);
+        if (probeLevel >= 2) {
+            D3DVIEWPORT9 tiny{ 0, 0, 1, 1, 0.0f, 1.0f };
+            dev->SetViewport(&tiny);
+            dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+        }
+        g_origSetRenderTarget(dev, 0, g_curRT);
+        if (g_origSetDepthStencilSurface && g_curDSKnown) g_origSetDepthStencilSurface(dev, g_curDS);
+        dev->SetViewport(&full);
+        dev->SetScissorRect(&probeScissor);
+        ++g_rtSwitchPairs;
+    }
 
     // ---- "with parallax" has to mean something ----
     //
@@ -3664,6 +3916,12 @@ void ApplyVrFov() {
             g_capTanMin < 1e8f ? 2.0f * atanf(g_capTanMin) * 57.2957795f : 0.0f,
             g_capTanMax > 0    ? 2.0f * atanf(g_capTanMax) * 57.2957795f : 0.0f,
             g_injCount);
+        Log("    head roll: %s, peak %.1f deg this window, %d draw matrix(es) rolled%s",
+            InterlockedCompareExchange(&g_rollOn, 0, 0) ? "ON" : "OFF",
+            g_maxRollDeg, g_rollApplied,
+            (g_maxRollDeg > 1.0f && g_rollApplied == 0)
+                ? "  <-- TILTED BUT NOTHING ROLLED - the matrix path is not being reached" : "");
+        g_maxRollDeg = 0.0f; g_rollApplied = 0;
         povMin = 1e9f; povMax = -1e9f;
     }
 }
@@ -3847,6 +4105,55 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             was ? "restored" : "DROPPED - if the decal artefact disappears, that surface is the pass");
     }
     pNum0 = kNum0;
+
+    // NUMPAD1 / NUMPAD2: head roll on-off and its sign. On the numpad rather than an F-key
+    // because F1-F12 are all spoken for, and NUMPAD0 already set the precedent.
+    //
+    // The sign flip is not laziness - F4 and F5 exist for exactly this reason on pitch and yaw.
+    // Handedness between OpenXR's frame and the game's has been guessed wrong on both of the
+    // other two axes, and a wrong roll sign looks plausible until you tilt far enough to notice
+    // the horizon going the wrong way. One keypress settles it in the headset.
+    static bool pNum1 = false, pNum2 = false;
+    bool kNum1 = (GetAsyncKeyState(VK_NUMPAD1) & 0x8000) != 0;
+    bool kNum2 = (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) != 0;
+    if (kNum1 && !pNum1) {
+        LONG was = InterlockedCompareExchange(&g_rollOn, 0, 0);
+        InterlockedExchange(&g_rollOn, was ? 0 : 1);
+        Log("NUMPAD1: head roll %s", was ? "OFF (horizon locked to the headset, as before)" : "ON");
+    }
+    if (kNum2 && !pNum2) {
+        g_rollSign = -g_rollSign;
+        Log("NUMPAD2: roll sign %+d - tilt your head and check which way the horizon goes",
+            g_rollSign);
+    }
+    pNum1 = kNum1; pNum2 = kNum2;
+
+    // NUMPAD3: the render-target switch probe. See the note by g_rtSwitchProbe.
+    //
+    // A HOTKEY rather than an ini setting, deliberately. Every A/B in this project so far has been
+    // two launches, and run 32's own discipline note says a measurement is only as good as the
+    // thing being measured is real - two launches means two different scenes, two different
+    // positions and two different streaming states. Toggling live compares the same frame against
+    // itself seconds apart, which is a far stronger comparison than any relaunch can give.
+    static bool pNum3 = false;
+    bool kNum3 = (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) != 0;
+    if (kNum3 && !pNum3) {
+        if (!g_probeRT || !g_probeDS) {
+            Log("NUMPAD3: RT-switch probe UNAVAILABLE - the scratch pair could not be created");
+        } else {
+            // Cycles off -> 1 -> 2 -> off. Level 1 is the cheap version and can be elided by a
+            // lazy driver; level 2 forces the bind with a 1x1 Clear. See the note in StereoPair.
+            LONG next = (InterlockedCompareExchange(&g_rtSwitchProbe, 0, 0) + 1) % 3;
+            InterlockedExchange(&g_rtSwitchProbe, next);
+            Log("NUMPAD3: RT-switch probe %s",
+                next == 0 ? "OFF - back to the normal path; this is the control"
+                : next == 1 ? "LEVEL 1: bind away and back, no draw between."
+                              " CAN BE ELIDED by a lazy driver - compare against level 2"
+                            : "LEVEL 2: bind + a 1x1 Clear on the scratch target, so the switch"
+                              " CANNOT be optimised away. This is the trustworthy number");
+        }
+    }
+    pNum3 = kNum3;
 
     // BACKSPACE: the whole mod on or off in one key. See SetVrMode.
     static bool pBack = false;
@@ -4033,6 +4340,31 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
                 offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak, upPeak, g_framesNoIdent,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
+            // ---- Stage 4B's gate, reported right under the frame time it must be read against ----
+            //
+            // Printed whether the probe is on or off, because the OFF line is the control and a
+            // measurement whose control is not written down is half a measurement. Toggle NUMPAD3
+            // and compare two consecutive perf lines.
+            //
+            // The per-frame figure is what the estimate in STATUS.md was guessing at ("~3,800
+            // switches"), so it also checks the arithmetic that estimate rests on.
+            {
+                const LONG lvl = InterlockedCompareExchange(&g_rtSwitchProbe, 0, 0);
+                Log("    RT-switch probe [%s]: %d swap pair(s) this window, %.0f/frame"
+                    " = %.0f SetRenderTarget + %.0f SetDepthStencilSurface per frame%s",
+                    lvl == 0 ? "off (control)" : lvl == 1 ? "L1 bind-only, ELIDABLE" : "L2 forced",
+                    g_rtSwitchPairs,
+                    frames > 0 ? (double)g_rtSwitchPairs / frames : 0.0,
+                    frames > 0 ? 2.0 * g_rtSwitchPairs / frames : 0.0,
+                    frames > 0 ? 2.0 * g_rtSwitchPairs / frames : 0.0,
+                    lvl == 0 ? ""
+                    : lvl == 1 ? "  <- image UNCHANGED, but a lazy driver may collapse this to"
+                                 " nothing. Trust level 2."
+                               : "  <- image UNCHANGED and the bind is forced. THIS is Stage 4B's"
+                                 " floor");
+            }
+            g_rtSwitchPairs = 0;
+
             // ---- the frame copy, broken into its three phases (run 31) ----
             //
             // This is the number that decides whether the D3D9Ex + MANAGED-pool wrapper is worth
@@ -4472,6 +4804,27 @@ void LoadIniSettings() {
         g_extraCamReg < 0 ? "off - only the scan-locked register is remapped"
                           : "also remap this register per eye (shadow-seam test)");
 
+    // Off by default - it is a measurement, not a setting, and NUMPAD3 is the intended way in.
+    // Here only so a run can start with it already on, which matters if the thing being compared
+    // is a level load or a cold start rather than steady-state gameplay.
+    LONG probeIni = GetPrivateProfileIntA("Render", "RtSwitchProbe", 0, path);
+    if (probeIni < 0 || probeIni > 2) probeIni = 0;
+    InterlockedExchange(&g_rtSwitchProbe, probeIni);
+    Log("ini: RtSwitchProbe=%ld (%s)", probeIni,
+        probeIni == 0 ? "off - NUMPAD3 cycles it live, which is the better A/B"
+        : probeIni == 1 ? "level 1 from launch - bind away and back; ELIDABLE by a lazy driver"
+                        : "level 2 from launch - bind + forced 1x1 Clear; the trustworthy number");
+
+    // On by default: a head tilt that does not tilt the view is a comfort problem, not a feature,
+    // and the whole cost is two multiply-adds on the ~50 constant uploads a frame that carry the
+    // camera. Switchable mainly so it can be A/B'd against a build without it.
+    LONG rollIni = GetPrivateProfileIntA("Render", "HeadRoll", 1, path);
+    if (rollIni < 0 || rollIni > 1) rollIni = 1;
+    InterlockedExchange(&g_rollOn, rollIni);
+    Log("ini: HeadRoll=%ld (%s)", rollIni,
+        rollIni ? "tilting your head tilts the view - NUMPAD1 toggles, NUMPAD2 flips the sign"
+                : "off - the horizon stays locked to the headset");
+
     g_splitColourOnly = GetPrivateProfileIntA("Render", "SplitColourTargetsOnly", 0, path);
     if (g_splitColourOnly < 0 || g_splitColourOnly > 1) g_splitColourOnly = 0;
     // Dump a handful of draws' worth of constants from the excluded target, then stop. Costs
@@ -4635,6 +4988,14 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         }
         // 37 = SetRenderTarget, so draws aimed at shadow maps can be told apart from scene draws.
         g_origSetRenderTarget = (PFN_SetRenderTarget)PatchVTable(*out, 37, (void*)&Hook_SetRenderTarget);
+        // 39 = SetDepthStencilSurface, two past SetRenderTarget (37) with GetRenderTarget between.
+        // Only there to cache the bound depth-stencil for the RT-switch probe, so a failed patch
+        // costs the probe and nothing else - the game must not be taken down for a diagnostic.
+        g_origSetDepthStencilSurface =
+            (PFN_SetDepthStencilSurface)PatchVTable(*out, 39, (void*)&Hook_SetDepthStencilSurface);
+        if (!g_origSetDepthStencilSurface)
+            Log("*** SetDepthStencilSurface patch FAILED - the RT-switch probe will swap the render"
+                " target only, understating Stage 4B's cost ***");
         // 118 = CreateQuery, the last method on IDirect3DDevice9. Counted forward from
         // SetVertexShaderConstantF at 94, which is independently confirmed working.
         g_origCreateQuery = (PFN_CreateQuery)PatchVTable(*out, 118, (void*)&Hook_CreateQuery);
