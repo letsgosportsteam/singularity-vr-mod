@@ -499,6 +499,62 @@ stays for the mode selection the shipped mod needs.
 **Guard added:** if duplication is on and *nothing* was split, the log now says so loudly. Stereo
 silently doing nothing cost a whole session here; it should never be inferred from a census again.
 
+## ✅ Run 42: SOLVED — a second view-projection at `vs c13` is never remapped
+
+**The run-18 "vanishing monster" theory was right all along, and the counter that twice "refuted"
+it could only ever report 1.**
+
+Three pieces of evidence, and they agree:
+
+**1. Only one register is ever remapped, by construction.**
+```
+camera matrix registers tracked: c0 (peak live in a frame 1)
+```
+The modify path keys entirely off `g_lockedReg`, a *single* register — the `g_camMats[8]` array is
+vestigial. The scan locks `g_hits[0]`, the single best hit, and discards the rest.
+
+**2. There is a real second view-projection at `vs c13`.**
+```
+vs c0  = (-0.9166,  0.0150, -0.0137, -0.0138)     vs c13 = (-0.3227,  0.0106, -0.0137, -0.0138)
+vs c3  = ( 0.8876,  1.5487,-10.8155,  -0.8263)    vs c16 = (5179.24,-1737.82,26024.01,26060.06)
+```
+Identical projection columns; `c0` is translated-world (small `c3`), `c13` is world-space (huge
+`c16`). Same camera, different space.
+
+**3. The user's observation named the geometry.** The artefact goes wild when a *monster* walks
+under the light, and settles to "on the gun and arm only" when it does not — but stays split across
+the eyes either way. Monster, arm and gun are all **skinned** geometry, and `vs c26` onward in the
+dump is a long run of bone matrices. Skinned meshes ride the second matrix.
+
+So: geometry driven by `c13` keeps full-frame coordinates, gets scissored anyway, and lands split
+across the seam. More shadow casters under the light means more of it visible at once.
+
+### Why this hid for twenty runs
+
+The perf line reported `registers cached: 1` and that was twice written into STATUS as evidence
+against the theory. **It is a tautology** — the cache can only ever hold `g_lockedReg`. Run 28
+caught this and annotated the line; nothing followed up. Fourth tautological diagnostic in this
+file, after `remapKnown = true`, the perf line's swallowed argument, and the census `<- SPLIT` label.
+
+The F7 scan cannot settle it either: it identifies view matrices by requiring the camera to
+transform to `w ≈ 0`, and only keeps the best single hit.
+
+### ⬜ The fix
+
+**Lock and remap every register carrying a view-projection, not just `g_hits[0]`.** The machinery
+downstream already supports it — `g_camMats` holds 8, and `StereoPair` already loops over every
+valid slot applying `ApplyOffset` + `ApplyEyeRemap`. What is missing is upstream: the scan keeping
+more than one hit, and the modify path in `Hook_SetVSConstF` running for each locked register
+rather than one.
+
+⚠️ **This is the most fragile code in the project** — runs 15, 19, 20 and 27 all broke something
+here. It deserves its own focused change behind an ini switch, not a hasty addition. Anything that
+touches the matrix path should be A/B-able in one relaunch.
+
+Note also `ps c1` = UE3's `ScreenPositionScaleBias`, found and confirmed by exact arithmetic in
+run 41 — **not** the cause here (a scissored fullscreen quad is already self-consistent with it),
+but it is the constant the viewport-split design needs and probably the post-processing bleed too.
+
 ## 🔎 Run 41: the shadow surface is `G16R16`, and the census label was lying
 
 ### The mystery target has a name
