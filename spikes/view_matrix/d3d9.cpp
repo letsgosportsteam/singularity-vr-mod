@@ -2772,6 +2772,25 @@ void NoteFirstUserPtrDraw(const char* which) {
 //
 // The mono-fallback count showing 0 is what pointed here: the camera matrix was live and everything
 // we HOOKED was being split correctly, so whatever was vanishing had to be a draw we never saw.
+// ---- run 46: tell a fullscreen post-process quad from real geometry ----
+//
+// Level 3 sends EVERY user-pointer draw through StereoPair, including UE3's DrawDenormalizedQuad -
+// the fullscreen quad every post-process pass uses. Scissoring that to a half and remapping the
+// matrix underneath it is the "rainbow" of run 28, and it makes the screen unreadable, so the test
+// it was meant to run cannot be judged.
+//
+// The classifier can be crude because the two cases are far apart: a fullscreen quad is TWO
+// triangles. Decal geometry, particles and dynamic meshes are all more than that. So draws at or
+// below the threshold pass through untouched (correct for a fullscreen quad, which must cover the
+// whole target) and everything above gets the per-eye treatment.
+//
+// Tunable from the ini rather than fixed, because "2" is an assumption about UE3's quad and the
+// point of this run is to stop assuming things.
+int g_userPtrMinPrims = 3;   // ini UserPtrMinPrims: split only draws with at least this many prims
+int g_drawsUPQuad = 0;       // how many were passed through as fullscreen quads
+
+inline bool UserPtrQuad(UINT primCount) { return (int)primCount < g_userPtrMinPrims; }
+
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
     if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
@@ -2779,6 +2798,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     if (UserPtrInert()) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     ++g_drawsUP;
     if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
+    if (UserPtrQuad(primCount)) { ++g_drawsUPQuad; return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
@@ -2795,6 +2815,11 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     if (g_userPtrHookLevel == 2)
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
+    if (UserPtrQuad(primCount)) {
+        ++g_drawsUPQuad;
+        return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
+                                       idxData, idxFormat, vtxData, vtxStride);
+    }
     NoteFirstUserPtrDraw("DrawIndexedPrimitiveUP");
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
@@ -4062,6 +4087,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // The detector is supposed to track every register holding a camera matrix, so this
             // may already be covered. Printing the register numbers settles it without another
             // theory: if 13 is absent, that is the bug.
+            if (g_userPtrHookLevel >= 3)
+                Log("    user-pointer draws: %d split per eye, %d passed through as fullscreen"
+                    " quads (threshold %d prims)", upPeak - g_drawsUPQuad, g_drawsUPQuad,
+                    g_userPtrMinPrims);
+            g_drawsUPQuad = 0;
             if (InterlockedCompareExchange(&g_skipExtraTarget, 0, 0))
                 Log("    NUMPAD0 ACTIVE: %d draws to the scene-sized non-colour target dropped"
                     " this window", g_drawsSkipped);
@@ -4387,6 +4417,13 @@ void LoadIniSettings() {
     Log("ini: GpuFenceProbe=%d (%s)", g_gpuFenceMode,
         g_gpuFenceMode ? "split the copy into gpu-wait vs transfer"
                        : "off - copy stays a single merged number");
+
+    // Below this many primitives a user-pointer draw is treated as a fullscreen post-process quad
+    // and passed through unsplit. See the note above Hook_DrawPrimUP.
+    g_userPtrMinPrims = GetPrivateProfileIntA("Render", "UserPtrMinPrims", 3, path);
+    if (g_userPtrMinPrims < 0 || g_userPtrMinPrims > 1000) g_userPtrMinPrims = 3;
+    Log("ini: UserPtrMinPrims=%d (user-pointer draws with fewer primitives pass through unsplit"
+        " - they are fullscreen quads)", g_userPtrMinPrims);
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;
