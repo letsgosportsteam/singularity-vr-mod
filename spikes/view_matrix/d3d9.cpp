@@ -2791,6 +2791,33 @@ int g_drawsUPQuad = 0;       // passed through as fullscreen quads, cumulative o
 int g_drawsUPSplit = 0;      // given the per-eye treatment, same units
 int g_upHist[6] = {};        // primitive-count histogram: 1, 2, 3-4, 5-8, 9-16, 17+
 
+// ---- is a geometric classifier even possible? one log line decides (run 47) ----
+//
+// If primitive count cannot separate decals from the post-process quad, the fallback is to look at
+// the vertices. UE3's function is called DrawDenormalizedQuad and draws in SCREEN PIXEL
+// coordinates, so a fullscreen quad should read as values like 0 and 4096 while decal geometry
+// reads as world coordinates in the thousands-but-arbitrary range. If that holds, the classifier
+// is a couple of float compares per draw - microseconds a frame, not a performance question.
+//
+// The unknown is layout: DrawPrimitiveUP gives a pointer and a stride but not the vertex format.
+// Position is conventionally first, so log the first four floats and the stride for a sample of
+// draws in each size bucket and read it off, rather than guessing at an offset.
+//
+// Readable() first - a bad pointer here would fault inside a draw hook, which is the worst place
+// in this codebase to take an access violation.
+int g_upVtxDumped[6] = {};
+
+inline void DumpUserPtrVertex(UINT primCount, const void* vtxData, UINT stride, const char* which) {
+    const int b = primCount <= 1 ? 0 : primCount == 2 ? 1 : primCount <= 4 ? 2
+                : primCount <= 8 ? 3 : primCount <= 16 ? 4 : 5;
+    if (g_upVtxDumped[b] >= 2 || !vtxData || stride < 8) return;
+    if (!Readable(vtxData, 16)) return;
+    ++g_upVtxDumped[b];
+    const float* v = static_cast<const float*>(vtxData);
+    Log("    UP vertex sample [%s] prims=%u stride=%u  v0 = (%.2f, %.2f, %.2f, %.2f)",
+        which, primCount, stride, v[0], v[1], v[2], stride >= 16 ? v[3] : 0.0f);
+}
+
 inline bool UserPtrQuad(UINT primCount) {
     const int b = primCount <= 1 ? 0 : primCount == 2 ? 1 : primCount <= 4 ? 2
                 : primCount <= 8 ? 3 : primCount <= 16 ? 4 : 5;
@@ -2807,6 +2834,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     if (UserPtrInert()) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     ++g_drawsUP;
     if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
+    DumpUserPtrVertex(primCount, vtxData, vtxStride, "DrawPrimUP");
     if (UserPtrQuad(primCount)) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
@@ -2824,6 +2852,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     if (g_userPtrHookLevel == 2)
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
+    DumpUserPtrVertex(primCount, vtxData, vtxStride, "DrawIndexedPrimUP");
     if (UserPtrQuad(primCount)) {
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
