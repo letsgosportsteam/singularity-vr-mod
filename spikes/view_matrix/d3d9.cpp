@@ -4206,6 +4206,38 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
 
     if (SUCCEEDED(hr) && out && *out && InterlockedExchange(&g_patched, 1) == 0) {
         g_gameDev = *out;
+
+        // ---- ⚠️ is the 4096 cap actually the HARDWARE's? Nobody has ever asked ----
+        //
+        // Run 33 found -ResX=4096 accepted and 4992 refused, and attributed it to the classic
+        // D3D9-era 4096 maximum texture dimension. That was a hypothesis. It is also the entire
+        // argument for "side-by-side can never reach parity, so per-eye render targets are
+        // mandatory" - a large architectural rewrite resting on an untested premise, which is
+        // exactly the shape of mistake that cancelled the D3D9Ex work on SSW-confounded data.
+        //
+        // One call settles it. If MaxTextureWidth comes back 8192 or 16384, the limit is UE3's own
+        // resolution validation rather than the GPU's, the side-by-side path that already runs at
+        // 115 fps only needs a bigger number, and per-eye targets go back to being optional.
+        {
+            D3DCAPS9 caps{};
+            if (SUCCEEDED((*out)->GetDeviceCaps(&caps))) {
+                Log("device caps: MaxTextureWidth=%lu MaxTextureHeight=%lu MaxTextureAspectRatio=%lu"
+                    " MaxSimultaneousTextures=%lu",
+                    (unsigned long)caps.MaxTextureWidth, (unsigned long)caps.MaxTextureHeight,
+                    (unsigned long)caps.MaxTextureAspectRatio,
+                    (unsigned long)caps.MaxSimultaneousTextures);
+                // 5376 is what side-by-side needs for 2688 per eye, the size the headset asked for.
+                const bool hwAllows = caps.MaxTextureWidth >= 5376 && caps.MaxTextureHeight >= 2880;
+                Log("    -> the hardware %s a 5376x2880 side-by-side target. The 4096 refusal in"
+                    " run 33 was therefore %s.",
+                    hwAllows ? "ALLOWS" : "does NOT allow",
+                    hwAllows ? "UE3's own limit, NOT the GPU's - per-eye render targets may be"
+                               " unnecessary"
+                             : "a genuine hardware cap - per-eye render targets are required");
+            } else {
+                Log("GetDeviceCaps failed - cannot tell whether 4096 is a hardware limit");
+            }
+        }
         if (g_deviceIsEx) {
             // 23/24/25/26/27, verified against d3d9.h by the same enumeration that reproduces
             // Present 17, SetRenderTarget 37, DrawPrimitive 81 and SetVertexShaderConstantF 94.
