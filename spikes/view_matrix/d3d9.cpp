@@ -962,6 +962,9 @@ uintptr_t g_camClass = 0, g_camera = 0;
 const int kRotFieldMax = 24;
 int g_ctlRotOffs[kRotFieldMax], g_ctlRotCount = 0;
 int g_camRotOffs[kRotFieldMax], g_camRotCount = 0;
+// Odd while a fire window is open, even when closed. Present uses it to tell "the player turned"
+// from "we wrote the hand for a microsecond" - see the fold-in guard.
+volatile LONG g_fireSeq = 0;
 volatile LONG g_rotScanSamples = 0;
 volatile LONG g_rotScanDone = 0;
 int32_t g_rotScanLastYaw = 0;
@@ -7011,6 +7014,8 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                 }
             }
             firedWindow = haveCtl || haveCam || havePov || nExtra > 0;
+            // Mark the window OPEN before anything else can observe the swapped fields.
+            if (firedWindow) InterlockedIncrement(&g_fireSeq);
 
             // Cap raised to 24: run 96 capped at 6 and spent them all on StartFire/BeginFire, so
             // the log could not show whether FireAmmunition - the one that actually matters - ever
@@ -7090,6 +7095,7 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
             extraAddr[i][0] = extraSaved[i][0];
             extraAddr[i][1] = extraSaved[i][1];
         }
+        InterlockedIncrement(&g_fireSeq);   // window CLOSED - seq is even again
     }
     if (mode9) return;
 
@@ -8459,8 +8465,29 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         uintptr_t ctl = FindController();
         if (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12)) {
             int32_t* rot = reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION);
-            if (g_haveLastWrittenYaw) {
-                int32_t externalDelta = rot[1] - g_lastWrittenYaw;
+            // ---- ⭐ run 99: do NOT fold in our own fire-window write ----
+            //
+            // "Every time I shot, the camera view moved." That is this fold-in, not the swap.
+            //
+            // Present runs on the render thread; the fire window runs on the game thread. If
+            // Present reads rot[1] while the window is open it sees the HAND, computes an
+            // externalDelta of tens of degrees, and adds it to g_baseYaw PERMANENTLY - because
+            // this code exists to absorb mouse and stick turning, and cannot tell someone else's
+            // input from our own microsecond write. The view then jumps by that amount and stays
+            // there. It is the exact feedback loop that inverted head tracking in mode 8; I named
+            // the mechanism there and did not guard against it here.
+            //
+            // The guard is a seqlock. The hook makes g_fireSeq odd while a window is open and even
+            // when it closes, so a read that spans a window is detectable rather than merely
+            // unlikely. Detected, the fold is SKIPPED for this frame: losing one frame of mouse
+            // turning is invisible, while folding in a 98-degree phantom delta is not.
+            const LONG seqBefore = InterlockedCompareExchange(&g_fireSeq, 0, 0);
+            const int32_t observedYaw = rot[1];
+            const LONG seqAfter = InterlockedCompareExchange(&g_fireSeq, 0, 0);
+            const bool windowRaced = (seqBefore != seqAfter) || (seqBefore & 1);
+
+            if (g_haveLastWrittenYaw && !windowRaced) {
+                int32_t externalDelta = observedYaw - g_lastWrittenYaw;
                 if (externalDelta) {
                     g_baseYaw += externalDelta;
                     g_wantYaw += externalDelta;
