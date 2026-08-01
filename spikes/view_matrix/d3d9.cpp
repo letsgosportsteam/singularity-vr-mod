@@ -4155,8 +4155,23 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             while (dvy >  3.14159265f) dvy -= 6.2831853f;
             while (dvy < -3.14159265f) dvy += 6.2831853f;
             const float dvp = g_handPitchRad[1] - pitchRad;
-            InterlockedExchange(&g_handDevYawUU,   (LONG)(dvy * kRadToUU));
-            InterlockedExchange(&g_handDevPitchUU, (LONG)(dvp * kRadToUU));
+            // ---- ⭐ run 113: apply the SAME sign convention as everything else ----
+            //
+            // Reported: left/right mirrored, up/down correct. That is not a coincidence and it is
+            // not the ini - g_yawSign is -1 and g_pitchSign is +1, because XR is right-handed with
+            // Y up while UE3 is left-handed with Z up. Every other conversion in this file applies
+            // them:
+            //
+            //     g_wantYaw = g_baseYaw + (int32_t)(g_yawSign * dYaw * kRadToUU);
+            //
+            // and this one did not. So yaw came out mirrored and pitch came out right, which is
+            // exactly the report. Deriving a new quantity without the conversion the rest of the
+            // file already uses is the same error as re-deriving an offset that was already known.
+            //
+            // Using the variables rather than a constant also means F5 and F4 keep working: flip
+            // the yaw sign at runtime and the bullet deflection follows it.
+            InterlockedExchange(&g_handDevYawUU,   (LONG)(g_yawSign   * dvy * kRadToUU));
+            InterlockedExchange(&g_handDevPitchUU, (LONG)(g_pitchSign * dvp * kRadToUU));
             InterlockedExchange(&g_handDevValid, 1);
         } else {
             // No hand, no deviation. Falling back to zero means the shot goes where you look,
@@ -7015,9 +7030,11 @@ int __fastcall Hook_SingleLineCheck(void* self, void* edx, void* hit, void* src,
                 const LONG n = InterlockedIncrement(&g_slcRotated);
                 if (n <= 8)
                     Log("SingleLineCheck rotated: start (%.0f %.0f %.0f) end (%.0f %.0f %.0f) ->"
-                        " (%.0f %.0f %.0f)  dYaw %d dPitch %d  flags 0x%X",
+                        " (%.0f %.0f %.0f)  dYaw %d dPitch %d  flags 0x%X"
+                        "  [yawSign %+d pitchSign %+d  iniYaw %+d iniPitch %+d]",
                         Start[0], Start[1], Start[2], bx, by, bz,
-                        End[0], End[1], End[2], dYaw, dPitch, flags);
+                        End[0], End[1], End[2], dYaw, dPitch, flags,
+                        g_yawSign, g_pitchSign, (int)g_traceSignYaw, (int)g_traceSignPitch);
             }
         }
     }
