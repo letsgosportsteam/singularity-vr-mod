@@ -296,14 +296,17 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < gExports.size(); ++i) {
         const Export& ex = gExports[i];
         std::string nm = NameAt(ex.nameIdx);
+        // Match the FULL PATH, not the leaf name: finding a function's parameters means asking for
+        // "RvSharedPawn.SetAim" and getting its children, which the leaf name alone cannot express.
+        const std::string path = FullPath((int32_t)i + 1);
         if (!filter.empty()) {
-            std::string low = nm;
+            std::string low = path;
             for (char& c : low) c = (char)tolower((unsigned char)c);
             if (low.find(filter) == std::string::npos) continue;
         }
         const std::string cls = ex.clsIdx ? EntryName(ex.clsIdx) : "Class";
-        printf("%-10s %-60s  super=%-28s  serial %7d @ 0x%08X\n",
-               cls.c_str(), FullPath((int32_t)i + 1).c_str(),
+        printf("%-14s %-58s  super=%-28s  serial %7d @ 0x%08X\n",
+               cls.c_str(), path.c_str(),
                ex.superIdx ? FullPath(ex.superIdx).c_str() : "-",
                ex.serialSize, ex.serialOffset);
         ++shown;

@@ -3229,6 +3229,11 @@ bool XrPathOf(const char* s, XrPath* out) {
     return XR_SUCCEEDED(xrStringToPath(g_xrInstance, s, out));
 }
 
+// Defined with the aim-pose code further down, next to the comment that explains what they mean.
+// Declared here because the ini is read long before that point in the file.
+extern LONG  g_aimPoseUUPer1;
+extern float g_aimPoseSignX, g_aimPoseSignY;
+
 bool InitXRInput() {
     if (g_xrInstance == XR_NULL_HANDLE || g_xrSession == XR_NULL_HANDLE) return false;
 
@@ -3243,6 +3248,14 @@ bool InitXRInput() {
             g_walkDirection = GetPrivateProfileIntA("Input", "WalkDirection", 1, path);
             g_walkSign      = GetPrivateProfileIntA("Input", "WalkSign", 1, path) >= 0 ? 1 : -1;
             g_autoPad       = GetPrivateProfileIntA("Input", "AutoPad", 1, path);
+            // ---- aim mode 7's gun pose, the two numbers that need calibrating ----
+            // UUPer1: engine rotation units per 1.0 of anim aim offset. 16384 = 90 deg, which is
+            // the common authored range - a guess, and the log prints what it should have been.
+            // Signs are separate because X and Y conventions are authored per AnimTree profile and
+            // there is no way to read them from here.
+            g_aimPoseUUPer1 = GetPrivateProfileIntA("Input", "AimPoseUUPer1", 16384, path);
+            g_aimPoseSignX  = GetPrivateProfileIntA("Input", "AimPoseSignX", 1, path) >= 0 ? 1.0f : -1.0f;
+            g_aimPoseSignY  = GetPrivateProfileIntA("Input", "AimPoseSignY", 1, path) >= 0 ? 1.0f : -1.0f;
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             for (int i = 0; i < kPadButtonCount; ++i)
@@ -6104,12 +6117,102 @@ ScriptFn g_scriptFns[] = {
     { "CalcWeaponFire",     -1 },
     { "InstantFire",        -1 },
     { "Tick",               -1 },   // [5] the CONTROL - see below
+    { "SetAim",             -1 },   // [6] the GUN'S POSE - see the note on mode 7
 };
 const int kFnGetAdjustedAim = 0;
 const int kFnTick           = 5;
+const int kFnSetAim         = 6;
 const int kScriptFnCount    = (int)(sizeof(g_scriptFns) / sizeof(g_scriptFns[0]));
 
 static LONG FnIdx(int i) { return InterlockedCompareExchange(&g_scriptFns[i].idx, 0, 0); }
+
+// ================================================== the GUN'S POSE, and why it is a second seam
+//
+// Aim decoupling has two halves and they are NOT the same mechanism:
+//
+//   the bullet   `GetAdjustedAim` RETURNS a rotator  -> overwrite the result buffer  (mode 6)
+//   the gun      `SetAim(float X, float Y)` TAKES two floats -> overwrite the params (mode 7)
+//
+// Route 1 got the gun to follow the hand by putting the hand into `AActor::Rotation`, which is
+// exactly why it costs culling: five other consumers read that field. This does not touch it.
+// `SetAim` feeds `RvAnimNodeAimOffset2D`, and the instance that matters is the one in
+// `ch_inview_arms_animtree` - the IN-VIEW ARMS tree, i.e. the first-person gun. An animation blend
+// is purely cosmetic: nothing culls, traces or collides off it. So the hand can be written here
+// with no cost at all, which is the whole point.
+//
+// All three values then point where they should, which is the arrangement that was wanted:
+//
+//   AActor::Rotation        HEAD   view, culling, LOD, draw distance, movement basis
+//   GetAdjustedAim return   HAND   the bullet
+//   SetAim(X, Y)            HAND   the gun you see
+//
+// ⚠️ The scale and signs are NOT known. X and Y are normalised aim offsets, conventionally +-1
+// over the node's configured range, but the range is authored per-profile in the AnimTree and this
+// mod cannot read it. So the defaults below are a guess, they are in the ini, and the hook LOGS
+// the game's own values next to ours - one run's log is enough to set them exactly. A wrong scale
+// makes the gun under- or over-swing; a wrong sign makes it swing the wrong way. Both are obvious
+// on sight and neither is dangerous.
+const int FFRAME_LOCALS = 0x20;   // Node is +0x14 (run 87), and UE3's FFrame runs
+                                  // Node, Object, Code, Locals - so Locals is +0x20.
+                                  // ⚠️ A PREDICTION. Validated on every use, never trusted: see
+                                  // RewriteSetAimParams. Guessing offsets on this object has cost
+                                  // this project a run each time.
+LONG  g_aimPoseUUPer1 = 16384;    // engine units per 1.0 of anim aim. 16384 = 90 deg.
+float g_aimPoseSignX  = 1.0f;
+float g_aimPoseSignY  = 1.0f;
+volatile LONG g_aimPoseWrites = 0, g_aimPoseRejects = 0;
+
+// Rewrite SetAim's two float parameters in place, BEFORE the original runs - the callee consumes
+// them, so unlike the return-value rewrite this one has to happen on the way in.
+//
+// The write is gated on the parameter block proving itself, for the same reason mode 6's is: this
+// dereferences a predicted offset, and a wrong pointer here is silent heap corruption rather than
+// a clean failure. Two normalised aim floats are always within +-1, so a block holding two values
+// in that range is the parameter block and anything else is not. NaN fails the test by
+// construction, since every comparison against NaN is false.
+static void RewriteSetAimParams(void* frame) {
+    if (!frame || !Readable(frame, FFRAME_LOCALS + 4)) return;
+    float* p = *reinterpret_cast<float**>(
+                   reinterpret_cast<uintptr_t>(frame) + FFRAME_LOCALS);
+    if (!p || !Readable(p, 8)) return;
+
+    const bool plausible = p[0] > -1.5f && p[0] < 1.5f && p[1] > -1.5f && p[1] < 1.5f;
+    if (!plausible) {
+        // Report it and write NOTHING. A silent skip here would look exactly like the gun simply
+        // not following the hand, which is the one reading that must stay distinguishable.
+        if (InterlockedIncrement(&g_aimPoseRejects) <= 3)
+            Log("aim pose: FFrame+0x%02X does not point at two normalised floats (%.3f, %.3f)."
+                " Locals is at a different offset in this build - NOTHING written. The gun will"
+                " not follow your hand and that is this message, not a failed rewrite.",
+                FFRAME_LOCALS, p[0], p[1]);
+        return;
+    }
+
+    // How far the hand is from the head, in the engine's own rotation units. int32 subtraction
+    // wraps correctly through the 65536-per-turn space, so crossing the wrap needs no special case.
+    const int32_t dYaw   = InterlockedCompareExchange(&g_aimYawForXi,   0, 0) - g_wantYaw;
+    const int32_t dPitch = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0) - g_wantPitch;
+
+    const float per = (float)(g_aimPoseUUPer1 ? g_aimPoseUUPer1 : 16384);
+    const float wasX = p[0], wasY = p[1];
+    float nx = wasX + g_aimPoseSignX * (dYaw   / per);
+    float ny = wasY + g_aimPoseSignY * (dPitch / per);
+    // Clamp so a bad scale cannot drive the blend node past its authored range and produce a
+    // broken pose. Out-of-range input to an aim offset is not a crash, but it does look wrong in
+    // a way that is easy to mistake for the wrong seam entirely.
+    if (nx >  1.0f) nx =  1.0f;  if (nx < -1.0f) nx = -1.0f;
+    if (ny >  1.0f) ny =  1.0f;  if (ny < -1.0f) ny = -1.0f;
+    p[0] = nx; p[1] = ny;
+
+    // Calibration data. The game's OWN X and Y are printed next to the view pitch that produced
+    // them, which is what makes the scale solvable from one run instead of guessed across several:
+    // the ratio between the game's Y and its own pitch IS the units-per-1.0 this needs.
+    const LONG n = InterlockedIncrement(&g_aimPoseWrites);
+    if (n <= 20 || (n % 600) == 0)
+        Log("aim pose #%ld: game (%.3f, %.3f) view pitch %d -> wrote (%.3f, %.3f)"
+            "  [hand-head dYaw %d dPitch %d, %ld UU per 1.0]",
+            n, wasX, wasY, g_wantPitch, nx, ny, dYaw, dPitch, g_aimPoseUUPer1);
+}
 
 // Resolve the table by scanning GNames for each string. Called from the HOTKEY handler, never from
 // the hook: it walks tens of thousands of entries with a VirtualQuery each, which is milliseconds -
@@ -6299,9 +6402,19 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
     // The name is checked BEFORE the original call so the common case costs one integer compare,
     // and the buffer is touched only AFTER it, because the value being replaced is the one the
     // original just wrote.
-    const bool wantAim = InterlockedCompareExchange(&g_aimMode, 0, 0) == 6
+    // The name is resolved ONCE here and reused, rather than per test: it walks two pointers and
+    // this is the hottest function in the process.
+    const LONG aimMode = InterlockedCompareExchange(&g_aimMode, 0, 0);
+    const bool routeTwo = (aimMode == 6 || aimMode == 7);
+    const int32_t fnIdx = routeTwo ? ScriptFuncNameIdx(Function) : -1;
+
+    const bool wantAim = routeTwo
                       && FnIdx(kFnGetAdjustedAim) >= 0
-                      && ScriptFuncNameIdx(Function) == FnIdx(kFnGetAdjustedAim);
+                      && fnIdx == FnIdx(kFnGetAdjustedAim);
+
+    // ---- mode 7: the gun's pose. On the way IN, because the callee consumes its parameters ----
+    if (aimMode == 7 && FnIdx(kFnSetAim) >= 0 && fnIdx == FnIdx(kFnSetAim))
+        RewriteSetAimParams(Function);
 
     g_origProcessEvent(self, edx, Function, Parms, Result);
 
@@ -6813,7 +6926,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Same reasoning as PAGE UP running upwards first: reaching a mode should not take five
         // presses while wearing a headset, because that is how a run gets lost to a miscount.
         // 0 off, 6 the run 91 fix, 1 the shipping route-1 arrangement, then the two dead probes.
-        static const LONG kAimCycle[] = { 0, 6, 1, 2, 3 };
+        static const LONG kAimCycle[] = { 0, 7, 6, 1, 2, 3 };
         const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
         LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
         int at = 0;
@@ -6850,7 +6963,21 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
                         " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
                     break;
-            case 6: Log("NUMPAD.: aim mode 6 - ROUTE 2. The view, the culling and the gun all stay"
+            case 7: Log("NUMPAD.: aim mode 7 - ROUTE 2, THE WHOLE THING. Bullet AND gun follow your"
+                        " controller; the view, culling, LOD and draw distance all stay on your"
+                        " HEAD, so pointing your hand at the floor can no longer black out the"
+                        " ceiling. AActor::Rotation is never written."
+                        " Two seams: GetAdjustedAim's RETURN value is the bullet, SetAim's two"
+                        " float PARAMETERS are the gun's pose via the in-view arms AnimTree."
+                        " >>> POINT AWAY FROM THE CROSSHAIR. Watch the gun, then fire at a wall. <<<"
+                        " Gun swings too far or too little = AimPoseUUPer1 in the ini is wrong."
+                        " Gun swings the WRONG WAY = AimPoseSignX / AimPoseSignY. The log prints"
+                        " the game's own values next to ours, which is enough to set both exactly.");
+                    break;
+            case 6: Log("NUMPAD.: aim mode 6 - ROUTE 2, BULLET ONLY. Isolates the fire trace: the"
+                        " gun stays pointing down your view on purpose, so if mode 7's gun pose"
+                        " misbehaves this says whether the bullet half is still good."
+                        " The view, the culling and the gun all stay"
                         " exactly as normal, on your HEAD - that is the design, not a failure."
                         " RvWeaponShared.GetAdjustedAim returns the rotator the fire trace uses,"
                         " named out of the game's own script package in run 91, and this rewrites"

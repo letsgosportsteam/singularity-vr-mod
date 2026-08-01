@@ -444,3 +444,35 @@ GpuFenceProbe=1
 ;
 ; -windowed is required because fullscreen clamps to real display modes.
 ; 4992x2688 is refused; the cap appears to be near 4096.
+
+; ---------------------------------------------------------------------------
+; [Input] - aim mode 7's gun pose (the two numbers that need calibrating)
+;
+; Aim mode 7 (NUMPAD . once from off) is route 2 in full: the bullet follows
+; your controller via GetAdjustedAim's return value, and the GUN follows it via
+; SetAim's two float parameters, which feed the in-view arms AnimTree. The
+; engine's own rotation is never written, so culling, LOD and draw distance
+; stay on your head - pointing your hand at the floor cannot black out the
+; ceiling the way aim mode 1 does.
+;
+; SetAim takes a normalised aim offset, conventionally +-1 over a range that is
+; authored per-profile inside the AnimTree. That range is not readable from
+; here, so these three are a GUESS with a calibration path rather than a
+; setting anyone got right in advance.
+;
+; The log prints the game's own X and Y next to the view pitch that produced
+; them, on every mode 7 run:
+;
+;   aim pose #7: game (0.000, 0.412) view pitch 5210 -> wrote (0.153, 0.412) ...
+;
+; The game's own Y divided by its own view pitch IS the units-per-1.0 wanted,
+; so one run's log sets AimPoseUUPer1 exactly. Symptoms:
+;
+;   gun swings too far / not far enough  -> AimPoseUUPer1 (bigger = less swing)
+;   gun swings the WRONG WAY             -> AimPoseSignX or AimPoseSignY = -1
+;
+; [Input]
+; AimPoseUUPer1=16384      ; engine rotation units per 1.0 of aim offset (16384 = 90 deg)
+; AimPoseSignX=1           ; -1 to mirror the horizontal swing
+; AimPoseSignY=1           ; -1 to mirror the vertical swing
+; ---------------------------------------------------------------------------
