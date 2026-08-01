@@ -129,6 +129,61 @@ swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Bod
 **add**, exactly as VR wants. That was the open question gating the whole input design and it is
 answered.
 
+## ❌ Runs 76–89: aim decoupling — route 2 is dead, and route 1 is still untested
+
+**Goal:** `PlayerController.Rotation` drives the view, the culling frustum, LOD, the movement basis
+*and* the weapon's fire trace. Aim decoupling needs the last of those to follow the hand while the
+rest follow the head.
+
+### What was established, and it is worth keeping
+
+| Finding | How |
+|---|---|
+| **There is no second rotation field.** `+0x05D4` deflects nothing | run 80, constant −25°/+25° written to it, shot went straight |
+| UE3 agrees: a player's aim is `Pawn.GetBaseAimRotation()`, which returns that same `Rotation` | — |
+| **The fire path DOES go through UnrealScript** — 3 functions at 77–89% enriched under fire vs a 28% baseline | run 84 census |
+| The bytecode **interpreter** is at `0x012A72C0` (15,209 bytes, `CallFunction` inlined) | the `"Error: CallFunction - '%s' is not a function"` string |
+| `0x01308A10` is `ProcessInternal` or an op handler — it takes an **`FFrame`**, not a `UFunction` | its arg is a stack address with an `FOutputDevice` vtable |
+| **`ProcessEvent` was never found.** Four passes | it is virtual, so no static call graph reaches it |
+
+### ⛔ The time split is finished, and not for want of another seam
+
+Modes 4 and 5 wrote the hand into `AActor::Rotation` at two different instants (Present, and the
+XInput poll) and let the camera update overwrite it with the head. Both failed — and the reason
+came from *watching*, not from a bullet hole: **the view was driven by the head and the controller
+at once, spinning wildly.**
+
+So the camera does not sample the rotation once at a point we can write after. It consumes it at
+more than one moment in the tick, and **there is no instant where the hand can sit in that field
+without the view taking it too.** The premise the whole idea rested on is false, so there is no
+sixth variant worth trying. Modes 4 and 5 are cut out of the `NUMPAD .` cycle (0–3 now) but left in
+the source as the record.
+
+### What remains
+
+1. **Route 1 — widen the culling frustum. STILL UNTESTED, one run.** `askDeg` governs culling only,
+   because `ApplyProjection` forces the rendered frustum separately, and `PAGE UP` now reaches 4×
+   and 6×. Aim mode 1 + enough headroom either stops the ceiling going black or shows the pop-in
+   cost. This is not the engine being *wrong* about where you look — it is the engine being
+   *conservative*.
+2. **Find the fire trace itself in Ghidra.** The honest version of route 2, and a real
+   reverse-engineering job rather than a probe.
+3. **Accept coupled aim.** The mod is fully playable without this rung.
+
+### ⚠️ Method notes, and they are unflattering
+
+- **Six runs went into hunting `ProcessEvent` and three of them were lost to my own instrument
+  bugs**, not to the problem: a filter that hid the data it existed to show (printed "(nothing)"
+  from a full table), a probe placed behind a switch the test was told not to press, and an
+  identification over-read from `ret 0xC` — which proved the ABI but could never have separated
+  `ProcessEvent` from `UFunction::Invoke`.
+- **The cheap alternative went untested the whole time.** Route 1 has cost zero runs and could have
+  ended this at any point. Preferring the interesting path to the cheap one is the actual error
+  here, and it repeated for six sessions.
+- **"Shots followed my gun" was ambiguous and I nearly built on it.** In mode 4 the view and the gun
+  are the same rotation, so that phrase covers both success and failure. What settled it was the
+  user reporting the *view spinning* — a symptom nobody had asked for.
+
 ## ✅ Runs 67–75: the judder was an INTERACTION, and one-factor tests could never have found it
 
 **Symptom:** judder and heavy frame loss whenever the controllers sat on the desk; fine once they

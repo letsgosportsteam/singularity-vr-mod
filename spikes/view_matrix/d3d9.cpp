@@ -315,6 +315,10 @@ PFN_XInputSetState g_origXInputSetState = nullptr;
 volatile LONG g_freezePacket = 0;    // numpad - : never advance dwPacketNumber
 volatile LONG g_setStateCalls = 0;   // rumble path activity, counted per second
 
+// The right trigger straight from OpenXR, 0-255, independent of whether the pad is currently
+// plugged in. The script census splits on this so an unplugged pad cannot silently empty it.
+volatile LONG g_rawTrigger = 0;
+
 // Set once the OpenXR action set is attached. Lives here rather than with the input code because
 // both halves read it: the input code to know it may publish, the test overrides to know whether
 // anything else is writing the pad at all.
@@ -531,8 +535,35 @@ volatile LONG g_xiCallsByIndex[4] = { 0, 0, 0, 0 };
 ULONGLONG g_xiLastStatsTick = 0;
 LONG      g_xiLastStatsCalls = 0;
 
+// Set from Present each frame: the hand's aim in engine units, and the live controller object.
+// The XInput hook cannot go looking for either - FindController walks GObjects, which is far too
+// expensive for a function the engine polls every frame and may not even call on our thread.
+volatile LONG g_aimYawForXi = 0, g_aimPitchForXi = 0;
+volatile LONG g_ctlForXi = 0;
+
+// Defined next to the Present-time rotation write it mirrors - the two are the same operation at
+// two different instants in the tick, and keeping them apart is how they get out of step.
+void WriteAimAtInputPoll();
+
 DWORD WINAPI Hook_XInputGetState(DWORD idx, XiState* st) {
     LARGE_INTEGER tHook = Now();
+
+    // ---- mode 5: write the hand at INPUT POLL time instead of at Present ----
+    //
+    // Mode 4 put the hand into AActor::Rotation at Present and let the camera update overwrite it
+    // with the head. The shot followed the head, which locates the fire trace AFTER the camera
+    // update in the tick - a real ordering fact, and the first one this project has had.
+    //
+    // So the write has to land later than Present does. This is the only other seam the mod owns
+    // that runs INSIDE the tick: the engine polls XInput once a frame from a single call site
+    // (0x011D4795, established run 72). If that poll happens after the camera update, the hand
+    // survives to the fire trace while the camera has already taken the head - which is the whole
+    // arrangement, reached without a symbol.
+    //
+    // ⚠️ Equally it may poll input BEFORE the camera update, in which case the head overwrites us
+    // again and this is the end of the time-split idea. Binary, one run, and the two candidate
+    // orderings are the only two there are.
+    WriteAimAtInputPoll();
     InterlockedIncrement(&g_xiCalls);
     if (idx < 4) InterlockedIncrement(&g_xiCallsByIndex[idx]);
 
@@ -867,6 +898,27 @@ bool Readable(const void* p, size_t n) {
     return ((uintptr_t)p + n) <= ((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
 }
 
+// Split out of NameOf so a name index can be resolved on its own. The ProcessEvent census keeps
+// indices rather than objects - a UFunction pointer is only valid for the instant of the call,
+// while its FName index stays meaningful for the whole run.
+bool NameFromIndex(int32_t idx, char* buf, size_t cap) {
+    buf[0] = 0;
+    if (!Readable((void*)kGNamesTArray, 12)) return false;
+    uintptr_t nd = *reinterpret_cast<uintptr_t*>(kGNamesTArray);
+    int32_t nc = *reinterpret_cast<int32_t*>(kGNamesTArray + 4);
+    if (!nd || idx < 0 || idx >= nc || !Readable((void*)(nd + idx*4), 4)) return false;
+    uintptr_t e = reinterpret_cast<uintptr_t*>(nd)[idx];
+    if (!e || !Readable((void*)e, 0x40)) return false;
+    bool wide = (*reinterpret_cast<uint32_t*>(e + 8)) & 1;
+    size_t n = 0;
+    if (wide) { auto* w = reinterpret_cast<const wchar_t*>(e + 0x10);
+                for (; n < cap-1 && w[n]; ++n) buf[n] = (char)(w[n] < 127 ? w[n] : '?'); }
+    else      { auto* a = reinterpret_cast<const char*>(e + 0x10);
+                for (; n < cap-1 && a[n]; ++n) buf[n] = a[n]; }
+    buf[n] = 0;
+    return n > 0;
+}
+
 bool NameOf(uintptr_t obj, char* buf, size_t cap) {
     buf[0] = 0;
     if (!Readable((void*)kGNamesTArray, 12) || !Readable((void*)obj, 0x40)) return false;
@@ -1183,8 +1235,28 @@ float g_forcedTanX = 0.0f, g_forcedTanY = 0.0f;   // read back AFTER the edit, t
 // point is found) or the ground-truth culling line starts reporting SHORTFALL and the edges of
 // the view begin dropping out. Those are the two ends of a real trade, and for the first time
 // both ends are instrumented.
-const float kFovHeadroomSteps[] = { 1.0f, 0.70f, 0.50f, 0.35f, 1.30f, 1.75f, 2.5f };
-const int   kFovHeadroomCount = 7;
+// ---- run 78: the top of this list is now the aim-decoupling lever ----
+//
+// Confirmed by report: with the engine aimed at the hand, "moving the gun down turned the ceiling
+// black", worsening as the clamp widened. That is UE3 culling against the ENGINE's frustum, which
+// now follows the weapon rather than the view - exactly the run-64 blocker, and this time
+// unambiguous because the user can point the gun and watch a specific surface disappear.
+//
+// The lever already existed and nobody had pushed it: `askDeg` is the FOV handed to the engine and
+// it governs ONLY culling, because ApplyProjection forces the rendered frustum independently. So
+// widening it buys culling coverage without touching the image.
+//
+// The arithmetic that says how much is needed: at a rendered half-angle of ~50 deg, a headroom of
+// k gives a culling half-angle of atan(k * tan 50). 2.5x reaches 71 deg - 21 deg of slack, short
+// of a 30 deg clamp. 6x reaches 82 deg. `askDeg` is capped at 170 deg total, so ~9.6x is the
+// ceiling and there is no point going past it.
+//
+// ⚠️ NOT free, and run 21 already priced it: inflating the engine's FOV makes objects project
+// smaller than the engine expects, which pushes distant geometry down its LOD and draw-distance
+// curves. That is the trade this test is really measuring - edge dropouts against pop-in - and it
+// is why the low steps stay in the list rather than being replaced.
+const float kFovHeadroomSteps[] = { 1.0f, 0.70f, 0.50f, 0.35f, 1.30f, 1.75f, 2.5f, 4.0f, 6.0f };
+const int   kFovHeadroomCount = 9;
 int   g_fovHeadroomStep = 0;
 float kFovHeadroom = 1.0f;
 
@@ -2648,6 +2720,19 @@ float g_wantRollRad = 0.0f;
 // separate step: it is a refactor with a visible no-op, so the mechanism can be proved before
 // anything is decoupled. Once it holds, the engine's rotation is free to carry the weapon.
 volatile LONG g_matrixRot = 0;
+// NUMPAD . - point the engine's rotation at the right hand instead of the body. Needs g_matrixRot,
+// since without the split the engine's rotation IS the view and aiming it at your hand would swing
+// the camera with your hand.
+volatile LONG g_aimDecouple = 0;
+
+// NUMPAD . cycles this. 0 off · 1 engine follows the hand (run 76, needs the matrix split and
+// breaks culling) · 2 constant +20 deg into the controller's SECOND rotation, as a probe ·
+// 3 the hand written to that second rotation, which is the arrangement worth having.
+//
+// Modes 2 and 3 deliberately need NO matrix split: the view and the engine both stay on the head,
+// which is the normal, truthful arrangement, and culling never diverges from what you can see.
+volatile LONG g_aimMode = 0;
+int32_t g_aimYawUU = 0, g_aimPitchUU = 0;   // the hand's aim, in the engine's own units
 int32_t g_matCurYawUU = 0;      // what the engine is being told
 int32_t g_matCurPitchUU = 0;
 int32_t g_matDesYawUU = 0;      // where the head actually is
@@ -2801,11 +2886,40 @@ XrPath   g_handSubPath[2] = { XR_NULL_PATH, XR_NULL_PATH };   // left, right
 // small consumer attached immediately so it is proven rather than merely present - if walking
 // follows your left hand, the pose and its conventions are right, and that is a much better test
 // than logging numbers nobody can check.
+// ---- ⚠️ run 77: MOTION was the wrong signal, and the hardware has the right one ----
+//
+// Auto-pad unplugged and replugged NINE times in one session, each replug costing a second of
+// frozen controls while UE3 re-enumerated. Cause: resting your hands still - listening to dialogue,
+// lining up a shot, just holding the controllers - drops both below any motion threshold that can
+// still tell a desk from a hand. I flagged this exact risk when choosing 3 seconds and picked
+// wrong; `both controllers must be still` does not save it, because both hands rest together.
+//
+// Motion was always an INFERENCE about whether a controller is held. Touch controllers report it
+// DIRECTLY: `thumbrest/touch` and `trigger/touch` are capacitive sensors that fire when a finger is
+// on the controller and stop when it is put down. A hand resting perfectly still is still touching
+// it; a controller on a desk is not. That is the actual question, asked of the hardware that
+// already answers it, instead of reconstructed from position deltas.
+//
+// Both bindings go to ONE action deliberately: a boolean action with several bound sources reads
+// as the OR of them, so a thumb on the rest or a finger on the trigger both count as held, and
+// neither has to be special-cased.
+//
+// Motion stays as the fallback for a runtime that does not expose the touch sensors - but with the
+// threshold dropped to 100 um, because it is now only being asked "did this move at all", not
+// "did this move enough to be a hand".
+XrAction g_actGrasp = XR_NULL_HANDLE;
+bool g_graspAvailable = false;
+
 XrAction g_actHandPose = XR_NULL_HANDLE;
 XrSpace  g_handSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 bool     g_handPoseValid[2] = { false, false };
 float    g_handYawRad[2] = { 0.0f, 0.0f };
 float    g_handPitchRad[2] = { 0.0f, 0.0f };
+
+// The right hand's resting offset from the head, captured at recentre. See the note where it is
+// captured - this is what makes the deviation clamp symmetric.
+float g_handYawOffset = 0.0f, g_handPitchOffset = 0.0f;
+bool  g_haveHandOffset = false;
 
 // The head yaw from the PREVIOUS frame. xrLocateViews runs after input is synced, so this is one
 // frame stale by construction. That is fine for the one thing it is used for: walk direction
@@ -2930,7 +3044,10 @@ int  g_handStillFrames = 0;
 //
 // The `||` below is what makes 3 s safe: BOTH controllers have to be still. Aiming with one hand
 // steady while the other moves keeps the pad alive.
-int g_handStillFramesToDisable = 360;   // ~3 s at 120 fps; ini AutoPadStillFrames
+// Raised to 5 s in run 77. With the capacitive sensors answering the question directly, putting a
+// controller down is unambiguous, so waiting longer costs nothing and absorbs a momentary blip
+// while re-gripping - which under the motion detector would have been another unplug/replug cycle.
+int g_handStillFramesToDisable = 600;   // ~5 s at 120 fps; ini AutoPadStillFrames
 
 void UpdateAutoPad() {
     if (!g_autoPad) return;
@@ -3123,7 +3240,7 @@ bool InitXRInput() {
             g_walkSign      = GetPrivateProfileIntA("Input", "WalkSign", 1, path) >= 0 ? 1 : -1;
             g_autoPad       = GetPrivateProfileIntA("Input", "AutoPad", 1, path);
             g_handStillFramesToDisable =
-                GetPrivateProfileIntA("Input", "AutoPadStillFrames", 360, path);
+                GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             for (int i = 0; i < kPadButtonCount; ++i)
                 g_padButtons[i].mask = (WORD)GetPrivateProfileIntA(
                     "Input", g_padButtons[i].iniKey, g_padButtons[i].mask, path);
@@ -3164,6 +3281,17 @@ bool InitXRInput() {
 
     {
         XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
+        strcpy_s(aci.actionName, "grasp");
+        strcpy_s(aci.localizedActionName, "Holding the controller");
+        aci.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+        aci.countSubactionPaths = 2;
+        aci.subactionPaths = g_handSubPath;
+        if (XR_FAILED(xrCreateAction(g_actionSet, &aci, &g_actGrasp)))
+            g_actGrasp = XR_NULL_HANDLE;
+    }
+
+    {
+        XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
         strcpy_s(aci.actionName, "handpose");
         strcpy_s(aci.localizedActionName, "Hand pose");
         aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
@@ -3187,7 +3315,7 @@ bool InitXRInput() {
     // adding a row to g_padButtons cannot silently overrun this.
     // 4 fixed + one per button + 2 haptic outputs + 2 hand poses. Sized from the same constants
     // that fill it, so adding a row to g_padButtons cannot silently overrun this.
-    XrActionSuggestedBinding binds[4 + kPadButtonCount + 2 + 2]{};
+    XrActionSuggestedBinding binds[4 + kPadButtonCount + 2 + 2 + 12]{};
     uint32_t nb = 0;
     struct { XrAction a; const char* p; } fixed[] = {
         { g_actMove,    "/user/hand/left/input/thumbstick"    },
@@ -3210,6 +3338,33 @@ bool InitXRInput() {
         for (int i = 0; i < 2; ++i) {
             XrPath p;
             if (XrPathOf(hp[i], &p)) { binds[nb].action = g_actHaptic; binds[nb].binding = p; ++nb; }
+        }
+    }
+    if (g_actGrasp != XR_NULL_HANDLE) {
+        // ⚠️ Run 82: thumbrest + trigger alone was TOO NARROW. The log caught it outright -
+        // "right on desk (2346 um/frame)" is a controller being waved about while the sensors
+        // insist nobody is touching it. A thumb parked on the STICK is not on the thumbrest, and
+        // an index finger curled round the grip is not on the trigger, so a perfectly normal hold
+        // reported as put-down.
+        //
+        // Every capacitive surface on the controller now feeds the same boolean, so any finger
+        // anywhere counts. Being generous is the right bias: a false "held" costs nothing, and a
+        // false "put down" unplugs the pad mid-fight.
+        const char* gp[12] = { "/user/hand/left/input/thumbrest/touch",
+                               "/user/hand/right/input/thumbrest/touch",
+                               "/user/hand/left/input/trigger/touch",
+                               "/user/hand/right/input/trigger/touch",
+                               "/user/hand/left/input/thumbstick/touch",
+                               "/user/hand/right/input/thumbstick/touch",
+                               "/user/hand/left/input/x/touch",
+                               "/user/hand/left/input/y/touch",
+                               "/user/hand/right/input/a/touch",
+                               "/user/hand/right/input/b/touch",
+                               "/user/hand/left/input/squeeze/value",
+                               "/user/hand/right/input/squeeze/value" };
+        for (int i = 0; i < 12; ++i) {
+            XrPath p;
+            if (XrPathOf(gp[i], &p)) { binds[nb].action = g_actGrasp; binds[nb].binding = p; ++nb; }
         }
     }
     if (g_actHandPose != XR_NULL_HANDLE) {
@@ -3406,17 +3561,36 @@ void SyncXRInput(XrTime displayTime) {
             const float dz = loc.pose.position.z - g_handLastPos[i].z;
             const float d = sqrtf(dx*dx + dy*dy + dz*dz);
             g_handSpeed[i] = g_handSpeed[i] * 0.95f + d * 0.05f;
-            // ⚠️ Raised 10x from 0.05 mm after run 72 logged "IN HAND" for essentially the whole
-            // session, including stretches the controllers spent on the desk. A stationary
-            // controller's tracking noise clears 0.05 mm easily, so the old threshold made the
-            // label a constant - and a bucket dimension that never varies cannot discriminate
-            // anything. It silently collapsed the correlation table to one row.
-            g_handHeld[i] = g_handSpeed[i] > 0.0005f;    // 0.5 mm/frame smoothed
         }
         g_handLastPos[i] = loc.pose.position;
         g_handHavePos[i] = true;
 
         g_handPoseValid[i] = true;
+    }
+
+    // Held, decided by the capacitive sensors and only falling back to motion when the runtime
+    // does not expose them. `isActive` is what says whether the binding resolved at all, so a
+    // profile without thumbrest/trigger touch degrades to the old behaviour instead of reporting
+    // every controller as permanently set down.
+    for (int i = 0; i < 2; ++i) {
+        bool touched = false, haveTouch = false;
+        if (g_actGrasp != XR_NULL_HANDLE) {
+            XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+            gi.action = g_actGrasp;
+            gi.subactionPath = g_handSubPath[i];
+            XrActionStateBoolean st{ XR_TYPE_ACTION_STATE_BOOLEAN };
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(g_xrSession, &gi, &st)) && st.isActive) {
+                haveTouch = true;
+                touched = st.currentState != 0;
+            }
+        }
+        if (haveTouch) {
+            g_graspAvailable = true;
+            g_handHeld[i] = touched;
+        } else {
+            // 100 um, not 500: this is now only being asked "did it move at all".
+            g_handHeld[i] = g_handSpeed[i] > 0.0001f;
+        }
     }
     {
         const double ms = MsSince(tPose);
@@ -3525,6 +3699,7 @@ void SyncXRInput(XrTime displayTime) {
     // into a byte that flickers between 0 and 1, and that is a state change every frame.
     if (lt < 0.10f) lt = 0.0f;
     if (rt < 0.10f) rt = 0.0f;
+    InterlockedExchange(&g_rawTrigger, (LONG)(rt * 255.0f));
     g_msActionStates += msStates;
     if (msStates > g_pkActionStates) g_pkActionStates = msStates;
     const LONG packedBtns = (LONG)btns
@@ -3686,10 +3861,43 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                                       : views[0].pose.position.z;
             g_haveCentrePos = (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
             g_haveCentre = true;
-            Log("recentred: head yaw %.1f, game yaw %d, head pos (%.3f, %.3f, %.3f)%s",
+
+            // ---- ⭐ the weapon's NEUTRAL, captured here (run 78) ----
+            //
+            // Reported: turning the head RIGHT dragged the gun along; turning LEFT did not. An
+            // asymmetric symptom from symmetric code means the quantity being clamped is not
+            // centred on zero - and it is not. Nobody holds a controller pointing exactly where
+            // they are looking; a natural grip sits some degrees off. So the resting deviation is
+            // already non-zero, and the clamp binds on whichever side that offset eats into first.
+            //
+            //     rest at -15 deg, clamp 30 : turn right 20 -> -35, CLAMPED, gun drags with head
+            //                                 turn left  20 -> +5,  free,    gun stays put
+            //
+            // Capturing hand-minus-head at recentre makes the resting pose deviation zero, so the
+            // clamp is symmetric about where the gun is actually held. This is the same thing
+            // RTCW Quest needed `vr_weapon_pitchadjust` and per-weapon offsets for - weapon
+            // alignment is a calibration problem, not only a plumbing one.
+            //
+            // Recentre is the right moment because it is deliberate: hold the gun where it feels
+            // neutral, hold MENU for a second, and that pose becomes straight ahead.
+            if (g_handPoseValid[1]) {
+                float dy = g_handYawRad[1] - yawRad;
+                while (dy >  3.14159265f) dy -= 6.2831853f;
+                while (dy < -3.14159265f) dy += 6.2831853f;
+                g_handYawOffset   = dy;
+                g_handPitchOffset = g_handPitchRad[1] - pitchRad;
+                g_haveHandOffset  = true;
+            } else {
+                g_haveHandOffset = false;
+            }
+
+            Log("recentred: head yaw %.1f, game yaw %d, head pos (%.3f, %.3f, %.3f)%s"
+                " | weapon neutral %s (yaw %+.1f, pitch %+.1f from the head)",
                 yawRad * 57.2958f, g_baseYaw,
                 g_centrePos[0], g_centrePos[1], g_centrePos[2],
-                g_haveCentrePos ? "" : " [POSITION NOT TRACKED]");
+                g_haveCentrePos ? "" : " [POSITION NOT TRACKED]",
+                g_haveHandOffset ? "captured" : "NOT captured (right controller not tracked)",
+                g_handYawOffset * 57.2958f, g_handPitchOffset * 57.2958f);
         }
 
         // ---- headset position -> game-world offset ----
@@ -3790,6 +3998,70 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         // the matrix supplies whatever is left over. At N = 0 the engine gets the full head angle
         // and the matrix rotation is identically zero, so the split collapses to today's
         // behaviour - which makes N = 0 a genuine control rather than a nominal one.
+        // ---- ⭐ AIM DECOUPLING (run 76): point the engine at the HAND, not the body ----
+        //
+        // Run 64 decoupled the engine all the way to the body's facing and geometry vanished
+        // behind the player. That was the worst case by construction and it is not what aim
+        // decoupling needs: `PlayerController.Rotation` should carry the WEAPON, and a weapon
+        // follows your hand, which stays far closer to your gaze than your body does. Run 65's
+        // attempt to measure the tolerable angle was invalid and run 67's environment made every
+        // reading suspect, so the bound is still unknown - but the bound only has to cover
+        // hand-vs-head, and it is now bounded on purpose by the same clamp.
+        //
+        // What this buys, immediately and without hiding anything: UE3 orients the first-person
+        // weapon from the controller rotation, so with the engine following the hand **the gun on
+        // screen swings with your hand** rather than staying welded to your gaze. Its POSITION is
+        // still the camera's, which will look odd - the gun hangs off your face rather than out of
+        // your fist - but the DIRECTION becomes correct, and the fire trace follows it for free
+        // because we are feeding the engine rather than fighting it. That is the whole reason for
+        // this architecture over hooking the fire trace.
+        //
+        // ⚠️ Falls back to the head whenever the right hand is not tracked, so setting the
+        // controller down cannot leave the engine aimed at a stale direction with the view
+        // detached from it.
+        // The hand's aim in engine units, computed unconditionally so modes 2 and 3 can use it
+        // without any of the matrix-split machinery being involved.
+        g_aimYawUU = g_wantYaw;
+        g_aimPitchUU = g_wantPitch;
+        if (g_handPoseValid[1]) {
+            float dh = g_handYawRad[1] - (g_haveHandOffset ? g_handYawOffset : 0.0f) - g_centreYaw;
+            while (dh >  3.14159265f) dh -= 6.2831853f;
+            while (dh < -3.14159265f) dh += 6.2831853f;
+            g_aimYawUU = g_baseYaw + (int32_t)(g_yawSign * dh * kRadToUU);
+            int32_t ap = (int32_t)(g_pitchSign
+                         * (g_handPitchRad[1] - (g_haveHandOffset ? g_handPitchOffset : 0.0f))
+                         * kRadToUU);
+            if (ap >  16000) ap =  16000;
+            if (ap < -16000) ap = -16000;
+            g_aimPitchUU = ap;
+        }
+
+        const bool aimOn = InterlockedCompareExchange(&g_aimDecouple, 0, 0) != 0;
+        int32_t engineYawTarget  = g_wantYaw;      // where the ENGINE should point
+        int32_t enginePitchTarget = g_wantPitch;
+        if (aimOn && g_handPoseValid[1]) {
+            // The right hand, mapped through exactly the transform the head uses - same centre,
+            // same signs - and then corrected by the neutral captured at recentre, so "pointing
+            // where I am looking" comes out as zero deviation rather than whatever your grip
+            // happens to be.
+            float dYawHand = g_handYawRad[1] - (g_haveHandOffset ? g_handYawOffset : 0.0f)
+                           - g_centreYaw;
+            while (dYawHand >  3.14159265f) dYawHand -= 6.2831853f;
+            while (dYawHand < -3.14159265f) dYawHand += 6.2831853f;
+            engineYawTarget = g_baseYaw + (int32_t)(g_yawSign * dYawHand * kRadToUU);
+            int32_t hp = (int32_t)(g_pitchSign
+                         * (g_handPitchRad[1] - (g_haveHandOffset ? g_handPitchOffset : 0.0f))
+                         * kRadToUU);
+            if (hp >  16000) hp =  16000;
+            if (hp < -16000) hp = -16000;
+            enginePitchTarget = hp;
+        } else if (aimOn) {
+            // No hand: aim where you look, which is the pre-decoupling behaviour and the only
+            // safe default.
+            engineYawTarget = g_wantYaw;
+            enginePitchTarget = g_wantPitch;
+        }
+
         {
             int stepIdx = (int)InterlockedCompareExchange(&g_devStep, 0, 0);
             if (InterlockedCompareExchange(&g_devFlicker, 0, 0)) {
@@ -3806,10 +4078,17 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 g_devPhaseAge = 999;
             }
             const int32_t maxDev = (int32_t)(kDevSteps[stepIdx] * (65536.0f / 360.0f));
+            // The view is always the head. The engine is pulled towards its target - the hand when
+            // decoupling, the body when only the run-64 split is being exercised - as far as the
+            // deviation clamp allows, and the matrix supplies the remainder. At maxDev = 0 the
+            // matrix rotation is identically zero and the whole thing collapses to today's
+            // behaviour, which keeps 0 a genuine control rather than a nominal one.
             g_matDesYawUU   = g_wantYaw;
             g_matDesPitchUU = g_wantPitch;
-            g_matCurYawUU   = g_wantYaw   + ClampDev(g_baseYaw - g_wantYaw, maxDev);
-            g_matCurPitchUU = g_wantPitch + ClampDev(0         - g_wantPitch, maxDev);
+            const int32_t yawTarget   = aimOn ? engineYawTarget   : g_baseYaw;
+            const int32_t pitchTarget = aimOn ? enginePitchTarget : 0;
+            g_matCurYawUU   = g_wantYaw   + ClampDev(yawTarget   - g_wantYaw,   maxDev);
+            g_matCurPitchUU = g_wantPitch + ClampDev(pitchTarget - g_wantPitch, maxDev);
             if (InterlockedCompareExchange(&g_matrixRot, 0, 0)) {
                 g_wantYaw   = g_matCurYawUU;
                 g_wantPitch = g_matCurPitchUU;
@@ -5729,6 +6008,260 @@ void ReportScan() {
         g_offsetUU);
 }
 
+// ================================================================ UObject::ProcessEvent (run 81)
+//
+// Found at last, and by a route the three earlier passes did not have. FindScriptVM walked up from
+// FFrame::Step and dead-ended because Step is 37 bytes and inlined everywhere. FindProcessEvent
+// chased a UTF-16 "recursion" string that turned out to be a Raven OOM reporter. The anchor that
+// worked was sitting in plain ASCII the whole time:
+//
+//   "Error: CallFunction - '%s' is not a function"   -> 0x012A72C0, a 15,209-byte function
+//
+// That size is itself the finding. UObject::CallFunction is a few hundred bytes in UE3, so this is
+// the bytecode INTERPRETER with CallFunction inlined into it - which is exactly what ENGINE_NOTES
+// deduced from the other end when it found opcodes 0x00-0x35 all pointing at execUndefined in
+// GNatives while the game plainly ran. Both halves of that puzzle now agree.
+//
+// One hop up its call graph: four callers, and 0x01308A10 carries
+// "Error: Stack overflow, max level of 255 nested calls is reached" - UE3's script-call recursion
+// guard. It also has ZERO direct callers, which is not suspicious but confirming: ProcessEvent is
+// virtual and reached through the UObject vtable, so a static call graph cannot see its callers.
+//
+// ⚠️ The decompiler reported TWO parameters. It is wrong, and taking its word for it would have
+// corrupted the stack on the first call: the epilogue is `ret 0xC`, so there are THREE stack args
+// plus `this` in ECX, and the prologue's `mov esi, ecx` confirms __thiscall. That is
+// `ProcessEvent(UFunction*, void* Parms, void* Result)` exactly. **Read the epilogue, not the
+// decompiler's guess** - this is the third time in this project that reading a signature has been
+// less reliable than reading the machine.
+const uintptr_t kProcessEventAddr = 0x01308A10;
+
+typedef void (__fastcall *PFN_ProcessEvent)(void* self, void* edx,
+                                            void* Function, void* Parms, void* Result);
+PFN_ProcessEvent g_origProcessEvent = nullptr;
+
+// ---- the census: which script functions run when you pull the trigger ----
+//
+// ProcessEvent carries the UFunction, and UFunction is a UObject whose name resolves through the
+// GNames machinery this mod already has. So every script call can be named for free.
+//
+// The point is not to list them - there are thousands a second - it is to DIFF them. Count each
+// name separately while the trigger is down and while it is not, and the fire path separates
+// itself out: names that appear only under fire are the candidates for the seam where
+// Controller.Rotation has to be the hand rather than the head.
+//
+// Open-addressed and fixed size because this is one of the hottest functions in the process. A
+// linear scan over a few hundred entries here would cost more than everything else this mod does.
+const int kPeSlots = 2048;
+struct PeSlot { int32_t nameIdx; uint32_t idle, firing; };
+PeSlot g_peSlots[kPeSlots]{};
+volatile LONG g_peCensus = 0;      // only counts while armed - the table is useless if it fills up
+                                   // with menu and startup traffic before the test begins
+volatile LONG g_peCalls = 0;
+volatile LONG g_peFiringCalls = 0; // ⚠️ if this stays 0 the split never happened and the whole
+                                   // table means nothing - run 82 dumped a census of 5544 calls
+                                   // with zero firing samples and reported "nothing", which reads
+                                   // identically to "the fire path uses no script"
+
+void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* Parms, void* Result) {
+    // ---- the name-source probe, OUTSIDE the census gate ----
+    //
+    // It was inside it last run and therefore never fired, because the census has to be armed by
+    // hand and the test that needed the probe did not require arming. Nothing in the log, which
+    // reads exactly like the probe finding nothing. A diagnostic behind a switch the test does not
+    // touch is not a diagnostic.
+    {
+        // ---- run 85: stop guessing the offset, scan every one ----
+        //
+        // +0x2C is the name offset for objects reached through GObjects, and it is wrong here:
+        // `this` gave 0 and -65536, while arg1 gave 'IntProperty' - a CLASS name, so arg1 is some
+        // UProperty-shaped thing and the census has been bucketing on whatever sits there.
+        //
+        // Guessing one offset at a time costs a headset run each. So walk every 4-byte slot in the
+        // first 0x40 bytes of both objects, resolve each as an FName index, and print the ones
+        // that come back as real names. The right offset identifies itself, and the raw dump
+        // alongside means the layout can be read even if none of them resolve.
+        // 30 samples rather than 6: the first handful are startup and loading traffic, and the
+        // point is to see the SAME offset name a function across many different calls. One hit
+        // could be a coincidence; twenty cannot.
+        static volatile LONG probed = 0;
+        if (InterlockedIncrement(&probed) <= 30) {
+            struct { const char* tag; void* p; } cands[2] = { { "this", self }, { "arg1", Function } };
+            for (int c = 0; c < 2; ++c) {
+                if (!cands[c].p || !Readable(cands[c].p, 0x40)) {
+                    Log("PE scan %s=%p  <unreadable>", cands[c].tag, cands[c].p);
+                    continue;
+                }
+                const uint32_t* w = reinterpret_cast<const uint32_t*>(cands[c].p);
+                char hex[260]; int n = 0;
+                for (int i = 0; i < 16; ++i)
+                    n += _snprintf_s(hex + n, sizeof(hex) - n, _TRUNCATE, "%08X ", w[i]);
+                Log("PE scan %s=%p  %s", cands[c].tag, cands[c].p, hex);
+                // ---- run 86: resolve POINTER fields as objects, not ints as name indices ----
+                //
+                // arg1 turned out to be an FFrame - stack address, FOutputDevice vtable, a link to
+                // the neighbouring frame - so the thing being executed is reachable through one of
+                // its pointer members (FFrame::Node, the UStruct/UFunction). Treating small ints
+                // as name indices was never going to find it, and produced only false positives:
+                // 00000004 resolving to 'FloatProperty' is just index 4 being a legal index.
+                //
+                // So walk the pointer-shaped slots and ask NameOf - the same known-good path that
+                // reads names off GObjects entries - which slot names a script function.
+                // ---- run 87: two filters, and they remove almost all of it ----
+                //
+                // The previous pass printed 'None' five times a line. Every one was FName index 0
+                // resolving legitimately - a slot holding zero, or a non-object whose +0x2C
+                // happens to be zero. Noise that looks like data.
+                //
+                // Also: one hit ('Assert') came off 0225F500, which is a STACK address a few bytes
+                // from the frame itself. An FFrame's members point at the heap; a pointer into its
+                // own neighbourhood is the previous frame or a local, not a UObject.
+                //
+                // So drop index 0, and drop anything within 64K of the frame pointer. What
+                // survived both filters last run was +0x14 -> 'SeeMonster', a real script function,
+                // which is FFrame::Node. This confirms it or corrects it without a third guess.
+                char line[400]; int m = 0;
+                const uintptr_t selfAddr = reinterpret_cast<uintptr_t>(cands[c].p);
+                for (int i = 0; i < 16; ++i) {
+                    const uintptr_t v = w[i];
+                    if (v < 0x01000000 || v > 0x7FFF0000) continue;
+                    if (v > selfAddr - 0x10000 && v < selfAddr + 0x10000) continue;   // stack
+                    if (!Readable((void*)v, 0x40)) continue;
+                    const int32_t ni = *reinterpret_cast<const int32_t*>(v + OBJ_NAME);
+                    if (ni <= 0) continue;                                            // 'None'
+                    char nm[64]{};
+                    if (NameOf(v, nm, sizeof(nm)) && nm[0])
+                        m += _snprintf_s(line + m, sizeof(line) - m, _TRUNCATE,
+                                         " +0x%02X->'%s'", i * 4, nm);
+                }
+                Log("     objects:%s", m ? line : " (none)");
+            }
+        }
+    }
+
+    if (InterlockedCompareExchange(&g_peCensus, 0, 0) && Function) {
+        InterlockedIncrement(&g_peCalls);
+        // ---- ⚠️ run 84: the name indices came out as HEAP POINTERS, so this is reading the
+        // wrong object ----
+        //
+        // The census itself worked - two entries sat at 83% and 89% under fire, which is exactly
+        // the enrichment being hunted - but the names read as 36039212 and 19958482. GNames holds
+        // tens of thousands of entries, not tens of millions, and those values land past the end
+        // of the image, so they are heap pointers. Only index 0 resolved, as "None".
+        //
+        // The likely cause is which object holds the name. Ghidra decompiled this function using
+        // `this` as something with fields at +0x40, +0x4C, +0x50 and +0x6A - the shape of a
+        // UFunction (code offset, locals size, flags), not of the object a method is being called
+        // on. So this may be `UFunction::Invoke(UObject*, FFrame&, RESULT)` rather than
+        // `UObject::ProcessEvent(UFunction*, ...)`. Both are __thiscall with three stack args, and
+        // both give `ret 0xC` - the epilogue proved the ABI but could never have told them apart.
+        //
+        // So stop inferring and print BOTH candidates for the first few calls. Whichever yields
+        // small indices that resolve to script names is the right one.
+        // The UFunction's FName index. Readable() rather than a bare dereference because this runs
+        // on every script call in the game and a single bad pointer would be an instant crash.
+        if (Readable(Function, 0x40)) {
+            const int32_t idx = *reinterpret_cast<const int32_t*>(
+                                    reinterpret_cast<uintptr_t>(Function) + OBJ_NAME);
+            if (idx >= 0) {
+                // ⚠️ Run 82: this used to read the published pad's trigger byte, and came back
+                // with ZERO firing samples out of 5544 calls. Two ways that happens and both are
+                // real: the shot was fired with the mouse rather than the controller, or auto-pad
+                // had unplugged the pad so nothing was published at all. Either way the census
+                // could only ever report "nothing", which is indistinguishable from the fire path
+                // genuinely using no script.
+                //
+                // So take the signal from every source that can mean "firing" - the raw OpenXR
+                // trigger, the published pad, and the mouse button - rather than from the one that
+                // happened to be wired up.
+                const LONG b = InterlockedCompareExchange(&g_padBtns, 0, 0);
+                const bool firing = ((b >> 24) & 0xFF) > 40
+                                 || InterlockedCompareExchange(&g_rawTrigger, 0, 0) > 20
+                                 || (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+                if (firing) InterlockedIncrement(&g_peFiringCalls);
+                uint32_t h = (uint32_t)idx * 2654435761u;
+                for (int i = 0; i < 8; ++i) {
+                    PeSlot& s = g_peSlots[(h + i) & (kPeSlots - 1)];
+                    if (s.nameIdx == 0 && s.idle == 0 && s.firing == 0) s.nameIdx = idx;
+                    if (s.nameIdx == idx) { if (firing) ++s.firing; else ++s.idle; break; }
+                }
+            }
+        }
+    }
+    g_origProcessEvent(self, edx, Function, Parms, Result);
+}
+
+void DumpProcessEventCensus() {
+    const LONG total = InterlockedCompareExchange(&g_peCalls, 0, 0);
+    const LONG firing = InterlockedCompareExchange(&g_peFiringCalls, 0, 0);
+    Log("=== script calls seen: %ld total, %ld of them while FIRING ===", total, firing);
+    if (firing == 0) {
+        // Plain ASCII: this is a string literal, not a comment, and the build is code page 1252.
+        Log("  *** ZERO firing samples. The split never happened, so an empty table below means"
+            " NOTHING - it cannot be told apart from the fire path using no script at all. Fire"
+            " with the right trigger or the mouse while the census is armed and run it again.");
+    }
+    // ---- ⚠️ run 83: the previous filter WAS the empty result ----
+    //
+    // It showed only names with idle == 0, or with firing >= idle. Every function that runs during
+    // a shot but also runs the rest of the time - which is most of them, Tick included - was
+    // silently dropped, and with 1067 firing samples against 5168 idle ones the ratio test threw
+    // away nearly everything else. The dump printed "(nothing)" from a table that was full.
+    //
+    // That is the same defect as the button probe and the culling flicker: **a filter that encodes
+    // the hypothesis cannot report against it.** So print the raw table, ranked, and let it say
+    // what it says. A genuine negative here - nothing enriched during firing - is a real and
+    // useful answer, and it now looks different from a bug.
+    int total_names = 0;
+    for (int i = 0; i < kPeSlots; ++i) if (g_peSlots[i].firing || g_peSlots[i].idle) ++total_names;
+    Log("  %d distinct script functions seen. Top 40 by FIRING count, enrichment = firing share"
+        " vs this function's total:", total_names);
+
+    bool used[kPeSlots]{};
+    for (int rank = 0; rank < 40; ++rank) {
+        int best = -1;
+        for (int i = 0; i < kPeSlots; ++i) {
+            if (used[i] || !g_peSlots[i].firing) continue;
+            if (best < 0 || g_peSlots[i].firing > g_peSlots[best].firing) best = i;
+        }
+        if (best < 0) break;
+        used[best] = true;
+        const PeSlot& s = g_peSlots[best];
+        char nm[96]{};
+        // Unresolvable names are PRINTED as their index rather than skipped - a name that will not
+        // resolve is itself a finding, and skipping it would be another silent filter.
+        if (!NameFromIndex(s.nameIdx, nm, sizeof(nm)))
+            _snprintf_s(nm, sizeof(nm), _TRUNCATE, "<unresolved name idx %d>", s.nameIdx);
+        const double share = 100.0 * s.firing / (double)(s.firing + s.idle);
+        Log("    %-44s firing %-6u idle %-6u  %5.1f%% under fire%s",
+            nm, s.firing, s.idle, share, s.idle == 0 ? "   <== ONLY WHILE FIRING" : "");
+    }
+    if (total_names == 0)
+        Log("    (table is genuinely empty - the census was not armed, or ProcessEvent is not"
+            " being called at all)");
+}
+
+// See the forward declaration by the XInput hook for why this exists and what it tests.
+void WriteAimAtInputPoll() {
+    if (InterlockedCompareExchange(&g_aimMode, 0, 0) != 5) return;
+    const uintptr_t ctl = (uintptr_t)InterlockedCompareExchange(&g_ctlForXi, 0, 0);
+    if (!ctl || !Readable((void*)(ctl + ACTOR_ROTATION), 12)) return;
+    int32_t* r = reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION);
+    r[0] = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
+    r[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
+}
+
+void InstallProcessEventHook() {
+    void* target = reinterpret_cast<void*>(kProcessEventAddr);
+    if (MH_CreateHook(target, (void*)&Hook_ProcessEvent, (void**)&g_origProcessEvent) != MH_OK) {
+        Log("ProcessEvent: MH_CreateHook failed at 0x%08X", kProcessEventAddr); return;
+    }
+    if (MH_EnableHook(target) != MH_OK) {
+        Log("ProcessEvent: MH_EnableHook failed"); g_origProcessEvent = nullptr; return;
+    }
+    Log("ProcessEvent hooked at 0x%08X (found run 81 via the CallFunction string anchor)."
+        " NUMPAD7 arms the fire-path census, NUMPAD7 again dumps it.", kProcessEventAddr);
+}
+
 void InstallViewHook() {
     // ALREADY_INITIALIZED is the normal case now: InstallAutoResolution runs in DllMain and gets
     // there first. Treating it as a failure here would silently disable head tracking.
@@ -5744,6 +6277,33 @@ void InstallViewHook() {
     if (MH_EnableHook(target) != MH_OK) { Log("MH_EnableHook failed"); return; }
     Log("view rotation detour installed at 0x%08X", kCalcViewRotationAddr);
 }
+
+// ================================================================ aim decoupling: where it stands
+//
+// `PlayerController.Rotation` is read by the view, the culling frustum, LOD, draw distance, the
+// movement basis and the weapon's fire trace. Run 80 established there is no second field to
+// redirect: +0x05D4 deflects nothing, and UE3's own design agrees - a player's aim comes from
+// `Pawn.GetBaseAimRotation()`, which returns that same Rotation. **Aim and culling are one value.**
+//
+// So they can only be separated in TIME or in the RENDERER, and exactly two routes remain:
+//
+// 1. **Widen the culling frustum until the deviation fits inside it.** Mode 1 aims the engine at
+//    the hand and `askDeg` - which governs culling only, because ApplyProjection forces the
+//    rendered frustum separately - is inflated to cover the gap. This is NOT the engine being
+//    wrong about where you are looking; it is the engine being CONSERVATIVE, drawing more than it
+//    needs. The bill is LOD and draw distance (run 21), and it is one test away: PAGE UP now
+//    reaches 4x and 6x and neither has been tried.
+//
+// 2. **Hook `UObject::ProcessEvent` and swap the rotation around the aim call.** Every UnrealScript
+//    call in UE3 passes through this one function with its UFunction, and this mod already
+//    resolves script names against GNames. Set Rotation to the hand on the way in to the fire or
+//    aim function, restore the head on the way out, and the separation is exact - culling never
+//    sees the hand at all. This is the principled fix and it is the standard UE3 modding seam,
+//    not an exotic one. It is also a genuine reverse-engineering job with no guarantee of a
+//    convenient hook point, which is why route 1 gets tested first.
+//
+// Route 1 is one session and might end this. Route 2 is the fallback and the better answer if it
+// does not.
 
 // ---------------------------------------------------------------- VR mode, as one switch
 //
@@ -5780,7 +6340,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // Whoever calls Present owns the device. Recorded so the user-pointer draw hooks can tell
     // render-thread calls from movie-playback-thread ones and stay completely inert on the latter.
     g_mainThreadId = GetCurrentThreadId();
-    if (InterlockedExchange(&g_initTried, 1) == 0) { InstallViewHook(); InitXR(); }
+    if (InterlockedExchange(&g_initTried, 1) == 0) {
+        InstallViewHook(); InstallProcessEventHook(); InitXR();
+    }
 
     // Retry until it takes. DllMain gets first refusal, but XINPUT1_3.dll is a sibling static
     // import and the loader owes us no ordering, so the first attempt can legitimately find it
@@ -5928,7 +6490,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         g_btnProbeIdx = (g_btnProbeIdx + 1) % kXiButtonNameCount;
         if (g_btnProbeIdx == 0) Log("NUMPAD6: that was the last button - wrapping back to A");
     }
-    if (kNum7 && !pNum7) { g_btnProbeIdx = 0; Log("NUMPAD7: button probe reset to A"); }
+    // NUMPAD7 no longer resets the button probe - it arms the script census now (see below). The
+    // probe wraps back to A by itself, so nothing was lost.
+    (void)kNum7;
     pNum6 = kNum6; pNum7 = kNum7;
 
     // NUMPAD8: move head yaw/pitch out of the engine's rotation and into the view matrix.
@@ -6010,6 +6574,104 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             " measured through that", was ? "restored" : "NEUTRALISED (render-thread sleeps -> 0)");
     }
     pAdd = kAdd;
+
+    // NUMPAD . : aim decoupling. Turns on the matrix split with it, because aiming the engine at
+    // your hand without moving the view into the matrix first would just swing the camera with
+    // your hand - the exact thing this is meant to stop.
+    static bool pDec = false;
+    bool kDec = (GetAsyncKeyState(VK_DECIMAL) & 0x8000) != 0;
+    if (kDec && !pDec) {
+        // ---- ❌ run 89: modes 4 and 5 are OUT of the cycle. The time split is dead ----
+        //
+        // Both wrote the hand into AActor::Rotation at a different instant and let the camera
+        // update overwrite it with the head. Both failed the same way, and the reason came from
+        // watching rather than from a bullet hole: **the view was driven by the head AND the
+        // controller at once, spinning wildly.** So the camera does not sample the rotation once
+        // at a point we can write after - it consumes it at more than one moment in the tick, and
+        // there is no instant where the hand can sit in that field without the view taking it too.
+        //
+        // That is the whole time-split idea, and it is finished. Not "needs another seam" - the
+        // premise it rested on, that the camera reads the rotation exactly once, is false.
+        //
+        // They are cut out of the cycle rather than deleted: they corrupt the view badly enough to
+        // be unpleasant to hit by accident, and the code is worth keeping as the record of what
+        // was tried. Cycle is 0-3 again.
+        const LONG mode = (InterlockedCompareExchange(&g_aimMode, 0, 0) + 1) % 4;
+        InterlockedExchange(&g_aimMode, mode);
+        // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
+        // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
+        // would be silently steering the view during a test of something else entirely.
+        InterlockedExchange(&g_aimDecouple, mode == 1 ? 1 : 0);
+        InterlockedExchange(&g_matrixRot, mode == 1 ? 1 : 0);
+        if (mode == 1 && InterlockedCompareExchange(&g_devStep, 0, 0) == 0)
+            InterlockedExchange(&g_devStep, 3);   // 30 deg - at 0 the feature does nothing at all
+        switch (mode) {
+            case 0: Log("NUMPAD.: aim mode 0 - OFF, plain game rotation"); break;
+            case 1: Log("NUMPAD.: aim mode 1 - engine follows the HAND (clamp %d deg)."
+                        " Gun tracks your hand, but culling follows it too - this is the mode"
+                        " that blacks out the ceiling",
+                        kDevSteps[InterlockedCompareExchange(&g_devStep, 0, 0)]); break;
+            case 2: Log("NUMPAD.: aim mode 2 - PROBE. NOTHING ON SCREEN WILL CHANGE. The view, the"
+                        " culling and the gun all stay exactly as normal - that is the design, not"
+                        " a failure. A constant -25 deg pitch and +25 deg yaw is written to the"
+                        " controller's SECOND rotation at +0x05D4, and the ONLY thing that can"
+                        " show it is a bullet."
+                        " >>> STAND CLOSE TO A WALL AND FIRE ONE SHOT. <<<"
+                        " Impact LOW AND RIGHT of the crosshair = +0x05D4 is the weapon's aim, and"
+                        " aim decoupling is solved. Impact ON the crosshair = it is not, and the"
+                        " fire trace has to be found in the binary.");
+                    break;
+            case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
+                        " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
+                    break;
+            case 5: Log("NUMPAD.: aim mode 5 - TIME SPLIT, second seam. Same idea as mode 4 but the"
+                        " hand is written at INPUT POLL time instead of at Present, which is later"
+                        " in the tick. Mode 4 showed the fire trace runs after the camera update,"
+                        " so the write has to land later than Present did."
+                        " >>> POINT WELL AWAY FROM THE CROSSHAIR AND FIRE. <<<"
+                        " Impact where your HAND points = this is the seam and aim decoupling"
+                        " works. Impact on the crosshair = input is polled before the camera"
+                        " update too, and the time-split idea is out of seams.");
+                    break;
+            default: Log("NUMPAD.: aim mode 4 - THE TIME SPLIT. View and culling stay on your HEAD,"
+                         " so nothing should vanish at the edges. The hand's aim is written to"
+                         " AActor::Rotation at Present, and the camera update overwrites it with"
+                         " the head - so anything in the tick that runs BEFORE the camera update"
+                         " sees your hand."
+                         " >>> STAND CLOSE TO A WALL, POINT WELL AWAY FROM YOUR CROSSHAIR, FIRE. <<<"
+                         " Impact where your HAND points = the fire trace is on the right side of"
+                         " the line and aim decoupling works. Impact on the crosshair = it runs"
+                         " after the camera update and this approach is finished.");
+                    break;
+        }
+    }
+    pDec = kDec;
+
+    // NUMPAD7 (or SCROLL LOCK): arm the script-call census, then press again to dump it.
+    //
+    // ⚠️ Run 83 was lost to this. SCROLL LOCK alone looked free, but the log recorded no press at
+    // all - plenty of keyboards omit the key entirely or bury it behind Fn, and one that cannot be
+    // pressed is indistinguishable from a feature that does not work. NUMPAD7 was the button
+    // probe's reset, which has been dead weight since the layout came out of the game's own config
+    // in run 61b; the probe wraps on its own without it. SCROLL LOCK stays wired up as well, since
+    // accepting both costs one `||`.
+    static bool pScr = false;
+    bool kScr = ((GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0)
+             || ((GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0);
+    if (kScr && !pScr) {
+        if (InterlockedCompareExchange(&g_peCensus, 0, 0)) {
+            InterlockedExchange(&g_peCensus, 0);
+            DumpProcessEventCensus();
+        } else {
+            memset(g_peSlots, 0, sizeof(g_peSlots));
+            InterlockedExchange(&g_peCalls, 0);
+            InterlockedExchange(&g_peFiringCalls, 0);
+            InterlockedExchange(&g_peCensus, 1);
+            Log("NUMPAD7: script-call census ARMED and cleared. Play for a bit, FIRE SEVERAL"
+                " TIMES, then press NUMPAD7 again to dump it.");
+        }
+    }
+    pScr = kScr;
 
     LogXInputStats();
 
@@ -6299,8 +6961,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // Speeds in MICROMETRES per frame, printed next to the verdict they produced. The
             // threshold is 500 um; if the two states do not separate cleanly either side of that,
             // the number is wrong and this line says so without another run being needed.
-            Log("    controllers: left %s (%.0f um/frame), right %s (%.0f um/frame), pad %s%s,"
+            Log("    controllers [%s]: left %s (%.0f um/frame), right %s (%.0f um/frame), pad %s%s,"
                 " XR input %s, sync-fail %d",
+                g_graspAvailable ? "touch sensors" : "MOTION FALLBACK - no touch bindings",
                 g_handHeld[0] ? "IN HAND" : "on desk", g_handSpeed[0] * 1.0e6f,
                 g_handHeld[1] ? "IN HAND" : "on desk", g_handSpeed[1] * 1.0e6f,
                 InterlockedCompareExchange(&g_padEmu, 0, 0) ? "ON" : "OFF",
@@ -6680,8 +7343,94 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 }
             }
             rot[1] = g_wantYaw;
-            if (Readable((void*)(ctl + CTL_ROTATION_2), 12))
-                reinterpret_cast<int32_t*>(ctl + CTL_ROTATION_2)[1] = g_wantYaw;
+
+            // ---- ⭐ run 79: stop lying to the engine, and look for a SECOND rotation ----
+            //
+            // The architecture was backwards, and the question that made it obvious was "shouldn't
+            // culling be based on where I'm looking?". Yes. Under the current scheme the engine's
+            // whole model of the player - culling, LOD, draw distance, movement basis, AI
+            // perception, the viewmodel - is pointed at the hand so that ONE consumer, the fire
+            // trace, comes out right. Five things made wrong to fix one, and the FOV headroom is
+            // then a workaround for damage we chose to do.
+            //
+            // The truthful arrangement is the reverse: `AActor::Rotation` keeps carrying the HEAD,
+            // everything derived from it stays correct by construction, and only the weapon's aim
+            // is redirected. That needs a separate seam - and there is a candidate nobody has
+            // tested for this.
+            //
+            // ❌ RESULT (run 80): +0x05D4 is NOT the weapon's aim. A constant -25 pitch / +25 yaw
+            // written there produced a shot straight down the crosshair - no deflection at all. So
+            // the second rotation drives neither the view (spike 5) nor the fire trace, and field
+            // guessing on this object is finished.
+            //
+            // That is consistent with how UE3 is built: `Pawn.GetBaseAimRotation()` returns the
+            // Controller's own `Rotation` for a player, so there is no second aim field to find.
+            // **The aim and the culling frustum genuinely are the same value**, which is why every
+            // arrangement that separates them has to separate them in TIME or in the RENDERER, not
+            // by finding another field. Two routes remain and both are recorded above SetVrMode.
+            //
+            // Kept as mode 2 because a negative that cost one shot at a wall is worth being able
+            // to re-run, and because the same harness will test the next candidate field if one
+            // ever turns up.
+            if (Readable((void*)(ctl + CTL_ROTATION_2), 12)) {
+                int32_t* rot2 = reinterpret_cast<int32_t*>(ctl + CTL_ROTATION_2);
+                const LONG mode = InterlockedCompareExchange(&g_aimMode, 0, 0);
+                if (mode == 2) {
+                    // ⚠️ Run 80: the offset is now LARGE and on BOTH axes, because run 79's probe
+                    // came back with no reading at all. In this mode nothing on screen changes -
+                    // view, culling and the gun all stay normal by design - so "I pressed it and
+                    // nothing happened" is the expected appearance and the test reads as a
+                    // non-event. The only evidence it can produce is where a BULLET lands.
+                    //
+                    // -25 pitch and +25 yaw puts the impact low and to the right, far enough from
+                    // the crosshair that it cannot be mistaken for spread or recoil.
+                    rot2[0] = g_wantPitch - (int32_t)(25.0f * (65536.0f / 360.0f));
+                    rot2[1] = g_wantYaw   + (int32_t)(25.0f * (65536.0f / 360.0f));
+                } else if (mode == 3) {
+                    rot2[0] = g_aimPitchUU;
+                    rot2[1] = g_aimYawUU;
+                } else {
+                    rot2[1] = g_wantYaw;
+                }
+            }
+
+            // ---- ⭐ mode 4: separate aim from culling in TIME, using seams we already own ----
+            //
+            // Six runs of chasing ProcessEvent produced one solid fact - the fire path DOES go
+            // through UnrealScript, 77-89% enriched under fire - and then stalled on naming the
+            // functions. 0x01308A10 turned out to take an FFrame rather than a UFunction, so it is
+            // ProcessInternal or an op handler, and no offset in that frame consistently names
+            // anything. That is archaeology with no end in sight.
+            //
+            // But the whole point of finding ProcessEvent was to own a moment INSIDE the tick when
+            // the rotation could differ. This mod already owns one: `FUN_0104e390` is detoured, and
+            // its caller copies the returned FRotator straight into AActor::Rotation. So the frame
+            // already has two distinct instants we control:
+            //
+            //     Present (end of frame)  -> write the HAND here
+            //     camera update (detour)  -> return the HEAD, caller overwrites +0x60 with it
+            //
+            // Everything in the tick that runs BEFORE the camera update therefore reads the hand;
+            // everything after reads the head. Culling is computed from the camera, which is
+            // downstream of the update, so it gets the head - which is exactly the property that
+            // has been missing.
+            //
+            // Whether the fire trace lands on the right side of that line is unknown and is
+            // precisely what this tests. It is a binary question, it needs no symbol, and it costs
+            // one run instead of an unbounded number.
+            //
+            // ⚠️ If the shot follows the head, the ordering is wrong and this approach is finished
+            // - which is still worth knowing in one run rather than five.
+            // Publish for the XInput seam (mode 5). Done unconditionally and cheaply so the hot
+            // hook only ever reads three interlocked words.
+            InterlockedExchange(&g_ctlForXi, (LONG)ctl);
+            InterlockedExchange(&g_aimYawForXi, g_aimYawUU);
+            InterlockedExchange(&g_aimPitchForXi, g_aimPitchUU);
+
+            if (InterlockedCompareExchange(&g_aimMode, 0, 0) == 4) {
+                rot[1] = g_aimYawUU;
+                rot[0] = g_aimPitchUU;
+            }
             g_lastWrittenYaw = g_wantYaw;
             g_haveLastWrittenYaw = true;
         }
