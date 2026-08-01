@@ -40,6 +40,44 @@ Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES
 >
 > Seven mechanisms were eliminated by direct test before this one landed. See **Run 30**.
 
+> # 🏆 120.0 fps LOCKED at 4096×2160. The cause was the wireless link, not the code.
+>
+> ```
+> frame:  median 8.33 ms   p90 8.56 ms   fps median 120.0
+> budget: xrWaitFrame 3.74 (idle) + copy 0.00 + XR submit 1.28 + our work 3.21
+> ```
+>
+> Median frame time is **exactly the 8.33 ms display period**, with **3.74 ms of idle headroom**.
+> Run 39's 112–117 fps was recorded as "just misses locking to a solid 120 Hz" — that gap is closed.
+>
+> **What fixed it was a dedicated router**, not a line of code. `xrEndFrame` was blocking for up to
+> **189 ms** on a congested shared WiFi link, and that time had always been pooled into "our work"
+> where it looked like a game-side stall. Timing it (run 56) named the culprit in one run after a
+> full day of bisecting the render path had found nothing.
+>
+> | XR submit | before | after |
+> |---|---|---|
+> | typical | 20.94 ms | **0.08–1.28 ms** |
+> | worst single frame | **189.25 ms** | **3.17 ms** |
+>
+> ⚠️ **This retracts "the `D3DPOOL_MANAGED` wrapper causes the spikes."** `D3D9ExMode=1` is ON in the
+> 120 fps run above. That conclusion came from four runs that happened to catch a quieter link.
+>
+> ### The method lesson, which cost a day
+>
+> The frame budget broke out `xrWaitFrame`, the copy and the GObjects walk, and called the remainder
+> **"our work"** — so the one call in the whole mod that reaches a *wireless link* was pooled in with
+> the game's own CPU work. Every stall chased that day landed in that remainder, and the day went
+> into changing code around the black box instead of measuring it.
+>
+> Three separate wrong conclusions came out of that: head roll, the reverted probe, and the wrapper.
+> Each was "confirmed" by an A/B taken while the link — an invisible, wildly varying background
+> load — moved underneath the comparison. **A residual bucket labelled "our work" is not a
+> measurement; it is everything you have not measured yet.**
+>
+> And the control that would have shown this in one minute — rename `d3d9.dll`, run the game
+> unmodded at the same resolution — was not run until late in the day.
+
 > # ✅ Head roll is in. Tilting your head tilts the view.
 >
 > The last axis of the head pose that was never written anywhere. Applied in the **view matrix**,
@@ -179,7 +217,7 @@ remaining issues are draw-path coverage.
 | Per eye at 3840×2160 | 1920×2160 — 77% of the panel |
 | Resolution cap | **4096 confirmed** (run 33) — 4096×2160 accepted and the scene targets followed; 4992 refused. Classic D3D9 max texture dimension |
 | Per eye at 4096×2160 | **2048×2160 — 76% linear of the 2688×2880 wanted.** Side-by-side needs 5376 wide, so parity is impossible without per-eye targets |
-| Frame rate | **112–117 fps at 4096×2160** with zero-copy (run 39); 105–118 at 1440p. SSW **off**, 120 Hz. The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
+| Frame rate | **120.0 fps LOCKED at 4096×2160** (run 57, dedicated router). Previously 112-117 with zero-copy (run 39); 105–118 at 1440p. SSW **off**, 120 Hz. The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
 | Frame copy | **0.00 ms** under zero-copy (run 39). Was ~9.8 ms of a ~16 ms frame at 4K on the CPU path |
 | Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
 | Scene targets | 2× scene-sized (A8R8G8B8 + A16B16G16R16F), shadow map 512×512 R32F |
