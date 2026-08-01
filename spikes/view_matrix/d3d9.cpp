@@ -1483,6 +1483,60 @@ bool EnsureSwapchain(UINT w, UINT h) {
     return true;
 }
 
+// ---- did the engine ACCEPT the resolution we asked for on the command line? ----
+//
+// Only two widths have ever been tried: 4096 accepted, 4992 refused (run 33). Run 40 then measured
+// the GPU at 16384x16384, so the refusal is UE3's own validation rather than hardware - and nobody
+// has bisected where it actually cuts off, or tried a TALLER frame at all. Vertical is independent
+// of whatever limits the width, and the headset wants 2688 against the 2160 being rendered.
+//
+// Reading the command line is not the GetCommandLineW DETOUR that would inject these automatically
+// - that is still unbuilt, and would be pointless until the engine's ceiling is known, since it
+// could only ever inject a size the engine already accepts. This just reads what was asked so the
+// log states the verdict instead of leaving it to be inferred from two numbers on different lines.
+void ReportResolutionRequest(UINT gotW, UINT gotH) {
+    const char* cl = GetCommandLineA();
+    if (!cl) return;
+    Log("command line: %s", cl);
+
+    unsigned reqW = 0, reqH = 0;
+    // -ResX= / -ResY=, case-insensitive, as UE3 itself parses them.
+    for (const char* p = cl; *p; ++p) {
+        if ((p[0] == '-' || p[0] == '/') &&
+            (p[1] == 'R' || p[1] == 'r') && (p[2] == 'e' || p[2] == 'E') &&
+            (p[3] == 's' || p[3] == 'S')) {
+            const char axis = p[4];
+            if (p[5] == '=') {
+                const unsigned v = (unsigned)strtoul(p + 6, nullptr, 10);
+                if (axis == 'X' || axis == 'x') reqW = v;
+                if (axis == 'Y' || axis == 'y') reqH = v;
+            }
+        }
+    }
+    if (!reqW && !reqH) {
+        Log("    no -ResX/-ResY on the command line - the engine used its own configured size,"
+            " %ux%u", gotW, gotH);
+        return;
+    }
+
+    const bool okW = (reqW == 0) || (reqW == gotW);
+    const bool okH = (reqH == 0) || (reqH == gotH);
+    Log("    requested %ux%u -> got %ux%u   *** %s ***", reqW, reqH, gotW, gotH,
+        (okW && okH) ? "ACCEPTED"
+        : (!okW && !okH) ? "REFUSED on BOTH axes - engine substituted its own size"
+        : !okW ? "WIDTH REFUSED (height was fine) - the limit is horizontal"
+               : "HEIGHT REFUSED (width was fine) - the limit is vertical");
+
+    // What this means for the eyes, which is the number the whole exercise is about.
+    if (g_recEyeW && g_recEyeH) {
+        const double hPct = 100.0 * (gotW / 2.0) / g_recEyeW;
+        const double vPct = 100.0 * gotH / g_recEyeH;
+        Log("    per eye %ux%u against the headset's %ux%u -> %.0f%% horizontal, %.0f%% vertical"
+            " (%.0f%% of the pixels)",
+            gotW / 2, gotH, g_recEyeW, g_recEyeH, hPct, vPct, hPct * vPct / 100.0);
+    }
+}
+
 // D3D9 SYSTEMMEM surfaces + matching CPU-writable D3D11 texture, all sized to the backbuffer.
 bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
     if (g_slot[0].surf && g_uploadTex && w == g_srcW && h == g_srcH && fmt == g_srcFmt) return true;
@@ -1573,6 +1627,7 @@ bool EnsureCopyResources(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
     Log("copy resources ready for %ux%u fmt=%d (%d readback slots, %s, %s)", w, h, (int)fmt,
         kCopySlots, g_copyMode == 1 ? "immediate" : "pipelined one frame",
         g_zeroCopyActive ? "ZERO-COPY" : "CPU round-trip");
+    ReportResolutionRequest(w, h);
     return true;
 }
 

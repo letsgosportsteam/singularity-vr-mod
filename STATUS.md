@@ -40,6 +40,46 @@ Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES
 >
 > Seven mechanisms were eliminated by direct test before this one landed. See **Run 30**.
 
+> # 🏆🏆 FULL RESOLUTION PARITY. 4992×2688 accepted, 100% of the headset's pixels, at 120 fps.
+>
+> ```
+> requested 4992x2688 -> got 4992x2688   *** ACCEPTED ***
+> per eye 2496x2688 against the headset's 2496x2688 -> 100% horizontal, 100% vertical
+>
+> fps median 119.9   our work 3.02 ms   xrWaitFrame 4.35 ms IDLE   XR submit 0.94 ms
+> render-target census: scene is 4992x2688 - all three scene targets followed
+> ```
+>
+> **Run 33's conclusion is dead.** It recorded 4992 as refused, called parity *"arithmetically
+> unreachable"*, and promoted per-eye render targets from optional to **mandatory** on the strength
+> of it. That framing has shaped this document for a dozen runs. 4992×2688 is accepted, the scene
+> targets follow it, and it runs at 120 fps with **more idle headroom than 4096×2160 had** (4.35 vs
+> 3.74 ms).
+>
+> **Likely why** — unconfirmed, but the timing is hard to ignore: run 33 predates the D3D9Ex work of
+> runs 38–39. With `D3D9ExMode=1` the device is Ex and `D3DPOOL_MANAGED` is translated to `DEFAULT`.
+> Run 40 read `MaxTextureWidth=16384` from the caps and concluded the refusal was "UE3's own limit";
+> the more likely reading now is that the *plain* device's creation path was the constraint, and the
+> Ex upgrade removed it as a side effect nobody went back to test.
+>
+> **The width bisection, for the record:** 4096 ✅ · 4608 ✅ (92%) · 4992 ✅ (100%). The old "the cap
+> is 4096" was never re-tested after the device changed underneath it.
+>
+> ⚠️ **Stage 4B's resolution justification is now completely gone.** Per-eye render targets were
+> wanted for pixels; side-by-side delivers 100% of them. Whatever case remains is correctness only,
+> and it costs ~5 ms of switching against 4.35 ms of idle.
+>
+> ### Launch line for parity
+>
+> ```
+> Singularity.exe -ResX=4992 -ResY=2688 -windowed
+> ```
+>
+> Keep the per-eye aspect matched to the headset's (2496/2688 ≈ 0.93). A *taller* frame at a fixed
+> width narrows the horizontal field instead — 4096×2688 renders 82.5° against 95° at 4096×2160,
+> and the leftover shows as **black bars at the sides**. `ApplyVrFov` anchors on the headset's
+> vertical FOV and derives horizontal from the frame's aspect, so shape matters, not just pixels.
+
 > # 🏆 120.0 fps LOCKED at 4096×2160. The cause was the wireless link, not the code.
 >
 > ```
@@ -199,7 +239,7 @@ system settings, which the command line does and a `CreateDevice` override does 
 | Colours — sRGB | ✅ done |
 | **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
 | **Stereo — per-eye offset for real depth** | ✅ **done** — true native stereo by draw-call duplication; eyes align, depth is correct, and the vanishing objects are fixed (run 30, occlusion query readback) |
-| FOV / aspect match | 🔧 projection is VR-correct and forced; **resolution cannot be matched in the current design** — the cap is 4096 (run 33), giving 2048 per eye against 2688 wanted. Needs per-eye render targets |
+| FOV / aspect match | ✅ **done (run 58)** — projection is VR-correct and forced, and `-ResX=4992 -ResY=2688` delivers **100% of the headset's pixels** at 120 fps. Run 33's "the cap is 4096" was never re-tested after the D3D9Ex device landed in run 38 |
 | Performance — CPU round-trip → D3D9Ex zero-copy | ✅ **done (runs 38–39)** — `D3DPOOL_MANAGED` wrapper + shared-surface frame path. 4096×2160 went from ~60 to **~115 fps**, frame copy 9.8 ms → **0.00 ms**, and the app is now display-bound with idle headroom |
 | Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
 
@@ -215,8 +255,9 @@ remaining issues are draw-path coverage.
 | Headset wants | **2496×2688 per eye** → 4992 wide for side-by-side |
 | Per eye at 2560×1440 | 1280×1440 — 51% of the panel |
 | Per eye at 3840×2160 | 1920×2160 — 77% of the panel |
-| Resolution cap | **4096 confirmed** (run 33) — 4096×2160 accepted and the scene targets followed; 4992 refused. Classic D3D9 max texture dimension |
-| Per eye at 4096×2160 | **2048×2160 — 76% linear of the 2688×2880 wanted.** Side-by-side needs 5376 wide, so parity is impossible without per-eye targets |
+| Resolution cap | **RETRACTED — there isn't one at these sizes.** 4096 ✅ · 4608 ✅ · **4992 ✅** (run 58), with `D3D9ExMode=1`; the scene targets follow every time. Run 33 measured its refusal on the *plain* D3D9 device, before the Ex upgrade |
+| Per eye at 4992×2688 | **2496×2688 — 100% of what the headset asks for.** Parity reached in side-by-side; no per-eye targets needed |
+| Frame aspect | Keep per-eye ≈ **0.93** (2496/2688). A taller frame at fixed width narrows the horizontal field — 4096×2688 renders 82.5° vs 95° at 4096×2160 — and the shortfall shows as **black bars at the sides** |
 | Frame rate | **120.0 fps LOCKED at 4096×2160** (run 57, dedicated router). Previously 112-117 with zero-copy (run 39); 105–118 at 1440p. SSW **off**, 120 Hz. The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
 | Frame copy | **0.00 ms** under zero-copy (run 39). Was ~9.8 ms of a ~16 ms frame at 4K on the CPU path |
 | Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
