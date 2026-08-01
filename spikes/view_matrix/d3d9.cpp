@@ -6636,6 +6636,87 @@ void FindProcessInternal() {
     }
 }
 
+// ================= ⭐ run 103: find the native trace, and what it calls =======================
+//
+// Route 2 continued. Field-swapping is dead - the null window proved every field carrying the aim
+// also feeds the view - so the bullet has to be redirected somewhere that holds no rotation at
+// all: the TRACE itself. Rotate the End point about Start by the (hand - head) delta and the shot
+// goes where the controller points, while nothing the view reads is ever touched.
+//
+// `Actor.Trace()` is a native function, so its UFunction::Func at +0xAC is the address of the
+// native implementation rather than ProcessInternal - the same read that found ProcessInternal,
+// which makes this the cheap half.
+//
+// ⚠️ execTrace itself is the wrong hook point and it is worth saying why before anyone tries it.
+// A UE3 native reads its parameters off the BYTECODE STREAM with P_GET_ macros, evaluating each
+// expression as it goes. At entry the parameters do not exist yet, so there is nothing to modify;
+// by exit the trace has already happened. What we want is the function it calls with explicit
+// FVectors - UWorld::SingleLineCheck or AActor::ActorLineCheck - and that one is reachable by
+// looking at execTrace's own call targets.
+//
+// So this logs the address and disassembles just enough to list the CALL rel32 targets. One run
+// produces the candidate list; picking from it is desk work against the exe, not another run.
+void ProbeTraceNative() {
+    static volatile LONG done = 0;
+    if (InterlockedExchange(&done, 1)) return;
+    if (g_funcOffset < 0) { Log("trace probe: UFunction::Func offset unknown, run the Func probe first"); return; }
+    if (!Readable((void*)kGObjectsTArray, 12)) return;
+    const uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+    const int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+    if (!data || count < 100) return;
+    auto* objs = reinterpret_cast<uintptr_t*>(data);
+
+    const char* kWanted[] = { "Trace", "FastTrace", "TraceAllPhysicsActors", "TraceActors" };
+    const int kWantedCount = 4;
+    char nm[128], on[128];
+
+    for (int i = 0; i < count; ++i) {
+        if (!Readable((void*)(data + i * 4), 4)) continue;
+        const uintptr_t o = objs[i];
+        if (!o || !Readable((void*)o, (size_t)g_funcOffset + 4)) continue;
+        const uintptr_t cls = *reinterpret_cast<uintptr_t*>(o + OBJ_CLASS);
+        if (!cls || !Readable((void*)cls, 0x40)) continue;
+        if (!NameOf(cls, nm, sizeof(nm)) || _stricmp(nm, "Function") != 0) continue;
+        if (!NameOf(o, nm, sizeof(nm))) continue;
+        bool want = false;
+        for (int w = 0; w < kWantedCount; ++w) if (_stricmp(nm, kWanted[w]) == 0) { want = true; break; }
+        if (!want) continue;
+
+        const uintptr_t fn = *reinterpret_cast<uintptr_t*>(o + g_funcOffset);
+        const uintptr_t outer = *reinterpret_cast<uintptr_t*>(o + OBJ_OUTER);
+        on[0] = 0;
+        if (outer && Readable((void*)outer, 0x40)) NameOf(outer, on, sizeof(on));
+        const bool isCode = fn >= g_textLo && fn < g_textHi;
+        Log("trace probe: %s.%s -> Func 0x%08X %s", on[0] ? on : "?", nm, (unsigned)fn,
+            isCode ? "(code)" : "*** NOT CODE - this one is script, not native ***");
+        if (!isCode) continue;
+
+        // ---- list the CALL rel32 targets ----
+        //
+        // A byte-scan for 0xE8, not a real disassembler, so some hits will be the middle of some
+        // other instruction. That is fine and is why the targets are FILTERED to .text and printed
+        // rather than acted on: a false hit lands outside the section or on a non-prologue, and
+        // the real ones are identifiable by their first bytes. Deliberately not clever - a wrong
+        // clever answer costs a run and a printed list costs nothing.
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(fn);
+        if (!Readable((void*)fn, 0x800)) continue;
+        int shown = 0;
+        for (int off = 0; off < 0x800 - 5 && shown < 24; ++off) {
+            if (p[off] != 0xE8) continue;
+            int32_t rel; memcpy(&rel, p + off + 1, 4);
+            const uintptr_t tgt = fn + off + 5 + (intptr_t)rel;
+            if (tgt < g_textLo || tgt >= g_textHi) continue;
+            if (!Readable((void*)tgt, 8)) continue;
+            const uint8_t* t = reinterpret_cast<const uint8_t*>(tgt);
+            Log("      +0x%03X CALL 0x%08X   [%02X %02X %02X %02X %02X %02X]",
+                off, (unsigned)tgt, t[0], t[1], t[2], t[3], t[4], t[5]);
+            ++shown;
+        }
+    }
+    Log("trace probe: done. The line-check is among the CALL targets above - it is the one taking"
+        " two FVectors, and the next step picks it apart against the exe rather than in a headset.");
+}
+
 // Move the script hook onto the address the probe found. The old detour at 0x01308A10 is removed
 // first: leaving a hook on a function that was proven to be the wrong one costs frame time on
 // every call and can only confuse the next log.
@@ -7752,7 +7833,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
         // Run 93: find the real ProcessInternal and move the hook onto it. Both are no-ops once
         // they have succeeded, so cycling modes does not re-walk GObjects.
-        if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); }
+        if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); ProbeTraceNative(); }
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
