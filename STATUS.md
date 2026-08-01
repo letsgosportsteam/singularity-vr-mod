@@ -163,7 +163,19 @@ arbitrary constant.
 the hand.** That is why this survived fifty runs. It is now measured directly — hand yaw/pitch
 minus head yaw/pitch in the same XR frame, zero by construction when they agree.
 
-`AimTraceSignYaw=-1` in the ini: left/right came out mirrored. Pitch is correct at `+1`.
+### ✅ Confirmed working (run 113)
+
+**Aim mode 11. Bullet follows the controller in both axes, view completely still, culling headroom
+can stay at 1.0** — route 2 costs nothing in LOD or draw distance, which was the entire point.
+
+The mirrored yaw was **`g_yawSign`**, not the ini. It is `-1` (XR is right-handed Y-up, UE3 is
+left-handed Z-up) and `g_pitchSign` is `+1`, so a deviation published without them comes out
+mirrored in yaw and correct in pitch — which is precisely what was reported, and the pairing is
+what identified it. Every other conversion in the file already applied them; the new one did not.
+**Deriving a quantity without the conversion the rest of the file already uses** is the same class
+of error as re-deriving an offset that was already known.
+
+`F5`/`F4` still flip those signs at runtime and the bullet deflection now follows them.
 
 ### Still open
 
