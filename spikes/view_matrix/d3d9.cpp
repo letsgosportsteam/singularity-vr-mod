@@ -3348,6 +3348,7 @@ bool XrPathOf(const char* s, XrPath* out) {
 // Declared here because the ini is read long before that point in the file.
 extern LONG  g_aimPoseUUPer1;
 extern LONG  g_aimFieldSet;
+extern LONG  g_traceSignYaw, g_traceSignPitch;
 extern float g_aimPoseSignX, g_aimPoseSignY;
 
 bool InitXRInput() {
@@ -3375,6 +3376,9 @@ bool InitXRInput() {
             // Which fields aim mode 9 may write. 0 controller only (default), 1 + mCurrentPOV,
             // 2 every scanned field. See the note on g_aimFieldSet - set 2 moves the camera.
             g_aimFieldSet   = GetPrivateProfileIntA("Input", "AimFieldSet", 0, path);
+            // Mode 11 trace rotation: flip if the shot deflects the wrong way.
+            g_traceSignYaw   = GetPrivateProfileIntA("Input", "AimTraceSignYaw", 1, path) >= 0 ? 1 : -1;
+            g_traceSignPitch = GetPrivateProfileIntA("Input", "AimTraceSignPitch", 1, path) >= 0 ? 1 : -1;
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             for (int i = 0; i < kPadButtonCount; ++i)
@@ -6764,6 +6768,47 @@ volatile LONG g_lineCheckLogged = 0;
 volatile LONG g_lineCheckCalls = 0;
 volatile LONG g_lineCheckNear = 0;
 
+// ================= ⭐ run 108: ROTATE THE TRACE. This is the actual feature. ===================
+//
+// Confirmed by counting rather than by filtering: 2 line checks run inside every shot's window.
+// The pistol is hitscan, the visible "bullets" are RvEmitter tracers, and the trace goes through
+// this function. The near-camera log missed it only because its 12-entry cap was spent on movement
+// traces before the first shot.
+//
+// The rotation is applied to the DIRECTION, not to an absolute rotation:
+//
+//     d      = End - Start
+//     yaw   += (handYaw   - headYaw)
+//     pitch += (handPitch - headPitch)
+//     End    = Start + rebuilt d, same length
+//
+// Using the delta rather than an absolute aim means the engine's own conventions for the base
+// direction do not have to be known - only the sign of the delta, and that is one ini key if it
+// comes out mirrored. Every previous attempt needed the absolute convention to be right.
+//
+// Nothing here writes a rotation field, so the view CANNOT follow. That is the property the last
+// dozen runs were unable to buy at any price.
+LONG g_traceSignYaw = 1, g_traceSignPitch = 1;
+volatile LONG g_traceRotated = 0;
+
+static void RotateTrace(float* start, float* end, int32_t dYawUU, int32_t dPitchUU) {
+    const float dx = end[0] - start[0], dy = end[1] - start[1], dz = end[2] - start[2];
+    const float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (len < 1.0f) return;                       // a degenerate trace has no direction to turn
+    const float kUUToRad = 6.2831853f / 65536.0f;
+    float yaw   = atan2f(dy, dx) + g_traceSignYaw   * dYawUU   * kUUToRad;
+    float pitch = asinf(dz / len) + g_traceSignPitch * dPitchUU * kUUToRad;
+    // Clamp pitch short of vertical: at exactly +-90 the yaw term becomes meaningless and the
+    // trace would snap to a pole.
+    const float kMaxPitch = 1.5533f;              // 89 degrees
+    if (pitch >  kMaxPitch) pitch =  kMaxPitch;
+    if (pitch < -kMaxPitch) pitch = -kMaxPitch;
+    const float cp = cosf(pitch);
+    end[0] = start[0] + len * cp * cosf(yaw);
+    end[1] = start[1] + len * cp * sinf(yaw);
+    end[2] = start[2] + len * sinf(pitch);
+}
+
 void* __cdecl Hook_LineCheck(void* params) {
     const LONG lcN = InterlockedIncrement(&g_lineCheckCalls);
     // Proof the hook is live at all. Without this, "no traces during a shot" and "the hook never
@@ -6795,6 +6840,46 @@ void* __cdecl Hook_LineCheck(void* params) {
                 Log("    +0x%02X  %12.2f %12.2f %12.2f", i * 4, f[i], f[i+1], f[i+2]);
         }
     }
+    // ---- the rotation itself, mode 11 ----
+    //
+    // Gated on the fire window so only the WEAPON's traces move - AI perception, movement and
+    // physics queries run through here constantly and must be left alone.
+    //
+    // Start is located by matching the camera position, exactly as the probe did, rather than by
+    // hardcoding +0x68: the offset was read off one build's movement traces and this is a weapon
+    // trace. If it does not match, nothing is written and the log says so - the same
+    // prove-itself-first rule that stopped mode 6 corrupting the heap.
+    if (InterlockedCompareExchange(&g_aimMode, 0, 0) == 11 &&
+        (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) &&
+        params && Readable(params, 0x80) &&
+        InterlockedCompareExchange(&g_camPosValid, 0, 0)) {
+        float* f = reinterpret_cast<float*>(params);
+        int s = -1;
+        for (int i = 0; i + 5 < 32; ++i) {
+            const float ex = f[i] - g_camPos[0], ey = f[i+1] - g_camPos[1], ez = f[i+2] - g_camPos[2];
+            if (ex*ex + ey*ey + ez*ez < 520.0f * 520.0f) { s = i; break; }
+        }
+        const int32_t dYaw   = InterlockedCompareExchange(&g_aimYawForXi, 0, 0)   - g_wantYaw;
+        const int32_t dPitch = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0) - g_wantPitch;
+        const LONG n = InterlockedIncrement(&g_traceRotated);
+        if (s >= 0) {
+            float* start = f + s;
+            float* end   = f + s + 3;
+            const float bx = end[0], by = end[1], bz = end[2];
+            RotateTrace(start, end, dYaw, dPitch);
+            if (n <= 8)
+                Log("trace rotated: start +0x%02X (%.0f %.0f %.0f)  end (%.0f %.0f %.0f) ->"
+                    " (%.0f %.0f %.0f)  dYaw %d dPitch %d",
+                    s * 4, start[0], start[1], start[2], bx, by, bz,
+                    end[0], end[1], end[2], dYaw, dPitch);
+        } else if (n <= 8) {
+            Log("trace NOT rotated: no triple near the camera (%.0f %.0f %.0f) in this struct -"
+                " nothing written. Either this trace does not start at the player, or the layout"
+                " differs from the movement traces the probe measured.",
+                g_camPos[0], g_camPos[1], g_camPos[2]);
+        }
+    }
+
     return g_origLineCheck(params);
 }
 
@@ -7270,8 +7355,10 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     }
 
     const bool mode10 = (aimMode == 10) && fnIdx >= 0;
-    const bool mode9 = ((aimMode == 9) || mode10) && fnIdx >= 0;
-    const bool nullWindow = mode10;
+    const bool mode9 = ((aimMode == 9) || mode10 || (aimMode == 11)) && fnIdx >= 0;
+    // Mode 11 also opens a null window: it needs the window as a FILTER for the trace hook, but
+    // must not write a rotation field or the view would follow - which is the whole point.
+    const bool nullWindow = mode10 || (aimMode == 11);
     bool firedWindow = false;
     int32_t savedCtl[3] = {}, savedCam[3] = {}, savedPov[3] = {};
     bool haveCtl = false, haveCam = false, havePov = false;
@@ -7990,7 +8077,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // the record, exactly as modes 4 and 5 were.
         // Mode 10 first: it is the null window, so it writes nothing and cannot cycle the view,
         // and it is now also the mode that dumps the weapon trace parameters.
-        static const LONG kAimCycle[] = { 0, 10, 9, 1, 2, 3 };
+        static const LONG kAimCycle[] = { 0, 11, 10, 9, 1, 2, 3 };
         const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
         LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
         int at = 0;
@@ -8029,6 +8116,19 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     break;
             case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
                         " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
+                    break;
+            case 11: Log("NUMPAD.: aim mode 11 - ROTATE THE TRACE. This is the real one."
+                        " The view, culling, LOD and the gun all stay on your HEAD and NOTHING"
+                        " writes a rotation field, so the camera cannot follow your hand - that is"
+                        " structural here, not a fix."
+                        " The weapon fires 2 line checks per shot through 0x00BD79D0, and each has"
+                        " its End rotated about its Start by the hand-minus-head delta."
+                        " >>> STAND CLOSE TO A WALL, POINT WELL AWAY FROM THE CROSSHAIR, FIRE. <<<"
+                        " Hole where your HAND points, view perfectly still = the bullet is"
+                        " decoupled at last, with no culling or LOD cost."
+                        " Hole mirrored the wrong way = AimTraceSignYaw or AimTraceSignPitch = -1"
+                        " in the ini, no rebuild."
+                        " NOTE: the gun MODEL still will not move. That is the separate half.");
                     break;
             case 10: Log("NUMPAD.: aim mode 10 - NULL WINDOW, the control for mode 9."
                         " Identical in every way - same fire functions, same hook, same nesting,"
