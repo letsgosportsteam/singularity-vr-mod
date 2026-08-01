@@ -1,235 +1,124 @@
 # STATUS — session handoff
 
-Last updated **2026-07-30** (end of run 31). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-07-31** (end of run 59). Read this first, then `ENGINE_NOTES.md`.
 
-> # 🚀 ZERO-COPY LANDED (run 39): 4096×2160 runs at ~115 fps, up from ~60.
+> # ✅ The ladder is complete except controller input.
 >
-> The CPU round-trip is **gone** — `StretchRect` into a shared D3D9Ex surface, `CopyResource` into
-> the XR swapchain, both GPU-side. Frame copy went from ~9.8 ms to **0.00 ms**, and the app is now
-> **display-bound with 4+ ms of idle headroom** instead of arriving late every frame. Performance is
-> no longer a project problem. See **Run 39**, and **Run 38** for the `D3DPOOL_MANAGED` wrapper that
-> made it legal.
-
-> # 🚨 THE GAME RUNS AT ~110 FPS. EVERY PERFORMANCE NUMBER BEFORE RUN 32 WAS WRONG.
->
-> **The "37–40 fps" this project has recorded for thirty runs was Virtual Desktop's Synchronous
-> Spacewarp**, which pins the app at *half* the headset refresh on purpose and synthesises the
-> frames in between. With SSW off and the headset at 120 Hz, the same build runs at **105–118 fps
-> (8.5–9.6 ms/frame)**. There was no performance problem to solve.
->
-> Every historical measurement here — the bimodal distribution, the "CPU-bound stall", run 31's
-> conclusions — was taken through that halving and must be re-derived before it is trusted. See
-> **Run 32**.
-
-> # ⚠️ Run 31's verdict is RETRACTED
->
-> Run 31 concluded "the frame copy is 3% of the frame, cancel the D3D9Ex plan". That was measured
-> under SSW: 0.88 ms of a frame padded out to 27.8 ms. **Unconfounded it is ~4.2 ms of an ~8.9 ms
-> frame — closer to half.** The D3D9Ex work is back on the table. See **Run 32**.
-
-> # ✅ THE FLICKER IS SOLVED (run 30)
->
-> **It was UE3's hardware occlusion queries.** The engine draws a bounding box per primitive,
-> reads the pixel count back, and skips drawing that primitive later if it came back zero. In
-> true stereo that readback is wrong, and it was wrong on a huge scale: with results forced to
-> "visible", **draws per frame went from ~1000 to 2100–3800** and every reported object came back
-> solid. The engine was discarding **50–70% of its own draw calls.**
->
-> Fixed by `OcclusionQueryMode=0` (auto), now the default. Frame rate is unchanged — 37–40 fps
-> with peaks of 70 — because this build is bottlenecked on the CPU frame copy, not on draw calls.
->
-> Seven mechanisms were eliminated by direct test before this one landed. See **Run 30**.
-
-> # 🏆🏆 FULL RESOLUTION PARITY. 4992×2688 accepted, 100% of the headset's pixels, at 120 fps.
+> **Full resolution parity at a locked 120 fps, inherited automatically from the headset.**
+> Launch `Singularity.exe` with no arguments and press **BACKSPACE**. That is the whole procedure.
 >
 > ```
-> requested 4992x2688 -> got 4992x2688   *** ACCEPTED ***
-> per eye 2496x2688 against the headset's 2496x2688 -> 100% horizontal, 100% vertical
+> auto-resolution: injecting -ResX=4992 -ResY=2688 -windowed (cached from the headset last run)
+>     requested 4992x2688 -> got 4992x2688   *** ACCEPTED ***
+>     per eye 2496x2688 against the headset's 2496x2688 -> 100% horizontal, 100% vertical
 >
 > fps median 119.9   our work 3.02 ms   xrWaitFrame 4.35 ms IDLE   XR submit 0.94 ms
-> render-target census: scene is 4992x2688 - all three scene targets followed
 > ```
->
-> **Run 33's conclusion is dead.** It recorded 4992 as refused, called parity *"arithmetically
-> unreachable"*, and promoted per-eye render targets from optional to **mandatory** on the strength
-> of it. That framing has shaped this document for a dozen runs. 4992×2688 is accepted, the scene
-> targets follow it, and it runs at 120 fps with **more idle headroom than 4096×2160 had** (4.35 vs
-> 3.74 ms).
->
-> **Likely why** — unconfirmed, but the timing is hard to ignore: run 33 predates the D3D9Ex work of
-> runs 38–39. With `D3D9ExMode=1` the device is Ex and `D3DPOOL_MANAGED` is translated to `DEFAULT`.
-> Run 40 read `MaxTextureWidth=16384` from the caps and concluded the refusal was "UE3's own limit";
-> the more likely reading now is that the *plain* device's creation path was the constraint, and the
-> Ex upgrade removed it as a side effect nobody went back to test.
->
-> **The width bisection, for the record:** 4096 ✅ · 4608 ✅ (92%) · 4992 ✅ (100%). The old "the cap
-> is 4096" was never re-tested after the device changed underneath it.
->
-> ⚠️ **Stage 4B's resolution justification is now completely gone.** Per-eye render targets were
-> wanted for pixels; side-by-side delivers 100% of them. Whatever case remains is correctness only,
-> and it costs ~5 ms of switching against 4.35 ms of idle.
->
-> ### Launch line for parity
->
-> ```
-> Singularity.exe -ResX=4992 -ResY=2688 -windowed
-> ```
->
-> Keep the per-eye aspect matched to the headset's (2496/2688 ≈ 0.93). A *taller* frame at a fixed
-> width narrows the horizontal field instead — 4096×2688 renders 82.5° against 95° at 4096×2160,
-> and the leftover shows as **black bars at the sides**. `ApplyVrFov` anchors on the headset's
-> vertical FOV and derives horizontal from the frame's aspect, so shape matters, not just pixels.
-
-> # 🏆 120.0 fps LOCKED at 4096×2160. The cause was the wireless link, not the code.
->
-> ```
-> frame:  median 8.33 ms   p90 8.56 ms   fps median 120.0
-> budget: xrWaitFrame 3.74 (idle) + copy 0.00 + XR submit 1.28 + our work 3.21
-> ```
->
-> Median frame time is **exactly the 8.33 ms display period**, with **3.74 ms of idle headroom**.
-> Run 39's 112–117 fps was recorded as "just misses locking to a solid 120 Hz" — that gap is closed.
->
-> **What fixed it was a dedicated router**, not a line of code. `xrEndFrame` was blocking for up to
-> **189 ms** on a congested shared WiFi link, and that time had always been pooled into "our work"
-> where it looked like a game-side stall. Timing it (run 56) named the culprit in one run after a
-> full day of bisecting the render path had found nothing.
->
-> | XR submit | before | after |
-> |---|---|---|
-> | typical | 20.94 ms | **0.08–1.28 ms** |
-> | worst single frame | **189.25 ms** | **3.17 ms** |
->
-> ⚠️ **This retracts "the `D3DPOOL_MANAGED` wrapper causes the spikes."** `D3D9ExMode=1` is ON in the
-> 120 fps run above. That conclusion came from four runs that happened to catch a quieter link.
->
-> ### The method lesson, which cost a day
->
-> The frame budget broke out `xrWaitFrame`, the copy and the GObjects walk, and called the remainder
-> **"our work"** — so the one call in the whole mod that reaches a *wireless link* was pooled in with
-> the game's own CPU work. Every stall chased that day landed in that remainder, and the day went
-> into changing code around the black box instead of measuring it.
->
-> Three separate wrong conclusions came out of that: head roll, the reverted probe, and the wrapper.
-> Each was "confirmed" by an A/B taken while the link — an invisible, wildly varying background
-> load — moved underneath the comparison. **A residual bucket labelled "our work" is not a
-> measurement; it is everything you have not measured yet.**
->
-> And the control that would have shown this in one minute — rename `d3d9.dll`, run the game
-> unmodded at the same resolution — was not run until late in the day.
-
-> # ✅ Head roll is in. Tilting your head tilts the view.
->
-> The last axis of the head pose that was never written anywhere. Applied in the **view matrix**,
-> not the engine's rotation — and it could *not* be left to the compositor, which is the trap: a
-> projection layer is reprojected by the **delta** between the pose we claim and the pose the
-> display is at, so claiming a rolled pose for an unrolled render cancels out exactly.
-> **NUMPAD1** toggles, **NUMPAD2** flips the sign. Costs nothing measurable and allocates nothing.
-> Maths verified as arithmetic before any headset run — `.\spikes\roll_math\build.ps1`.
-
-> # ⚠️ Method note that cost a whole afternoon: gating a diagnostic's WORK is not gating its COST.
->
-> The Stage 4B probe (since reverted) allocated a scene-sized render target **and** depth-stencil —
-> **~70 MB at 4096×2160** — in `EnsureCopyResources`, unconditionally, behind a hotkey that had to
-> be pressed for them to be touched at all. Every run paid it from the first frame.
->
-> Worse was the diagnosis. Hours went into bisecting commits while **the machine itself was
-> degrading**: the identical `fa02fb1` binary ran at **32–38%** of windows over 15 ms at midday and
-> **4%** the same evening after the machine rested, with "our work" halving 11.02 → 5.80 ms. The
-> cheap control — rename `d3d9.dll` and run the game unmodded — was not tried until after half a
-> dozen sessions had been burned on code. **Validate the environment before bisecting yourself.**
 
 ## TL;DR — where we stand
 
-**Working and wearable.** Head tracking, 6-DOF, correct colours, a VR-correct projection, and
-**true native stereo** with real per-eye parallax. The stereo mechanism is validated: the eyes line
-up, depth reads correctly, and it holds ~37 fps at 2560×1440 / ~28 at 3840×2160.
+A **working, wearable VR mod** for Singularity (2010, UE3, D3D9, x86), shipping as one `d3d9.dll`
+dropped beside the game exe. No game files modified.
 
-**The flicker is fixed** (run 30 — occlusion query readback). Objects no longer vanish. Everything
-remaining on the list is planned work rather than a bug.
+| rung | state |
+|---|---|
+| Head-tracked image, sRGB colours | ✅ |
+| **6-DOF positional tracking** | ✅ camera position solved via the view matrix |
+| **Head roll** | ✅ run 59 — applied in the view matrix, `NUMPAD1`/`NUMPAD2` |
+| **True stereo**, real per-eye parallax | ✅ draw-call duplication; eyes align, depth correct |
+| **FOV / aspect / resolution** | ✅ **100% of the headset's pixels, automatic** |
+| **Performance** | ✅ **120 fps locked**, 4.35 ms idle per frame |
+| Controller input, menus, aim decoupling | ⬜ **not started — this is the whole remaining project** |
 
 ### If you are picking this up cold, read these three things
 
-1. **The seam.** In true stereo the frame is side by side, left half → left eye. Any geometry that
-   reaches the frame *without* being remapped into an eye-half keeps full-frame coordinates — and
-   the centre of the frame **is** the seam, so a head-on object is clipped out of *both* halves and
-   disappears. Three separate causes have fed into this one mechanism.
-2. **Draw-path coverage is the unsolved half.** Catching every route geometry takes to the GPU is
-   what keeps failing. `DrawPrimitiveUP`/`DrawIndexedPrimitiveUP` are the currently-known gap, and
-   as of run 27 they are hooked again — the thing that used to block them is fixed.
-3. **Placement depends on matrix identification, and that is the fragility.** A draw we cannot
-   remap gets drawn once at full-frame coordinates, which puts a centred object *on* the seam. So
-   any failure to recognise the view matrix — for one draw or for a whole frame — turns straight
-   into the reported artefact. Run 27 fixed several ways that failed; **Stage 4** below is the
-   change that removes the dependency altogether.
+1. **Almost every hard problem here was a stale premise, not a hard problem.** Parity was recorded
+   as "arithmetically unreachable" for a dozen runs because a 2010-era cap was measured once on a
+   device that later changed. 120 fps was blocked by a wireless link nobody had timed. The frame
+   rate was wrong for thirty runs because SSW was halving it. **Re-test the premise before building
+   on it**, especially one you inherited from an earlier run.
+2. **"our work" in the frame budget is not a measurement.** It is the residual — everything not yet
+   broken out — and it will absorb any amount of someone else's latency while looking exactly like
+   your own bug. `xrEndFrame` hid a **189 ms** stall in there for an entire day.
+3. **The cheap control first.** Rename `d3d9.dll` to `d3d9.dll.off` and run the game unmodded at the
+   same resolution. One minute, and it settles "is this us at all" before any bisection starts.
 
 ### Next session, in order
 
-With the flicker closed, the ladder's remaining rungs are all *quality* work rather than
-debugging.
+1. **Controller input.** The only untouched rung, and now the whole remaining project. Needs OpenXR
+   input: menus (currently inert by design), motion-controller aiming, and decoupling head-look
+   from `PlayerController.Rotation`, which today drives both the view and the fire trace.
+2. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+   `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
+   turn **High Quality Decals** off in the in-game video options.
+3. **One object still culls early at distance.** Not occlusion — it vanished with the override ON
+   too. **PAGE DOWN** fixes it, which points at the run-21 mechanism: FOV inflation ×2.01 makes
+   objects project 3.4× smaller than the engine expects. The real fix is finding UE3's
+   draw-distance/LOD scale and compensating directly.
 
-1. **✅ DONE — zero-copy (runs 38–39).** 4096×2160 at ~115 fps, frame copy 0.00 ms, app
-   display-bound with 4+ ms idle. Turn it on with `D3D9ExMode=1` + `ZeroCopy=1`.
-   **Remaining follow-ups, both small:** confirm no tearing by eye, and consider raising the 100 ms
-   fence bound that fired once during a level load.
-2. **Per-eye render targets (Stage 4B) — promoted from "worth one measurement" to mandatory.**
-   Run 33 settled the cap at 4096, so side-by-side tops out at 2048 per eye against 2688 wanted.
-   **Parity is arithmetically unreachable** in a single side-by-side frame. This is also the fix
-   for the seam, post-processing bleed and occlusion-box remapping, so it collapses four open items
-   into one. Cost to check first: a render-target *and* depth-stencil swap per draw, ~2,400/frame.
-3. **`GetCommandLineW` detour** to inject `-ResX`/`-ResY` from the headset's reported size, so the
-   manual command line goes away. Designed, not implemented; must fail safe or the game will not
-   launch.
-4. **Vertical culling shortfall** — 98° rendered against the engine's 51.1° (run 33). Revisit the
-   headroom removed in run 28; **PAGE UP** walks it.
-2. **Resolution.** Per-eye is currently 1280×1440 against the headset's 2496×2688. Needs the
-   command-line detour (design already written up under *How resolution will work*), and probably
-   per-eye render targets given the ~4096 cap.
-3. **Controller input and menus.** Untouched — needs OpenXR input. Same work unlocks
-   motion-controller aiming.
-4. **Head roll.** F9 drives pitch and yaw only; `r->roll` is never written, so tilting your head
-   sideways does not tilt the view. Small job, and it is felt in VR without being easy to name.
+**Watch this one:** MinHook now initialises in `DllMain` (run 59, for the command-line detour)
+rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
+accordingly — treating it as a failure would silently kill head tracking. It is the newest
+structural change in the build and the first thing to suspect if tracking ever misbehaves.
 
-Two loose threads worth keeping visible, neither blocking:
+### ⚠️ Method notes that cost the most to learn
 
-- **`HookUserPointerDraws` stays 0.** Level 3 routes UE3's `DrawDenormalizedQuad` — the fullscreen
-  quad every post-process pass uses — through `StereoPair`, which scissors it to a half and
-  overwrites `c0` underneath it. That is the "rainbow" of run 28. Fixing it needs draw
-  classification, and with the flicker solved there is no longer a reason to rush it.
-- **Post-processing still bleeds across the seam** (bloom and similar sample the whole target).
-  Stage 4 below addresses it as a side effect.
+- **Validate the environment before bisecting yourself.** A full day went into bisecting commits
+  while the wireless link — an invisible, wildly varying background load — moved underneath every
+  comparison. Three separate conclusions were "confirmed" by A/Bs taken across it and all three had
+  to be retracted. The identical binary ran at 4% of windows over 15 ms and at 84% within the same
+  evening.
+- **Measure the black box; do not redesign around it.** The instrument that solved the performance
+  mystery took ten minutes and should have been written first.
+- **Gating a diagnostic's WORK is not gating its COST.** The Stage 4B probe allocated ~70 MB of
+  scene-sized surfaces in `EnsureCopyResources` behind a hotkey nobody had pressed.
+- **A cost measured while its benefit is disabled is not a verdict.** Run 48 priced
+  `HookUserPointerDraws=3` at 104 → 94 fps and called it worthless, while the occlusion override
+  was actively suppressing what it unlocked.
+- **Build discriminators, not hypotheses.** A test that separates two whole classes retires more in
+  one session than three rounds of argument.
+- **Check whether the instrument can report anything at all.** Eight tautological diagnostics have
+  been found here — counters that could only ever report the good case.
 
-### Method note earned the hard way this session
+## ✅ Resolution — inherited from the headset, automatically (design run 17, built run 59)
 
-**Five theories about the flicker were wrong, each killed by the diagnostic built to test it.** What
-finally worked was *elimination* — turning one intervention off at a time — not another mechanism.
-Reach for that sooner. Equally: three of those wrong theories assumed a single-threaded draw path,
-and a bisection ladder driven from the ini (no rebuild per test) settled in three launches what
-guessing had not in three sessions.
+Manual `-ResX=`/`-ResY=` was a development crutch for forty runs. It is gone.
 
-## How resolution will work in the shipped mod (design, run 17)
-
-Manual `-ResX=`/`-ResY=` is a **development crutch, not the shipping design.** Every other VR title
-inherits resolution from the headset and lets the platform's own render-scale slider adjust it, and
-this mod should behave the same way.
-
-The mechanism: OpenXR's `xrEnumerateViewConfigurationViews` reports a *recommended* per-eye rect,
-and that value **already includes whatever render-scale the user set in SteamVR or the Meta app**.
-So honouring it gives exactly the expected behaviour, with no per-user command line. The build now
-queries and logs it, along with the exact launch line it implies:
+OpenXR's `xrEnumerateViewConfigurationViews` reports a recommended per-eye rect that **already
+includes whatever render-scale is set in Virtual Desktop**, so honouring it gives exactly the
+behaviour every other VR title has. The mod queries it every run, caches it to the ini, and the
+next launch detours `GetCommandLineW`/`A` to append the computed size.
 
 ```
-headset wants 2496x2688 per eye (max ...) - includes your runtime's render-scale setting
-  => for side-by-side stereo, launch the game with:  -ResX=4992 -ResY=2688 -windowed
+auto-resolution: injecting -ResX=4992 -ResY=2688 -windowed (cached from the headset last run)
+    requested 4992x2688 -> got 4992x2688   *** ACCEPTED ***
 ```
 
-To remove the manual step entirely, the DLL loads **before** the game parses its command line, so it
-can detour `GetCommandLineW`/`A` and append the computed `-ResX`/`-ResY`. That is the piece that
-turns this from guidance into automatic behaviour — **not yet implemented**, deliberately: it must
-fail safe (leave the command line untouched if the XR query fails) or the game will not launch.
+**Your command line always wins.** Pass `-ResX` yourself and nothing is injected:
 
-Note this is also why forcing the backbuffer failed (run 14): the resolution has to reach UE3's own
-system settings, which the command line does and a `CreateDevice` override does not.
+```
+auto-resolution: not injecting (you passed -ResX yourself, which always wins)
+```
+
+**Why `DllMain`.** The DLL is a `d3d9.dll` proxy, so it is a static import of the exe: the loader
+runs `DllMain` *before* the exe's entry point, and the CRT reads `GetCommandLineW` inside that entry
+point to build `WinMain`'s `lpCmdLine`. Any later hook point is too late — by the time the first D3D
+export is called, UE3 has already parsed its arguments.
+
+**Why a cache, not a live query.** A temporary XR instance in `DllMain` is possible (the view-config
+query needs no session or graphics device) but puts XR initialisation in the process startup path,
+where a failure means *the game does not launch*. The cached size is one run stale after a
+render-scale change; that is a far better failure mode. Every failure path leaves the command line
+untouched.
+
+**Why not the backbuffer** (run 14): the resolution has to reach UE3's own system settings. Forcing
+the D3D9 backbuffer only desynchronises it from the engine's scene targets and breaks stereo.
+
+**Keep the aspect right.** Per-eye should stay near the headset's `2496/2688 ≈ 0.93`. A taller frame
+at a fixed width narrows the horizontal field instead — 4096×2688 renders 82.5° against 95° at
+4096×2160 — and the shortfall shows as **black bars at the sides**. `ApplyVrFov` anchors on the
+headset's vertical FOV and derives horizontal from the frame's aspect, so shape matters as much as
+pixel count.
 
 ## Ladder status (against the original plan)
 
@@ -240,11 +129,13 @@ system settings, which the command line does and a `CreateDevice` override does 
 | **6-DOF positional tracking** | ✅ **done** — camera position solved via the view matrix |
 | **Stereo — per-eye offset for real depth** | ✅ **done** — true native stereo by draw-call duplication; eyes align, depth is correct, and the vanishing objects are fixed (run 30, occlusion query readback) |
 | FOV / aspect match | ✅ **done (run 58)** — projection is VR-correct and forced, and `-ResX=4992 -ResY=2688` delivers **100% of the headset's pixels** at 120 fps. Run 33's "the cap is 4096" was never re-tested after the D3D9Ex device landed in run 38 |
-| Performance — CPU round-trip → D3D9Ex zero-copy | ✅ **done (runs 38–39)** — `D3DPOOL_MANAGED` wrapper + shared-surface frame path. 4096×2160 went from ~60 to **~115 fps**, frame copy 9.8 ms → **0.00 ms**, and the app is now display-bound with idle headroom |
-| Controller input, menus, aim decoupling | ⬜ not started (mouse/stick coexistence fixed run 12 as a prerequisite) |
+| **Head roll** | ✅ **done (run 59)** — applied in the view matrix, not the engine's rotation; `NUMPAD1` toggles, `NUMPAD2` flips the sign. Maths verified as arithmetic in `spikes/roll_math` |
+| Performance | ✅ **done (runs 38–39, 56)** — zero-copy removed the 9.8 ms CPU round-trip; a **dedicated router** removed a 189 ms `xrEndFrame` stall. **120 fps locked, 4.35 ms idle at full parity** |
+| **Resolution inherited from the headset** | ✅ **done (run 59)** — `GetCommandLineW` detour, cached from the headset's own query. No command line needed |
+| Controller input, menus, aim decoupling | ⬜ **not started** — the only remaining rung (mouse/stick coexistence fixed run 12 as a prerequisite) |
 
-So: **6-DOF is solved**, and stereo is *working* rather than done — the mechanism is right and the
-remaining issues are draw-path coverage.
+**Every rung is done except controller input.** Stereo, 6-DOF, roll, parity resolution and 120 fps
+all hold simultaneously.
 
 ### Measured, so it does not have to be re-derived
 
@@ -258,8 +149,9 @@ remaining issues are draw-path coverage.
 | Resolution cap | **RETRACTED — there isn't one at these sizes.** 4096 ✅ · 4608 ✅ · **4992 ✅** (run 58), with `D3D9ExMode=1`; the scene targets follow every time. Run 33 measured its refusal on the *plain* D3D9 device, before the Ex upgrade |
 | Per eye at 4992×2688 | **2496×2688 — 100% of what the headset asks for.** Parity reached in side-by-side; no per-eye targets needed |
 | Frame aspect | Keep per-eye ≈ **0.93** (2496/2688). A taller frame at fixed width narrows the horizontal field — 4096×2688 renders 82.5° vs 95° at 4096×2160 — and the shortfall shows as **black bars at the sides** |
-| Frame rate | **120.0 fps LOCKED at 4096×2160** (run 57, dedicated router). Previously 112-117 with zero-copy (run 39); 105–118 at 1440p. SSW **off**, 120 Hz. The old "~37 fps / floor ~13" figures were SSW halving the rate and are void |
-| Frame copy | **0.00 ms** under zero-copy (run 39). Was ~9.8 ms of a ~16 ms frame at 4K on the CPU path |
+| Frame rate | **120.0 fps LOCKED at 4992×2688 (full parity)** — median 8.34 ms, `our work` 3.02 ms, **4.35 ms idle**. Needed both zero-copy (run 39) and a **dedicated router** (run 56). SSW **off**, 120 Hz. Every figure before run 32 was SSW halving the rate and is void |
+| Frame copy | **0.00 ms** under zero-copy. Was ~9.8 ms of a ~16 ms frame at 4K on the CPU path |
+| XR submit (`xrBeginFrame`+`xrEndFrame`) | **0.08–1.28 ms** on a dedicated router. Was **20.94 ms mean / 189 ms worst** on shared WiFi — and it was pooled into "our work", where it looked like a game-side stall for a whole day (run 56) |
 | Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
 | Scene targets | 2× scene-sized (A8R8G8B8 + A16B16G16R16F), shadow map 512×512 R32F |
 
@@ -288,6 +180,18 @@ crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch
 ```
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe
 ```
+
+**No arguments needed** since run 59 — the resolution is inherited from the headset. Pass `-ResX`
+only to override it deliberately.
+
+> ### 🛜 Virtual Desktop needs a dedicated router, and this is not optional
+>
+> On a shared WiFi network `xrEndFrame` blocked for up to **189 ms**, which read as seconds-long
+> stalls and cost an entire session of misdiagnosis. With a dedicated router and the PC on
+> **ethernet** to it, XR submit is **0.08–1.28 ms** and the frame locks to 120 fps.
+>
+> The `XR submit` figure in the frame budget is the check. If it is anything but small, the link is
+> the problem and **nothing in the render code will help** — see run 56.
 
 **Cold start is flat**, as always. **BACKSPACE reaches head tracking + 6-DOF + true stereo in one
 press** instead of three (run 37 reverted run 36's default-on, which rendered the untested main
