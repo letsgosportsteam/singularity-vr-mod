@@ -6296,6 +6296,150 @@ static void RewriteSetAimParams(void* frame) {
 // main menu before RvGame is in memory finds nothing. That case is LOGGED as itself rather than
 // left to look like "the function is not on the fire path" - which is exactly the ambiguity that
 // wasted run 82.
+// ================================ run 93: find ProcessInternal through UFunction::Func ==========
+//
+// 0x01308A10 is not it. Run 92 settled that with a measurement rather than an argument: over 300
+// calls, no slot in its argument named a script function more than 4% of the time, and `Tick` -
+// which every level runs on every actor every frame - appeared ZERO times in 48,811 calls. The
+// hook is on something, but not on the general script path.
+//
+// Four passes have failed to find ProcessEvent by static analysis, and they were always going to:
+// it is virtual, so no call graph reaches it. But it does not have to be found in the binary at
+// all, because the ENGINE stores its address in a place this mod can already read.
+//
+// UE3's UFunction::Bind() sets `Func` to &UObject::ProcessInternal for every non-native function.
+// So every script UFunction in GObjects - and there are tens of thousands - holds the SAME code
+// pointer at the SAME offset. That is a signature nothing else in the object can imitate:
+//
+//   * find the offset where hundreds of DIFFERENT UFunctions agree on one code-range value
+//   * that offset is Func, and that value is ProcessInternal
+//
+// It needs no disassembly, no signature scan and no guess. It is also the same GObjects walk that
+// already finds the controller and the camera, so the machinery is proven.
+//
+// ⚠️ Native functions hold their own natives here, so agreement will be strong but never total.
+// The test is the MODE, not unanimity - and a weak mode is reported as a failure rather than
+// adopted, which is the mistake that cost runs 87 through 92.
+uintptr_t g_processInternal = 0;
+int       g_funcOffset = -1;
+
+// Both defined further down, with the census they belong to. Declared here because the probe has
+// to reset them when it moves the hook.
+void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* Parms, void* Result);
+extern volatile LONG g_peSeen, g_peUnnamed;
+
+const uintptr_t kCodeLo = 0x00401000, kCodeHi = 0x01E00000;
+
+void FindProcessInternal() {
+    if (g_processInternal) return;
+    if (!Readable((void*)kGObjectsTArray, 12)) { Log("Func probe: GObjects not readable"); return; }
+    const uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+    const int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+    if (!data || count < 100) { Log("Func probe: GObjects not populated"); return; }
+    auto* objs = reinterpret_cast<uintptr_t*>(data);
+
+    // Offsets to test. UStruct is large, so Func sits well past the UObject header; scanning a
+    // generous window costs nothing here because this runs once, on a keypress.
+    const int kLo = 0x40, kHi = 0x100, kStep = 4;
+    const int kOffCount = (kHi - kLo) / kStep;
+    const int kBuckets = 6;
+    struct Tally { uintptr_t val[kBuckets]; int hit[kBuckets]; };
+    static Tally tal[(0x100 - 0x40) / 4];
+    memset(tal, 0, sizeof(tal));
+
+    int sampled = 0;
+    uintptr_t funcClass = 0;
+    char nm[128];
+
+    for (int i = 0; i < count && sampled < 3000; ++i) {
+        if (!Readable((void*)(data + i * 4), 4)) continue;
+        const uintptr_t o = objs[i];
+        if (!o || !Readable((void*)o, kHi)) continue;
+        const uintptr_t cls = *reinterpret_cast<uintptr_t*>(o + OBJ_CLASS);
+        if (!cls || !Readable((void*)cls, 0x40)) continue;
+        if (!funcClass) {
+            if (!NameOf(cls, nm, sizeof(nm)) || _stricmp(nm, "Function") != 0) continue;
+            funcClass = cls;
+        } else if (cls != funcClass) continue;
+
+        ++sampled;
+        for (int k = 0; k < kOffCount; ++k) {
+            const uintptr_t v = *reinterpret_cast<uintptr_t*>(o + kLo + k * kStep);
+            if (v < kCodeLo || v > kCodeHi) continue;
+            Tally& t = tal[k];
+            int slot = -1;
+            for (int b = 0; b < kBuckets; ++b) {
+                if (t.hit[b] && t.val[b] == v) { slot = b; break; }
+                if (!t.hit[b] && slot < 0) slot = b;
+            }
+            if (slot >= 0) { t.val[slot] = v; ++t.hit[slot]; }
+        }
+    }
+
+    Log("Func probe: %d UFunction objects sampled from %d GObjects entries", sampled, count);
+    if (sampled < 50) {
+        Log("  *** too few UFunctions found - is a level loaded? Nothing decided.");
+        return;
+    }
+
+    int bestOff = -1, bestHit = 0; uintptr_t bestVal = 0;
+    for (int k = 0; k < kOffCount; ++k)
+        for (int b = 0; b < kBuckets; ++b)
+            if (tal[k].hit[b] > bestHit) { bestHit = tal[k].hit[b]; bestVal = tal[k].val[b]; bestOff = kLo + k * kStep; }
+
+    // Print every offset with a strong mode, not just the winner. If two offsets are close, the
+    // winner is not trustworthy and that has to be visible rather than inferred from silence.
+    for (int k = 0; k < kOffCount; ++k)
+        for (int b = 0; b < kBuckets; ++b)
+            if (tal[k].hit[b] * 10 >= sampled)
+                Log("    +0x%02X  0x%08X shared by %d of %d (%.0f%%)", kLo + k * kStep,
+                    (unsigned)tal[k].val[b], tal[k].hit[b], sampled,
+                    100.0 * tal[k].hit[b] / sampled);
+
+    if (bestOff >= 0 && bestHit * 2 >= sampled) {
+        g_funcOffset = bestOff;
+        g_processInternal = bestVal;
+        Log("  -> UFunction::Func is at +0x%02X, and UObject::ProcessInternal is at 0x%08X"
+            " (%d of %d agree). Found through the object model, with no disassembly.",
+            bestOff, (unsigned)bestVal, bestHit, sampled);
+    } else {
+        Log("  *** NO OFFSET AGREES. Best was +0x%02X with 0x%08X, %d of %d. Either these are not"
+            " UFunctions or this build does not bind Func the way UE3 does. Nothing adopted.",
+            bestOff, (unsigned)bestVal, bestHit, sampled);
+    }
+}
+
+// Move the script hook onto the address the probe found. The old detour at 0x01308A10 is removed
+// first: leaving a hook on a function that was proven to be the wrong one costs frame time on
+// every call and can only confuse the next log.
+void RepointScriptHook() {
+    if (!g_processInternal) return;
+    if (g_origProcessEvent) {
+        MH_DisableHook(reinterpret_cast<void*>(kProcessEventAddr));
+        MH_RemoveHook(reinterpret_cast<void*>(kProcessEventAddr));
+        g_origProcessEvent = nullptr;
+    }
+    void* target = reinterpret_cast<void*>(g_processInternal);
+    if (MH_CreateHook(target, (void*)&Hook_ProcessEvent, (void**)&g_origProcessEvent) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        Log("  *** could not hook 0x%08X - aim modes 6 and 7 stay dead this run.",
+            (unsigned)g_processInternal);
+        g_origProcessEvent = nullptr;
+        return;
+    }
+    // The FFrame vote has to start over: it was fed 300 frames from the WRONG function, and its
+    // verdict was about that object, not this one.
+    InterlockedExchange(&g_nodeOffset, -1);
+    InterlockedExchange(&g_nodeDecided, 0);
+    InterlockedExchange(&g_nodeSamples, 0);
+    for (int i = 0; i < kNodeSlots; ++i) InterlockedExchange(&g_nodeVotes[i], 0);
+    InterlockedExchange(&g_peSeen, 0);
+    InterlockedExchange(&g_peUnnamed, 0);
+    Log("  script hook MOVED to 0x%08X. The FFrame vote restarts on real frames from here -"
+        " expect a slot to win convincingly this time, and aim modes 6 and 7 to come alive"
+        " a fraction of a second later.", (unsigned)g_processInternal);
+}
+
 void ResolveScriptNames() {
     if (!Readable((void*)kGNamesTArray, 12)) { Log("script names: GNames not readable yet"); return; }
     const int32_t nc = *reinterpret_cast<int32_t*>(kGNamesTArray + 4);
@@ -7064,6 +7208,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Unconditional rather than only for mode 6: the census needs the same table, and a
         // resolve that only runs in one mode is a diagnostic behind a switch the test may not press.
         if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
+        // Run 93: find the real ProcessInternal and move the hook onto it. Both are no-ops once
+        // they have succeeded, so cycling modes does not re-walk GObjects.
+        if (mode == 6 || mode == 7) { FindProcessInternal(); RepointScriptHook(); }
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
