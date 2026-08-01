@@ -6717,6 +6717,79 @@ void ProbeTraceNative() {
         " two FVectors, and the next step picks it apart against the exe rather than in a headset.");
 }
 
+// ================= ⭐ run 104: the line check, and its parameter struct ========================
+//
+// Found by reading the CALL SITES rather than the callee, which is what made it cheap:
+//
+//     8D 4D 9C    lea ecx,[ebp-0x64]     ; a local struct
+//     51          push ecx               ; ONE argument
+//     E8 ...      call 0x00BD79D0
+//     ...
+//     83 C4 04    add esp,4              ; the CALLER cleans -> __cdecl
+//
+// Both of Actor.Trace's call sites and Actor.TraceActors' call it the same way, and the SSE just
+// before each site is assembling FVectors into that struct - movss to [eax], [eax+4], [eax+8],
+// three floats at a time. So the struct carries the trace's Start and End, and rotating End about
+// Start there redirects the shot without touching a single field the view can read. That is the
+// whole point of route 2 and it is the first mechanism in this project that is structurally
+// incapable of moving the camera.
+//
+// ⚠️ A `ret 4` appears at +0x9A5 and it belongs to a DIFFERENT function - the byte scan ran past
+// the end of this one. The call site is authoritative: if the callee also cleaned, every call
+// would corrupt the stack by four bytes and the game would never run. Getting this backwards is
+// exactly what crashed the game twice on ProcessInternal, so it is checked rather than assumed.
+const uintptr_t kLineCheckAddr = 0x00BD79D0;
+typedef void* (__cdecl *PFN_LineCheck)(void* params);
+PFN_LineCheck g_origLineCheck = nullptr;
+volatile LONG g_lineCheckLogged = 0;
+
+void* __cdecl Hook_LineCheck(void* params) {
+    // Log ONLY while a fire window is open. Traces run constantly - AI perception, movement,
+    // physics - and a log of all of them would be unreadable. g_fireSeq being odd means we are
+    // inside StartFire/BeginFire/FireAmmunition, so what gets printed is the WEAPON's trace and
+    // nothing else. The window built for mode 9 turns out to be exactly the right filter.
+    if ((InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) &&
+        InterlockedCompareExchange(&g_lineCheckLogged, 0, 0) < 6 &&
+        params && Readable(params, 0x80)) {
+        InterlockedIncrement(&g_lineCheckLogged);
+        const float* f = reinterpret_cast<const float*>(params);
+        Log("linecheck: camera at (%.1f %.1f %.1f) - struct follows, offsets in bytes",
+            g_camPos[0], g_camPos[1], g_camPos[2]);
+        for (int i = 0; i + 2 < 32; ++i) {
+            const float dx = f[i] - g_camPos[0], dy = f[i+1] - g_camPos[1], dz = f[i+2] - g_camPos[2];
+            const float d2 = dx*dx + dy*dy + dz*dz;
+            // A triple within ~10 metres of the camera is the START of the player's shot. Nothing
+            // else in this struct has a reason to sit there, which is what makes it self-labelling
+            // rather than a guess about the layout.
+            const bool nearCam = d2 < (520.0f * 520.0f);
+            Log("    +0x%02X  %12.2f %12.2f %12.2f%s", i * 4, f[i], f[i+1], f[i+2],
+                nearCam ? "   <== NEAR THE CAMERA - candidate Start" : "");
+        }
+    }
+    return g_origLineCheck(params);
+}
+
+void InstallLineCheckHook() {
+    if (g_origLineCheck) return;                     // idempotent - run 102's lesson
+    void* target = reinterpret_cast<void*>(kLineCheckAddr);
+    if (!Readable(target, 8)) { Log("linecheck: 0x%08X unreadable", (unsigned)kLineCheckAddr); return; }
+    // Signature check. The address came from this build; refusing to hook anything that does not
+    // start the way the analysis said stops a different build from being patched blind.
+    static const uint8_t kSig[7] = { 0x55, 0x8B, 0xEC, 0x56, 0x8B, 0x75, 0x08 };
+    if (memcmp(target, kSig, sizeof(kSig)) != 0) {
+        const uint8_t* c = reinterpret_cast<const uint8_t*>(target);
+        Log("linecheck: 0x%08X does NOT match the expected prologue (%02X %02X %02X %02X %02X %02X %02X)"
+            " - refusing to hook", (unsigned)kLineCheckAddr, c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+        return;
+    }
+    const MH_STATUS cs = MH_CreateHook(target, (void*)&Hook_LineCheck, (void**)&g_origLineCheck);
+    if (cs != MH_OK) { Log("linecheck: MH_CreateHook failed, status %d", (int)cs); g_origLineCheck = nullptr; return; }
+    const MH_STATUS es = MH_EnableHook(target);
+    if (es != MH_OK) { Log("linecheck: MH_EnableHook failed, status %d", (int)es); MH_RemoveHook(target); g_origLineCheck = nullptr; return; }
+    Log("linecheck hooked at 0x%08X (__cdecl, one param struct). Fire in aim mode 10 and the"
+        " weapon's own trace parameters are dumped.", (unsigned)kLineCheckAddr);
+}
+
 // Move the script hook onto the address the probe found. The old detour at 0x01308A10 is removed
 // first: leaving a hook on a function that was proven to be the wrong one costs frame time on
 // every call and can only confuse the next log.
@@ -7820,7 +7893,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Mode 8 is CUT from the cycle: it puts the hand into the view permanently via PlayerMove
         // and inverts head tracking, so hitting it by accident costs a restart. Kept in source as
         // the record, exactly as modes 4 and 5 were.
-        static const LONG kAimCycle[] = { 0, 9, 10, 1, 2, 3 };
+        // Mode 10 first: it is the null window, so it writes nothing and cannot cycle the view,
+        // and it is now also the mode that dumps the weapon trace parameters.
+        static const LONG kAimCycle[] = { 0, 10, 9, 1, 2, 3 };
         const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
         LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
         int at = 0;
@@ -7833,7 +7908,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
         // Run 93: find the real ProcessInternal and move the hook onto it. Both are no-ops once
         // they have succeeded, so cycling modes does not re-walk GObjects.
-        if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); ProbeTraceNative(); }
+        if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); ProbeTraceNative(); InstallLineCheckHook(); }
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
