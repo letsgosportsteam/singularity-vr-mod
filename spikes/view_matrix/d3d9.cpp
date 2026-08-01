@@ -7227,7 +7227,9 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     if ((aimMode == 9 || aimMode == 10) && fnIdx >= 0 &&
         (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) && self) {
         static volatile LONG shown = 0;
-        if (InterlockedCompareExchange(&shown, 0, 0) < 30) {
+        // Cap 150, not 30. Run 105 spent all thirty entries on muzzle-flash emitters and stopped
+        // exactly AT FireAmmunition - truncating the log at the one place it mattered.
+        if (InterlockedCompareExchange(&shown, 0, 0) < 150) {
             InterlockedIncrement(&shown);
             char fn[96]{}, cn[96]{};
             NameFromIndex(fnIdx, fn, sizeof(fn));
@@ -7249,6 +7251,7 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     int32_t* extraAddr[kExtraMax] = {};
     int32_t  extraSaved[kExtraMax][2] = {};
     int      nExtra = 0;
+    LONG     lcAtOpen = 0;
 
     if (mode9) {
         bool isFireFn = false;
@@ -7313,6 +7316,10 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
             firedWindow = haveCtl || haveCam || havePov || nExtra > 0;
             // Mark the window OPEN before anything else can observe the swapped fields.
             if (firedWindow) InterlockedIncrement(&g_fireSeq);
+            // ---- run 106: count traces ACROSS the window, which is unambiguous ----
+            // The near-camera filter can only report traces it recognises. This cannot miss:
+            // if the shot traces at all, the counter moves between open and close.
+            lcAtOpen = InterlockedCompareExchange(&g_lineCheckCalls, 0, 0);
 
             // Cap raised to 24: run 96 capped at 6 and spent them all on StartFire/BeginFire, so
             // the log could not show whether FireAmmunition - the one that actually matters - ever
@@ -7393,6 +7400,15 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
             extraAddr[i][1] = extraSaved[i][1];
         }
         InterlockedIncrement(&g_fireSeq);   // window CLOSED - seq is even again
+        // How many line checks ran inside this window. A weapon that hitscans MUST move this;
+        // zero across every shot means the damage path does not use 0x00BD79D0 at all, and that
+        // is a fact rather than the absence of a log line I was hoping for.
+        {
+            const LONG delta = InterlockedCompareExchange(&g_lineCheckCalls, 0, 0) - lcAtOpen;
+            static volatile LONG saidIt = 0;
+            if (InterlockedIncrement(&saidIt) <= 12)
+                Log("  window closed: %ld line check(s) ran inside it", delta);
+        }
     }
     if (mode9) return;
 
