@@ -975,6 +975,9 @@ int g_camRotOffs[kRotFieldMax], g_camRotCount = 0;
 // Depth is the correct primitive for a nested window. The sequence counter stays, but only for
 // what it was actually good for: letting Present detect that a window opened or closed ACROSS its
 // read. Open-ness itself is now depth > 0.
+// The hand-minus-head deviation in engine rotation units, measured directly from the two poses
+// in the same XR frame - see run 112. This is what the trace rotation uses.
+volatile LONG g_handDevYawUU = 0, g_handDevPitchUU = 0, g_handDevValid = 0;
 volatile LONG g_fireDepth = 0;
 volatile LONG g_fireSeq = 0;
 
@@ -4131,6 +4134,39 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         // Published for next frame's walk-direction transform - see the note on g_headYawRad.
         g_headYawRad = yawRad;
 
+        // ---- ⭐ run 112: the hand's deviation from the head, measured directly ----
+        //
+        // Mode 11 derived this by differencing two engine-space values - g_aimYawUU (built from
+        // g_baseYaw, the recentre offset and g_centreYaw) against g_wantYaw - and got 121 degrees
+        // of yaw and a pitch pinned at the +-16000 clamp. Every one of those terms is a place for
+        // a bias to enter, and one of them clearly did: the recentre offsets are only captured
+        // when the right controller is tracked at the moment MENU is held, so a session without a
+        // clean recentre carries an arbitrary constant.
+        //
+        // Aim mode 1 never exposed it because it CLAMPS the deviation to 30 degrees, so a biased
+        // hand direction still looks like it follows the hand.
+        //
+        // The physical quantity wanted is just the angle between where the hand points and where
+        // the head points, and both are already known in the same XR frame. No base, no centre, no
+        // offsets, nothing that can drift - if the hand and head point the same way this is zero
+        // by construction, which none of the derived versions could promise.
+        if (g_handPoseValid[1]) {
+            float dvy = g_handYawRad[1] - yawRad;
+            while (dvy >  3.14159265f) dvy -= 6.2831853f;
+            while (dvy < -3.14159265f) dvy += 6.2831853f;
+            const float dvp = g_handPitchRad[1] - pitchRad;
+            InterlockedExchange(&g_handDevYawUU,   (LONG)(dvy * kRadToUU));
+            InterlockedExchange(&g_handDevPitchUU, (LONG)(dvp * kRadToUU));
+            InterlockedExchange(&g_handDevValid, 1);
+        } else {
+            // No hand, no deviation. Falling back to zero means the shot goes where you look,
+            // which is the pre-mod behaviour rather than a stale direction from wherever the
+            // controller was last seen.
+            InterlockedExchange(&g_handDevYawUU, 0);
+            InterlockedExchange(&g_handDevPitchUU, 0);
+            InterlockedExchange(&g_handDevValid, 0);
+        }
+
         float dYaw = yawRad - g_centreYaw;
         while (dYaw >  3.14159265f) dYaw -= 6.2831853f;
         while (dYaw < -3.14159265f) dYaw += 6.2831853f;
@@ -6971,9 +7007,9 @@ int __fastcall Hook_SingleLineCheck(void* self, void* edx, void* hit, void* src,
             if (ex*ex + ey*ey + ez*ez < 520.0f * 520.0f) {
                 const int32_t kTestYaw = (int32_t)(25.0f * (65536.0f / 360.0f));
                 const int32_t dYaw   = (am == 12) ? kTestYaw
-                                     : InterlockedCompareExchange(&g_aimYawForXi, 0, 0)   - g_wantYaw;
+                                     : (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0);
                 const int32_t dPitch = (am == 12) ? 0
-                                     : InterlockedCompareExchange(&g_aimPitchForXi, 0, 0) - g_wantPitch;
+                                     : (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0);
                 const float bx = End[0], by = End[1], bz = End[2];
                 RotateTrace(Start, End, dYaw, dPitch);
                 const LONG n = InterlockedIncrement(&g_slcRotated);
