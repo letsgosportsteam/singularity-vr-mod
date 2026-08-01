@@ -941,6 +941,81 @@ bool NameOf(uintptr_t obj, char* buf, size_t cap) {
 uintptr_t g_ctlClass = 0, g_controller = 0;
 uintptr_t g_camClass = 0, g_camera = 0;
 
+// ================= ⭐ run 98: find EVERY field that holds the view rotation ====================
+//
+// Run 97 swapped Controller.Rotation, the camera actor's Rotation and mCurrentPOV.Rotation for the
+// duration of FireAmmunition - the log confirms all three were SET, with the hand 98 degrees off -
+// and the bullet still went down the crosshair. So the aim is read from a field nobody has named.
+//
+// UE3's GetPlayerViewPoint reads `PlayerCamera.CameraCache.POV.Rotation`, and CameraCache is a
+// DIFFERENT member from Raven's mCurrentPOV. That is the leading candidate. But guessing its
+// offset is exactly what has cost this project run after run, so it does not get guessed.
+//
+// Instead: scan both objects for every 3-int32 triple whose pitch and yaw match the view rotation
+// this mod is itself writing. A field that holds the view rotation must track it. The filter is
+// that it has to track it across SEVERAL DIFFERENT head orientations - a single sample would match
+// dozens of offsets by coincidence, since small integers are everywhere, and requiring agreement
+// at four orientations at least 5 degrees apart removes essentially all of them.
+//
+// This is the same discipline that finally worked for UFunction::Func: do not adopt a candidate
+// that a wrong answer could imitate.
+const int kRotFieldMax = 24;
+int g_ctlRotOffs[kRotFieldMax], g_ctlRotCount = 0;
+int g_camRotOffs[kRotFieldMax], g_camRotCount = 0;
+volatile LONG g_rotScanSamples = 0;
+volatile LONG g_rotScanDone = 0;
+int32_t g_rotScanLastYaw = 0;
+
+static void ScanOne(uintptr_t obj, int limit, int* offs, int* count, bool first,
+                    int32_t wantPitch, int32_t wantYaw) {
+    const int32_t kTol = 200;          // ~1.1 degrees in the 65536-per-turn space
+    if (first) {
+        *count = 0;
+        for (int o = 0; o + 12 <= limit && *count < kRotFieldMax; o += 4) {
+            const int32_t* r = reinterpret_cast<const int32_t*>(obj + o);
+            const int32_t dp = r[0] - wantPitch, dy = r[1] - wantYaw;
+            if (dp < kTol && dp > -kTol && dy < kTol && dy > -kTol) offs[(*count)++] = o;
+        }
+        return;
+    }
+    int keep = 0;
+    for (int i = 0; i < *count; ++i) {
+        const int32_t* r = reinterpret_cast<const int32_t*>(obj + offs[i]);
+        const int32_t dp = r[0] - wantPitch, dy = r[1] - wantYaw;
+        if (dp < kTol && dp > -kTol && dy < kTol && dy > -kTol) offs[keep++] = offs[i];
+    }
+    *count = keep;
+}
+
+// Called from Present. Samples only when the head has actually MOVED - four samples taken at the
+// same orientation would confirm nothing, and would look identical to four that had.
+void ScanViewRotFields(uintptr_t ctl, uintptr_t cam, int32_t wantPitch, int32_t wantYaw) {
+    if (InterlockedCompareExchange(&g_rotScanDone, 0, 0)) return;
+    const LONG n = InterlockedCompareExchange(&g_rotScanSamples, 0, 0);
+    if (n > 0) {
+        const int32_t moved = wantYaw - g_rotScanLastYaw;
+        if (moved < 910 && moved > -910) return;      // under 5 degrees - not a new orientation
+    }
+    if (!ctl || !cam || !Readable((void*)ctl, 0x600) || !Readable((void*)cam, 0x700)) return;
+    g_rotScanLastYaw = wantYaw;
+
+    const bool first = (n == 0);
+    ScanOne(ctl, 0x600, g_ctlRotOffs, &g_ctlRotCount, first, wantPitch, wantYaw);
+    ScanOne(cam, 0x700, g_camRotOffs, &g_camRotCount, first, wantPitch, wantYaw);
+    const LONG got = InterlockedIncrement(&g_rotScanSamples);
+    Log("view-rot scan %ld/4 (yaw %d): controller %d field(s), camera %d field(s) still matching",
+        got, wantYaw, g_ctlRotCount, g_camRotCount);
+
+    if (got >= 4) {
+        InterlockedExchange(&g_rotScanDone, 1);
+        for (int i = 0; i < g_ctlRotCount; ++i) Log("    controller +0x%04X", g_ctlRotOffs[i]);
+        for (int i = 0; i < g_camRotCount; ++i) Log("    camera     +0x%04X", g_camRotOffs[i]);
+        if (g_ctlRotCount + g_camRotCount == 0)
+            Log("    *** NOTHING survived. The view rotation is not stored on either object in the"
+                " form this mod writes it, and the fire window cannot reach it by swapping fields.");
+    }
+}
+
 // Read-only now: these are what the matrix detector substitutes into the candidate matrices.
 // Writing them was proven useless in spike 8 - the render does not read them back.
 const int ACTOR_LOCATION   = 0x0054;   // FVector, 3 floats
@@ -6877,6 +6952,10 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     int32_t savedCtl[3] = {}, savedCam[3] = {}, savedPov[3] = {};
     bool haveCtl = false, haveCam = false, havePov = false;
     uintptr_t fireCtl = 0, fireCam = 0;
+    const int kExtraMax = 2 * kRotFieldMax;
+    int32_t* extraAddr[kExtraMax] = {};
+    int32_t  extraSaved[kExtraMax][2] = {};
+    int      nExtra = 0;
 
     if (mode9) {
         bool isFireFn = false;
@@ -6903,7 +6982,35 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                 savedPov[0] = r[0]; savedPov[1] = r[1]; savedPov[2] = r[2];
                 r[0] = hp; r[1] = hy; havePov = true;
             }
-            firedWindow = haveCtl || haveCam || havePov;
+
+            // ---- run 98: and every OTHER field that tracks the view rotation ----
+            //
+            // The three above were chosen by reasoning about UE3 and all three were wrong. These
+            // are chosen by measurement: fields that followed the view across four head
+            // orientations at least 5 degrees apart. If the aim is read from a rotation stored
+            // anywhere on the controller or the camera, it is in this list.
+            //
+            // ⚠️ Brute force, and worth being honest that it is. A field that tracks the view but
+            // is not the aim gets written too. That is acceptable ONLY because the write lasts one
+            // call and is restored from what was read - the same unwind the nesting already proved
+            // correct. It is a diagnostic that happens to also be the fix if it works.
+            if (InterlockedCompareExchange(&g_rotScanDone, 0, 0)) {
+                for (int i = 0; i < g_ctlRotCount && nExtra < kExtraMax; ++i) {
+                    int32_t* r = reinterpret_cast<int32_t*>(fireCtl + g_ctlRotOffs[i]);
+                    if (!fireCtl) break;
+                    extraAddr[nExtra] = r;
+                    extraSaved[nExtra][0] = r[0]; extraSaved[nExtra][1] = r[1];
+                    r[0] = hp; r[1] = hy; ++nExtra;
+                }
+                for (int i = 0; i < g_camRotCount && nExtra < kExtraMax; ++i) {
+                    if (!fireCam) break;
+                    int32_t* r = reinterpret_cast<int32_t*>(fireCam + g_camRotOffs[i]);
+                    extraAddr[nExtra] = r;
+                    extraSaved[nExtra][0] = r[0]; extraSaved[nExtra][1] = r[1];
+                    r[0] = hp; r[1] = hy; ++nExtra;
+                }
+            }
+            firedWindow = haveCtl || haveCam || havePov || nExtra > 0;
 
             // Cap raised to 24: run 96 capped at 6 and spent them all on StartFire/BeginFire, so
             // the log could not show whether FireAmmunition - the one that actually matters - ever
@@ -6913,11 +7020,11 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                 char nm[96]{};
                 NameFromIndex(fnIdx, nm, sizeof(nm));
                 Log("aim mode 9: %-16s hand(p %d y %d) | ctl %s was(p %d y %d) | cam %s was(p %d y %d)"
-                    " | POV %s was(p %d y %d)",
+                    " | POV %s was(p %d y %d) | +%d scanned fields",
                     nm, hp, hy,
                     haveCtl ? "SET" : "--", savedCtl[0], savedCtl[1],
                     haveCam ? "SET" : "--", savedCam[0], savedCam[1],
-                    havePov ? "SET" : "--", savedPov[0], savedPov[1]);
+                    havePov ? "SET" : "--", savedPov[0], savedPov[1], nExtra);
             }
         }
     }
@@ -6975,6 +7082,13 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
         if (havePov) {
             int32_t* r = reinterpret_cast<int32_t*>(fireCam + CAM_POV_ROT);
             r[0] = savedPov[0]; r[1] = savedPov[1]; r[2] = savedPov[2];
+        }
+        // Unwind the scanned fields last-first, so an offset that appears twice (the three named
+        // fields above can also be in the scan list) ends up holding the value it started with
+        // rather than an intermediate one.
+        for (int i = nExtra - 1; i >= 0; --i) {
+            extraAddr[i][0] = extraSaved[i][0];
+            extraAddr[i][1] = extraSaved[i][1];
         }
     }
     if (mode9) return;
@@ -8434,6 +8548,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // Publish for the XInput seam (mode 5). Done unconditionally and cheaply so the hot
             // hook only ever reads three interlocked words.
             InterlockedExchange(&g_ctlForXi, (LONG)ctl);
+
+            // Run 98: find every field holding the view rotation, while we still know what the
+            // view rotation IS. Runs only in mode 9 and stops after four samples, so it costs
+            // nothing once decided. It must run BEFORE rot[1] is overwritten below - after that
+            // write the field we are matching against is the one we just set, and every offset
+            // holding a stale value would silently drop out.
+            if (InterlockedCompareExchange(&g_aimMode, 0, 0) == 9)
+                ScanViewRotFields(ctl, g_camera, g_wantPitch, g_wantYaw);
             InterlockedExchange(&g_aimYawForXi, g_aimYawUU);
             InterlockedExchange(&g_aimPitchForXi, g_aimPitchUU);
 
