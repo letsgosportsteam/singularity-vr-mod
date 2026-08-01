@@ -6639,13 +6639,23 @@ void FindProcessInternal() {
 // Move the script hook onto the address the probe found. The old detour at 0x01308A10 is removed
 // first: leaving a hook on a function that was proven to be the wrong one costs frame time on
 // every call and can only confuse the next log.
+// ---- 💥 run 102: this crashed on the SECOND press, and the bug was three lines ----
+//
+// Cycling to another mode >= 6 called this again. The old body then:
+//   1. saw g_origProcessEvent non-null and removed a hook at kProcessEventAddr - an address
+//      nothing has been hooked at since run 94 - and nulled the trampoline anyway, while the
+//      REAL hook at 0x004B7E40 was still live;
+//   2. got MH_ERROR_ALREADY_CREATED from MH_CreateHook and nulled the trampoline a second time;
+//   3. left every subsequent script call doing g_origProcessEvent(...) on a null pointer.
+//
+// So it is now idempotent, it never clears the trampoline while a hook is installed, and it does
+// not touch the disproven address at all. The rule this violated is worth stating: a function
+// that installs something must be safe to call twice, because a hotkey WILL be pressed twice.
+uintptr_t g_hookedAt = 0;
+
 void RepointScriptHook() {
     if (!g_processInternal) return;
-    if (g_origProcessEvent) {
-        MH_DisableHook(reinterpret_cast<void*>(kProcessEventAddr));
-        MH_RemoveHook(reinterpret_cast<void*>(kProcessEventAddr));
-        g_origProcessEvent = nullptr;
-    }
+    if (g_hookedAt == g_processInternal && g_origProcessEvent) return;   // already done, no-op
     void* target = reinterpret_cast<void*>(g_processInternal);
 
     // Print the first bytes of whatever is about to be hooked. Run 93 spent a whole run on
@@ -6673,7 +6683,9 @@ void RepointScriptHook() {
     if (cs != MH_OK) {
         Log("  *** MH_CreateHook(0x%08X) failed, status %d - aim modes 6 and 7 stay dead this run.",
             (unsigned)g_processInternal, (int)cs);
-        g_origProcessEvent = nullptr;
+        // NOT cleared: if a hook is already installed the trampoline is still valid, and
+        // nulling it here is what turned a failed re-install into a null call on every
+        // script function in the game.
         return;
     }
     const MH_STATUS es = MH_EnableHook(target);
@@ -6684,6 +6696,7 @@ void RepointScriptHook() {
         g_origProcessEvent = nullptr;
         return;
     }
+    g_hookedAt = g_processInternal;
     // The FFrame vote has to start over: it was fed 300 frames from the WRONG function, and its
     // verdict was about that object, not this one.
     InterlockedExchange(&g_nodeOffset, -1);
@@ -6750,6 +6763,22 @@ volatile LONG g_peFiringCalls = 0; // ⚠️ if this stays 0 the split never hap
                                    // identically to "the fire path uses no script"
 
 void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Result) {
+    // ---- run 102: never call a null trampoline ----
+    //
+    // A detour whose trampoline has been cleared while the detour is still installed turns every
+    // script call in the game into a null call. That is what crashed on the second NUMPAD-dot
+    // press. The install path is fixed, but this costs one predicted-taken branch on the hot path
+    // and removes the whole failure class rather than the one instance of it.
+    //
+    // Returning without calling through breaks script execution, which is bad - but it is a
+    // diagnosable stall with a log line, not an access violation.
+    if (!g_origProcessEvent) {
+        static volatile LONG told = 0;
+        if (InterlockedIncrement(&told) == 1)
+            Log("*** script hook has no trampoline - calling through is impossible. The game will"
+                " misbehave from here. This is a bug in the install path, not in the engine.");
+        return;
+    }
     // ---- the name-source probe, OUTSIDE the census gate ----
     //
     // It was inside it last run and therefore never fired, because the census has to be armed by
