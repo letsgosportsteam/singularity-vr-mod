@@ -6052,8 +6052,26 @@ void ReportScan() {
 // less reliable than reading the machine.
 const uintptr_t kProcessEventAddr = 0x01308A10;
 
-typedef void (__fastcall *PFN_ProcessEvent)(void* self, void* edx,
-                                            void* Function, void* Parms, void* Result);
+// ---- 💥 run 94: THE SIGNATURE IS TWO STACK ARGS, AND GETTING IT WRONG CRASHES INSTANTLY ----
+//
+// 0x01308A10 ends in `ret 0xC` - three stack args - and this hook was written for it. The real
+// ProcessInternal at 0x004B7E40 ends in `ret 8`: TWO. Calling the trampoline with three pushed
+// twelve bytes while the callee popped eight, leaking four bytes of stack on the hottest function
+// in the process. It crashed within milliseconds, twice, deterministically.
+//
+// So the signature now matches the function that is actually hooked:
+//
+//     UObject::ProcessInternal(FFrame& Stack, RESULT_DECL)    __thiscall
+//         ECX      -> self      the UObject the script call is on
+//         stack[0] -> Stack     the FFrame: Node names the function, Locals holds the parameters
+//         stack[1] -> Result    the return-value buffer
+//
+// Verified from the machine, not from a decompiler: the prologue is
+// 55 8B EC 83 EC 54 A1 <cookie> ... 8B 45 0C (arg2) ... 8B 75 08 (arg1) ... 8B F9 (this from ECX),
+// and the epilogue is `ret 8`. **Read the epilogue** - that is now the fourth time in this project
+// that reading the machine beat reading a signature, and the first time not doing so cost a crash
+// rather than a wasted run.
+typedef void (__fastcall *PFN_ProcessEvent)(void* self, void* edx, void* Stack, void* Result);
 PFN_ProcessEvent g_origProcessEvent = nullptr;
 
 // ---- ⭐ run 91: what the arguments ACTUALLY are ----
@@ -6104,16 +6122,25 @@ volatile LONG g_nodeVotes[kNodeSlots] = {};
 volatile LONG g_nodeDecided = 0;
 
 static int32_t ScriptFuncNameIdx(void* frame) {
-    if (!frame || !Readable(frame, kNodeSlots * 4)) return -1;
+    if (!frame) return -1;
     const uintptr_t f = reinterpret_cast<uintptr_t>(frame);
 
     const LONG off = InterlockedCompareExchange(&g_nodeOffset, 0, 0);
     if (off >= 0) {
+        // ---- ⚠️ run 94: NO VirtualQuery on this path ----
+        //
+        // Readable() is a VirtualQuery, and this now runs inside ProcessInternal - tens of
+        // thousands of calls a second. Two VirtualQuery per call is 100k syscalls a second, which
+        // would not crash but would eat a double-digit share of the frame and be blamed on
+        // something else entirely. The frame itself needs no check at all: it is a reference the
+        // engine is actively using, so if it were unreadable the game would already be dead.
+        // The node gets a cheap range test instead, the same bound the vote used to accept it.
         const uintptr_t node = *reinterpret_cast<const uintptr_t*>(f + off);
-        if (!node || !Readable((void*)node, OBJ_NAME + 4)) return -1;
+        if (node < 0x01000000 || node > 0x7FFF0000 || (node & 3)) return -1;
         const int32_t idx = *reinterpret_cast<const int32_t*>(node + OBJ_NAME);
         return idx > 0 ? idx : -1;
     }
+    if (!Readable(frame, kNodeSlots * 4)) return -1;   // learning phase only, 300 calls
 
     // ---- learning phase ----
     const LONG n = InterlockedIncrement(&g_nodeSamples);
@@ -6325,7 +6352,7 @@ int       g_funcOffset = -1;
 
 // Both defined further down, with the census they belong to. Declared here because the probe has
 // to reset them when it moves the hook.
-void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* Parms, void* Result);
+void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Result);
 extern volatile LONG g_peSeen, g_peUnnamed;
 
 // ---- ⚠️ run 93b: "in the image" is NOT "is code", and that mistake picked a vtable ----
@@ -6560,7 +6587,7 @@ volatile LONG g_peFiringCalls = 0; // ⚠️ if this stays 0 the split never hap
                                    // with zero firing samples and reported "nothing", which reads
                                    // identically to "the fire path uses no script"
 
-void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* Parms, void* Result) {
+void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Result) {
     // ---- the name-source probe, OUTSIDE the census gate ----
     //
     // It was inside it last run and therefore never fired, because the census has to be armed by
@@ -6583,7 +6610,7 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
         // could be a coincidence; twenty cannot.
         static volatile LONG probed = 0;
         if (InterlockedIncrement(&probed) <= 30) {
-            struct { const char* tag; void* p; } cands[2] = { { "this", self }, { "arg1", Function } };
+            struct { const char* tag; void* p; } cands[2] = { { "this", self }, { "arg1", Stack } };
             for (int c = 0; c < 2; ++c) {
                 if (!cands[c].p || !Readable(cands[c].p, 0x40)) {
                     Log("PE scan %s=%p  <unreadable>", cands[c].tag, cands[c].p);
@@ -6661,13 +6688,13 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
     const bool routeTwo = (aimMode == 6 || aimMode == 7);
     const bool censusOn = InterlockedCompareExchange(&g_peCensus, 0, 0) != 0;
     int32_t fnIdx = -1;
-    if ((censusOn || routeTwo) && Function) {
-        fnIdx = ScriptFuncNameIdx(Function);
+    if ((censusOn || routeTwo) && Stack) {
+        fnIdx = ScriptFuncNameIdx(Stack);
         InterlockedIncrement(&g_peSeen);
         if (fnIdx < 0) InterlockedIncrement(&g_peUnnamed);
     }
 
-    if (censusOn && Function) {
+    if (censusOn && Stack) {
         InterlockedIncrement(&g_peCalls);
         // ---- ⚠️ run 84: the name indices came out as HEAP POINTERS, so this is reading the
         // wrong object ----
@@ -6729,56 +6756,53 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
 
     // ---- mode 7: the gun's pose. On the way IN, because the callee consumes its parameters ----
     if (aimMode == 7 && FnIdx(kFnSetAim) >= 0 && fnIdx == FnIdx(kFnSetAim))
-        RewriteSetAimParams(Function);
+        RewriteSetAimParams(Stack);
 
-    g_origProcessEvent(self, edx, Function, Parms, Result);
+    g_origProcessEvent(self, edx, Stack, Result);
 
     if (!wantAim) return;
 
-    // ---- which argument is the result buffer, decided by the DATA and not by the ABI ----
+    // ---- the result buffer, still decided by the DATA and not by the ABI ----
     //
-    // `Parms` is where __thiscall(FFrame&, RESULT_DECL) puts the result pointer, but that is a
-    // prediction and writing 12 bytes through a wrong pointer is an access violation at best and
-    // silent heap corruption at worst.
+    // With the signature corrected there is only ONE candidate: `Result`, the second stack
+    // argument of ProcessInternal(FFrame&, RESULT_DECL). The two-candidate search is gone with the
+    // third argument that never existed.
     //
-    // So the write is gated on the buffer proving itself: GetAdjustedAim has just returned the
-    // player's aim, which for a human player is Controller.Rotation - the value this mod itself
-    // wrote as g_wantYaw a few milliseconds ago. If the yaw sitting in that buffer is within a few
-    // degrees of g_wantYaw, it is the return value; nothing else in memory has any reason to hold
-    // that number. If it is not, NOTHING IS WRITTEN and the mismatch is logged.
+    // The proof-of-itself gate stays, because it is not about which argument - it is about whether
+    // writing 12 bytes through this pointer is safe at all. GetAdjustedAim has just returned the
+    // player's aim, which for a human player is Controller.Rotation: the value this mod itself
+    // wrote as g_wantYaw a few milliseconds ago. If the yaw in that buffer is within a few degrees
+    // of g_wantYaw it is the return value, because nothing else in memory has reason to hold that
+    // number. If it is not, NOTHING IS WRITTEN and the mismatch is logged.
     //
     // ⚠️ This is what stops the test being fooled. A hook that wrote unconditionally and produced
     // no visible change would be indistinguishable from GetAdjustedAim not being on the fire path -
     // the run 82 failure mode. Here the two look completely different in the log.
     const int32_t kUUPerDeg = (int32_t)(65536.0f / 360.0f);
-    void* const cands[2] = { Parms, Result };
     static volatile LONG reported = 0;
 
-    for (int c = 0; c < 2; ++c) {
-        if (!cands[c] || !Readable(cands[c], 12)) continue;
-        int32_t* rot = reinterpret_cast<int32_t*>(cands[c]);
+    if (Result && Readable(Result, 12)) {
+        int32_t* rot = reinterpret_cast<int32_t*>(Result);
         const int32_t dYaw = rot[1] - g_wantYaw;           // int32 wrap is correct in FRotator space
-        if (dYaw > 8 * kUUPerDeg || dYaw < -8 * kUUPerDeg) continue;
-
-        const int32_t wasPitch = rot[0], wasYaw = rot[1];
-        rot[0] = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
-        rot[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
-        if (InterlockedIncrement(&reported) <= 3)
-            Log("aim mode 6: arg%d is the result buffer - was pitch %d yaw %d (g_wantYaw %d),"
-                " rewrote to hand pitch %d yaw %d",
-                c + 1, wasPitch, wasYaw, g_wantYaw, rot[0], rot[1]);
-        return;
+        if (dYaw <= 8 * kUUPerDeg && dYaw >= -8 * kUUPerDeg) {
+            const int32_t wasPitch = rot[0], wasYaw = rot[1];
+            rot[0] = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
+            rot[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
+            if (InterlockedIncrement(&reported) <= 3)
+                Log("aim mode 6: result buffer confirmed - was pitch %d yaw %d (g_wantYaw %d),"
+                    " rewrote to hand pitch %d yaw %d",
+                    wasPitch, wasYaw, g_wantYaw, rot[0], rot[1]);
+            return;
+        }
     }
 
-    // Neither candidate held the aim. Say so, loudly and once - a silent no-op here would read
+    // The buffer did not hold the aim. Say so, loudly and once - a silent no-op here would read
     // exactly like the feature working and the fire trace ignoring it.
     if (InterlockedIncrement(&reported) <= 3) {
-        const int32_t a = (Parms  && Readable(Parms, 12))  ? reinterpret_cast<int32_t*>(Parms)[1]  : 0;
-        const int32_t b = (Result && Readable(Result, 12)) ? reinterpret_cast<int32_t*>(Result)[1] : 0;
-        Log("aim mode 6: *** GetAdjustedAim ran but NEITHER argument holds the aim."
-            " arg1 yaw %d, arg2 yaw %d, g_wantYaw %d. Nothing was written. Either the result is"
-            " returned some other way, or this build's ProcessInternal has a different signature.",
-            a, b, g_wantYaw);
+        const int32_t y = (Result && Readable(Result, 12)) ? reinterpret_cast<int32_t*>(Result)[1] : 0;
+        Log("aim mode 6: *** GetAdjustedAim ran but the result buffer does not hold the aim."
+            " yaw there %d, g_wantYaw %d. Nothing was written. Either the return comes back some"
+            " other way, or the name matched a different GetAdjustedAim.", y, g_wantYaw);
     }
 }
 
@@ -6914,16 +6938,24 @@ void WriteAimAtInputPoll() {
     r[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
 }
 
+// ---- ❌ run 94: nothing is hooked at startup any more ----
+//
+// This used to detour 0x01308A10 on every launch. Two reasons it is gone rather than disabled:
+//
+// 1. **It is the wrong function**, proven by measurement in run 92 - `Tick` appeared ZERO times in
+//    48,811 calls through it, and every level ticks every actor every frame.
+// 2. **It would now CRASH.** 0x01308A10 ends in `ret 0xC`; the hook is written for
+//    ProcessInternal's `ret 8`. Leaving a disproven hook wired to a corrected signature is exactly
+//    how a fix for one crash becomes the cause of the next.
+//
+// The only script hook installed now is the one RepointScriptHook puts on the address the
+// UFunction::Func probe finds, which is discovered at runtime and checked for being executable
+// code before anything is written to it.
 void InstallProcessEventHook() {
-    void* target = reinterpret_cast<void*>(kProcessEventAddr);
-    if (MH_CreateHook(target, (void*)&Hook_ProcessEvent, (void**)&g_origProcessEvent) != MH_OK) {
-        Log("ProcessEvent: MH_CreateHook failed at 0x%08X", kProcessEventAddr); return;
-    }
-    if (MH_EnableHook(target) != MH_OK) {
-        Log("ProcessEvent: MH_EnableHook failed"); g_origProcessEvent = nullptr; return;
-    }
-    Log("ProcessEvent hooked at 0x%08X (found run 81 via the CallFunction string anchor)."
-        " NUMPAD7 arms the fire-path census, NUMPAD7 again dumps it.", kProcessEventAddr);
+    Log("script hook: NOT installed at startup. 0x%08X was disproven in run 92 (Tick seen 0 times"
+        " in 48,811 calls) and its `ret 0xC` does not match ProcessInternal's `ret 8`."
+        " The real one is found through UFunction::Func when aim mode 6 or 7 is selected.",
+        kProcessEventAddr);
 }
 
 void InstallViewHook() {
