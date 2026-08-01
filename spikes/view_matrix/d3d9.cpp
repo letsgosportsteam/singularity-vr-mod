@@ -6043,6 +6043,107 @@ typedef void (__fastcall *PFN_ProcessEvent)(void* self, void* edx,
                                             void* Function, void* Parms, void* Result);
 PFN_ProcessEvent g_origProcessEvent = nullptr;
 
+// ---- ⭐ run 91: what the arguments ACTUALLY are ----
+//
+// The parameter names above are the original guess and they are wrong, but they are left alone
+// because renaming them is churn and the mapping is what matters:
+//
+//     UObject::ProcessInternal(FFrame& Stack, RESULT_DECL)   __thiscall
+//         ECX      -> self        the UObject the script call is on
+//         stack[0] -> `Function`  the FFrame          (run 86 proved this - FOutputDevice vtable)
+//         stack[1] -> `Parms`     the RESULT buffer   ⚠️ predicted from the ABI, NOT yet observed
+//         stack[2] -> `Result`    beyond the call's args - garbage
+//
+// The Result buffer is the whole point now: `GetAdjustedAim` RETURNS the rotator the fire trace
+// uses, so overwriting that buffer decouples aim from everything else exactly, with no window
+// during which AActor::Rotation holds the hand. That is why the run 76-89 conclusion - "there is
+// no instant where the hand can sit in that field without the view taking it too" - is true and
+// does not apply here. Nothing is written to the field at all.
+const int FFRAME_NODE = 0x14;   // FFrame::Node, the UStruct being executed. Run 87 found this by
+                                // scanning every pointer slot; it was the only one that named a
+                                // real script function ('SeeMonster') across many calls.
+
+// The FName index of the script function this frame is executing, or -1.
+//
+// ⚠️ This replaces reading `Function + OBJ_NAME`, which was the census's whole defect: arg1 is an
+// FFrame, not a UObject, so +0x2C was some interior field and the "names" came out as heap
+// pointers (run 84). The fix was found in run 87 and never applied to the census.
+//
+// Index 0 is rejected, not accepted as 'None': run 87 established that a slot holding zero and a
+// non-object whose +0x2C happens to be zero both resolve to 'None' perfectly legitimately, so it
+// is noise that looks like data.
+static int32_t ScriptFuncNameIdx(void* frame) {
+    if (!frame || !Readable(frame, FFRAME_NODE + 4)) return -1;
+    const uintptr_t node = *reinterpret_cast<const uintptr_t*>(
+                               reinterpret_cast<uintptr_t>(frame) + FFRAME_NODE);
+    if (!node || !Readable((void*)node, OBJ_NAME + 4)) return -1;
+    const int32_t idx = *reinterpret_cast<const int32_t*>(node + OBJ_NAME);
+    return idx > 0 ? idx : -1;
+}
+
+// ---- the script functions, named out of the game's own package (run 91) ----
+//
+// These are not guesses. tools/uedecompress + tools/uepkg read RvGame.xxx - which is the .u script
+// package, LZO-compressed whole-file - and the export table names every one of them, with Raven's
+// override and the Engine base it overrides:
+//
+//     RvWeaponShared.GetAdjustedAim                   super = Engine.Weapon.GetAdjustedAim
+//     RvGameSharedPlayerController.GetAdjustedAimFor  super = Engine.PlayerController.GetAdjustedAimFor
+//     RvTacticalPawn.GetBaseAimRotation               super = Engine.Pawn.GetBaseAimRotation
+//     RvWeaponShared.CalcWeaponFire                   super = Engine.Weapon.CalcWeaponFire
+//     RvWeaponShared.InstantFire                      super = Engine.Weapon.InstantFire
+//
+// Comparing FName INDICES rather than strings, because this runs on every script call in the game
+// and a strcmp there would cost more than everything else this mod does. The indices are resolved
+// once, off the hot path - see ResolveScriptNames.
+struct ScriptFn { const char* name; volatile LONG idx; };
+ScriptFn g_scriptFns[] = {
+    { "GetAdjustedAim",     -1 },   // [0] the one that RETURNS the fire trace's rotator
+    { "GetAdjustedAimFor",  -1 },
+    { "GetBaseAimRotation", -1 },
+    { "CalcWeaponFire",     -1 },
+    { "InstantFire",        -1 },
+    { "Tick",               -1 },   // [5] the CONTROL - see below
+};
+const int kFnGetAdjustedAim = 0;
+const int kFnTick           = 5;
+const int kScriptFnCount    = (int)(sizeof(g_scriptFns) / sizeof(g_scriptFns[0]));
+
+static LONG FnIdx(int i) { return InterlockedCompareExchange(&g_scriptFns[i].idx, 0, 0); }
+
+// Resolve the table by scanning GNames for each string. Called from the HOTKEY handler, never from
+// the hook: it walks tens of thousands of entries with a VirtualQuery each, which is milliseconds -
+// fine once on a keypress, ruinous on the hottest function in the process.
+//
+// ⚠️ It can legitimately fail. GNames is populated as packages load, so pressing the key at the
+// main menu before RvGame is in memory finds nothing. That case is LOGGED as itself rather than
+// left to look like "the function is not on the fire path" - which is exactly the ambiguity that
+// wasted run 82.
+void ResolveScriptNames() {
+    if (!Readable((void*)kGNamesTArray, 12)) { Log("script names: GNames not readable yet"); return; }
+    const int32_t nc = *reinterpret_cast<int32_t*>(kGNamesTArray + 4);
+    int found = 0;
+    for (int i = 0; i < kScriptFnCount; ++i) {
+        if (FnIdx(i) >= 0) { ++found; continue; }
+        for (int32_t n = 0; n < nc; ++n) {
+            char nm[96]{};
+            if (!NameFromIndex(n, nm, sizeof(nm))) continue;
+            if (_stricmp(nm, g_scriptFns[i].name) == 0) {
+                InterlockedExchange(&g_scriptFns[i].idx, n);
+                ++found;
+                break;
+            }
+        }
+    }
+    Log("script names: %d of %d resolved against %d GNames entries", found, kScriptFnCount, nc);
+    for (int i = 0; i < kScriptFnCount; ++i)
+        Log("    %-22s %s", g_scriptFns[i].name,
+            FnIdx(i) >= 0 ? "resolved" : "NOT FOUND - is a level loaded?");
+    if (FnIdx(kFnGetAdjustedAim) < 0)
+        Log("  *** GetAdjustedAim did not resolve. Aim mode 6 CANNOT WORK until it does - load a"
+            " save and press this again, rather than reading the next test as a negative.");
+}
+
 // ---- the census: which script functions run when you pull the trigger ----
 //
 // ProcessEvent carries the UFunction, and UFunction is a UObject whose name resolves through the
@@ -6161,11 +6262,11 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
         //
         // So stop inferring and print BOTH candidates for the first few calls. Whichever yields
         // small indices that resolve to script names is the right one.
-        // The UFunction's FName index. Readable() rather than a bare dereference because this runs
-        // on every script call in the game and a single bad pointer would be an instant crash.
-        if (Readable(Function, 0x40)) {
-            const int32_t idx = *reinterpret_cast<const int32_t*>(
-                                    reinterpret_cast<uintptr_t>(Function) + OBJ_NAME);
+        // ✅ Run 91: FIXED. The name now comes from FFrame::Node, which is what run 87 identified
+        // and what the four lines of comment above have been describing while the code below read
+        // the wrong object anyway.
+        {
+            const int32_t idx = ScriptFuncNameIdx(Function);
             if (idx >= 0) {
                 // ⚠️ Run 82: this used to read the published pad's trigger byte, and came back
                 // with ZERO firing samples out of 5544 calls. Two ways that happens and both are
@@ -6191,7 +6292,66 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
             }
         }
     }
+    // ---- ⭐ run 91: aim mode 6 - rewrite what GetAdjustedAim RETURNS ----
+    //
+    // Everything above this line is diagnostics. This is the feature.
+    //
+    // The name is checked BEFORE the original call so the common case costs one integer compare,
+    // and the buffer is touched only AFTER it, because the value being replaced is the one the
+    // original just wrote.
+    const bool wantAim = InterlockedCompareExchange(&g_aimMode, 0, 0) == 6
+                      && FnIdx(kFnGetAdjustedAim) >= 0
+                      && ScriptFuncNameIdx(Function) == FnIdx(kFnGetAdjustedAim);
+
     g_origProcessEvent(self, edx, Function, Parms, Result);
+
+    if (!wantAim) return;
+
+    // ---- which argument is the result buffer, decided by the DATA and not by the ABI ----
+    //
+    // `Parms` is where __thiscall(FFrame&, RESULT_DECL) puts the result pointer, but that is a
+    // prediction and writing 12 bytes through a wrong pointer is an access violation at best and
+    // silent heap corruption at worst.
+    //
+    // So the write is gated on the buffer proving itself: GetAdjustedAim has just returned the
+    // player's aim, which for a human player is Controller.Rotation - the value this mod itself
+    // wrote as g_wantYaw a few milliseconds ago. If the yaw sitting in that buffer is within a few
+    // degrees of g_wantYaw, it is the return value; nothing else in memory has any reason to hold
+    // that number. If it is not, NOTHING IS WRITTEN and the mismatch is logged.
+    //
+    // ⚠️ This is what stops the test being fooled. A hook that wrote unconditionally and produced
+    // no visible change would be indistinguishable from GetAdjustedAim not being on the fire path -
+    // the run 82 failure mode. Here the two look completely different in the log.
+    const int32_t kUUPerDeg = (int32_t)(65536.0f / 360.0f);
+    void* const cands[2] = { Parms, Result };
+    static volatile LONG reported = 0;
+
+    for (int c = 0; c < 2; ++c) {
+        if (!cands[c] || !Readable(cands[c], 12)) continue;
+        int32_t* rot = reinterpret_cast<int32_t*>(cands[c]);
+        const int32_t dYaw = rot[1] - g_wantYaw;           // int32 wrap is correct in FRotator space
+        if (dYaw > 8 * kUUPerDeg || dYaw < -8 * kUUPerDeg) continue;
+
+        const int32_t wasPitch = rot[0], wasYaw = rot[1];
+        rot[0] = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
+        rot[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
+        if (InterlockedIncrement(&reported) <= 3)
+            Log("aim mode 6: arg%d is the result buffer - was pitch %d yaw %d (g_wantYaw %d),"
+                " rewrote to hand pitch %d yaw %d",
+                c + 1, wasPitch, wasYaw, g_wantYaw, rot[0], rot[1]);
+        return;
+    }
+
+    // Neither candidate held the aim. Say so, loudly and once - a silent no-op here would read
+    // exactly like the feature working and the fire trace ignoring it.
+    if (InterlockedIncrement(&reported) <= 3) {
+        const int32_t a = (Parms  && Readable(Parms, 12))  ? reinterpret_cast<int32_t*>(Parms)[1]  : 0;
+        const int32_t b = (Result && Readable(Result, 12)) ? reinterpret_cast<int32_t*>(Result)[1] : 0;
+        Log("aim mode 6: *** GetAdjustedAim ran but NEITHER argument holds the aim."
+            " arg1 yaw %d, arg2 yaw %d, g_wantYaw %d. Nothing was written. Either the result is"
+            " returned some other way, or this build's ProcessInternal has a different signature.",
+            a, b, g_wantYaw);
+    }
 }
 
 void DumpProcessEventCensus() {
@@ -6217,6 +6377,54 @@ void DumpProcessEventCensus() {
     // useful answer, and it now looks different from a bug.
     int total_names = 0;
     for (int i = 0; i < kPeSlots; ++i) if (g_peSlots[i].firing || g_peSlots[i].idle) ++total_names;
+
+    // ---- ⭐ run 91: the CONTROL, and the thing that decides whether this table means anything ----
+    //
+    // The hook is at 0x01308A10, which is ProcessInternal or an opcode handler - the two have never
+    // been told apart. If it is an opcode handler, this census can fill with perfectly real,
+    // perfectly resolvable names and still never see the fire path, which reads IDENTICALLY to
+    // "the fire path is native". That ambiguity is the run 82 failure and it is not detectable by
+    // looking at the table.
+    //
+    // `Tick` settles it. Every UE3 level has actors ticking every frame, so if this hook is on the
+    // general script path Tick MUST be here in the thousands. If it is absent, the hook is on some
+    // narrower path and an empty fire-path result proves nothing at all.
+    //
+    // The five aim functions are printed by name for the same reason: a specific expected name
+    // present-or-absent is a real answer, while "top 40 by enrichment" needs interpreting.
+    {
+        const LONG tickIdx = FnIdx(kFnTick);
+        uint32_t tickSeen = 0;
+        if (tickIdx >= 0)
+            for (int i = 0; i < kPeSlots; ++i)
+                if (g_peSlots[i].nameIdx == tickIdx) tickSeen = g_peSlots[i].idle + g_peSlots[i].firing;
+
+        Log("  --- CONTROL: Tick seen %u times ---", tickSeen);
+        if (tickIdx < 0)
+            Log("      *** 'Tick' never resolved in GNames, so this control could not run. Press"
+                " NUMPAD7 again in gameplay. Do NOT read the table below as an answer.");
+        else if (tickSeen == 0)
+            Log("      *** ZERO. This hook is NOT on the general script path - it is an opcode"
+                " handler or something narrower. An empty fire-path result below would mean"
+                " NOTHING. Finding the real ProcessEvent is the prerequisite.");
+        else
+            Log("      hook is on the general script path - the table below is meaningful.");
+
+        Log("  --- the five aim functions named out of RvGame.xxx (run 91) ---");
+        for (int f = 0; f < kScriptFnCount; ++f) {
+            if (f == kFnTick) continue;
+            const LONG want = FnIdx(f);
+            uint32_t fnIdle = 0, fnFiring = 0;   // not `firing` - that is this function's TOTAL,
+            bool seen = false;                   // and shadowing it here would be a trap
+            if (want >= 0)
+                for (int i = 0; i < kPeSlots; ++i)
+                    if (g_peSlots[i].nameIdx == want && (g_peSlots[i].idle || g_peSlots[i].firing)) {
+                        fnIdle = g_peSlots[i].idle; fnFiring = g_peSlots[i].firing; seen = true;
+                    }
+            Log("      %-22s %s  firing %-6u idle %-6u", g_scriptFns[f].name,
+                want < 0 ? "(name unresolved)" : (seen ? "SEEN   " : "absent "), fnFiring, fnIdle);
+        }
+    }
     Log("  %d distinct script functions seen. Top 40 by FIRING count, enrichment = firing share"
         " vs this function's total:", total_names);
 
@@ -6600,8 +6808,22 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // They are cut out of the cycle rather than deleted: they corrupt the view badly enough to
         // be unpleasant to hit by accident, and the code is worth keeping as the record of what
         // was tried. Cycle is 0-3 again.
-        const LONG mode = (InterlockedCompareExchange(&g_aimMode, 0, 0) + 1) % 4;
+        // ---- run 91: cycle order puts the LIVE modes first ----
+        //
+        // Same reasoning as PAGE UP running upwards first: reaching a mode should not take five
+        // presses while wearing a headset, because that is how a run gets lost to a miscount.
+        // 0 off, 6 the run 91 fix, 1 the shipping route-1 arrangement, then the two dead probes.
+        static const LONG kAimCycle[] = { 0, 6, 1, 2, 3 };
+        const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
+        LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
+        int at = 0;
+        for (int i = 0; i < kAimCycleLen; ++i) if (kAimCycle[i] == cur) { at = i; break; }
+        const LONG mode = kAimCycle[(at + 1) % kAimCycleLen];
         InterlockedExchange(&g_aimMode, mode);
+        // Resolving GNames is milliseconds, so it happens here on a keypress and never in the hook.
+        // Unconditional rather than only for mode 6: the census needs the same table, and a
+        // resolve that only runs in one mode is a diagnostic behind a switch the test may not press.
+        if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
@@ -6627,6 +6849,19 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     break;
             case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
                         " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
+                    break;
+            case 6: Log("NUMPAD.: aim mode 6 - ROUTE 2. The view, the culling and the gun all stay"
+                        " exactly as normal, on your HEAD - that is the design, not a failure."
+                        " RvWeaponShared.GetAdjustedAim returns the rotator the fire trace uses,"
+                        " named out of the game's own script package in run 91, and this rewrites"
+                        " that RETURN VALUE to your hand. AActor::Rotation is never touched, so"
+                        " nothing else in the engine can see the hand."
+                        " >>> STAND CLOSE TO A WALL, POINT WELL AWAY FROM THE CROSSHAIR, FIRE. <<<"
+                        " Impact where your HAND points = aim decoupling is solved with NO culling"
+                        " or LOD cost - set PAGE UP headroom back to 1.0."
+                        " Impact ON the crosshair = GetAdjustedAim is not on this build's fire path."
+                        " Check the log either way: it says which argument held the aim, or says"
+                        " that neither did.");
                     break;
             case 5: Log("NUMPAD.: aim mode 5 - TIME SPLIT, second seam. Same idea as mode 4 but the"
                         " hand is written at INPUT POLL time instead of at Present, which is later"
@@ -6670,6 +6905,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             memset(g_peSlots, 0, sizeof(g_peSlots));
             InterlockedExchange(&g_peCalls, 0);
             InterlockedExchange(&g_peFiringCalls, 0);
+            // Resolve before arming, not at dump time: the Tick control and the five named aim
+            // functions are useless if their indices are still -1 when the table is read, and
+            // arming is the moment the user is definitely in gameplay with packages loaded.
+            ResolveScriptNames();
             InterlockedExchange(&g_peCensus, 1);
             Log("NUMPAD7: script-call census ARMED and cleared. Play for a bit, FIRE SEVERAL"
                 " TIMES, then press NUMPAD7 again to dump it.");
