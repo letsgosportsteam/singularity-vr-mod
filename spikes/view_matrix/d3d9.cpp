@@ -6743,27 +6743,54 @@ typedef void* (__cdecl *PFN_LineCheck)(void* params);
 PFN_LineCheck g_origLineCheck = nullptr;
 volatile LONG g_lineCheckLogged = 0;
 
+// ---- ⭐ run 105: the weapon does not call this, and the log has to say WHY ----
+//
+// Run 104 installed this hook, the fire window opened 24 times, and NOT ONE trace was dumped. So
+// the shot does not go through 0x00BD79D0. Two very different reasons, needing opposite next
+// steps, and the previous filter could not tell them apart:
+//
+//   A. The weapon is a PROJECTILE weapon and never traces at fire time. The run-95 census is
+//      already suggestive: PreBeginPlay, PostBeginPlay and SetInitialState all sit at 84.6% under
+//      fire, which is the signature of an actor being SPAWNED.
+//   B. The trace happens, but outside StartFire/BeginFire/FireAmmunition - `ShouldDeferFire` is in
+//      the census too, so Raven may defer the shot to a timer.
+//
+// So this run stops filtering on the window and reports the raw facts instead: how often the line
+// check is called at all, and what the first traces STARTING NEAR THE CAMERA look like whether or
+// not a window is open. A player-originated trace starts at the player; that is the filter that
+// survives being wrong about when it happens.
+volatile LONG g_lineCheckCalls = 0;
+volatile LONG g_lineCheckNear = 0;
+
 void* __cdecl Hook_LineCheck(void* params) {
+    const LONG lcN = InterlockedIncrement(&g_lineCheckCalls);
+    // Proof the hook is live at all. Without this, "no traces during a shot" and "the hook never
+    // fired" read identically - the tautological-diagnostic trap this project keeps finding.
+    if ((lcN & 0x3FFF) == 0) Log("linecheck: %ld calls so far (hook is live)", lcN);
     // Log ONLY while a fire window is open. Traces run constantly - AI perception, movement,
     // physics - and a log of all of them would be unreadable. g_fireSeq being odd means we are
     // inside StartFire/BeginFire/FireAmmunition, so what gets printed is the WEAPON's trace and
     // nothing else. The window built for mode 9 turns out to be exactly the right filter.
-    if ((InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) &&
-        InterlockedCompareExchange(&g_lineCheckLogged, 0, 0) < 6 &&
-        params && Readable(params, 0x80)) {
-        InterlockedIncrement(&g_lineCheckLogged);
+    if (InterlockedCompareExchange(&g_lineCheckNear, 0, 0) < 12 &&
+        params && Readable(params, 0x80) &&
+        InterlockedCompareExchange(&g_camPosValid, 0, 0)) {
         const float* f = reinterpret_cast<const float*>(params);
-        Log("linecheck: camera at (%.1f %.1f %.1f) - struct follows, offsets in bytes",
-            g_camPos[0], g_camPos[1], g_camPos[2]);
+        int startAt = -1;
         for (int i = 0; i + 2 < 32; ++i) {
             const float dx = f[i] - g_camPos[0], dy = f[i+1] - g_camPos[1], dz = f[i+2] - g_camPos[2];
-            const float d2 = dx*dx + dy*dy + dz*dz;
-            // A triple within ~10 metres of the camera is the START of the player's shot. Nothing
-            // else in this struct has a reason to sit there, which is what makes it self-labelling
-            // rather than a guess about the layout.
-            const bool nearCam = d2 < (520.0f * 520.0f);
-            Log("    +0x%02X  %12.2f %12.2f %12.2f%s", i * 4, f[i], f[i+1], f[i+2],
-                nearCam ? "   <== NEAR THE CAMERA - candidate Start" : "");
+            if (dx*dx + dy*dy + dz*dz < 520.0f * 520.0f) { startAt = i; break; }
+        }
+        // Only traces that START AT THE PLAYER get printed. That is the filter that survives being
+        // wrong about WHEN the shot happens - it does not depend on the fire window at all, so a
+        // deferred shot is caught just as well as an immediate one.
+        if (startAt >= 0) {
+            InterlockedIncrement(&g_lineCheckNear);
+            const bool inWindow = (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) != 0;
+            Log("linecheck #%ld  window %s  camera (%.1f %.1f %.1f)  start-like triple at +0x%02X",
+                InterlockedCompareExchange(&g_lineCheckNear, 0, 0), inWindow ? "OPEN" : "closed",
+                g_camPos[0], g_camPos[1], g_camPos[2], startAt * 4);
+            for (int i = 0; i + 2 < 32; i += 3)
+                Log("    +0x%02X  %12.2f %12.2f %12.2f", i * 4, f[i], f[i+1], f[i+2]);
         }
     }
     return g_origLineCheck(params);
@@ -7188,6 +7215,29 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     //
     // Either answer ends a line of work rather than extending one, which is the thing the last
     // three runs did not do.
+    // ---- ⭐ run 105: what actually happens during a shot, with the OBJECT named ----
+    //
+    // The census named the functions but never the objects they ran on, and that is the missing
+    // half. `PreBeginPlay` at 84.6% under fire means something is being spawned - but a census of
+    // NAMES cannot say WHAT. If the class is a projectile, the weapon does not trace at all and
+    // the whole line-check route is inapplicable to it; if it is an effect or a decal, the trace
+    // is simply elsewhere.
+    //
+    // Cheap because it only runs while a fire window is open and only logs each function once.
+    if ((aimMode == 9 || aimMode == 10) && fnIdx >= 0 &&
+        (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) && self) {
+        static volatile LONG shown = 0;
+        if (InterlockedCompareExchange(&shown, 0, 0) < 30) {
+            InterlockedIncrement(&shown);
+            char fn[96]{}, cn[96]{};
+            NameFromIndex(fnIdx, fn, sizeof(fn));
+            const uintptr_t cls = Readable(self, OBJ_CLASS + 4)
+                                ? *reinterpret_cast<uintptr_t*>((uintptr_t)self + OBJ_CLASS) : 0;
+            if (cls && Readable((void*)cls, 0x40)) NameOf(cls, cn, sizeof(cn));
+            Log("  in-shot: %-24s on a %s", fn[0] ? fn : "?", cn[0] ? cn : "?");
+        }
+    }
+
     const bool mode10 = (aimMode == 10) && fnIdx >= 0;
     const bool mode9 = ((aimMode == 9) || mode10) && fnIdx >= 0;
     const bool nullWindow = mode10;
