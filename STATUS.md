@@ -46,9 +46,10 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **Controller input.** The only untouched rung, and now the whole remaining project. Needs OpenXR
-   input: menus (currently inert by design), motion-controller aiming, and decoupling head-look
-   from `PlayerController.Rotation`, which today drives both the view and the fire trace.
+1. **Aim decoupling, route 2 — one headset run from an answer.** Run 91 named the function out of
+   the game's own script: `RvWeaponShared.GetAdjustedAim`. Apply the unapplied `FFrame::Node` fix
+   to the census (see run 91), gate it on that name, and the run answers yes/no. Route 1 already
+   works and stays as the fallback; route 2 costs no LOD.
 2. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
@@ -128,6 +129,68 @@ the **thumbstick** too: with the look stick held over, `head yaw` stayed within 
 swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Body-turn and head-turn
 **add**, exactly as VR wants. That was the open question gating the whole input design and it is
 answered.
+
+## ✅ Run 91 (desk, no headset): route 2 is NOT dead — the game ships its own UnrealScript
+
+**`RvGame\CookedPC\*.xxx` are the `.u` script packages.** They are whole-file LZO-compressed UE3
+packages, and nothing in this project had ever opened one. `tools/uedecompress` unpacks them;
+`tools/uepkg` reads the name / import / export tables. Both are host tools, zero headset cost.
+
+### The answer route 2 spent six runs probing for
+
+```
+Function  RvWeaponShared.GetAdjustedAim                  super=Engine.Weapon.GetAdjustedAim
+Function  RvGameSharedPlayerController.GetAdjustedAimFor super=Engine.PlayerController.GetAdjustedAimFor
+Function  RvTacticalPawn.GetBaseAimRotation              super=Engine.Pawn.GetBaseAimRotation
+Function  RvWeaponShared.CalcWeaponFire                  super=Engine.Weapon.CalcWeaponFire
+Function  RvWeaponShared.InstantFire                     super=Engine.Weapon.InstantFire
+```
+
+The stock UE3 aim chain, every link overridden by Raven and every one a **script** function with
+real bytecode — so all of them pass through the interpreter, which is the seam this mod already
+has a hook on. `GetAdjustedAim` is the one that returns the rotator the fire trace uses.
+
+### Why this reopens route 2 rather than just informing it
+
+`GetAdjustedAim` **returns** the aim. So the hook does not have to swap `Rotation` and race the
+camera at all — it calls the original and overwrites the returned `FRotator` with the hand's. The
+separation is exact by construction: culling, LOD, movement basis and the view never observe the
+hand for even an instant. The run 76–89 finding that killed the time split — *"there is no instant
+where the hand can sit in that field without the view taking it too"* — is true and **does not
+apply**, because this touches a return buffer, not the field.
+
+### ⚠️ The last blocker is an unapplied one-line fix, not an unknown
+
+The census at `Hook_ProcessEvent` still buckets names on `Function + OBJ_NAME`, where `Function`
+is arg1 — which **run 86 proved is an `FFrame`, not a `UFunction`**. That is why run 84's names
+came back as heap pointers. Run 87 found the right source and wrote it down four lines away in the
+same file: `+0x14 -> 'SeeMonster'`, i.e. `FFrame::Node`. The fix was found and never applied.
+
+Also: arg2 (`Parms` in the current signature) is the **Result** pointer, not a parms block —
+`ProcessInternal(FFrame&, RESULT_DECL)` under `__thiscall` puts them in that order. Confirm before
+relying on it.
+
+### Method: three checks that would have caught a wrong parse
+
+Both tools validate their own layout instead of trusting it, because a package parser that cannot
+tell "layout right" from "layout wrong" prints fiction with total confidence — the same defect
+class as the eight tautological diagnostics already found here.
+
+| Check | Result on RvGame.u |
+|---|---|
+| Name table must end **exactly** at `importOffset` | exact |
+| Every name / outer / serial index in range | 0 bad of 36,873 |
+| Header slack must equal `4 × exportCount` (empty depends map) | exact — pins the export struct size |
+| Serial regions must **tile** the file | 0 gaps, 0 overlaps |
+
+The tiling check is the one that earns its keep: wrong `SerialSize`/`SerialOffset` fields still
+look plausible one at a time and cannot possibly tile 36,873 regions.
+
+For the decompressor the equivalent is the **size**: LZO desynchronises within a few hundred bytes
+if a shift is wrong, so 214 consecutive chunks each landing on its declared uncompressed size is
+proof, not encouragement. `Core.xxx` -> 198,749 bytes, which is `Core.u`'s size, is the control.
+
+**Do not commit `uscript/`** — it is decompiled game content and already in `.gitignore`.
 
 ## ✅ Run 90: aim decoupling WORKS via route 1 — culling headroom
 
