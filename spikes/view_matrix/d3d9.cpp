@@ -6328,10 +6328,48 @@ int       g_funcOffset = -1;
 void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* Parms, void* Result);
 extern volatile LONG g_peSeen, g_peUnnamed;
 
-const uintptr_t kCodeLo = 0x00401000, kCodeHi = 0x01E00000;
+// ---- ⚠️ run 93b: "in the image" is NOT "is code", and that mistake picked a vtable ----
+//
+// The first version of this probe accepted anything in 0x00401000-0x01E00000, which spans .rdata
+// and .data as well as .text. The winner was +0xC0 at 94% - and 0x017A0520 is in .RDATA, a table
+// of code pointers, i.e. the vtable every UFunction shares. A shared vtable beats the real answer
+// on agreement every time, so the loose filter did not merely admit noise, it admitted something
+// that outvotes the signal.
+//
+// The runner-up +0xAC at 55% was right all along: 0x004B7E40 is in .text and begins
+// 55 8B EC 83 EC 54 ... - an MSVC prologue with a /GS cookie, then `mov edi,ecx` (this in ECX,
+// so __thiscall) and two stack arguments. That is ProcessInternal(FFrame&, RESULT_DECL).
+//
+// So the bound now comes from the image's own section table rather than from a guessed constant.
+// The lesson is the project's own, again: a filter wide enough to admit the wrong KIND of thing
+// will be won by the wrong thing, and it looks like a stronger result, not a weaker one.
+uintptr_t g_textLo = 0, g_textHi = 0;
+
+void FindTextSection() {
+    if (g_textLo) return;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    if (!base || !Readable((void*)base, 0x40)) return;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(base + dos->e_lfanew);
+    if (!Readable(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE) return;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        // EXECUTE is the property that matters, not the name - a section called .text that is not
+        // executable would be just as wrong as .rdata, and this is checking for "can be hooked".
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const uintptr_t lo = base + sec[i].VirtualAddress;
+        const uintptr_t hi = lo + sec[i].Misc.VirtualSize;
+        if (!g_textLo || (hi - lo) > (g_textHi - g_textLo)) { g_textLo = lo; g_textHi = hi; }
+    }
+    Log("executable range: 0x%08X - 0x%08X (from the image's own section table)",
+        (unsigned)g_textLo, (unsigned)g_textHi);
+}
 
 void FindProcessInternal() {
     if (g_processInternal) return;
+    FindTextSection();
+    if (!g_textLo) { Log("Func probe: could not read the image's section table"); return; }
     if (!Readable((void*)kGObjectsTArray, 12)) { Log("Func probe: GObjects not readable"); return; }
     const uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
     const int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
@@ -6365,7 +6403,7 @@ void FindProcessInternal() {
         ++sampled;
         for (int k = 0; k < kOffCount; ++k) {
             const uintptr_t v = *reinterpret_cast<uintptr_t*>(o + kLo + k * kStep);
-            if (v < kCodeLo || v > kCodeHi) continue;
+            if (v < g_textLo || v >= g_textHi) continue;
             Tally& t = tal[k];
             int slot = -1;
             for (int b = 0; b < kBuckets; ++b) {
@@ -6420,10 +6458,40 @@ void RepointScriptHook() {
         g_origProcessEvent = nullptr;
     }
     void* target = reinterpret_cast<void*>(g_processInternal);
-    if (MH_CreateHook(target, (void*)&Hook_ProcessEvent, (void**)&g_origProcessEvent) != MH_OK ||
-        MH_EnableHook(target) != MH_OK) {
-        Log("  *** could not hook 0x%08X - aim modes 6 and 7 stay dead this run.",
+
+    // Print the first bytes of whatever is about to be hooked. Run 93 spent a whole run on
+    // "could not hook 0x017A0520" without recording that the address was in .rdata and held a
+    // vtable - the one fact that explained it. A failure message that does not carry the evidence
+    // for its own diagnosis costs a run every time.
+    if (Readable(target, 16)) {
+        const uint8_t* c = reinterpret_cast<const uint8_t*>(target);
+        Log("  bytes at 0x%08X: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+            (unsigned)g_processInternal, c[0], c[1], c[2], c[3], c[4], c[5],
+            c[6], c[7], c[8], c[9], c[10], c[11]);
+    } else {
+        Log("  *** 0x%08X is not even readable - it is not a function.",
             (unsigned)g_processInternal);
+        return;
+    }
+    if (g_processInternal < g_textLo || g_processInternal >= g_textHi) {
+        Log("  *** 0x%08X is OUTSIDE the executable range 0x%08X-0x%08X. It is data, not code,"
+            " and hooking it would be meaningless.", (unsigned)g_processInternal,
+            (unsigned)g_textLo, (unsigned)g_textHi);
+        return;
+    }
+
+    const MH_STATUS cs = MH_CreateHook(target, (void*)&Hook_ProcessEvent, (void**)&g_origProcessEvent);
+    if (cs != MH_OK) {
+        Log("  *** MH_CreateHook(0x%08X) failed, status %d - aim modes 6 and 7 stay dead this run.",
+            (unsigned)g_processInternal, (int)cs);
+        g_origProcessEvent = nullptr;
+        return;
+    }
+    const MH_STATUS es = MH_EnableHook(target);
+    if (es != MH_OK) {
+        Log("  *** MH_EnableHook(0x%08X) failed, status %d - aim modes 6 and 7 stay dead this run.",
+            (unsigned)g_processInternal, (int)es);
+        MH_RemoveHook(target);
         g_origProcessEvent = nullptr;
         return;
     }
