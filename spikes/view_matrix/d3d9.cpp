@@ -964,6 +964,18 @@ int g_ctlRotOffs[kRotFieldMax], g_ctlRotCount = 0;
 int g_camRotOffs[kRotFieldMax], g_camRotCount = 0;
 // Odd while a fire window is open, even when closed. Present uses it to tell "the player turned"
 // from "we wrote the hand for a microsecond" - see the fold-in guard.
+// ---- 💥 run 109: DEPTH, not parity ----
+//
+// g_fireSeq is bumped once per window, and the fire windows NEST - StartFire five deep, then
+// BeginFire, then FireAmmunition. So "odd means open" flips seven times during one shot and is
+// meaningless by the time the trace runs. That is why aim mode 11 rotated nothing: the gate was
+// effectively random, and it is also why spawn lines read "window closed" for emitters that are
+// certainly inside the shot.
+//
+// Depth is the correct primitive for a nested window. The sequence counter stays, but only for
+// what it was actually good for: letting Present detect that a window opened or closed ACROSS its
+// read. Open-ness itself is now depth > 0.
+volatile LONG g_fireDepth = 0;
 volatile LONG g_fireSeq = 0;
 
 // ---- ⭐ run 100: which fields the fire window is allowed to touch ----
@@ -6832,7 +6844,7 @@ void* __cdecl Hook_LineCheck(void* params) {
         // deferred shot is caught just as well as an immediate one.
         if (startAt >= 0) {
             InterlockedIncrement(&g_lineCheckNear);
-            const bool inWindow = (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) != 0;
+            const bool inWindow = InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0;
             Log("linecheck #%ld  window %s  camera (%.1f %.1f %.1f)  start-like triple at +0x%02X",
                 InterlockedCompareExchange(&g_lineCheckNear, 0, 0), inWindow ? "OPEN" : "closed",
                 g_camPos[0], g_camPos[1], g_camPos[2], startAt * 4);
@@ -6850,7 +6862,7 @@ void* __cdecl Hook_LineCheck(void* params) {
     // trace. If it does not match, nothing is written and the log says so - the same
     // prove-itself-first rule that stopped mode 6 corrupting the heap.
     if (InterlockedCompareExchange(&g_aimMode, 0, 0) == 11 &&
-        (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) &&
+        InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0 &&
         params && Readable(params, 0x80) &&
         InterlockedCompareExchange(&g_camPosValid, 0, 0)) {
         float* f = reinterpret_cast<float*>(params);
@@ -7334,12 +7346,12 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                                 ? *reinterpret_cast<uintptr_t*>((uintptr_t)self + OBJ_CLASS) : 0;
             if (cls && Readable((void*)cls, 0x40)) NameOf(cls, cn, sizeof(cn));
             Log("  spawn: %-28s  window %s", cn[0] ? cn : "?",
-                (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) ? "OPEN" : "closed");
+                InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0 ? "OPEN" : "closed");
         }
     }
 
     if ((aimMode == 9 || aimMode == 10) && fnIdx >= 0 &&
-        (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) && self) {
+        InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0 && self) {
         static volatile LONG shown = 0;
         // Cap 150, not 30. Run 105 spent all thirty entries on muzzle-flash emitters and stopped
         // exactly AT FireAmmunition - truncating the log at the one place it mattered.
@@ -7431,7 +7443,7 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
             }
             firedWindow = haveCtl || haveCam || havePov || nExtra > 0;
             // Mark the window OPEN before anything else can observe the swapped fields.
-            if (firedWindow) InterlockedIncrement(&g_fireSeq);
+            if (firedWindow) { InterlockedIncrement(&g_fireDepth); InterlockedIncrement(&g_fireSeq); }
             // ---- run 106: count traces ACROSS the window, which is unambiguous ----
             // The near-camera filter can only report traces it recognises. This cannot miss:
             // if the shot traces at all, the counter moves between open and close.
@@ -7515,7 +7527,8 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
             extraAddr[i][0] = extraSaved[i][0];
             extraAddr[i][1] = extraSaved[i][1];
         }
-        InterlockedIncrement(&g_fireSeq);   // window CLOSED - seq is even again
+        InterlockedDecrement(&g_fireDepth);
+        InterlockedIncrement(&g_fireSeq);   // seq moves on every open AND close, for the race check
         // How many line checks ran inside this window. A weapon that hitscans MUST move this;
         // zero across every shot means the damage path does not use 0x00BD79D0 at all, and that
         // is a fact rather than the absence of a log line I was hoping for.
@@ -8939,7 +8952,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             const LONG seqBefore = InterlockedCompareExchange(&g_fireSeq, 0, 0);
             const int32_t observedYaw = rot[1];
             const LONG seqAfter = InterlockedCompareExchange(&g_fireSeq, 0, 0);
-            const bool windowRaced = (seqBefore != seqAfter) || (seqBefore & 1);
+            const bool windowRaced = (seqBefore != seqAfter)
+                                  || InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0;
 
             if (g_haveLastWrittenYaw && !windowRaced) {
                 int32_t externalDelta = observedYaw - g_lastWrittenYaw;
