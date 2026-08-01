@@ -39,6 +39,60 @@
 [Render]
 
 ; ---------------------------------------------------------------------------
+; AutoResolution   -- inherit the resolution from the headset (run 59)
+;
+; Every other VR title takes its resolution from the headset. This one needed a
+; hand-typed -ResX/-ResY from run 17 until now. With this on, you just launch
+; the game.
+;
+;   Singularity.exe          <- that is the whole command
+;
+; ---- YOUR COMMAND LINE ALWAYS WINS ----
+;
+; If you pass -ResX yourself, nothing is injected and your value is used. The
+; log says so explicitly:
+;
+;   auto-resolution: not injecting (you passed -ResX yourself, which always wins)
+;
+; ---- how it works, and why it is a CACHE ----
+;
+; This DLL is a d3d9.dll proxy, so the loader runs its DllMain before the exe's
+; entry point - before the CRT reads GetCommandLineW and before UE3 parses it.
+; A detour installed there is in place in time; anything later is not, because
+; the engine has already read it.
+;
+; The size itself comes from the PREVIOUS run. The mod queries the headset every
+; launch and writes the answer to AutoResX/AutoResY below; the next launch
+; injects it. The alternative was spinning up a temporary OpenXR instance inside
+; DllMain to ask live, which is possible but puts XR initialisation in the
+; process startup path - where a failure means THE GAME DOES NOT LAUNCH.
+;
+; So: change your headset's render scale and the first run afterwards uses the
+; old size, the next one is correct. One stale run beats a game that won't boot.
+;
+; The first ever run injects nothing, because there is no cache yet. Launch once
+; with your own -ResX, or just launch and let it write the cache, then relaunch.
+;
+; Every failure path leaves the command line untouched: no cache, a nonsense
+; value, a failed hook, or -ResX already present.
+;
+; Why the command line and not the backbuffer: run 14 proved that overriding the
+; D3D9 backbuffer does NOT raise UE3's render resolution. The engine sizes its
+; scene targets from its own config, so forcing the backbuffer desynchronises
+; the two and breaks stereo. The resolution has to reach UE3's own settings.
+;
+;   1 = inject the cached headset size when you did not specify one <- default
+;   0 = never touch the command line
+; ---------------------------------------------------------------------------
+AutoResolution=1
+
+; Written by the mod, not by you. The headset's per-eye width x2 (side by side)
+; and its height, cached from the last run. Delete these to force a re-cache.
+; Overwritten only when the headset's answer actually changes.
+;AutoResX=4992
+;AutoResY=2688
+
+; ---------------------------------------------------------------------------
 ; The cold start is flat, as always - no head tracking, no 6-DOF, mono. Press
 ; F9, F10 and F1 individually as before, OR press BACKSPACE once for all three
 ; at once (and again to drop back to flat). BACKSPACE is just a shortcut for

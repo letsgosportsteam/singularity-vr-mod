@@ -126,6 +126,120 @@ void Log(_Printf_format_string_ const char* fmt, ...) {
     LeaveCriticalSection(&g_lock);
 }
 
+// SingularityVR.ini, always beside this DLL rather than beside the exe or in the working directory
+// - the mod is dropped in next to the game binary and nothing about it should depend on where the
+// game was launched from.
+bool IniPath(char* out /*MAX_PATH*/) {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)&IniPath, &self)) return false;
+    if (!GetModuleFileNameA(self, out, MAX_PATH)) return false;
+    char* slash = strrchr(out, '\\');
+    if (!slash) return false;
+    strcpy_s(slash + 1, MAX_PATH - (slash + 1 - out), "SingularityVR.ini");
+    return true;
+}
+
+// ================================================================ automatic resolution (run 59)
+//
+// Every other VR title inherits its resolution from the headset. This one has needed a hand-typed
+// `-ResX=4992 -ResY=2688 -windowed` since run 17, and run 58 finally proved the engine ACCEPTS the
+// parity size - which is what makes automating it worth doing rather than merely tidy.
+//
+// ---- why the command line and not the backbuffer ----
+//
+// Run 14 settled this: overriding the D3D9 backbuffer in CreateDevice does NOT raise UE3's render
+// resolution. The engine sizes its scene targets from its own configured resolution, so forcing the
+// backbuffer only desynchronises the two and breaks stereo. The resolution has to reach UE3's own
+// config, and the command line is the route that does that.
+//
+// ---- why the timing works ----
+//
+// This DLL is a d3d9.dll proxy, so it is a STATIC import of the exe: the loader runs our DllMain
+// before it calls the exe's entry point. The CRT then reads GetCommandLineW inside that entry
+// point to build WinMain's lpCmdLine, and UE3 parses it from there. So a detour installed in
+// DllMain is in place before anything has looked at the command line - but only if it is installed
+// in DllMain. By the time our first D3D export is called, the engine has long since parsed it.
+//
+// ---- why a CACHED size and not a live XR query ----
+//
+// The honest option was to spin up a temporary OpenXR instance in DllMain and ask the runtime.
+// xrEnumerateViewConfigurationViews needs only an instance and a system id - no session, no
+// graphics device - so it is technically possible. It also puts OpenXR initialisation into the
+// process's startup path, where a failure means THE GAME DOES NOT LAUNCH.
+//
+// So instead the size the mod already queries and logs every run is written back to the ini, and
+// the NEXT launch injects it. Change your headset's render scale and the first run afterwards uses
+// the old number while the next one is correct. A wrong resolution for one run is a far better
+// failure than a game that will not start.
+int  g_autoResMode = 1;          // ini AutoResolution
+UINT g_autoResW = 0, g_autoResH = 0;
+bool g_autoResInjected = false;
+char  g_cmdLineA[1024]{};
+WCHAR g_cmdLineW[1024]{};
+
+typedef LPSTR  (WINAPI *PFN_GetCmdA)(void);
+typedef LPWSTR (WINAPI *PFN_GetCmdW)(void);
+PFN_GetCmdA g_origGetCmdA = nullptr;
+PFN_GetCmdW g_origGetCmdW = nullptr;
+
+// Case-insensitive search for "-ResX" / "/ResX" so an explicit choice can be detected.
+bool HasResArg(const char* s) {
+    for (const char* p = s; *p; ++p) {
+        if ((p[0] == '-' || p[0] == '/') &&
+            (p[1] == 'R' || p[1] == 'r') && (p[2] == 'e' || p[2] == 'E') &&
+            (p[3] == 's' || p[3] == 'S') && (p[4] == 'X' || p[4] == 'x')) return true;
+    }
+    return false;
+}
+
+// Builds the augmented command line once. Returns false to mean "use the original untouched",
+// which is the answer for every failure path here - see the note above.
+bool BuildAutoCmdLine(const char* orig) {
+    if (!g_autoResMode || !orig) return false;
+    if (!g_autoResW || !g_autoResH) return false;                 // nothing cached yet
+    if (g_autoResW < 640 || g_autoResH < 480 ||
+        g_autoResW > 16384 || g_autoResH > 16384) return false;   // refuse nonsense
+    // ⚠️ AN EXPLICIT -ResX ON THE COMMAND LINE ALWAYS WINS. Injecting a second one would leave the
+    // engine parsing two, and whichever it picked would silently override a deliberate choice.
+    if (HasResArg(orig)) return false;
+
+    const int n = _snprintf_s(g_cmdLineA, sizeof(g_cmdLineA), _TRUNCATE,
+                              "%s -ResX=%u -ResY=%u -windowed", orig, g_autoResW, g_autoResH);
+    if (n <= 0) return false;   // truncated or failed - do not hand back a mangled command line
+    if (MultiByteToWideChar(CP_ACP, 0, g_cmdLineA, -1, g_cmdLineW,
+                            sizeof(g_cmdLineW) / sizeof(g_cmdLineW[0])) == 0) return false;
+    return true;
+}
+
+// Write the size the headset just asked for back to the ini, so the NEXT launch can inject it.
+// Only rewritten when it actually changes, so a render-scale change costs one file write rather
+// than one per launch. Deliberately writes nothing else: this is the only value the mod ever
+// authors, and a settings file the user edits by hand should not be churned.
+void CacheAutoResolution(UINT sideBySideW, UINT h) {
+    if (!sideBySideW || !h) return;
+    if (g_autoResW == sideBySideW && g_autoResH == h) return;    // already correct
+    char path[MAX_PATH]{};
+    if (!IniPath(path)) return;
+    char v[32]{};
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%u", sideBySideW);
+    WritePrivateProfileStringA("Render", "AutoResX", v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%u", h);
+    WritePrivateProfileStringA("Render", "AutoResY", v, path);
+    Log("auto-resolution: cached %ux%u to the ini - the NEXT launch will use it automatically",
+        sideBySideW, h);
+}
+
+LPSTR WINAPI Hook_GetCommandLineA(void) {
+    LPSTR orig = g_origGetCmdA ? g_origGetCmdA() : nullptr;
+    return (g_autoResInjected && orig) ? g_cmdLineA : orig;
+}
+LPWSTR WINAPI Hook_GetCommandLineW(void) {
+    LPWSTR orig = g_origGetCmdW ? g_origGetCmdW() : nullptr;
+    return (g_autoResInjected && orig) ? g_cmdLineW : orig;
+}
+
 // ---------------------------------------------------------------- the view rotation hook
 struct FRotator { int32_t pitch, yaw, roll; };
 
@@ -1006,6 +1120,7 @@ bool InitXR() {
                     vcv[0].maxImageRectWidth, vcv[0].maxImageRectHeight);
                 Log("  => for side-by-side stereo, launch the game with:"
                     "  -ResX=%u -ResY=%u -windowed", g_recEyeW * 2, g_recEyeH);
+                CacheAutoResolution(g_recEyeW * 2, g_recEyeH);
             }
         }
     }
@@ -3955,7 +4070,12 @@ void ReportScan() {
 }
 
 void InstallViewHook() {
-    if (MH_Initialize() != MH_OK) { Log("MH_Initialize failed"); return; }
+    // ALREADY_INITIALIZED is the normal case now: InstallAutoResolution runs in DllMain and gets
+    // there first. Treating it as a failure here would silently disable head tracking.
+    const MH_STATUS mhInit = MH_Initialize();
+    if (mhInit != MH_OK && mhInit != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("MH_Initialize failed (%d)", (int)mhInit); return;
+    }
     void* target = reinterpret_cast<void*>(kCalcViewRotationAddr);
     if (MH_CreateHook(target, reinterpret_cast<void*>(&Hook_CalcViewRotation),
                       reinterpret_cast<void**>(&g_origCalcViewRotation)) != MH_OK) {
@@ -4642,14 +4762,7 @@ void LoadIniSettings() {
     done = true;
 
     char path[MAX_PATH]{};
-    HMODULE self = nullptr;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&LoadIniSettings, &self);
-    if (!GetModuleFileNameA(self, path, MAX_PATH)) return;
-    char* slash = strrchr(path, '\\');
-    if (!slash) return;
-    strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "SingularityVR.ini");
+    if (!IniPath(path)) return;
 
     if (GetPrivateProfileIntA("Render", "ResX", 0, path)) {
         Log("ini: [Render] ResX/ResY are IGNORED - forcing the backbuffer does not change UE3's");
@@ -4974,6 +5087,59 @@ void  WINAPI D3DPERF_SetOptions(DWORD o)               { if (p_Options) p_Option
 void  WINAPI DebugSetMute(void)                        { if (p_Mute) p_Mute(); }
 }
 
+// Called from DllMain, which is the only place early enough - see the note above g_autoResMode.
+//
+// MinHook is initialised here rather than in InstallViewHook because this runs first. At
+// DLL_PROCESS_ATTACH during process startup the loader has created exactly one thread, so
+// MH_EnableHook's thread-freeze has nothing to suspend and the usual loader-lock hazard does not
+// arise. InstallViewHook now tolerates MH_ERROR_ALREADY_INITIALIZED for the same reason.
+//
+// EVERY failure path leaves the command line untouched. A malformed command line means the game
+// does not launch at all, which is far worse than typing -ResX yourself.
+void InstallAutoResolution() {
+    char path[MAX_PATH]{};
+    if (!IniPath(path)) return;
+
+    g_autoResMode = GetPrivateProfileIntA("Render", "AutoResolution", 1, path);
+    if (g_autoResMode != 1) { Log("auto-resolution: OFF by ini"); return; }
+
+    g_autoResW = (UINT)GetPrivateProfileIntA("Render", "AutoResX", 0, path);
+    g_autoResH = (UINT)GetPrivateProfileIntA("Render", "AutoResY", 0, path);
+    if (!g_autoResW || !g_autoResH) {
+        Log("auto-resolution: nothing cached yet - this run uses your command line as typed."
+            " The headset's size will be written to the ini and injected from the next launch.");
+        return;
+    }
+
+    if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("auto-resolution: MH_Initialize failed - command line left alone"); return;
+    }
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) { Log("auto-resolution: kernel32 handle failed - command line left alone"); return; }
+    void* tA = (void*)GetProcAddress(k32, "GetCommandLineA");
+    void* tW = (void*)GetProcAddress(k32, "GetCommandLineW");
+    if (!tA || !tW) { Log("auto-resolution: GetCommandLine not found - left alone"); return; }
+
+    if (MH_CreateHook(tA, (void*)&Hook_GetCommandLineA, (void**)&g_origGetCmdA) != MH_OK ||
+        MH_CreateHook(tW, (void*)&Hook_GetCommandLineW, (void**)&g_origGetCmdW) != MH_OK) {
+        Log("auto-resolution: MH_CreateHook failed - command line left alone"); return;
+    }
+    // Build the string BEFORE enabling, so the hooks can never be live with nothing to hand back.
+    LPSTR orig = g_origGetCmdA ? g_origGetCmdA() : nullptr;
+    if (!BuildAutoCmdLine(orig)) {
+        Log("auto-resolution: not injecting (%s)",
+            (orig && HasResArg(orig)) ? "you passed -ResX yourself, which always wins"
+                                      : "no usable cached size");
+        return;                                   // hooks created but never enabled
+    }
+    if (MH_EnableHook(tA) != MH_OK || MH_EnableHook(tW) != MH_OK) {
+        Log("auto-resolution: MH_EnableHook failed - command line left alone"); return;
+    }
+    g_autoResInjected = true;
+    Log("auto-resolution: injecting -ResX=%u -ResY=%u -windowed (cached from the headset last run)",
+        g_autoResW, g_autoResH);
+}
+
 BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(m);
@@ -4988,6 +5154,7 @@ BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         }
         if (!LoadReal()) { Log("FATAL: real d3d9.dll not loadable"); return FALSE; }
+        InstallAutoResolution();
     }
     return TRUE;
 }
