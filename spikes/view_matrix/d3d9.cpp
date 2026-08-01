@@ -6214,13 +6214,44 @@ ScriptFn g_scriptFns[] = {
     { "InstantFire",        -1 },
     { "Tick",               -1 },   // [5] the CONTROL - see below
     { "SetAim",             -1 },   // [6] the GUN'S POSE - see the note on mode 7
+    { "PlayerTick",         -1 },   // [7] run 95: the window - see the note on mode 8
+    { "ProcessViewRotation",-1 },   // [8] and the things inside it that must NOT see the hand
+    { "UpdateCamera",       -1 },   // [9]
+    { "LimitViewRotation",  -1 },   // [10]
 };
 const int kFnGetAdjustedAim = 0;
 const int kFnTick           = 5;
 const int kFnSetAim         = 6;
+const int kFnPlayerTick     = 7;
+const int kFnMaskFirst      = 8;    // [8..10] are the masked-out view functions
+const int kFnMaskLast       = 10;
 const int kScriptFnCount    = (int)(sizeof(g_scriptFns) / sizeof(g_scriptFns[0]));
 
 static LONG FnIdx(int i) { return InterlockedCompareExchange(&g_scriptFns[i].idx, 0, 0); }
+
+// ---- the nesting census for mode 8 ----
+//
+// Every function that runs while the hand is sitting in AActor::Rotation, named once each. Mode 4
+// failed and left NOTHING to act on - "the view spun" was the whole result. If mode 8's view
+// still moves, this list names the function that has to join the mask, in the same run that shows
+// the symptom. Bounded to 64 names so it cannot flood the log.
+volatile LONG g_tickDepth = 0;
+const int kNestMax = 64;
+volatile LONG g_nestSeen[kNestMax] = {};
+volatile LONG g_nestCount = 0;
+
+static void NoteNested(int32_t idx) {
+    const LONG n = InterlockedCompareExchange(&g_nestCount, 0, 0);
+    for (LONG i = 0; i < n && i < kNestMax; ++i)
+        if (InterlockedCompareExchange(&g_nestSeen[i], 0, 0) == idx) return;
+    if (n >= kNestMax) return;
+    const LONG slot = InterlockedIncrement(&g_nestCount) - 1;
+    if (slot >= kNestMax) return;
+    InterlockedExchange(&g_nestSeen[slot], idx);
+    char nm[96]{};
+    if (!NameFromIndex(idx, nm, sizeof(nm))) _snprintf_s(nm, sizeof(nm), _TRUNCATE, "<idx %d>", idx);
+    Log("  inside PlayerTick: %s", nm);
+}
 
 // ================================================== the GUN'S POSE, and why it is a second seam
 //
@@ -6685,7 +6716,8 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // VirtualQuery, and this is the hottest function in the process. It used to run twice per call
     // whenever a route-2 mode was on.
     const LONG aimMode = InterlockedCompareExchange(&g_aimMode, 0, 0);
-    const bool routeTwo = (aimMode == 6 || aimMode == 7);
+    // Mode 8 needs the name on every call too - it is the whole mechanism, not a diagnostic.
+    const bool routeTwo = (aimMode == 6 || aimMode == 7 || aimMode == 8);
     const bool censusOn = InterlockedCompareExchange(&g_peCensus, 0, 0) != 0;
     int32_t fnIdx = -1;
     if ((censusOn || routeTwo) && Stack) {
@@ -6758,7 +6790,72 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     if (aimMode == 7 && FnIdx(kFnSetAim) >= 0 && fnIdx == FnIdx(kFnSetAim))
         RewriteSetAimParams(Stack);
 
+    // ================= ⭐ run 95: aim mode 8 - the MASKED time split ==============================
+    //
+    // Run 94 proved this hook is genuinely ProcessInternal and genuinely works: 152,430 calls, 0
+    // unnamed, and `Tick` present 2347 times. It also proved the aim functions are not reachable
+    // through it. Only 87 distinct functions appear and every one is a native->script ENTRY POINT;
+    // script-to-script calls do not pass through, which matches ENGINE_NOTES' finding that
+    // CallFunction is inlined into the interpreter. GetAdjustedAim is called from script, so it
+    // will never be here, and neither will SetAim. That route is closed - by measurement, not by
+    // another guess.
+    //
+    // But one of those 87 is `PlayerTick`, and it is the PlayerController's per-frame update INSIDE
+    // the game tick. That is a seam modes 4 and 5 never had: they wrote the hand at Present and at
+    // the XInput poll, both OUTSIDE the tick, and held it for a whole frame. This holds it for the
+    // duration of one function and gives both ends back.
+    //
+    // ⚠️ Why this is not simply mode 4 again. The run 89 conclusion was that the camera consumes
+    // the rotation at more than one moment, so no frame-wide write can work. Correct - and the fix
+    // is to make the window smaller than the camera's consumption points, then MASK the ones that
+    // fall inside it. `ProcessViewRotation`, `UpdateCamera` and `LimitViewRotation` are all in the
+    // 87, so if they nest inside PlayerTick they get the HEAD put back for their duration and the
+    // view never sees the hand at all.
+    //
+    // The nesting census below is what makes this checkable rather than hopeful: it records what
+    // actually runs inside PlayerTick, so if the view still swings, the log already names the
+    // function that has to join the mask. That is the difference between this and mode 4, which
+    // failed and left nothing to act on.
+    const bool mode8 = (aimMode == 8) && fnIdx >= 0;
+    bool openedWindow = false, maskedHere = false;
+    int32_t savedPitch = 0, savedYaw = 0;
+    uintptr_t ctlNow = 0;
+
+    if (mode8) {
+        ctlNow = (uintptr_t)InterlockedCompareExchange(&g_ctlForXi, 0, 0);
+        if (ctlNow && Readable((void*)(ctlNow + ACTOR_ROTATION), 12)) {
+            int32_t* rot = reinterpret_cast<int32_t*>(ctlNow + ACTOR_ROTATION);
+            if (fnIdx == FnIdx(kFnPlayerTick)) {
+                savedPitch = rot[0]; savedYaw = rot[1];
+                rot[0] = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
+                rot[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
+                InterlockedIncrement(&g_tickDepth);
+                openedWindow = true;
+            } else if (InterlockedCompareExchange(&g_tickDepth, 0, 0) > 0) {
+                for (int m = kFnMaskFirst; m <= kFnMaskLast; ++m) {
+                    if (FnIdx(m) >= 0 && fnIdx == FnIdx(m)) {
+                        savedPitch = rot[0]; savedYaw = rot[1];
+                        rot[0] = g_wantPitch; rot[1] = g_wantYaw;   // the HEAD, for this call only
+                        maskedHere = true;
+                        break;
+                    }
+                }
+                // The nesting census: which functions run while the hand is in the field. If the
+                // view still moves, the answer is in this list and no further run is needed to
+                // find it.
+                if (!maskedHere) NoteNested(fnIdx);
+            }
+        }
+    }
+
     g_origProcessEvent(self, edx, Stack, Result);
+
+    if ((openedWindow || maskedHere) && ctlNow && Readable((void*)(ctlNow + ACTOR_ROTATION), 12)) {
+        int32_t* rot = reinterpret_cast<int32_t*>(ctlNow + ACTOR_ROTATION);
+        rot[0] = savedPitch; rot[1] = savedYaw;
+        if (openedWindow) InterlockedDecrement(&g_tickDepth);
+    }
+    if (mode8) return;
 
     if (!wantAim) return;
 
@@ -7297,7 +7394,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Same reasoning as PAGE UP running upwards first: reaching a mode should not take five
         // presses while wearing a headset, because that is how a run gets lost to a miscount.
         // 0 off, 6 the run 91 fix, 1 the shipping route-1 arrangement, then the two dead probes.
-        static const LONG kAimCycle[] = { 0, 7, 6, 1, 2, 3 };
+        static const LONG kAimCycle[] = { 0, 8, 1, 7, 6, 2, 3 };
         const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
         LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
         int at = 0;
@@ -7310,7 +7407,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
         // Run 93: find the real ProcessInternal and move the hook onto it. Both are no-ops once
         // they have succeeded, so cycling modes does not re-walk GObjects.
-        if (mode == 6 || mode == 7) { FindProcessInternal(); RepointScriptHook(); }
+        if (mode == 6 || mode == 7 || mode == 8) { FindProcessInternal(); RepointScriptHook(); }
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
@@ -7336,6 +7433,21 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     break;
             case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
                         " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
+                    break;
+            case 8: Log("NUMPAD.: aim mode 8 - THE MASKED TIME SPLIT. Run 94 closed the script route"
+                        " by measurement: only 87 functions reach this hook and all are"
+                        " native->script entry points, so GetAdjustedAim and SetAim never appear."
+                        " But PlayerTick does, and it runs INSIDE the game tick - which modes 4 and"
+                        " 5 never had, they wrote at Present and held the hand for a whole frame."
+                        " Here the hand is in AActor::Rotation only for the duration of PlayerTick,"
+                        " and ProcessViewRotation, UpdateCamera and LimitViewRotation get the HEAD"
+                        " put back for their own duration if they nest inside it."
+                        " >>> POINT AWAY FROM THE CROSSHAIR. Watch the gun, then fire at a wall. <<<"
+                        " Gun and bullet follow your hand and the view stays put = solved."
+                        " VIEW SWINGS OR SPINS = something else in the tick reads the rotation, and"
+                        " the log now NAMES it - every function that ran inside the window is"
+                        " listed as 'inside PlayerTick', which is what mode 4 failed to leave"
+                        " behind.");
                     break;
             case 7: Log("NUMPAD.: aim mode 7 - ROUTE 2, THE WHOLE THING. Bullet AND gun follow your"
                         " controller; the view, culling, LOD and draw distance all stay on your"
