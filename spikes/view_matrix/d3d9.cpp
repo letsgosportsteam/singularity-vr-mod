@@ -1255,7 +1255,11 @@ float g_forcedTanX = 0.0f, g_forcedTanY = 0.0f;   // read back AFTER the edit, t
 // smaller than the engine expects, which pushes distant geometry down its LOD and draw-distance
 // curves. That is the trade this test is really measuring - edge dropouts against pop-in - and it
 // is why the low steps stay in the list rather than being replaced.
-const float kFovHeadroomSteps[] = { 1.0f, 0.70f, 0.50f, 0.35f, 1.30f, 1.75f, 2.5f, 4.0f, 6.0f };
+// ⚠️ Reordered run 90 to run UPWARDS first. The old order put 0.70/0.50/0.35 immediately after
+// 1.0, so reaching 4x took eight presses and 6x took nine - in a headset, while trying to watch a
+// ceiling for black patches. Mis-counting wastes the whole run. The shortfall-measuring values
+// below 1.0 are still reachable, just moved to the end where they are no longer in the way.
+const float kFovHeadroomSteps[] = { 1.0f, 1.30f, 1.75f, 2.5f, 4.0f, 6.0f, 0.70f, 0.50f, 0.35f };
 const int   kFovHeadroomCount = 9;
 int   g_fovHeadroomStep = 0;
 float kFovHeadroom = 1.0f;
@@ -6701,8 +6705,13 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     if (kPgUp && !pPgUp) {
         g_fovHeadroomStep = (g_fovHeadroomStep + 1) % kFovHeadroomCount;
         kFovHeadroom = kFovHeadroomSteps[g_fovHeadroomStep];
+        // The ASKED figure is printed alongside because the engine does not necessarily take it -
+        // the readback has been landing at ~124.5 while 129.8 was requested, which would mean a
+        // hard clamp and a ceiling on how much headroom can ever be bought. Watch the "asked the
+        // engine for" and "read back before write" lines against each other.
         Log("PAGE UP: culling headroom now x%.2f%s", kFovHeadroom,
-            kFovHeadroom < 1.05f ? " (no headroom - expect edge dropouts, but correct LOD)" : "");
+            kFovHeadroom < 1.05f ? " (no headroom - expect edge dropouts, but correct LOD)"
+                                 : " - check the FOV readback below actually follows it");
     }
     pPgUp = kPgUp;
 

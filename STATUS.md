@@ -29,7 +29,7 @@ dropped beside the game exe. No game files modified.
 | **FOV / aspect / resolution** | ✅ **100% of the headset's pixels, automatic** |
 | **Performance** | ✅ **120 fps locked**, 4.35 ms idle per frame |
 | **Controller input** | ✅ **working** — full Touch mapping, menus, haptics, snap turn, off-hand movement |
-| **Aim decoupling** | 🟡 mechanism built and proven a no-op at 0° deviation; **blocked on frustum culling** (run 64) |
+| **Aim decoupling** | ✅ **working (run 90)** — engine follows the hand, 30° clamp, 4× culling headroom. Costs some LOD pop |
 
 ### If you are picking this up cold, read these three things
 
@@ -128,6 +128,44 @@ the **thumbstick** too: with the look stick held over, `head yaw` stayed within 
 swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Body-turn and head-turn
 **add**, exactly as VR wants. That was the open question gating the whole input design and it is
 answered.
+
+## ✅ Run 90: aim decoupling WORKS via route 1 — culling headroom
+
+**Aim mode 1 (engine follows the hand, 30° clamp) + `PAGE UP` to 4× culling headroom.** Reported:
+4× "pretty good", 6× maybe better, LOD pop-out visible but "worth the trade off".
+
+So the rung is reachable. `askDeg` governs culling only — `ApplyProjection` forces the rendered
+frustum separately — so widening it buys coverage without touching the image.
+
+`PAGE UP` now runs **upwards** first (1.0 → 1.30 → 1.75 → 2.5 → **4.0** → **6.0**, then the
+sub-1.0 values), because reaching 4× used to take eight presses in a headset.
+
+### Why the LOD cost cannot simply be switched off
+
+It is not a side effect, it is **the same act**. UE3 sizes objects on screen from the projection it
+derives from `mCurrentPOV.FOV` — the value we inflate. A wider FOV makes everything compute as
+smaller, which both drops meshes to lower LODs *and* brings their cull distance nearer. Seeing more
+of the world and shrinking apparent object size are one operation, so there is no setting that
+keeps one and drops the other.
+
+Three ways to address it, ranked by cost:
+
+1. **Pay less of it — free, no code.** The headroom needed scales with the deviation clamp. At 30°
+   it takes 4–6×; at 20° much less. `NUMPAD9` cycles the clamp, `PAGE UP` the headroom. Tuning the
+   pair is the cheapest available win and needs no new mechanism.
+2. **Compensate the screen-size computation — bounded RE.** UE3 computes bounds screen size from
+   its CPU-side projection matrix. Find that and multiply the result back by the headroom factor,
+   and LOD and cull distances are exactly restored while the frustum stays wide. This is the
+   *correct* fix, and unlike `ProcessEvent` it is a bounded target — one function, one multiply,
+   non-virtual. Still RE with no guarantee.
+3. **Config knobs — checked, they do not exist.** Only `DecalCullDistanceScale`,
+   `FractureCullDistanceScale`, `SkeletalMeshLODBias`, `ParticleLODBias`,
+   `FoliageDrawRadiusMultiplier`. No global draw-distance or LOD-distance scale.
+
+⚠️ **"Pops out" and "loses detail" are different symptoms with different fixes.** The first is
+distance culling, the second is LOD selection. `SkeletalMeshLODBias` could address the second and
+only for characters, not static meshes. Worth identifying which one is actually being seen before
+spending anything on it.
 
 ## ❌ Runs 76–89: aim decoupling — route 2 is dead, and route 1 is still untested
 
