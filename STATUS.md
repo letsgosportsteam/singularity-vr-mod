@@ -130,6 +130,47 @@ swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Bod
 **add**, exactly as VR wants. That was the open question gating the whole input design and it is
 answered.
 
+## ⛔ Runs 91–102: route 2's field-swapping is DEAD, and this time it was measured
+
+**The null window settled it.** Mode 10 runs the identical fire window — same functions, same hook,
+same nesting, same seqlock, same logging — and writes nothing. The view is **steady** in mode 10 and
+**cycles** in mode 9. So the view movement is our write, not recoil and not a race.
+
+**Therefore: every field that carries the aim also feeds the view.** That is run 80's and run 89's
+conclusion re-confirmed at microsecond granularity. No window around a shared rotation field can
+separate aim from view, whichever field is chosen. Narrowing `AimFieldSet` further is wasted runs.
+
+### What was genuinely won, and it is not nothing
+
+| Finding | How |
+|---|---|
+| **`ProcessInternal` is at `0x004B7E40`**, `UFunction::Func` at **`+0xAC`** | read out of the object model — every script UFunction holds the same code pointer. No disassembly |
+| `0x01308A10` was never it | `Tick` seen **0** times in 48,811 calls through it |
+| **`FFrame::Node` is `+0x10`**, `Locals` `+0x1C` | voted over 300 real frames, 100% |
+| **The script seam cannot reach the aim.** Only 87 functions cross `ProcessInternal`, all native→script entry points | `GetAdjustedAim`/`SetAim` absent from a census with 0% miss rate |
+| **The fire path, named**: `FireAmmunition` 88.9%, `NotifyWeaponFired` 88.9%, `BeginFire` 86.5%, `StartFire` 84.2% under fire vs a 2.9% baseline | the census that finally worked |
+| **Seven fields track the view**: ctl `+0x0060`, `+0x05D4`; cam `+0x0060`, `+0x0338`, `+0x035C`, `+0x042C`, `+0x0464` | matched across 4 head orientations ≥5° apart |
+| **The aim is in a CAMERA field, not a controller one** | `AimFieldSet=0` (controller only) lost pitch tracking — retroactively vindicating run 80 on `+0x05D4` |
+| **Pitch decoupling was observed working** | run 99, all seven fields written |
+
+`RvGame.xxx` is the game's `.u` script package. `tools/uedecompress` + `tools/uepkg` read it, and
+that is how the fire path was named rather than guessed. Both validate their own layout.
+
+### ⚠️ Method notes, and they are the unflattering kind
+
+- **Five of these runs were lost to my own defects, not to the problem.** A guessed offset adopted
+  from six samples during level load; a code-range filter that spanned `.rdata` so a shared vtable
+  outvoted the real answer at 94% vs 55%; an argument count (`ret 0xC` vs `ret 8`) that crashed the
+  game twice; a literal `%` in a `Log()` string; and a hotkey installer that was not idempotent and
+  nulled a live trampoline on the second press.
+- **Three builds chased "the camera moves when I shoot" without ever running the control.** The
+  fix for it (a seqlock) was correct on its own terms and aimed at the wrong mechanism. The control
+  cost one mode and settled it immediately. **This is the run-56 lesson for the third time.**
+- **Read the epilogue, not the decompiler.** `ret 8` vs `ret 0xC` was checkable at a desk in one
+  minute and instead cost two crashes.
+- **A filter wide enough to admit the wrong KIND of thing gets won by the wrong thing** — and it
+  presents as a *stronger* result. 94% agreement looked like confirmation and was a vtable.
+
 ## ✅ Run 91 (desk, no headset): route 2 is NOT dead — the game ships its own UnrealScript
 
 **`RvGame\CookedPC\*.xxx` are the `.u` script packages.** They are whole-file LZO-compressed UE3
