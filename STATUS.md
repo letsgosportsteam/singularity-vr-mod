@@ -130,6 +130,49 @@ swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Bod
 **add**, exactly as VR wants. That was the open question gating the whole input design and it is
 answered.
 
+## ✅ Runs 103–112: ROUTE 2 WORKS — rotate the trace, not the rotation
+
+**The bullet follows the controller and the camera does not move.** Aim mode 11. The rung that has
+been open since run 64.
+
+### The mechanism, and why it could not have been reached by any earlier attempt
+
+`UWorld::SingleLineCheck` at **`0x00A108B0`** — `__thiscall(GWorld, FCheckResult&, AActor*, End,
+Start, flags, Extent, +1)`. During a shot, `End` is rotated about `Start` by the hand-minus-head
+deviation. **No rotation field is written**, so the view is immune *structurally* rather than by a
+fix layered on top — which is exactly what runs 91–102 proved could not be bought by swapping
+fields at any timescale.
+
+| Step | How it was found |
+|---|---|
+| `Actor.Trace`'s native at `0x00AC9E60` | `UFunction::Func` at `+0xAC` — the object model, no disassembly |
+| It calls only three functions | byte-scan for `CALL rel32`, printed rather than acted on |
+| `0x00BD79D0` is the **result processor**, not the trace | a constant 25° deflection moved nothing, and its struct is zeros and NaNs around an impact point |
+| `0x00A108B0` **is** the trace | the call site pushes 7 args with `this = GWorld`; the epilogue is `ret 0x1C` = 7. **Two independent confirmations** |
+| It reaches the bullet | mode 12's fixed 25° deflected the shot — the hand taken out of the experiment entirely |
+
+### ⚠️ The hand deviation was biased for fifty runs and mode 1 hid it
+
+Mode 11 first derived the deviation by differencing engine-space values (`g_aimYawUU`, built from
+`g_baseYaw` + recentre offset + `g_centreYaw`, against `g_wantYaw`) and got **121° of yaw with
+pitch pinned at the ±16000 clamp**. The recentre offsets are only captured when the right
+controller is tracked at the instant MENU is held, so a session without a clean recentre carries an
+arbitrary constant.
+
+**Aim mode 1 clamps the deviation to 30°, so a biased hand direction still looks like it follows
+the hand.** That is why this survived fifty runs. It is now measured directly — hand yaw/pitch
+minus head yaw/pitch in the same XR frame, zero by construction when they agree.
+
+`AimTraceSignYaw=-1` in the ini: left/right came out mirrored. Pitch is correct at `+1`.
+
+### Still open
+
+- **The tracer.** The impact moves but the visible round does not appear. Cosmetic; `SetFlashLocation`
+  is a native→script entry point the hook already sees, so its parameter is reachable.
+- **The gun model.** Unchanged and still the separate mechanism — `SetAim` is script→script and
+  unreachable, so it needs a direct GObjects write to the `RvAnimNodeAimOffset2D` in
+  `ch_inview_arms_animtree`. Unproven, with an ordering risk.
+
 ## ⛔ Runs 91–102: route 2's field-swapping is DEAD, and this time it was measured
 
 **The null window settled it.** Mode 10 runs the identical fire window — same functions, same hook,
