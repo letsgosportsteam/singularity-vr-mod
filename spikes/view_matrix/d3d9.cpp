@@ -6218,6 +6218,16 @@ ScriptFn g_scriptFns[] = {
     { "ProcessViewRotation",-1 },   // [8] and the things inside it that must NOT see the hand
     { "UpdateCamera",       -1 },   // [9]
     { "LimitViewRotation",  -1 },   // [10]
+    // ---- ⭐ run 96: the fire path, found by the census that finally worked ----
+    // Enrichment under fire, against a 2.9% baseline for everything that runs every frame:
+    //   FireAmmunition 88.9%  NotifyWeaponFired 88.9%  SetFlashLocation 88.9%
+    //   BeginFire 86.5%       StartFire 84.2%
+    // These are native->script ENTRY POINTS, so unlike GetAdjustedAim they reach this hook.
+    // FireAmmunition is the one that matters: it calls InstantFire/ProjectileFire, which call
+    // GetAdjustedAim. Put the hand in Rotation for its duration and the trace uses the hand.
+    { "FireAmmunition",     -1 },   // [11]
+    { "BeginFire",          -1 },   // [12]
+    { "StartFire",          -1 },   // [13]
 };
 const int kFnGetAdjustedAim = 0;
 const int kFnTick           = 5;
@@ -6225,6 +6235,8 @@ const int kFnSetAim         = 6;
 const int kFnPlayerTick     = 7;
 const int kFnMaskFirst      = 8;    // [8..10] are the masked-out view functions
 const int kFnMaskLast       = 10;
+const int kFnFireFirst      = 11;   // [11..13] open the mode 9 window
+const int kFnFireLast       = 13;
 const int kScriptFnCount    = (int)(sizeof(g_scriptFns) / sizeof(g_scriptFns[0]));
 
 static LONG FnIdx(int i) { return InterlockedCompareExchange(&g_scriptFns[i].idx, 0, 0); }
@@ -6717,7 +6729,7 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // whenever a route-2 mode was on.
     const LONG aimMode = InterlockedCompareExchange(&g_aimMode, 0, 0);
     // Mode 8 needs the name on every call too - it is the whole mechanism, not a diagnostic.
-    const bool routeTwo = (aimMode == 6 || aimMode == 7 || aimMode == 8);
+    const bool routeTwo = (aimMode >= 6);
     const bool censusOn = InterlockedCompareExchange(&g_peCensus, 0, 0) != 0;
     int32_t fnIdx = -1;
     if ((censusOn || routeTwo) && Stack) {
@@ -6816,6 +6828,58 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // actually runs inside PlayerTick, so if the view still swings, the log already names the
     // function that has to join the mask. That is the difference between this and mode 4, which
     // failed and left nothing to act on.
+    // ================= ⭐ run 96: aim mode 9 - the window is the SHOT, not the tick ==============
+    //
+    // Mode 8 failed and said exactly why. Its nesting log named `PlayerMove`, and UE3's PlayerMove
+    // calls UpdateRotation, which does:
+    //
+    //     ViewRotation = Rotation;                    <-- copies the HAND out
+    //     ProcessViewRotation( DeltaTime, ViewRotation, DeltaRot );
+    //     SetRotation( ViewRotation );                <-- writes hand+delta back, permanently
+    //
+    // UpdateRotation is a script-to-script call and therefore invisible here, and the copy happens
+    // BEFORE ProcessViewRotation - so masking that function was always too late. That single
+    // mechanism produced both reported symptoms: the view took the hand permanently, and the mod's
+    // external-delta fold-in then read its own write back as somebody else's turning, which is
+    // what inverted head tracking.
+    //
+    // The fix is not a better mask. It is a window that does not contain the view update at all.
+    // `FireAmmunition` runs 32 times a session instead of PlayerTick's 636, it is 88.9% enriched
+    // under fire against a 2.9% baseline, and it is the function that calls InstantFire /
+    // ProjectileFire -> GetAdjustedAim. The view is computed in PlayerMove, a different entry
+    // point, so it cannot see inside this window at all.
+    //
+    // ⚠️ This is the third time the time split has been tried, so the difference is worth stating
+    // plainly rather than asserted. Modes 4 and 5 held the hand for a whole FRAME. Mode 8 held it
+    // for a whole TICK, which still contained the view update. This holds it for one shot.
+    const bool mode9 = (aimMode == 9) && fnIdx >= 0;
+    bool firedWindow = false;
+    int32_t fireSavedPitch = 0, fireSavedYaw = 0;
+    uintptr_t fireCtl = 0;
+
+    if (mode9) {
+        bool isFireFn = false;
+        for (int fk = kFnFireFirst; fk <= kFnFireLast; ++fk)
+            if (FnIdx(fk) >= 0 && fnIdx == FnIdx(fk)) { isFireFn = true; break; }
+        if (isFireFn) {
+            fireCtl = (uintptr_t)InterlockedCompareExchange(&g_ctlForXi, 0, 0);
+            if (fireCtl && Readable((void*)(fireCtl + ACTOR_ROTATION), 12)) {
+                int32_t* rot = reinterpret_cast<int32_t*>(fireCtl + ACTOR_ROTATION);
+                fireSavedPitch = rot[0]; fireSavedYaw = rot[1];
+                rot[0] = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
+                rot[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
+                firedWindow = true;
+                static volatile LONG shots = 0;
+                if (InterlockedIncrement(&shots) <= 6) {
+                    char nm[96]{};
+                    NameFromIndex(fnIdx, nm, sizeof(nm));
+                    Log("aim mode 9: %s - rotation swapped head(p %d y %d) -> hand(p %d y %d)"
+                        " for this call only", nm, fireSavedPitch, fireSavedYaw, rot[0], rot[1]);
+                }
+            }
+        }
+    }
+
     const bool mode8 = (aimMode == 8) && fnIdx >= 0;
     bool openedWindow = false, maskedHere = false;
     int32_t savedPitch = 0, savedYaw = 0;
@@ -6849,6 +6913,16 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     }
 
     g_origProcessEvent(self, edx, Stack, Result);
+
+    // Mode 9's window closes here. Restoring the value that was READ rather than a cached head
+    // means a nested fire function (StartFire -> BeginFire -> FireAmmunition) puts back the hand
+    // for the outer call and the head only when the outermost one returns - no depth counter
+    // needed, and no way for an unbalanced nesting to leave the hand stuck in the field.
+    if (firedWindow && Readable((void*)(fireCtl + ACTOR_ROTATION), 12)) {
+        int32_t* rot = reinterpret_cast<int32_t*>(fireCtl + ACTOR_ROTATION);
+        rot[0] = fireSavedPitch; rot[1] = fireSavedYaw;
+    }
+    if (mode9) return;
 
     if ((openedWindow || maskedHere) && ctlNow && Readable((void*)(ctlNow + ACTOR_ROTATION), 12)) {
         int32_t* rot = reinterpret_cast<int32_t*>(ctlNow + ACTOR_ROTATION);
@@ -7394,7 +7468,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Same reasoning as PAGE UP running upwards first: reaching a mode should not take five
         // presses while wearing a headset, because that is how a run gets lost to a miscount.
         // 0 off, 6 the run 91 fix, 1 the shipping route-1 arrangement, then the two dead probes.
-        static const LONG kAimCycle[] = { 0, 8, 1, 7, 6, 2, 3 };
+        // Mode 8 is CUT from the cycle: it puts the hand into the view permanently via PlayerMove
+        // and inverts head tracking, so hitting it by accident costs a restart. Kept in source as
+        // the record, exactly as modes 4 and 5 were.
+        static const LONG kAimCycle[] = { 0, 9, 1, 2, 3 };
         const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
         LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
         int at = 0;
@@ -7407,7 +7484,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
         // Run 93: find the real ProcessInternal and move the hook onto it. Both are no-ops once
         // they have succeeded, so cycling modes does not re-walk GObjects.
-        if (mode == 6 || mode == 7 || mode == 8) { FindProcessInternal(); RepointScriptHook(); }
+        if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); }
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
@@ -7433,6 +7510,21 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     break;
             case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
                         " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
+                    break;
+            case 9: Log("NUMPAD.: aim mode 9 - THE WINDOW IS THE SHOT. The view, the culling and the"
+                        " gun all stay exactly as normal on your HEAD - that is the design, not a"
+                        " failure, and nothing on screen will change when you press this."
+                        " The hand goes into the rotation ONLY for the duration of"
+                        " FireAmmunition/BeginFire/StartFire, which the run 95 census found at 86-89%%"
+                        " enriched under fire against a 2.9%% baseline. FireAmmunition is what calls"
+                        " InstantFire -> GetAdjustedAim. The view is computed in PlayerMove, a"
+                        " different entry point, so it cannot see inside this window."
+                        " >>> STAND CLOSE TO A WALL, POINT WELL AWAY FROM THE CROSSHAIR, FIRE. <<<"
+                        " Impact where your HAND points = the bullet is decoupled, with no culling"
+                        " or LOD cost at all. Impact ON the crosshair = the trace reads the aim"
+                        " somewhere outside this window."
+                        " NOTE: THE GUN MODEL WILL NOT MOVE. That is expected here - this mode is the"
+                        " BULLET only. The gun's pose is a separate mechanism and is next.");
                     break;
             case 8: Log("NUMPAD.: aim mode 8 - THE MASKED TIME SPLIT. Run 94 closed the script route"
                         " by measurement: only 87 functions reach this hook and all are"

@@ -50,7 +50,12 @@ try {
     $anOut | Write-Host
     # Format-string mistakes are the ones that have actually cost time here, so they fail the
     # build. The rest of /analyze's output is advisory.
-    $fatal = $anOut | Select-String -Pattern "warning C6067|warning C6063|warning C6064|warning C6066|warning C6272|warning C6273|warning C6328"
+    # C6270/C6271 added run 96: a literal '%' left unescaped in a Log() string. "86-89% enriched"
+    # becomes the float specifier %e with no argument, which reads garbage off the stack. Exactly
+    # the run-27 defect this check exists for, and it slipped through because only some of the
+    # family were listed. If a warning says the format string and the arguments disagree, it is
+    # fatal - there is no benign version of that.
+    $fatal = $anOut | Select-String -Pattern "warning C6067|warning C6063|warning C6064|warning C6066|warning C6270|warning C6271|warning C6272|warning C6273|warning C6328"
     if ($fatal) { throw "static analysis found a format-string defect - fix it before building" }
 
     $cmd = "`"$vcvars`" x86 && cl /nologo /LD /EHsc /W3 /Zi /MD /std:c++17 " +
