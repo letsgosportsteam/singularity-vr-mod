@@ -28,7 +28,8 @@ dropped beside the game exe. No game files modified.
 | **True stereo**, real per-eye parallax | ✅ draw-call duplication; eyes align, depth correct |
 | **FOV / aspect / resolution** | ✅ **100% of the headset's pixels, automatic** |
 | **Performance** | ✅ **120 fps locked**, 4.35 ms idle per frame |
-| Controller input, menus, aim decoupling | ⬜ **not started — this is the whole remaining project** |
+| **Controller input** | ✅ **working** — full Touch mapping, menus, haptics, snap turn, off-hand movement |
+| **Aim decoupling** | 🟡 mechanism built and proven a no-op at 0° deviation; **blocked on frustum culling** (run 64) |
 
 ### If you are picking this up cold, read these three things
 
@@ -79,6 +80,207 @@ structural change in the build and the first thing to suspect if tracking ever m
   one session than three rounds of argument.
 - **Check whether the instrument can report anything at all.** Eight tautological diagnostics have
   been found here — counters that could only ever report the good case.
+
+## ✅ Run 60: the game has a native gamepad path, and it accepts a synthetic pad
+
+**`Singularity.exe` statically imports `XINPUT1_3.dll`, ordinals 2 and 3** — `XInputGetState` and
+`XInputSetState`. It is a 2010 console port, so Raven's entire 360 path is already compiled in:
+analog move, analog look, buttons, rumble, and **menu navigation**.
+
+So the last rung is not "teach UE3 about controllers". It is **impersonate one Xbox 360 pad**, and
+let Raven's own input code supply the dead zones, the acceleration curves and the menu focus
+handling — none of which then have to be written or tuned here. Confirmed live.
+
+### The mechanism, from the call-rate log
+
+| State | What the log shows |
+|---|---|
+| Before a pad is reported | **2 calls/sec, round-robin across all four ports** — that is device *enumeration*, not input |
+| After port 0 answers `ERROR_SUCCESS` | **port 0 alone jumps to ~122/sec** (the frame rate); ports 1–3 stay on the slow scan |
+
+The engine **promotes a port to per-frame polling on first successful read**. Two consequences:
+
+1. **Detection costs up to ~4 seconds** (four ports, ~1/sec). A pad that only appears on a keypress
+   is therefore absent for the whole main menu — the one place it is most needed. Emulation
+   defaults **ON** as of run 61 (`[Input] Gamepad=0` in the ini turns it off).
+2. **The per-port call rate is a free, non-tautological instrument.** `port0` at frame rate means
+   the engine is reading us as a real input device — and it genuinely reported the *bad* case for
+   the first two seconds of the probe run, which is the test eight earlier diagnostics here failed.
+
+### Two traps that were avoided, both silent
+
+- **The exe imports these BY ORDINAL.** There is no `XInputGetState` string in its import table, so
+  an IAT patch keyed on the name would have found nothing to patch and reported success. MinHook
+  detours the function body inside `XINPUT1_3.dll`, which catches the caller however it resolved
+  the address. `GetProcAddress` by name is still the way to *find* it.
+- **`dwPacketNumber` must advance only on change.** One that increments every call defeats the
+  game's own skip-unchanged optimisation; one that never increments can make the game ignore us
+  entirely. Both fail quietly.
+
+**It costs nothing in the frame.** While emulating, the real `XInputGetState` is never called —
+polling an absent device is the expensive case and the game was already paying it every frame.
+Measured after: **120.0 fps, our work 1.08 ms, XR submit 1.31 ms.** No regression.
+
+### ✅ And engine-driven turning composes with head tracking
+
+The run-12 external-delta fold-in was written for the mouse. Run 60's NUMPAD5 test proved it covers
+the **thumbstick** too: with the look stick held over, `head yaw` stayed within ±2° while `want yaw`
+swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Body-turn and head-turn
+**add**, exactly as VR wants. That was the open question gating the whole input design and it is
+answered.
+
+## ✅ Runs 67–75: the judder was an INTERACTION, and one-factor tests could never have found it
+
+**Symptom:** judder and heavy frame loss whenever the controllers sat on the desk; fine once they
+were picked up. Nine runs, five dead theories.
+
+**The measurement that settled it** — three buckets, cumulative over a whole session, draw counts
+controlled:
+
+| pad | controllers | fps | residual | missed | draws |
+|---|---|---|---|---|---|
+| off | on desk | 109.3 | 4.13 | 2.1% | 1316 |
+| **ON** | **in hand** | **117.9** | **4.14** | **1.0%** | 1563 |
+| **ON** | **ON DESK** | **71.9** | **10.40** | **18.7%** | **1148** |
+
+**Neither factor is the cause alone.** A connected pad while the controllers are held is fine. The
+controllers on the desk with no pad is fine. Only both together break it. The confound is
+controlled the right way round for once: the bad row has the *fewest* draws and is still 40 fps
+slower.
+
+**This is why five consecutive theories died.** Every run before this tested one factor at a time,
+which is a question with no answer when the effect is an interaction — so each mechanism looked
+plausible in isolation and each was eliminated:
+
+| Theory | Killed by |
+|---|---|
+| OpenXR input calls cost too much | all four phases timed at <0.1 ms peak |
+| Sleeping controllers stall the runtime | haptics gated on tracking: no change |
+| `dwPacketNumber` churn makes UE3 re-process input | deadzone cut churn 20×: no change — **and the controls still worked with the packet frozen, so the engine never reads it** |
+| 900 XInput polls/sec | that was the *loading screen* — 0 draws, 27 fps. In gameplay it is 1/frame |
+| `bSmoothFrameRate` governor holds the rate down | neutralising every render-thread sleep: no change |
+
+### The fix: auto-pad
+
+Unplug the virtual gamepad when neither controller has moved for 3 s; plug it back in the instant
+one moves. `[Input] AutoPad=0`, `AutoPadStillFrames` to tune. Confirmed over a full session: no
+judder.
+
+**The mechanism is still unknown**, and that is worth stating plainly rather than dressing up. This
+is a workaround built on a correlation that survived every test, not an explanation that passed
+one.
+
+- **"Asleep" was always the wrong question.** A controller can be awake, delivering input, and
+  still be on a desk — proven by a trigger firing accidentally on the desk without helping. The
+  distinguishing signal is **motion**: in hand measures 878–10359 µm/frame, a resting desk reads 0.
+- **The timeout stays at 3 s.** The costs are asymmetric — a premature unplug costs 2–3 s of *dead
+  controls* mid-combat while UE3 re-enumerates (run 60: round-robin, ~1 port/sec), which is worse
+  than 3 s of judder. Both controllers must be still, so aiming with one hand steady keeps it alive.
+
+### ⚠️ Method notes from nine runs of not converging
+
+- **A one-factor test cannot find an interaction**, and it does not fail loudly — it produces a
+  plausible mechanism every time, which is exactly what happened five times running here.
+- **Two instruments were themselves broken**, and both hid the answer rather than merely missing
+  it. `NUMPAD/` forced the controller-state flags to false, making the one row the experiment
+  needed physically unrecordable. The motion threshold was 10× too low, so every sample read
+  "in hand" and the correlation table collapsed to a single row.
+- **`ORIENTATION_TRACKED` reads backwards from intuition.** A controller on a desk is in clear
+  camera view and reports tracked; one in your hands sits below the camera cone and does not. A
+  table was read exactly wrong because of it.
+- **Fixing the mechanism you blamed and not fixing the symptom means it was not the mechanism.**
+  The deadzone worked perfectly and changed nothing.
+
+## 🚨 Run 67: the CONTROLLERS are an experimental variable, and every test in runs 64–66 ran inside it
+
+**Reported symptom:** the image judders and the frame rate drops whenever the head moves — always,
+from launch — and it **stops the moment the controllers are picked up**, returning when they are
+set down and the keyboard is used instead. Touch controllers sleep after a few seconds of
+stillness, so "set down" and "asleep" are the same state.
+
+**Why this contaminates everything above it:** every hotkey in this mod is on the keyboard. Pressing
+NUMPAD8, NUMPAD9 or NUMPAD\* *requires putting a controller down*. So every controller-related test
+in this session was performed in the degraded state, and none of the results separate the thing
+being tested from the state required to test it.
+
+### ⚠️ Retracted pending re-test
+
+- **Run 66's conclusion is UNSAFE.** "The split is not a no-op and the engine is smoothing our
+  written rotation" was inferred from a strobe that may have had nothing to do with the split. The
+  smoothing hypothesis is still plausible — `mDesiredRotationInterpRate` is real — but it is
+  **not evidence** until the controller state is held fixed.
+- **Run 64's "geometry disappearing behind me"** is more likely genuine, because culling is
+  direction-dependent in a way judder is not. Still worth re-confirming.
+
+This is the **run 56 lesson, word for word**: validate the environment before bisecting yourself.
+Three conclusions were retracted last time for exactly this reason, and the identical binary
+measured 4% and 84% of windows over 15 ms across one evening. **The instrument that settles it is
+the frame budget that already exists** — `XR submit` separates the link and the compositor from our
+own work, and it has been in every log since run 56.
+
+### What was added to separate it
+
+- **`NUMPAD /`** turns *all* of this mod's XR input work off — no `xrSyncActions`, no pose
+  locations, no haptics. If the judder is unchanged either way, it is not our input code.
+- **Controller state is logged on the frame-budget cadence** (`left TRACKED / asleep`, sync-fail
+  frame count), so one run with the controllers picked up and set down a few times shows the
+  correlation directly rather than depending on anyone remembering when they did it.
+- **Haptics are now gated on `ORIENTATION_TRACKED`,** not merely `VALID`. A set-down controller
+  keeps reporting a valid last-known pose long after it stops being tracked, so the valid bit alone
+  cannot tell a live controller from a sleeping one. This also rules out a plausible cause on its
+  own terms: the mod asks for haptics every time the game rumbles, which in combat is constantly.
+
+## ✅ Run 61b: Raven's 360 layout, read out of the game's own config
+
+`RvGame\CookedPC\Coalesced_INT.bin` is UE3's coalesced config archive and it carries the shipped
+binding table as UTF-16 text. Extract the strings, grep for `XboxTypeS`, and the whole layout falls
+out — no guessing, no probing:
+
+| 360 | Command | 360 | Command |
+|---|---|---|---|
+| RT | Fire | LT | Aim |
+| A | Jump | B | Crouch |
+| X | Use / reload | Y | **CycleWeapon** |
+| LB | AgeYoung (TMD) | RB | Impulse (TMD) |
+| L-stick click | Dash | R-stick click | AntiGrav (TMD) |
+| **D-pad up** | **Health** | D-pad down | Flashlight |
+| START | ShowMenu | BACK | Scoreboard |
+
+Every binding routes through `PressChainButton CB_x | OnRelease ReleaseChainButton CB_x`, so the
+engine wants a **press and a release** — a one-frame pulse can land between its own input ticks.
+D-pad left/right are bound to generic `CB_DPAD_LEFT/RIGHT` with no gameplay command behind them.
+
+Two facts that changed the mapping rather than merely confirming it:
+
+- **D-pad up is the health item.** That is what run 61's weapon-switch mapping actually hit.
+- **There is no next/prev weapon, only CYCLE.** One command, and the mouse wheel is bound to it in
+  *both* directions. A two-way stick gesture was wrong by construction, so the stick's other
+  direction is now free and carries health.
+
+### ⚠️ The probe could confirm a binding but could not refute one
+
+Fourteen buttons were pressed one at a time. Four reported something — A, B, RB, START — and the
+other ten read as "nothing happened". **All ten of those readings were uninformative.** Use,
+CycleWeapon and the three TMD powers do nothing without a target, a second weapon or a charge, and
+D-pad up read as nothing *at full health*, having demonstrably used a health item ten minutes
+earlier.
+
+So the instrument could only ever report the positive case — the ninth instance of that trap in
+this project, and the first one that was not caught before the run. The config file was the better
+instrument and it was sitting in the install the whole time. **Look for the game's own answer
+before building something to infer it.**
+
+### The VR mapping that follows
+
+| VR input | 360 | Action |
+|---|---|---|
+| Right trigger / left trigger | RT / LT | Fire / Aim |
+| Right A · B · grip · stick-click | A · B · X · R-stick | Jump · Crouch · Use · AntiGrav |
+| Left X · Y · grip · stick-click | LB · D-pad down · RB · L-stick | AgeYoung · Flashlight · Impulse · Dash |
+| Left menu | START | Menu |
+| Look stick up / down | Y / D-pad up | Cycle weapon / Health |
+| Look stick left / right | — | snap turn, ours (steps `g_baseYaw` directly) |
+| Move stick | L-stick axes | move (HMD-relative by construction) |
 
 ## ✅ Resolution — inherited from the headset, automatically (design run 17, built run 59)
 
@@ -207,7 +409,15 @@ stereo (draw duplication) · **F12** alternate-eye stereo ·
 **PAGE UP** cycle culling headroom (now runs *down* from 1.0) · **PAGE DOWN** cycle how much of
 the headset's FOV we render · **HOME** scissor off (drawn-then-clipped vs never-drawn) ·
 **END** clip out everything driven by the tracked register (remapped vs unremapped) ·
-**NUMPAD1** head roll on/off · **NUMPAD2** flip the roll sign.
+**NUMPAD1** head roll on/off · **NUMPAD2** flip the roll sign ·
+**NUMPAD3** gamepad emulation (on by default since run 61) · **NUMPAD4** walk-forward test ·
+**NUMPAD5** stick-look test.
+
+Controller settings live in an `[Input]` section of `Binaries\SingularityVR.ini`: `Gamepad`,
+`TurnMode` (0 smooth / 1 snap), `TurnAngle`, `TurnSign`, and a 360 button mask per action
+(`Jump`, `Crouch`, `Reload`, `Use`, `Menu`, `Sprint`, `LeftX`, `LeftY`, `Melee`). Raven's own
+console layout is not documented anywhere, so the masks are a first guess kept editable rather
+than a rebuild.
 
 **Do not press F12 after F1.** F1 clears alternate-eye, but F12 does *not* clear duplication, so
 that order leaves both stereo modes running at once. F12 before F1 is harmless and pointless.
