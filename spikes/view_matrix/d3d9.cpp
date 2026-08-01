@@ -6861,18 +6861,41 @@ void* __cdecl Hook_LineCheck(void* params) {
     // hardcoding +0x68: the offset was read off one build's movement traces and this is a weapon
     // trace. If it does not match, nothing is written and the log says so - the same
     // prove-itself-first rule that stopped mode 6 corrupting the heap.
-    if (InterlockedCompareExchange(&g_aimMode, 0, 0) == 11 &&
+    const LONG amNow = InterlockedCompareExchange(&g_aimMode, 0, 0);
+    if ((amNow == 11 || amNow == 12) &&
         InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0 &&
-        params && Readable(params, 0x80) &&
+        params && Readable(params, 0x100) &&
         InterlockedCompareExchange(&g_camPosValid, 0, 0)) {
         float* f = reinterpret_cast<float*>(params);
         int s = -1;
-        for (int i = 0; i + 5 < 32; ++i) {
+        // 64 floats, not 32. One of the two traces per shot found nothing in the first 0x80
+        // bytes, and a Start living past that would look exactly like "this trace does not start
+        // at the player" - which is a conclusion, not a measurement.
+        for (int i = 0; i + 5 < 64; ++i) {
             const float ex = f[i] - g_camPos[0], ey = f[i+1] - g_camPos[1], ez = f[i+2] - g_camPos[2];
             if (ex*ex + ey*ey + ez*ez < 520.0f * 520.0f) { s = i; break; }
         }
-        const int32_t dYaw   = InterlockedCompareExchange(&g_aimYawForXi, 0, 0)   - g_wantYaw;
-        const int32_t dPitch = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0) - g_wantPitch;
+        // ---- ⭐ run 110: mode 12 takes the hand OUT of the experiment ----
+        //
+        // Mode 11's deltas came out at dYaw 22110 (121 deg) and dPitch 16336 (89.7 deg). Nobody
+        // points a controller 90 degrees up, so the hand-vs-head delta carries a bias - and mode 1
+        // has always CLAMPED that deviation to 30 degrees, which is precisely why the bias has
+        // never been visible before.
+        //
+        // That leaves two unknowns stacked: is the rotation reaching the bullet, and is the delta
+        // correct. Mode 12 removes the second one by rotating the trace a constant 25 degrees of
+        // yaw, exactly as aim mode 2 once probed +0x05D4:
+        //
+        //   hole 25 deg to the RIGHT -> the rotation reaches the bullet. Only the hand delta is
+        //                               wrong, and that is arithmetic rather than archaeology.
+        //   hole ON the crosshair    -> we are rotating a trace that does not decide the impact,
+        //                               and the OTHER line check is the one that matters.
+        const LONG am = InterlockedCompareExchange(&g_aimMode, 0, 0);
+        const int32_t kTestYaw = (int32_t)(25.0f * (65536.0f / 360.0f));
+        const int32_t dYaw   = (am == 12) ? kTestYaw
+                             : InterlockedCompareExchange(&g_aimYawForXi, 0, 0)   - g_wantYaw;
+        const int32_t dPitch = (am == 12) ? 0
+                             : InterlockedCompareExchange(&g_aimPitchForXi, 0, 0) - g_wantPitch;
         const LONG n = InterlockedIncrement(&g_traceRotated);
         if (s >= 0) {
             float* start = f + s;
@@ -6884,11 +6907,16 @@ void* __cdecl Hook_LineCheck(void* params) {
                     " (%.0f %.0f %.0f)  dYaw %d dPitch %d",
                     s * 4, start[0], start[1], start[2], bx, by, bz,
                     end[0], end[1], end[2], dYaw, dPitch);
-        } else if (n <= 8) {
-            Log("trace NOT rotated: no triple near the camera (%.0f %.0f %.0f) in this struct -"
-                " nothing written. Either this trace does not start at the player, or the layout"
-                " differs from the movement traces the probe measured.",
+        } else if (n <= 4) {
+            // DUMP it. Every shot fires two line checks and only one has a Start at the camera;
+            // if the bullet is decided by the other, this dump is the only thing that can say so.
+            // Saying "not rotated" and nothing else is how the last run ended with a symptom and
+            // no evidence.
+            Log("trace NOT rotated: no triple near the camera (%.0f %.0f %.0f). Struct follows -"
+                " this is the OTHER line check of the pair and may be the one that decides the hit.",
                 g_camPos[0], g_camPos[1], g_camPos[2]);
+            for (int i = 0; i + 2 < 64; i += 3)
+                Log("    +0x%02X  %14.2f %14.2f %14.2f", i * 4, f[i], f[i+1], f[i+2]);
         }
     }
 
@@ -7367,10 +7395,10 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     }
 
     const bool mode10 = (aimMode == 10) && fnIdx >= 0;
-    const bool mode9 = ((aimMode == 9) || mode10 || (aimMode == 11)) && fnIdx >= 0;
+    const bool mode9 = ((aimMode == 9) || mode10 || (aimMode == 11) || (aimMode == 12)) && fnIdx >= 0;
     // Mode 11 also opens a null window: it needs the window as a FILTER for the trace hook, but
     // must not write a rotation field or the view would follow - which is the whole point.
-    const bool nullWindow = mode10 || (aimMode == 11);
+    const bool nullWindow = mode10 || (aimMode == 11) || (aimMode == 12);
     bool firedWindow = false;
     int32_t savedCtl[3] = {}, savedCam[3] = {}, savedPov[3] = {};
     bool haveCtl = false, haveCam = false, havePov = false;
@@ -8090,7 +8118,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // the record, exactly as modes 4 and 5 were.
         // Mode 10 first: it is the null window, so it writes nothing and cannot cycle the view,
         // and it is now also the mode that dumps the weapon trace parameters.
-        static const LONG kAimCycle[] = { 0, 11, 10, 9, 1, 2, 3 };
+        // Mode 12 leads: it is the discriminator, and the one to press first.
+        static const LONG kAimCycle[] = { 0, 12, 11, 1, 2, 3 };
         const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
         LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
         int at = 0;
@@ -8129,6 +8158,22 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     break;
             case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
                         " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
+                    break;
+            case 12: Log("NUMPAD.: aim mode 12 - CONSTANT 25 DEGREE TRACE DEFLECTION. A probe, not a"
+                        " feature: the trace End is rotated a fixed 25 degrees of YAW regardless of"
+                        " where your controller points, which takes the hand out of the experiment"
+                        " entirely."
+                        " Mode 11 rotated by hand-minus-head and got 121 deg of yaw and 90 deg of"
+                        " pitch, so that delta carries a bias - mode 1 has always clamped it to 30"
+                        " deg, which is why nobody has seen it."
+                        " NOTHING ON SCREEN WILL CHANGE and the gun will not move. The only"
+                        " evidence is the bullet."
+                        " >>> STAND CLOSE TO A WALL, AIM AT A MARK, FIRE ONE SHOT. <<<"
+                        " Hole about 25 deg to the RIGHT of where you aimed = the rotation reaches"
+                        " the bullet, and only the hand delta is wrong - arithmetic, not"
+                        " archaeology."
+                        " Hole exactly ON your mark = we are rotating a trace that does not decide"
+                        " the impact, and the log now dumps the OTHER one.");
                     break;
             case 11: Log("NUMPAD.: aim mode 11 - ROTATE THE TRACE. This is the real one."
                         " The view, culling, LOD and the gun all stay on your HEAD and NOTHING"
