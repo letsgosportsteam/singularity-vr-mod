@@ -6861,8 +6861,11 @@ void* __cdecl Hook_LineCheck(void* params) {
     // hardcoding +0x68: the offset was read off one build's movement traces and this is a weapon
     // trace. If it does not match, nothing is written and the log says so - the same
     // prove-itself-first rule that stopped mode 6 corrupting the heap.
+    // ---- run 111: this no longer ROTATES, it only reports ----
+    // 0x00BD79D0 turned out to be the result processor, not the trace. The rotation moved to
+    // SingleLineCheck; this block stays because the struct dump is what identified it.
     const LONG amNow = InterlockedCompareExchange(&g_aimMode, 0, 0);
-    if ((amNow == 11 || amNow == 12) &&
+    if (false && (amNow == 11 || amNow == 12) &&
         InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0 &&
         params && Readable(params, 0x100) &&
         InterlockedCompareExchange(&g_camPosValid, 0, 0)) {
@@ -6921,6 +6924,87 @@ void* __cdecl Hook_LineCheck(void* params) {
     }
 
     return g_origLineCheck(params);
+}
+
+// ================= ⭐ run 111: UWorld::SingleLineCheck, the REAL trace ========================
+//
+// 0x00BD79D0 was the wrong function and the data said so: a constant 25 degree deflection (mode 12,
+// dYaw 4551) moved nothing, and the struct it receives is mostly zeros and NaNs holding an impact
+// position. That is a RESULT being processed, not a trace being performed.
+//
+// The right one is the other call, and the call site names it completely:
+//
+//     push esi                       ; arg7
+//     lea ecx,[ebp-0x70]  push ecx   ; arg6  Extent
+//     push ebx                       ; arg5  TraceFlags
+//     lea edx,[ebp-0x7C]  push edx   ; arg4  Start
+//     lea eax,[ebp-0xC0]  push eax   ; arg3  End
+//     push edi                       ; arg2  SourceActor
+//     lea ecx,[ebp-0x64]  push ecx   ; arg1  FCheckResult
+//     mov ecx,[0x01CF74E4]           ; this = GWorld, a global
+//     call 0x00A108B0
+//
+// Seven stack args plus `this` in ECX, and the epilogue is `ret 0x1C` - 28 bytes, exactly seven.
+// TWO independent confirmations of the argument count, which is what ProcessInternal needed and
+// did not get before it crashed the game twice.
+//
+// arg1 is [ebp-0x64], the same local later handed to 0x00BD79D0 - which is what proves that one is
+// the result processor rather than the trace.
+const uintptr_t kSingleLineCheckAddr = 0x00A108B0;
+typedef int (__fastcall *PFN_SLC)(void* self, void* edx, void* hit, void* src,
+                                  float* End, float* Start, uint32_t flags, void* extent, void* a7);
+PFN_SLC g_origSLC = nullptr;
+volatile LONG g_slcRotated = 0;
+
+int __fastcall Hook_SingleLineCheck(void* self, void* edx, void* hit, void* src,
+                                    float* End, float* Start, uint32_t flags,
+                                    void* extent, void* a7) {
+    if (InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0 &&
+        End && Start && Readable(End, 12) && Readable(Start, 12) &&
+        InterlockedCompareExchange(&g_camPosValid, 0, 0)) {
+        const LONG am = InterlockedCompareExchange(&g_aimMode, 0, 0);
+        if (am == 11 || am == 12) {
+            // Start must be the player's own eye/muzzle. Nothing else fired inside the window has
+            // a reason to originate there, and refusing to touch anything else keeps AI and
+            // physics traces - which pour through this function - untouched.
+            const float ex = Start[0] - g_camPos[0], ey = Start[1] - g_camPos[1], ez = Start[2] - g_camPos[2];
+            if (ex*ex + ey*ey + ez*ez < 520.0f * 520.0f) {
+                const int32_t kTestYaw = (int32_t)(25.0f * (65536.0f / 360.0f));
+                const int32_t dYaw   = (am == 12) ? kTestYaw
+                                     : InterlockedCompareExchange(&g_aimYawForXi, 0, 0)   - g_wantYaw;
+                const int32_t dPitch = (am == 12) ? 0
+                                     : InterlockedCompareExchange(&g_aimPitchForXi, 0, 0) - g_wantPitch;
+                const float bx = End[0], by = End[1], bz = End[2];
+                RotateTrace(Start, End, dYaw, dPitch);
+                const LONG n = InterlockedIncrement(&g_slcRotated);
+                if (n <= 8)
+                    Log("SingleLineCheck rotated: start (%.0f %.0f %.0f) end (%.0f %.0f %.0f) ->"
+                        " (%.0f %.0f %.0f)  dYaw %d dPitch %d  flags 0x%X",
+                        Start[0], Start[1], Start[2], bx, by, bz,
+                        End[0], End[1], End[2], dYaw, dPitch, flags);
+            }
+        }
+    }
+    return g_origSLC(self, edx, hit, src, End, Start, flags, extent, a7);
+}
+
+void InstallSingleLineCheckHook() {
+    if (g_origSLC) return;                        // idempotent, run 102's lesson
+    void* target = reinterpret_cast<void*>(kSingleLineCheckAddr);
+    if (!Readable(target, 8)) { Log("SLC: 0x%08X unreadable", (unsigned)kSingleLineCheckAddr); return; }
+    static const uint8_t kSig[6] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68 };
+    if (memcmp(target, kSig, sizeof(kSig)) != 0) {
+        const uint8_t* c = reinterpret_cast<const uint8_t*>(target);
+        Log("SLC: 0x%08X prologue mismatch (%02X %02X %02X %02X %02X %02X) - refusing to hook",
+            (unsigned)kSingleLineCheckAddr, c[0], c[1], c[2], c[3], c[4], c[5]);
+        return;
+    }
+    const MH_STATUS cs = MH_CreateHook(target, (void*)&Hook_SingleLineCheck, (void**)&g_origSLC);
+    if (cs != MH_OK) { Log("SLC: MH_CreateHook failed, status %d", (int)cs); g_origSLC = nullptr; return; }
+    const MH_STATUS es = MH_EnableHook(target);
+    if (es != MH_OK) { Log("SLC: MH_EnableHook failed, status %d", (int)es); MH_RemoveHook(target); g_origSLC = nullptr; return; }
+    Log("UWorld::SingleLineCheck hooked at 0x%08X (__thiscall, 7 stack args, ret 0x1C).",
+        (unsigned)kSingleLineCheckAddr);
 }
 
 void InstallLineCheckHook() {
@@ -8132,7 +8216,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
         // Run 93: find the real ProcessInternal and move the hook onto it. Both are no-ops once
         // they have succeeded, so cycling modes does not re-walk GObjects.
-        if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); ProbeTraceNative(); InstallLineCheckHook(); }
+        if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); ProbeTraceNative(); InstallLineCheckHook(); InstallSingleLineCheckHook(); }
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
