@@ -965,6 +965,37 @@ int g_camRotOffs[kRotFieldMax], g_camRotCount = 0;
 // Odd while a fire window is open, even when closed. Present uses it to tell "the player turned"
 // from "we wrote the hand for a microsecond" - see the fold-in guard.
 volatile LONG g_fireSeq = 0;
+
+// ---- ⭐ run 100: which fields the fire window is allowed to touch ----
+//
+// Run 99 wrote all seven scanned fields and produced the first real result: the bullet followed
+// the controller in PITCH. It also moved the camera on every shot, and the two are the same story.
+// Yaw is almost certainly decoupling as well and cannot be seen, because the camera jumps to the
+// hand's yaw at the instant of the shot - so the bullet lands on the crosshair because the
+// CROSSHAIR MOVED. Pitch survives because the mod's fold-in is yaw-only and has no pitch
+// equivalent to corrupt.
+//
+// The camera movement is not the fold-in race the seqlock guards - that was already fixed and the
+// symptom is unchanged. It is a WRITE the engine acts on: ENGINE_NOTES records
+// mDesiredRotationInterpRate on the camera, so a desired-rotation field written even for a
+// microsecond makes the camera interpolate toward the hand over the following frames. No seqlock
+// can prevent that, because it is not a race.
+//
+// Three of the seven scanned fields (camera +0x0338, +0x035C, +0x0464) have never been identified,
+// and one of them is the obvious candidate. So narrow the set instead of guessing which:
+//
+//   0  controller only  - +0x0060 and +0x05D4, no camera writes at all      (DEFAULT)
+//   1  controller + mCurrentPOV.Rotation
+//   2  every scanned field                                    (run 99's behaviour)
+//
+// Set 0 is the default because it removes every camera write, and because +0x05D4 is a CONTROLLER
+// field that run 99 added for the first time - run 97 wrote the camera fields WITHOUT it and got
+// nothing, so the new information is more likely to be there than in the camera.
+//
+// ⚠️ Run 80 wrote a constant to +0x05D4 and saw no deflection, and that is NOT a contradiction: it
+// wrote from Present, once per frame, so the engine had a whole tick to overwrite it before the
+// shot. Inside the fire window there is no such gap.
+LONG g_aimFieldSet = 0;
 volatile LONG g_rotScanSamples = 0;
 volatile LONG g_rotScanDone = 0;
 int32_t g_rotScanLastYaw = 0;
@@ -3316,6 +3347,7 @@ bool XrPathOf(const char* s, XrPath* out) {
 // Defined with the aim-pose code further down, next to the comment that explains what they mean.
 // Declared here because the ini is read long before that point in the file.
 extern LONG  g_aimPoseUUPer1;
+extern LONG  g_aimFieldSet;
 extern float g_aimPoseSignX, g_aimPoseSignY;
 
 bool InitXRInput() {
@@ -3340,6 +3372,9 @@ bool InitXRInput() {
             g_aimPoseUUPer1 = GetPrivateProfileIntA("Input", "AimPoseUUPer1", 16384, path);
             g_aimPoseSignX  = GetPrivateProfileIntA("Input", "AimPoseSignX", 1, path) >= 0 ? 1.0f : -1.0f;
             g_aimPoseSignY  = GetPrivateProfileIntA("Input", "AimPoseSignY", 1, path) >= 0 ? 1.0f : -1.0f;
+            // Which fields aim mode 9 may write. 0 controller only (default), 1 + mCurrentPOV,
+            // 2 every scanned field. See the note on g_aimFieldSet - set 2 moves the camera.
+            g_aimFieldSet   = GetPrivateProfileIntA("Input", "AimFieldSet", 0, path);
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             for (int i = 0; i < kPadButtonCount; ++i)
@@ -6975,12 +7010,12 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                 savedCtl[0] = r[0]; savedCtl[1] = r[1]; savedCtl[2] = r[2];
                 r[0] = hp; r[1] = hy; haveCtl = true;
             }
-            if (fireCam && Readable((void*)(fireCam + ACTOR_ROTATION), 12)) {
+            if (g_aimFieldSet >= 2 && fireCam && Readable((void*)(fireCam + ACTOR_ROTATION), 12)) {
                 int32_t* r = reinterpret_cast<int32_t*>(fireCam + ACTOR_ROTATION);
                 savedCam[0] = r[0]; savedCam[1] = r[1]; savedCam[2] = r[2];
                 r[0] = hp; r[1] = hy; haveCam = true;
             }
-            if (fireCam && Readable((void*)(fireCam + CAM_POV_ROT), 12)) {
+            if (g_aimFieldSet >= 1 && fireCam && Readable((void*)(fireCam + CAM_POV_ROT), 12)) {
                 int32_t* r = reinterpret_cast<int32_t*>(fireCam + CAM_POV_ROT);
                 savedPov[0] = r[0]; savedPov[1] = r[1]; savedPov[2] = r[2];
                 r[0] = hp; r[1] = hy; havePov = true;
@@ -7005,7 +7040,9 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                     extraSaved[nExtra][0] = r[0]; extraSaved[nExtra][1] = r[1];
                     r[0] = hp; r[1] = hy; ++nExtra;
                 }
-                for (int i = 0; i < g_camRotCount && nExtra < kExtraMax; ++i) {
+                // Camera fields only at set 2. This is the loop that moved the view: one of these
+                // is very likely a desired-rotation the engine interpolates toward.
+                for (int i = 0; g_aimFieldSet >= 2 && i < g_camRotCount && nExtra < kExtraMax; ++i) {
                     if (!fireCam) break;
                     int32_t* r = reinterpret_cast<int32_t*>(fireCam + g_camRotOffs[i]);
                     extraAddr[nExtra] = r;
@@ -7024,9 +7061,9 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
             if (InterlockedIncrement(&shots) <= 24) {
                 char nm[96]{};
                 NameFromIndex(fnIdx, nm, sizeof(nm));
-                Log("aim mode 9: %-16s hand(p %d y %d) | ctl %s was(p %d y %d) | cam %s was(p %d y %d)"
+                Log("aim mode 9: %-16s hand(p %d y %d) fieldSet %d | ctl %s was(p %d y %d) | cam %s was(p %d y %d)"
                     " | POV %s was(p %d y %d) | +%d scanned fields",
-                    nm, hp, hy,
+                    nm, hp, hy, (int)g_aimFieldSet,
                     haveCtl ? "SET" : "--", savedCtl[0], savedCtl[1],
                     haveCam ? "SET" : "--", savedCam[0], savedCam[1],
                     havePov ? "SET" : "--", savedPov[0], savedPov[1], nExtra);

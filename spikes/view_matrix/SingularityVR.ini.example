@@ -476,3 +476,30 @@ GpuFenceProbe=1
 ; AimPoseSignX=1           ; -1 to mirror the horizontal swing
 ; AimPoseSignY=1           ; -1 to mirror the vertical swing
 ; ---------------------------------------------------------------------------
+
+; ---------------------------------------------------------------------------
+; [Input] AimFieldSet - which fields aim mode 9 may write during a shot
+;
+; Run 99 wrote all seven scanned rotation fields and the bullet followed the
+; controller in PITCH for the first time - but the camera moved on every shot.
+; Both are the same story: yaw is very likely decoupling too and cannot be
+; seen, because the camera jumps to the hand's yaw at the instant of the shot,
+; so the bullet lands on the crosshair because the CROSSHAIR MOVED. Pitch
+; survives because the mod's external-delta fold-in is yaw-only.
+;
+; The camera movement is not a race - it survived the seqlock. It is a write
+; the engine ACTS on: the camera has mDesiredRotationInterpRate, so a
+; desired-rotation field written even briefly makes the camera interpolate
+; toward the hand over the following frames.
+;
+;   AimFieldSet=0   controller only: +0x0060 and +0x05D4, no camera writes
+;   AimFieldSet=1   the above plus mCurrentPOV.Rotation (camera +0x042C)
+;   AimFieldSet=2   every scanned field - this is run 99's behaviour, and the
+;                   one that moves the camera
+;
+; Start at 0. If the bullet stops tracking pitch there, the aim is carried by
+; a camera field and 1 then 2 narrow which one.
+;
+; [Input]
+; AimFieldSet=0
+; ---------------------------------------------------------------------------
