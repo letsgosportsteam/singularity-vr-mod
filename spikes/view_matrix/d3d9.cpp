@@ -6347,6 +6347,7 @@ ScriptFn g_scriptFns[] = {
     { "FireAmmunition",     -1 },   // [11]
     { "BeginFire",          -1 },   // [12]
     { "StartFire",          -1 },   // [13]
+    { "PreBeginPlay",       -1 },   // [14] run 107 - every spawn, in or out of the window
 };
 const int kFnGetAdjustedAim = 0;
 const int kFnTick           = 5;
@@ -6356,6 +6357,7 @@ const int kFnMaskFirst      = 8;    // [8..10] are the masked-out view functions
 const int kFnMaskLast       = 10;
 const int kFnFireFirst      = 11;   // [11..13] open the mode 9 window
 const int kFnFireLast       = 13;
+const int kFnPreBeginPlay   = 14;
 const int kScriptFnCount    = (int)(sizeof(g_scriptFns) / sizeof(g_scriptFns[0]));
 
 static LONG FnIdx(int i) { return InterlockedCompareExchange(&g_scriptFns[i].idx, 0, 0); }
@@ -7224,6 +7226,33 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // is simply elsewhere.
     //
     // Cheap because it only runs while a fire window is open and only logs each function once.
+    // ---- ⭐ run 107: log EVERY spawn, in or out of the window ----
+    //
+    // Reported: "when I shoot I do see bullets come out." Two readings, and they need opposite
+    // work: a hitscan weapon's visible tracer is an emitter spawned along the trace line, while a
+    // real projectile is an actor with its own rotation and no trace at all.
+    //
+    // The in-shot log below cannot tell them apart, because it only records what happens while the
+    // fire window is OPEN - and a projectile spawned on a deferred tick would be invisible to it.
+    // Which is the same defect three times over: a filter that encodes the expected answer.
+    //
+    // So PreBeginPlay is logged wherever it happens, with the class of the object being spawned
+    // and whether a window was open at the time. RvEmitter means tracer; anything projectile-shaped
+    // spawned OUTSIDE the window means the shot is deferred and the whole fire-window premise is
+    // wrong.
+    if ((aimMode == 9 || aimMode == 10) && fnIdx >= 0 && self &&
+        FnIdx(kFnPreBeginPlay) >= 0 && fnIdx == FnIdx(kFnPreBeginPlay)) {
+        static volatile LONG spawns = 0;
+        if (InterlockedIncrement(&spawns) <= 40) {
+            char cn[96]{};
+            const uintptr_t cls = Readable(self, OBJ_CLASS + 4)
+                                ? *reinterpret_cast<uintptr_t*>((uintptr_t)self + OBJ_CLASS) : 0;
+            if (cls && Readable((void*)cls, 0x40)) NameOf(cls, cn, sizeof(cn));
+            Log("  spawn: %-28s  window %s", cn[0] ? cn : "?",
+                (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) ? "OPEN" : "closed");
+        }
+    }
+
     if ((aimMode == 9 || aimMode == 10) && fnIdx >= 0 &&
         (InterlockedCompareExchange(&g_fireSeq, 0, 0) & 1) && self) {
         static volatile LONG shown = 0;
