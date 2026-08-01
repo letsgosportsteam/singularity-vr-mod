@@ -60,6 +60,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
+#include <intrin.h>       // _ReturnAddress, for the XInput caller census
 
 #pragma comment(lib, "d3d11.lib")
 
@@ -139,6 +140,18 @@ bool IniPath(char* out /*MAX_PATH*/) {
     if (!slash) return false;
     strcpy_s(slash + 1, MAX_PATH - (slash + 1 - out), "SingularityVR.ini");
     return true;
+}
+
+// ---------------------------------------------------------------- timing primitives
+// Up here rather than beside the frame-copy code that first needed them: the XInput hook times
+// itself now, and that runs long before any of the render timing does.
+inline LARGE_INTEGER Now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
+
+inline double MsSince(const LARGE_INTEGER& t0) {
+    static LARGE_INTEGER freq{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    return double(now.QuadPart - t0.QuadPart) * 1000.0 / double(freq.QuadPart);
 }
 
 // ================================================================ automatic resolution (run 59)
@@ -238,6 +251,541 @@ LPSTR WINAPI Hook_GetCommandLineA(void) {
 LPWSTR WINAPI Hook_GetCommandLineW(void) {
     LPWSTR orig = g_origGetCmdW ? g_origGetCmdW() : nullptr;
     return (g_autoResInjected && orig) ? g_cmdLineW : orig;
+}
+
+// ================================================================ the gamepad path (run 60)
+//
+// Singularity.exe statically imports XINPUT1_3.dll - ordinals 2 and 3, which are XInputGetState
+// and XInputSetState. It is a 2010 console port, so Raven's whole 360-pad path is already
+// compiled in: analog move, analog look, buttons, rumble, and - the part worth the most here -
+// MENU NAVIGATION.
+//
+// That reframes the last rung entirely. The mod does not have to teach UE3 about controllers,
+// invent a laser pointer for menus that are currently inert, or synthesise keystrokes at the OS
+// level (tried for view rotation in spike 5 and rejected: closed-loop, laggy, special-cased in
+// menus). It has to impersonate ONE Xbox 360 pad and let the game's own input code do the rest -
+// including its dead zones, its acceleration curves and its menu focus handling, none of which
+// then have to be written or tuned here.
+//
+// ---- why detour the FUNCTION and not the import table ----
+//
+// The exe imports these BY ORDINAL. There is no "XInputGetState" string anywhere in its import
+// table, so an IAT patch keyed on the name would have found nothing to patch and quietly reported
+// success - the ninth tautological instrument this project would have built. MinHook rewrites the
+// prologue inside XINPUT1_3.dll itself, which catches the caller however it resolved the address.
+// GetProcAddress by name is still the way to FIND it: the DLL exports the name regardless of how
+// the importer chose to ask.
+//
+// ---- what this probe settles, before any OpenXR input code exists ----
+//
+//   1. Is the poll live at all? If the engine asked once at startup, found no pad and gave up,
+//      the call count stays at zero and this approach is dead. One run to find out.
+//   2. Does the game accept a pad that is not there? NUMPAD3 says one is plugged in.
+//   3. Does engine-driven turning coexist with head tracking? NUMPAD5 holds the look stick over
+//      and the run-12 external-delta fold-in either absorbs it or fights it. That question has
+//      to be answered before a thumbstick is wired to anything.
+//
+// Structs are declared here rather than included from <xinput.h> deliberately: the SDK header
+// describes XInput 1.4, this is 1.3, and the two agree on these layouts only by convention. Two
+// fixed-ABI structs are cheaper to read than that caveat.
+struct XiGamepad {
+    WORD  wButtons;
+    BYTE  bLeftTrigger;
+    BYTE  bRightTrigger;
+    SHORT sThumbLX, sThumbLY;
+    SHORT sThumbRX, sThumbRY;
+};
+struct XiState { DWORD dwPacketNumber; XiGamepad Gamepad; };
+struct XiVibration { WORD wLeftMotorSpeed, wRightMotorSpeed; };
+typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, XiState*);
+typedef DWORD (WINAPI *PFN_XInputSetState)(DWORD, XiVibration*);
+
+const DWORD kXiOk           = 0;      // ERROR_SUCCESS
+const DWORD kXiNotConnected = 1167;   // ERROR_DEVICE_NOT_CONNECTED
+
+const WORD XI_DPAD_UP = 0x0001, XI_DPAD_DOWN = 0x0002, XI_DPAD_LEFT = 0x0004,
+           XI_DPAD_RIGHT = 0x0008, XI_START = 0x0010, XI_BACK = 0x0020,
+           XI_LTHUMB = 0x0040, XI_RTHUMB = 0x0080, XI_LSHOULDER = 0x0100,
+           XI_RSHOULDER = 0x0200, XI_A = 0x1000, XI_B = 0x2000, XI_X = 0x4000, XI_Y = 0x8000;
+
+PFN_XInputGetState g_origXInputGetState = nullptr;
+PFN_XInputSetState g_origXInputSetState = nullptr;
+
+// Probe state shared by both hooks. See the run-72 note further down for what they are for.
+volatile LONG g_freezePacket = 0;    // numpad - : never advance dwPacketNumber
+volatile LONG g_setStateCalls = 0;   // rumble path activity, counted per second
+
+// Set once the OpenXR action set is attached. Lives here rather than with the input code because
+// both halves read it: the input code to know it may publish, the test overrides to know whether
+// anything else is writing the pad at all.
+bool g_xrInputReady = false;
+
+volatile LONG g_padEmu      = 0;   // NUMPAD3 - report a connected pad on port 0
+volatile LONG g_padWalkTest = 0;   // NUMPAD4 - hold the move stick forward
+volatile LONG g_padLookTest = 0;   // NUMPAD5 - hold the look stick right
+
+// The published pad state, packed into three LONGs so the hook can read it without a lock.
+// XInputGetState is called from whichever thread the engine ticks input on, which is not
+// guaranteed to be the one Present runs on, and a critical section in a per-frame engine callback
+// is a cost this project has already paid once for (run 24's file I/O in a draw hook). Tearing
+// between the three words is one frame of mixed input at 120 Hz and is not observable; tearing
+// WITHIN a word is what would matter, and interlocked access rules it out.
+volatile LONG g_padBtns   = 0;   // low 16: wButtons          high 16: rTrigger<<8 | lTrigger
+volatile LONG g_padLStick = 0;   // low 16: sThumbLX          high 16: sThumbLY
+volatile LONG g_padRStick = 0;   // low 16: sThumbRX          high 16: sThumbRY
+
+LONG PackStick(int16_t x, int16_t y) {
+    return (LONG)(((uint32_t)(uint16_t)y << 16) | (uint16_t)x);
+}
+
+// ---- rumble, which Raven already authored and nothing was listening to (run 62) ----
+//
+// The exe imports ordinal 3 as well as ordinal 2, and the config names
+// `WinDrv.XnaForceFeedbackManager` with a `bForceFeedbackEnabled` switch and
+// `Engine.ForceFeedbackWaveform` assets. So every weapon, impact and scripted jolt in the game
+// already has force feedback authored against it, aimed at a 360 pad that was never there.
+//
+// Forwarding it to the controllers costs one more hook and gets the whole authored set for free -
+// the cheapest content in this project, because somebody else wrote all of it in 2010.
+//
+// 360 motors are asymmetric by design: LEFT is the large low-frequency weight, RIGHT the small
+// high-frequency one. Sending each to the hand of the same name keeps that asymmetry meaningful
+// rather than averaging it away.
+volatile LONG g_rumbleL = 0, g_rumbleR = 0;   // 0..65535, as the game sends them
+
+DWORD WINAPI Hook_XInputSetState(DWORD idx, XiVibration* v) {
+    InterlockedIncrement(&g_setStateCalls);
+    if (InterlockedCompareExchange(&g_padEmu, 0, 0) && idx == 0) {
+        if (v) {
+            InterlockedExchange(&g_rumbleL, v->wLeftMotorSpeed);
+            InterlockedExchange(&g_rumbleR, v->wRightMotorSpeed);
+        }
+        // Answered here rather than passed on, for the same reason as GetState: there is no
+        // physical pad on port 0, so the real call can only fail, and slowly.
+        return kXiOk;
+    }
+    return g_origXInputSetState ? g_origXInputSetState(idx, v) : kXiNotConnected;
+}
+
+DWORD g_padPacket = 0;
+XiGamepad g_padLast{};
+
+// ---- ✅ run 70: SOLVED. It is the packet number, and the cause is stick NOISE ----
+//
+//     pad off, feed ON,  in hand : 119.1 fps | residual 4.02 | MISSED 0.7%
+//     pad off, feed ON,  on desk : 119.8 fps | residual 3.31 | MISSED 0.6%
+//     pad ON,  feed off, in hand : 106.7 fps | residual 4.24 | MISSED 2.2%
+//     pad ON,  feed ON,  on desk :  91.5 fps | residual 5.97 | MISSED 8.4%
+//     pad ON,  feed ON,  in hand :  76.6 fps | residual 10.88 | MISSED 11.5%
+//
+// Draw counts sit between 1163 and 1638 across every row, so the activity confound that ruined run
+// 68 is controlled this time. The dominant variable is **the pad, not the controllers** - with the
+// pad off it is 119 fps and 0.6% missed in BOTH controller states, which is the one comparison in
+// the table where the controller position provably does not matter.
+//
+// And the rows are monotonic in HOW OFTEN THE PAD STATE CHANGES:
+//
+//   pad absent            -> no input processing at all        0.7% missed
+//   pad present, frozen   -> state identical every frame       2.2% missed
+//   pad present, on desk  -> some jitter                       8.4% missed
+//   pad present, in hand  -> maximum jitter                   11.5% missed
+//
+// The mechanism: `dwPacketNumber` advances whenever the state differs, and a game uses that to
+// skip re-processing an unchanged pad. Our stick values come straight from raw OpenXR thumbstick
+// readings, which are NOISY - a resting controller still reports a few thousandths that wobble
+// every frame. So the state differed every frame, the packet advanced every frame, and UE3 ran its
+// full input path - fourteen chain buttons through UnrealScript - 120 times a second, for input
+// nobody gave. A real 360 pad at rest reports a hard zero and the game skips all of it.
+//
+// This is also why "in hand" measured worse than "on desk": a held controller jitters more. The
+// hand/desk correlation was real, and it was a proxy for noise the whole time.
+//
+// Fix: a radial deadzone, so a resting stick produces a BIT-IDENTICAL state frame to frame and the
+// packet stops advancing. Not a comfort tweak - it is the difference between the engine skipping
+// its input path and running it every frame.
+DWORD g_padPacketAdvances = 0;    // per second: ~0 at rest is the whole point
+
+// ---- ❌ run 71: the deadzone WORKED and the judder did NOT go away. Run 70 is retracted ----
+//
+// Packet advances fell from ~120/sec to 5-60/sec, so the noise diagnosis was right and the fix did
+// what it claimed. The judder stayed. **Fixing the mechanism I blamed did not fix the symptom, so
+// it was not the mechanism.** Keeping the deadzone regardless - it is correct on its own terms and
+// matches Raven's own configured values - but it is not the answer.
+//
+// What the same log shows instead, and what nothing had been looking at:
+//
+//     xinput: 938 calls/sec ... at 27 fps      -> ~33 polls PER FRAME
+//     xinput:  72 calls/sec ... at 63 fps      -> ~1 poll per frame
+//
+// The game polls XInput **thirty-three times a frame** during the bad stretches and once a frame
+// when it is healthy. Run 60 established that one poll per frame is the normal, promoted state, so
+// this is something else entirely.
+//
+// ⚠️ And 900 calls a second through this detour is perhaps 2 ms of CPU across a WHOLE second, so
+// the polling itself cannot be the cost. It is a SYMPTOM - the visible edge of the game's input
+// path running 33 times per frame, and whatever that path drags with it is where the milliseconds
+// are. Chasing the poll count directly would be optimising the thermometer.
+//
+// So find out who is calling. The return address separates "one site in a loop" from "many
+// subsystems each asking once", which are different bugs with different fixes, and it hands over an
+// address that can be looked up in Ghidra rather than argued about.
+struct XiCaller { uintptr_t addr; DWORD count; };
+XiCaller g_xiCallers[12]{};
+int   g_xiCallerN = 0;
+double g_msInHook = 0.0;
+
+// ---- ❌ run 72: the 900 polls/sec were the LOADING SCREEN. Run 71's lead is dead ----
+//
+// One caller, `0x011D4795`, always. And correlated against the frame log it reads:
+//
+//     912 polls/sec @ 27 fps, **0 draws**   <- loading screen, polling for "press any button"
+//      77 polls/sec @ 72 fps, 1730 draws    <- gameplay, one poll per frame
+//     122 polls/sec @ 120 fps, 1695 draws   <- gameplay, one poll per frame
+//
+// In gameplay it is one poll per frame throughout, exactly as run 60 established. The 33-per-frame
+// figure was a loading screen doing what loading screens do, and it had nothing to do with the
+// judder. Our hook costs 0.18 ms per SECOND, so it was never a candidate either.
+//
+// What the frame budget actually shows across the same transition, at a constant ~1700 draws:
+//
+//     72 fps : xrWaitFrame 0.03 idle, our work 13.7 ms, XR submit 0.09
+//    120 fps : xrWaitFrame 3.90 idle, our work  3.4 ms, XR submit 1.10
+//
+// So the app is genuinely compute-bound in the bad stretch - not paced, not stalled on the link
+// (submit is FASTER when we are slow, which is what an app arriving late looks like), and drawing
+// the same amount. **10 ms a frame appears and disappears inside "our work" at constant draw
+// count.** The display period never changes, so it is not a refresh-rate drop either.
+//
+// The one clean, draw-controlled comparison still standing is run 70's: pad OFF gives 119 fps and
+// 0.6% missed in BOTH controller states; pad ON gives 76-91 fps. Since our own hook is free, the
+// cost has to be what UE3 does when it believes a pad is present.
+//
+// Two candidates remain, and they split cleanly:
+//   (a) INPUT PROCESSING - the engine re-runs its chain-button path whenever dwPacketNumber moves.
+//   (b) MERE PRESENCE - `WinDrv.XnaForceFeedbackManager` runs a waveform evaluator every frame once
+//       a pad exists, regardless of whether anything is pressed.
+//
+// Freezing the packet number tells them apart in one keypress: (a) collapses, (b) does not.
+// (g_freezePacket and g_setStateCalls are declared up with the other hook state - both hooks
+// touch them and Hook_XInputSetState is defined before this point.)
+
+// ---- ❌ run 73: the packet number is not read at all, and the pad may be innocent ----
+//
+// Freezing dwPacketNumber changed nothing - **and the controls kept working.** The second half is
+// the real result: if the engine still responded to sticks and buttons while being told the state
+// never changed, then it does not consult the packet number. So run 70's whole theory was wrong
+// twice over, not just once, and the deadzone stays only because it is right on its own terms.
+//
+// SetState/sec tracks calls/sec exactly (74 vs 76, 115 vs 117), so the force-feedback manager runs
+// once a frame - present, but our hook answers it in nanoseconds.
+//
+// ---- ⭐ what the config says, and it explains the entire session ----
+//
+//     bSmoothFrameRate     = TRUE
+//     MinSmoothedFrameRate = 22
+//     MaxSmoothedFrameRate = 121
+//
+// UE3's frame-rate smoother keeps a history of recent frame times, picks a target from it, clamps
+// to [Min, Max] - and then **SLEEPS to hold the frame rate down to that target.** It is not a cap
+// at 121; it is a governor that follows recent history. One hitch drops the target, and the engine
+// then actively holds you there until the history rolls over.
+//
+// That is the missing mechanism, and it fits every anomaly at once:
+//
+//   * **72.0 fps for four samples in a row, then 120.0** - locked values, no key pressed, draw
+//     count unchanged at ~1700. Compute-bound apps do not produce round stable numbers; governors
+//     do.
+//   * **The sleep lands in "our work"** - it happens inside the game's own tick, between our
+//     Present hooks, where xrWaitFrame is not waiting (0.03 ms idle) and nothing else can see it.
+//   * **Every A/B this session has been noisy and contradictory**, including ones that should have
+//     been clean, because the frame rate was being held by hysteresis that outlasted whatever was
+//     being toggled. "I pressed X and it got better" and "I picked up the controllers and it got
+//     better" are the same coincidence: the history rolled over.
+//
+// ⚠️ This is the run-56 pattern for a third time: an invisible external governor moving underneath
+// every comparison. The instrument is the same shape too - do not redesign around it, MEASURE it.
+// UE3's smoother sleeps through appSleep, which is ::Sleep on Win32, so a hook on Sleep reports the
+// governor's cost directly and a switch on that hook tests the fix in the same run.
+typedef void (WINAPI *PFN_Sleep)(DWORD);
+PFN_Sleep g_origSleep = nullptr;
+volatile LONG g_killSleep = 0;      // numpad + : neutralise the governor on the game thread
+volatile LONG g_sleepCalls = 0;
+volatile LONG g_sleepMs = 0;
+DWORD g_mainThreadId = 0;           // set at the first Present - see Hook_Present
+
+void WINAPI Hook_Sleep(DWORD ms) {
+    // Only the thread that renders, and only short sleeps. A process-wide Sleep(0) would spin
+    // every worker and streaming thread the game owns, which would cost far more than it saved and
+    // would look exactly like the bug being chased. Long sleeps are somebody deliberately waiting.
+    if (GetCurrentThreadId() == g_mainThreadId && ms > 0 && ms <= 50) {
+        InterlockedIncrement(&g_sleepCalls);
+        InterlockedAdd(&g_sleepMs, (LONG)ms);
+        if (InterlockedCompareExchange(&g_killSleep, 0, 0)) { if (g_origSleep) g_origSleep(0); return; }
+    }
+    if (g_origSleep) g_origSleep(ms);
+}
+
+// Call statistics. These are the whole point of the first run: a zero here kills the approach.
+volatile LONG g_xiCalls = 0;
+volatile LONG g_xiCallsByIndex[4] = { 0, 0, 0, 0 };
+ULONGLONG g_xiLastStatsTick = 0;
+LONG      g_xiLastStatsCalls = 0;
+
+DWORD WINAPI Hook_XInputGetState(DWORD idx, XiState* st) {
+    LARGE_INTEGER tHook = Now();
+    InterlockedIncrement(&g_xiCalls);
+    if (idx < 4) InterlockedIncrement(&g_xiCallsByIndex[idx]);
+
+    // Who called us. MinHook patches the target's prologue and reaches the detour through a
+    // trampoline, so the return address on this frame is the GAME's call site, not MinHook's.
+    // Linear scan over at most twelve entries, which is cheaper than any structure that would
+    // avoid it at this call count.
+    {
+        const uintptr_t ra = reinterpret_cast<uintptr_t>(_ReturnAddress());
+        int slot = -1;
+        for (int i = 0; i < g_xiCallerN; ++i) if (g_xiCallers[i].addr == ra) { slot = i; break; }
+        if (slot < 0 && g_xiCallerN < 12) { slot = g_xiCallerN++; g_xiCallers[slot].addr = ra; }
+        if (slot >= 0) ++g_xiCallers[slot].count;
+    }
+
+    const bool emu = InterlockedCompareExchange(&g_padEmu, 0, 0) != 0;
+
+    // ⚠️ While emulating, the real function is NOT called - and that is a saving, not a shortcut.
+    // XInputGetState against an absent device is the known-expensive case (it re-enumerates), and
+    // the game is already paying it every frame today. Answering from our own state removes that
+    // from the frame budget rather than adding to it. The real result is sampled once at install
+    // time instead, which is all the diagnostic ever needed it for.
+    if (!emu || idx != 0 || !st) {
+        const DWORD r = (emu && idx != 0)
+                      ? kXiNotConnected                 // exactly one pad, on port 0
+                      : (g_origXInputGetState ? g_origXInputGetState(idx, st) : kXiNotConnected);
+        g_msInHook += MsSince(tHook);
+        return r;
+    }
+
+    const LONG b = InterlockedCompareExchange(&g_padBtns, 0, 0);
+    const LONG l = InterlockedCompareExchange(&g_padLStick, 0, 0);
+    const LONG r = InterlockedCompareExchange(&g_padRStick, 0, 0);
+
+    XiGamepad g{};
+    g.wButtons      = (WORD)(b & 0xFFFF);
+    g.bLeftTrigger  = (BYTE)((b >> 16) & 0xFF);
+    g.bRightTrigger = (BYTE)((b >> 24) & 0xFF);
+    g.sThumbLX = (SHORT)(l & 0xFFFF);  g.sThumbLY = (SHORT)((l >> 16) & 0xFFFF);
+    g.sThumbRX = (SHORT)(r & 0xFFFF);  g.sThumbRY = (SHORT)((r >> 16) & 0xFFFF);
+
+    // dwPacketNumber must only advance when something actually changed. Games use it to skip
+    // re-reading an unchanged pad, and one that increments every call defeats that; one that never
+    // increments can make the game ignore us entirely. Both failure modes are silent.
+    if (memcmp(&g, &g_padLast, sizeof(g)) != 0) {
+        g_padLast = g;
+        // Frozen deliberately when probing: the pad stays connected and keeps reporting live stick
+        // and button values, but the engine's "has anything changed" test always says no. Controls
+        // are expected to stop responding while this is on - that is the point, not a side effect.
+        if (!InterlockedCompareExchange(&g_freezePacket, 0, 0)) ++g_padPacket;
+        ++g_padPacketAdvances;
+    }
+
+    st->dwPacketNumber = g_padPacket;
+    st->Gamepad = g;
+    g_msInHook += MsSince(tHook);
+    return kXiOk;
+}
+
+// Returns true once the hook is live. Called from DllMain first and retried from Present, because
+// XINPUT1_3.dll and this DLL are both static imports of the exe and the loader's order between
+// them is not ours to assume.
+bool InstallXInputHook() {
+    if (g_origXInputGetState) return true;
+
+    HMODULE h = GetModuleHandleA("XINPUT1_3.dll");
+    if (!h) return false;                     // not loaded yet - Present will try again
+
+    void* target = (void*)GetProcAddress(h, "XInputGetState");
+    if (!target) { Log("xinput: XInputGetState not exported - gamepad path unavailable"); return true; }
+
+    // ON by default. UE3 enumerates ports at ~1/sec round-robin, so a pad that only appears on a
+    // keypress is absent for the whole main menu - the one place it is most needed. See the note
+    // above InitXRInput for why this is not the run-36 mistake repeated.
+    {
+        char path[MAX_PATH]{};
+        if (IniPath(path))
+            InterlockedExchange(&g_padEmu, GetPrivateProfileIntA("Input", "Gamepad", 1, path) ? 1 : 0);
+        else
+            InterlockedExchange(&g_padEmu, 1);
+    }
+
+    const MH_STATUS mhInit = MH_Initialize();
+    if (mhInit != MH_OK && mhInit != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("xinput: MH_Initialize failed (%d)", (int)mhInit); return true;
+    }
+    if (MH_CreateHook(target, (void*)&Hook_XInputGetState,
+                      (void**)&g_origXInputGetState) != MH_OK) {
+        Log("xinput: MH_CreateHook failed at %p", target); return true;
+    }
+    if (MH_EnableHook(target) != MH_OK) {
+        Log("xinput: MH_EnableHook failed"); g_origXInputGetState = nullptr; return true;
+    }
+
+    // The frame-rate governor's sleep. Installed here because MinHook is already up and this runs
+    // once; a failure costs the measurement and nothing else.
+    if (HMODULE k32 = GetModuleHandleA("kernel32.dll")) {
+        if (void* sleepTarget = (void*)GetProcAddress(k32, "Sleep")) {
+            if (MH_CreateHook(sleepTarget, (void*)&Hook_Sleep, (void**)&g_origSleep) == MH_OK &&
+                MH_EnableHook(sleepTarget) == MH_OK) {
+                Log("sleep: hooked kernel32!Sleep - UE3's frame-rate smoother sleeps through this."
+                    " NUMPAD+ neutralises it on the render thread.");
+            } else {
+                g_origSleep = nullptr;
+                Log("sleep: hook failed - the governor cannot be measured this run");
+            }
+        }
+    }
+
+    // Rumble. A failure here costs haptics and nothing else, so it does not gate the input path.
+    if (void* setTarget = (void*)GetProcAddress(h, "XInputSetState")) {
+        if (MH_CreateHook(setTarget, (void*)&Hook_XInputSetState,
+                          (void**)&g_origXInputSetState) == MH_OK &&
+            MH_EnableHook(setTarget) == MH_OK) {
+            Log("xinput: hooked XInputSetState - the game's authored force feedback will drive"
+                " controller haptics");
+        } else {
+            g_origXInputSetState = nullptr;
+            Log("xinput: XInputSetState hook failed - no haptics, everything else unaffected");
+        }
+    }
+
+    // Sample the real state of all four ports once, so "is a physical pad plugged in" is on the
+    // record and cannot be confused later with our own synthetic one.
+    for (DWORD i = 0; i < 4; ++i) {
+        XiState s{};
+        const DWORD rr = g_origXInputGetState(i, &s);
+        if (rr == kXiOk) Log("xinput: port %u has a REAL pad attached - it will be overridden while"
+                             " emulation is on", i);
+    }
+    Log("xinput: hooked XInputGetState at %p. NUMPAD3 = pretend a 360 pad is plugged in.", target);
+    Log("xinput:   the game imports this BY ORDINAL, so watch the call count below - if it stays"
+        " at 0 the engine is not polling and the gamepad route is dead.");
+    return true;
+}
+
+// Once a second, and only while something is worth saying. The call count is the measurement this
+// probe exists for, so it is reported whether or not emulation is on.
+void LogXInputStats() {
+    const ULONGLONG now = GetTickCount64();
+    if (g_xiLastStatsTick && now - g_xiLastStatsTick < 1000) return;
+    const LONG total = InterlockedCompareExchange(&g_xiCalls, 0, 0);
+    if (g_xiLastStatsTick) {
+        const LONG delta = total - g_xiLastStatsCalls;
+        // Packet advances is the run-70 instrument. At rest it should be ~0: a nonzero rate with
+        // nobody touching a stick means the state is still churning and UE3 is still running its
+        // whole input path for nothing.
+        Log("xinput: %ld calls/sec (total %ld), packet advances/sec %lu%s, SetState/sec %ld"
+            " - port0 %ld port1 %ld port2 %ld port3 %ld, emulation %s",
+            delta, total, (unsigned long)g_padPacketAdvances,
+            InterlockedCompareExchange(&g_freezePacket, 0, 0) ? " [PACKET FROZEN]" : "",
+            InterlockedExchange(&g_setStateCalls, 0),
+            InterlockedCompareExchange(&g_xiCallsByIndex[0], 0, 0),
+            InterlockedCompareExchange(&g_xiCallsByIndex[1], 0, 0),
+            InterlockedCompareExchange(&g_xiCallsByIndex[2], 0, 0),
+            InterlockedCompareExchange(&g_xiCallsByIndex[3], 0, 0),
+            InterlockedCompareExchange(&g_padEmu, 0, 0) ? "ON" : "off");
+    }
+    // Who called, and what our own hook cost. If the hook total is a fraction of a millisecond
+    // while the game is losing 6 ms a frame, the polls are a symptom and the call SITE is the lead.
+    if (g_xiCallerN > 0) {
+        char line[512]; int n = 0;
+        n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE,
+                         "xinput callers (hook total %.2f ms/sec):", g_msInHook);
+        for (int i = 0; i < g_xiCallerN && n < 400; ++i)
+            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE,
+                             "  0x%08X x%lu", (unsigned)g_xiCallers[i].addr,
+                             (unsigned long)g_xiCallers[i].count);
+        Log("%s", line);
+        for (int i = 0; i < g_xiCallerN; ++i) g_xiCallers[i].count = 0;
+    }
+    g_msInHook = 0.0;
+
+    g_xiLastStatsTick = now;
+    g_xiLastStatsCalls = total;
+    g_padPacketAdvances = 0;
+}
+
+void ClearPad() {
+    InterlockedExchange(&g_padBtns, 0);
+    InterlockedExchange(&g_padLStick, PackStick(0, 0));
+    InterlockedExchange(&g_padRStick, PackStick(0, 0));
+}
+
+// ---- the button probe (run 61b): stop guessing Raven's console layout, measure it ----
+//
+// Run 61 mapped weapon switch to D-pad up and it used a healing item. That is the second guess at
+// a layout nobody has written down, and guessing again would be the third. Raven's 360 mapping is
+// a fact about the shipped game, it is fourteen buttons wide, and one press each settles it
+// completely - so press them one at a time and write down what happens.
+//
+// Cheaper than reading the layout out of the binary, and it cannot be wrong about the build that
+// is actually installed.
+struct XiButtonName { WORD mask; const char* name; };
+const XiButtonName kXiButtonNames[] = {
+    { XI_A,           "A"                 },
+    { XI_B,           "B"                 },
+    { XI_X,           "X"                 },
+    { XI_Y,           "Y"                 },
+    { XI_LSHOULDER,   "LB"                },
+    { XI_RSHOULDER,   "RB"                },
+    { XI_LTHUMB,      "left stick click"  },
+    { XI_RTHUMB,      "right stick click" },
+    { XI_DPAD_UP,     "D-pad up"          },
+    { XI_DPAD_DOWN,   "D-pad down"        },
+    { XI_DPAD_LEFT,   "D-pad left"        },
+    { XI_DPAD_RIGHT,  "D-pad right"       },
+    // Last deliberately: START opens the pause menu, which interrupts whatever you were watching.
+    { XI_START,       "START"             },
+    { XI_BACK,        "BACK"              },
+};
+const int kXiButtonNameCount = (int)(sizeof(kXiButtonNames) / sizeof(kXiButtonNames[0]));
+
+int  g_btnProbeIdx    = 0;
+int  g_btnProbeFrames = 0;    // frames left in the pulse
+WORD g_btnProbeMask   = 0;
+
+// The look stick's vertical axis, which turn never uses. Up cycles the weapon (Raven has only a
+// cycle, not next/prev), leaving down free for the health item - the one action with no natural
+// home on a Touch controller once the TMD powers have taken the grips and the face buttons.
+WORD g_stickUpMask   = XI_Y;         // ini StickUp   - CycleWeapon
+WORD g_stickDownMask = XI_DPAD_UP;   // ini StickDown - Health
+
+// The NUMPAD4/NUMPAD5 test inputs, laid OVER whatever the controllers just published.
+//
+// ⚠️ Ordering, and it is not incidental: this MUST run after SyncXRInput, or the real controller
+// state overwrites the test every frame and the test silently does nothing. Both write the same
+// three words. It is called from Hook_Present rather than from UpdateFromHeadset for exactly that
+// reason - UpdateFromHeadset returns early on half a dozen paths, and a test that only works when
+// the headset happens to be running is not a control.
+void ApplyPadTestOverrides() {
+    const bool walk = InterlockedCompareExchange(&g_padWalkTest, 0, 0) != 0;
+    const bool look = InterlockedCompareExchange(&g_padLookTest, 0, 0) != 0;
+    const bool probe = g_btnProbeFrames > 0;
+
+    if (!walk && !look && !probe) {
+        // Nothing else writes the pad when the controllers are not driving it, so a test switched
+        // off would otherwise leave its last value latched and the player walking for ever.
+        if (!g_xrInputReady) ClearPad();
+        return;
+    }
+    // 24000 of 32767 - clear of any dead zone the engine applies, and short of the rim so a
+    // stuck-at-maximum reading stays distinguishable from a deliberate one.
+    if (walk) InterlockedExchange(&g_padLStick, PackStick(0, 24000));
+    if (look) InterlockedExchange(&g_padRStick, PackStick(24000, 0));
+    if (probe) {
+        // OR'd in, and held for several frames. A single-frame press is not reliably seen: the
+        // engine samples the pad on its own tick, which is not this one, and an action that needs
+        // a press AND a release needs the button to have been down across at least one of them.
+        InterlockedExchange(&g_padBtns,
+            InterlockedCompareExchange(&g_padBtns, 0, 0) | (LONG)g_btnProbeMask);
+        --g_btnProbeFrames;
+    }
 }
 
 // ---------------------------------------------------------------- the view rotation hook
@@ -1049,6 +1597,83 @@ void ApplyRoll(Reg4* r, int conv, float rollRad, float tanX, float tanY) {
     }
 }
 
+// ---- head YAW and PITCH in the view matrix, the way roll already is (run 64) ----
+//
+// The last rung needs `PlayerController.Rotation` free to carry the WEAPON's aim, and today it
+// carries the head's. Roll already proves the alternative works: run 59 put it in the matrix
+// rather than the engine's FRotator, and it has been correct ever since. Yaw and pitch are the
+// same move with two more axes.
+//
+// Unlike roll, this is NOT a clip-space rotation. Roll is about the view's forward axis, so it
+// only mixes clip x and y and can be conjugated through the projection with two tangents. Yaw and
+// pitch mix in depth, and conjugating those through a projection matrix is a projective transform
+// involving the near and far planes - fiddly, and unnecessary, because there is a much better
+// place to stand.
+//
+// The engine renders in TRANSLATED-WORLD space, so **the camera sits at the origin**. A rotation
+// about the camera is therefore a rotation about the origin: a pure 3x3, no translation term, and
+// it pre-multiplies the matrix on the world side where the projection cannot interfere.
+//
+//     clip = v * M,  M = V * P        (row-vector, ROW storage - the locked convention here)
+//     camera basis rotates by R  =>   V' = R * V   =>   M' = R * M
+//
+// which for row storage is a linear combination of the first three rows and leaves row 3 - the
+// translation - untouched. That last part matters: the camera POSITION must survive this, and it
+// does so by construction rather than by care.
+//
+// R is built as B_desired * B_current^T rather than composed from separate yaw and pitch
+// rotations. Composition order is the classic place to be subtly wrong here, and two bases
+// multiplied together cannot be in the wrong order - the ordering of the basis columns cancels,
+// so long as both use the same one.
+//
+// ⚠️ Order against ApplyOffset: rotation FIRST, offset second. We want the camera rotated about
+// its own position and then displaced, which is M' = T(-o) * R * M. ApplyOffset already computes
+// T(-o) * M, so calling it after this composes correctly. The reverse order would swing the 6-DOF
+// offset around with the head instead of holding it in world space.
+void CamBasis(float pitchRad, float yawRad, float b[3][3]) {
+    // UE3: X forward, Y right, Z up - the same construction the camera-axis code uses, so the two
+    // cannot drift apart.
+    const float cp = cosf(pitchRad), sp = sinf(pitchRad);
+    const float cy = cosf(yawRad),   sy = sinf(yawRad);
+    const float fwd[3]   = { cp * cy, cp * sy, sp };
+    const float right[3] = { -sy,     cy,      0.0f };
+    // up = fwd x right, which comes out +Z at zero pitch - checked against the existing axes.
+    const float up[3] = { fwd[1]*right[2] - fwd[2]*right[1],
+                          fwd[2]*right[0] - fwd[0]*right[2],
+                          fwd[0]*right[1] - fwd[1]*right[0] };
+    for (int i = 0; i < 3; ++i) { b[i][0] = right[i]; b[i][1] = up[i]; b[i][2] = fwd[i]; }
+}
+
+void ApplyHeadRotation(Reg4* r, int conv,
+                       float pitchCur, float yawCur, float pitchDes, float yawDes) {
+    float bc[3][3], bd[3][3];
+    CamBasis(pitchCur, yawCur, bc);
+    CamBasis(pitchDes, yawDes, bd);
+
+    float R[3][3];
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 3; ++k)
+            R[i][k] = bd[i][0]*bc[k][0] + bd[i][1]*bc[k][1] + bd[i][2]*bc[k][2];
+
+    if (conv == CONV_ROW) {
+        Reg4 out[3];
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 4; ++k)
+                (&out[i].x)[k] = R[i][0]*(&r[0].x)[k]
+                               + R[i][1]*(&r[1].x)[k]
+                               + R[i][2]*(&r[2].x)[k];
+        for (int i = 0; i < 3; ++i) r[i] = out[i];
+    } else {
+        // COL: registers are the rows of clip = M*v, so the same camera rotation lands on the
+        // right as M * R^T. UNTESTED - every lock this project has ever taken has been ROW.
+        for (int i = 0; i < 4; ++i) {
+            const float x = r[i].x, y = r[i].y, z = r[i].z;
+            for (int k = 0; k < 3; ++k)
+                (&r[i].x)[k] = x*R[k][0] + y*R[k][1] + z*R[k][2];
+        }
+    }
+}
+
 void ApplyOffset(Reg4* r, int conv, const float* o) {
     if (conv == CONV_ROW) {
         float* r3 = &r[3].x;
@@ -1072,6 +1697,14 @@ bool g_xrReady = false, g_xrRunning = false;
 // What the runtime recommends per eye, once known. Drives the resolution guidance now and the
 // automatic sizing later.
 uint32_t g_recEyeW = 0, g_recEyeH = 0;
+
+// Defined further down, next to g_baseYaw - snap turn steers that directly, so the input code
+// lives beside it rather than being separated from the one variable it writes.
+bool InitXRInput();
+
+// Which OpenXR session state we are in. Actions only deliver data while FOCUSED, and the
+// difference between "not focused" and "not working" is invisible without this.
+XrSessionState g_xrSessionState = XR_SESSION_STATE_UNKNOWN;
 
 bool InitXR() {
     const char* exts[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
@@ -1160,6 +1793,11 @@ bool InitXR() {
     rs.poseInReferenceSpace.orientation.w = 1.0f;
     if (XR_FAILED(xrCreateReferenceSpace(g_xrSession, &rs, &g_xrSpace))) return false;
 
+    // Must happen before the first xrSyncActions, and xrAttachSessionActionSets can only ever be
+    // called once for a session - so this is the only place it can go. A failure here disables
+    // controller input and nothing else; the head-tracked render path does not depend on it.
+    InitXRInput();
+
     Log("OpenXR ready");
     g_xrReady = true;
     return true;
@@ -1170,6 +1808,7 @@ void PumpXR() {
     while (xrPollEvent(g_xrInstance, &ev) == XR_SUCCESS) {
         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             auto* s = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
+            g_xrSessionState = s->state;
             if (s->state == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi{ XR_TYPE_SESSION_BEGIN_INFO };
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1433,15 +2072,6 @@ IDirect3DQuery9* g_gpuFence = nullptr;
 double g_msGpuWait = 0.0;
 int    g_gpuWaitFrames = 0;
 int    g_gpuFenceMode = 1;        // ini GpuFenceProbe: 1 = split the copy, 0 = leave it alone
-
-inline LARGE_INTEGER Now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return t; }
-
-inline double MsSince(const LARGE_INTEGER& t0) {
-    static LARGE_INTEGER freq{};
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-    return double(now.QuadPart - t0.QuadPart) * 1000.0 / double(freq.QuadPart);
-}
 
 // ---- pipelining the readback, and why the pose has to travel with the pixels ----
 //
@@ -2008,11 +2638,956 @@ volatile LONG g_rollOn = 1;      // ini HeadRoll, NUMPAD1 - rides with head trac
 // the next runtime or headset is not obliged to agree.
 int   g_rollSign = -1;           // NUMPAD2 - the same escape hatch F4/F5 give pitch and yaw
 float g_wantRollRad = 0.0f;
+
+// ---- the view/engine rotation split (run 64, NUMPAD8) ----
+//
+// OFF: today's arrangement - the engine's rotation carries the head, and drives the view with it.
+// ON:  the engine gets the BASE only, and the head's yaw and pitch are added in the view matrix.
+//
+// With the split on, the image should be IDENTICAL. That is the whole point of doing it as a
+// separate step: it is a refactor with a visible no-op, so the mechanism can be proved before
+// anything is decoupled. Once it holds, the engine's rotation is free to carry the weapon.
+volatile LONG g_matrixRot = 0;
+int32_t g_matCurYawUU = 0;      // what the engine is being told
+int32_t g_matCurPitchUU = 0;
+int32_t g_matDesYawUU = 0;      // where the head actually is
+int32_t g_matDesPitchUU = 0;
+
+// ---- the deviation clamp: how far the ENGINE's camera may point away from your view ----
+//
+// Run 64's test decoupled the engine's rotation all the way to the BODY's facing, and geometry
+// disappeared behind the player. That is CPU frustum culling in UE3, and no hook here can reach
+// it: the actors are culled before a draw call is ever issued, long before
+// SetVertexShaderConstantF sees anything. The fix has to be upstream, in what the engine believes
+// it is looking at.
+//
+// ⚠️ ENGINE_NOTES records "CPU frustum culling is a non-issue at stereo scale - a 1.4-2.9% band at
+// 300 UU". That measurement is sound and completely inapplicable here. It was taken for an eye
+// separation of a few UU; this is a rotation of up to ninety degrees. Same mechanism, different
+// regime by three orders of magnitude - the project's own recurring trap, and worth naming rather
+// than quietly re-measuring.
+//
+// So bound it instead of arguing about it. This clamp guarantees |engine - view| <= N:
+//
+//     N = 0    engine points exactly where you look   (today's behaviour, culling perfect)
+//     N = 90   engine may be a quarter turn away      (run 64's test, culling visibly broken)
+//
+// Raise N until geometry pops, and the answer is a number rather than an opinion. That number
+// decides the whole remaining design: the weapon aim only has to deviate from the view by as much
+// as your hand does from your gaze, which is nothing like ninety degrees. If N holds to ~40 this
+// approach ships. If it collapses at ~10, the fire trace has to be hooked instead.
+//
+// It is also the shipping mechanism, not only the instrument - clamping how far the weapon may
+// stray from the view is a reasonable design in its own right.
+const int kDevStepCount = 7;
+const int kDevSteps[kDevStepCount] = { 0, 10, 20, 30, 45, 60, 90 };
+volatile LONG g_devStep = 0;    // index into kDevSteps
+
+// ---- ⚠️ why the clamp alone is NOT a valid test, and the flicker is (run 65) ----
+//
+// Cycling the clamp and looking for missing geometry asks the player to notice an ABSENCE. That is
+// the one thing human vision is worst at, especially in the periphery where a small deviation puts
+// the culled band - so "I saw nothing wrong at 30 degrees" is almost no evidence that nothing was
+// culled at 30 degrees. The instrument could only ever report the bad case when it was already
+// severe enough to be obvious, which is how it got set up to confirm whatever it was pointed at.
+//
+// This is the SAME defect as the button probe two runs ago, caught this time by the person holding
+// the headset rather than by the person who wrote it. Tenth instance in this project.
+//
+// The fix converts the absence into a MOTION signal. Alternate the clamp between 0 and the test
+// angle a few times a second. The rendered view is identical either way - that is the no-op
+// property the split was built to have - so anything the engine culls at the test angle appears
+// and disappears at ~4 Hz. Vision is superb at detecting flicker and hopeless at detecting
+// absence, so this reads the same defect through the channel that can actually see it.
+//
+// It also makes a clean NEGATIVE possible: if nothing flickers, nothing visible was culled. That
+// is a real result rather than an absence of evidence.
+//
+// The draw-count delta logged alongside is a SUPPORTING number, not the verdict. It counts the
+// engine's whole frustum, which at a large clamp covers a different region of the world - so it
+// includes geometry that was never in view and reads as an upper bound on what was lost.
+volatile LONG g_devFlicker = 0;
+int    g_devPhase = 1;          // 0 = baseline (clamp 0), 1 = the test angle
+int    g_devPhaseAge = 999;
+double g_devDraws[2] = { 0.0, 0.0 };
+int    g_devDrawFrames[2] = { 0, 0 };
+
+// ---- ⚠️ the flicker test was confounded by its own mechanism (run 66) ----
+//
+// Reported symptom: at a clamp of only 10 degrees EVERYTHING strobed, including geometry straight
+// ahead, and it read as a misalignment whose ANGLE GREW WITH THE CLAMP. None of that is culling.
+// Culling removes objects at the edges; it does not tilt the ones in front of you, and it does not
+// scale its error with a knob.
+//
+// What it is: the split assumes the engine's camera adopts the rotation we write to it IMMEDIATELY.
+// ENGINE_NOTES already flagged the reason it might not - `mDesiredRotationInterpRate` and friends,
+// "will likely need neutralising so the engine does not smooth away a directly-written HMD pose".
+// A smoothing filter is INVISIBLE for smooth input and glaring for step input, and flicking the
+// clamp four times a second is a step input of exactly the clamp's size. So the test manufactured
+// the artefact it then reported, and the amplitude tracking the clamp is the signature.
+//
+// The consequence is bigger than the test: the matrix must compensate for where the engine's camera
+// ACTUALLY is, not for where we asked it to go. Those were the same thing while the head drove the
+// rotation smoothly, and they stop being the same the moment anything steps it - which aim
+// decoupling will do constantly, because a hand does not move like a head.
+//
+// So the camera's real rotation is now read once per frame AT RENDER TIME - at the first matched
+// constant upload, by which point the engine's camera update for this frame has already run, so it
+// is the value this frame is actually being drawn with rather than last frame's.
+//
+// The residual below is the instrument, and it can report the bad case: **at clamp 0 it should be
+// ~0**, because there we ask for the same rotation the head already had. A nonzero residual there
+// would mean the camera actor is not what the view matrix is built from, which is a premise this
+// whole approach rests on and has never been checked directly.
+volatile LONG g_camRotDirty = 1;
+int32_t g_camYawUU = 0, g_camPitchUU = 0;
+bool    g_camRotKnown = false;
+double  g_residSum = 0.0, g_residMax = 0.0;
+int     g_residN = 0;
+
+int32_t ClampDev(int32_t d, int32_t maxAbs) {
+    // The subtraction that produced `d` wrapped through the FRotator's 65536-per-turn space, so
+    // normalise into (-32768, +32768] before comparing - otherwise a turn across the wrap point
+    // reads as an enormous deviation and gets clamped the wrong way.
+    while (d >  32768) d -= 65536;
+    while (d < -32768) d += 65536;
+    if (d >  maxAbs) d =  maxAbs;
+    if (d < -maxAbs) d = -maxAbs;
+    return d;
+}
 float g_maxRollDeg = 0.0f;       // largest magnitude seen this report window
 bool  g_haveCentre = false;
 float g_centreYaw = 0.0f;
 int32_t g_baseYaw = 0;
 int   g_tick = 0;
+
+// ================================================================ OpenXR input -> the pad (run 61)
+//
+// The probe settled the route, and the log settled the mechanism with it. Before a pad was
+// reported, UE3 polled at 2 calls/sec ROUND-ROBIN across all four ports - that is device
+// ENUMERATION, not input. The moment port 0 answered ERROR_SUCCESS the rate on that port alone
+// jumped to ~122/sec, matching the frame rate, while ports 1-3 stayed on the slow scan. So the
+// engine promotes a port to per-frame polling on first successful read.
+//
+// Two consequences, both design-forcing:
+//
+//   1. Detection costs up to ~4 seconds (four ports, ~1/sec). A pad that only appears when a
+//      hotkey is pressed is therefore ABSENT for the whole main menu, which is precisely where it
+//      is needed most. So emulation defaults ON.
+//   2. The per-port call rate is a free, non-tautological instrument: port0 at frame rate means
+//      the engine is reading us as a real input device, and it genuinely reported the bad case
+//      for the first two seconds of the probe run. It stays in the log.
+//
+// ⚠️ Defaulting ON changes the game before any key is pressed, which run 36 did with VR mode and
+// run 37 reverted. The distinction that makes it safe here: this changes no RENDERING. The menu
+// gains button prompts and a highlighted item - the arrangement a pad user would already see -
+// and `Gamepad=0` in the ini restores the old behaviour without a rebuild.
+//
+// ---- what is deliberately NOT done ----
+//
+// No key synthesis, no menu cursor, no engine input hooks. Raven's own 360 path owns dead zones,
+// acceleration curves and menu focus, and every one of those is a thing not written or tuned here.
+
+XrActionSet g_actionSet = XR_NULL_HANDLE;
+XrAction g_actMove = XR_NULL_HANDLE, g_actTurn = XR_NULL_HANDLE;
+XrAction g_actFire = XR_NULL_HANDLE, g_actAltFire = XR_NULL_HANDLE;
+XrAction g_actHaptic = XR_NULL_HANDLE;
+XrPath   g_handSubPath[2] = { XR_NULL_PATH, XR_NULL_PATH };   // left, right
+
+// ---- controller poses (run 63) ----
+//
+// The shared prerequisite for everything still outstanding: off-hand-relative movement, aim
+// decoupling, a laser sight, and putting the weapon model in your hand. Built once, here, with a
+// small consumer attached immediately so it is proven rather than merely present - if walking
+// follows your left hand, the pose and its conventions are right, and that is a much better test
+// than logging numbers nobody can check.
+XrAction g_actHandPose = XR_NULL_HANDLE;
+XrSpace  g_handSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+bool     g_handPoseValid[2] = { false, false };
+float    g_handYawRad[2] = { 0.0f, 0.0f };
+float    g_handPitchRad[2] = { 0.0f, 0.0f };
+
+// The head yaw from the PREVIOUS frame. xrLocateViews runs after input is synced, so this is one
+// frame stale by construction. That is fine for the one thing it is used for: walk direction
+// depends on the DIFFERENCE between hand and head yaw, and turning your body moves both together,
+// so the difference changes slowly even when both are moving fast.
+float g_headYawRad = 0.0f;
+
+int g_walkDirection = 1;   // ini WalkDirection: 0 = head-relative, 1 = off-hand-relative
+int g_walkSign      = 1;   // ini WalkSign - handedness has been guessed wrong on three axes here
+
+// ---- ⚠️ THE CONTROLLERS THEMSELVES ARE A VARIABLE, AND EVERY TEST SO FAR RAN INSIDE IT ----
+//
+// Reported run 67: the image judders and the frame rate drops whenever the head moves, ALWAYS -
+// and it stops the moment the controllers are picked up, and returns when they are set down and
+// the keyboard is used instead. Touch controllers sleep after a few seconds of stillness, so
+// "set down" and "asleep" are the same state.
+//
+// This is bad news for the last three runs, and it has to be said plainly: **every hotkey in this
+// mod is on the keyboard, so pressing NUMPAD8, 9 or * REQUIRES putting a controller down.** Every
+// test in this session was therefore performed in whichever state that produces, and the run-66
+// conclusion - that the split is not a no-op and the engine is smoothing our writes - was drawn
+// from a strobe that may have had nothing to do with the split at all.
+//
+// That conclusion is now UNSAFE and is not to be built on until this is separated. It is the run-56
+// lesson word for word: validate the environment before bisecting yourself. Three conclusions were
+// retracted last time for exactly this reason.
+//
+// So: instrument the controller state into the frame budget, and add the cheap control - a switch
+// that turns ALL of this mod's XR input work off, so "is it us at all" is one keypress rather than
+// a rebuild.
+bool g_handTracked[2] = { false, false };
+
+// ---- ⚠️ run 69: "TRACKED" was never the question, and it reads BACKWARDS ----
+//
+// Reported: on the desk = judder; in hand = fine; and a trigger firing by accident on the desk
+// does NOT help. That last detail is the load-bearing one - it rules out "is the controller awake"
+// and "is the runtime delivering input" outright, because an accidental trigger is both.
+//
+// It also explains why the table looked inverted. A controller sitting on a desk in front of the
+// headset is in clear view of the cameras and reports ORIENTATION_TRACKED. A controller in your
+// hands spends most of its time at your sides or in your lap, BELOW the camera cone, where the
+// runtime keeps the pose VALID from the IMU but drops the TRACKED bit. So "TRACKED" was labelling
+// *on the desk*, and the 76 fps bucket was the bad case all along - the data agreed with the
+// report and the label disagreed with both.
+//
+// What actually distinguishes the two states is MOTION. A held controller never stops moving; a
+// desk controller is still to within noise. So measure that instead of asking the runtime a
+// question it was not being asked.
+float g_handSpeed[2] = { 0.0f, 0.0f };      // smoothed metres/frame
+bool  g_handHeld[2] = { false, false };
+XrVector3f g_handLastPos[2]{};
+bool  g_handHavePos[2] = { false, false };
+
+// ---- ❌ run 74: the governor is dead too, and the approach changes ----
+//
+// NUMPAD+ neutralised every render-thread sleep and the frame rate did not move. So
+// `bSmoothFrameRate` was not holding anything down either. That is four mechanisms proposed and
+// four eliminated - packet churn, poll rate, force feedback, and now the governor - each one
+// diagnosed from a symptom that turned out to be a coincidence of something else.
+//
+// The honest read: root-causing this from the outside is not converging, and the one durable,
+// draw-controlled fact in the whole session is still run 70's - **pad OFF is 119 fps and 0.6%
+// missed; pad ON is 76-91 fps.** Every attempt to explain WHY has failed; the correlation itself
+// has not.
+//
+// So stop explaining and start using it. Turning the pad off when nobody is holding a controller
+// is worth having regardless of the cause - a gamepad that is not in anyone's hands has no
+// business being fed to the game - and it converts the outstanding question into a CONTINUOUS
+// experiment instead of another one-shot A/B. If the judder tracks the auto-toggle over an entire
+// session, the pad is the cause and this is the fix. If it does not, that is the cleanest evidence
+// yet that the pad is innocent and run 70's table was confounded like everything else.
+//
+// ---- "set down but not asleep" is exactly what MOTION distinguishes ----
+//
+// Asleep is the wrong question, and the accidental-trigger observation already proved it: a
+// controller can be wide awake, delivering input, and still be sitting on a desk. Motion is the
+// signal that separates them - a held controller never stops moving, because a hand at rest still
+// drifts by fractions of a millimetre every frame, and a desk does not drift at all.
+//
+// ⚠️ The threshold is a guess, and run 72's guess was wrong by enough to collapse a whole table.
+// So the measured speeds are logged now, and the number can be set from data rather than from
+// another guess.
+int  g_autoPad = 1;                 // ini AutoPad
+bool g_autoPadDisabled = false;     // did WE turn it off, or did the user with NUMPAD3
+int  g_handStillFrames = 0;
+
+// ⚠️ Re-detection is NOT instant. Run 60 measured UE3 enumerating ports round-robin at about one
+// per second, so port 0 comes round every ~2 s and a pad only "appears" on the first successful
+// read after that. Picking the controllers up will therefore cost a second or two before they
+// work. That is why the disable is slow (3 s of stillness) and the enable is immediate - the
+// asymmetry puts the whole latency where it is least annoying.
+// ---- ✅ run 75 RESULT: it is the INTERACTION, and auto-pad removes it ----
+//
+//   pad off, feed ON, ON DESK : 109.3 fps | residual  4.13 | MISSED  2.1% | 1316 draws | 5193 fr
+//   pad ON,  feed ON, in hand : 117.9 fps | residual  4.14 | MISSED  1.0% | 1563 draws | 2913 fr
+//   pad ON,  feed ON, ON DESK :  71.9 fps | residual 10.40 | MISSED 18.7% | 1148 draws | 1176 fr
+//
+// **Neither factor is the cause on its own.** A connected pad while the controllers are in hand is
+// fine (1.0% missed). Controllers on the desk with no pad is fine (2.1%). Only both together break
+// it - 18.7% missed at 71.9 fps. Every earlier run tested one factor at a time and was therefore
+// asking a question with no answer, which is why four consecutive mechanisms each looked plausible
+// and each died.
+//
+// The activity confound is controlled the right way round this time: the bad row has the FEWEST
+// draws (1148 against 1316 and 1563) and is still the slowest by 40 fps.
+//
+// The remaining 1176 bad frames are ~16 seconds, which is about three 3-second detection windows
+// plus the re-enumeration after each - in other words, the exposure is now only the delay before
+// auto-pad disengages, and the user reports no judder over a full session.
+//
+// The MECHANISM is still unknown. That is worth saying plainly rather than dressing up: five
+// theories have died here, and this is a workaround built on a correlation that has survived every
+// test rather than an explanation that has passed one.
+//
+// ---- why the timeout stays at 3 s and does not get shortened ----
+//
+// Tempting, because the 3 s window is now the whole remaining exposure. But the costs are
+// asymmetric: a premature unplug costs ~2-3 s of DEAD CONTROLS mid-combat while the game
+// re-enumerates, and that is far worse than 3 s of judder. Measured speeds leave room but not a
+// lot - in hand runs 878 to 10359 um/frame, a resting desk reads 0, and one borderline sample came
+// in at 389. Holding still to line up a shot is a real thing a player does.
+//
+// The `||` below is what makes 3 s safe: BOTH controllers have to be still. Aiming with one hand
+// steady while the other moves keeps the pad alive.
+int g_handStillFramesToDisable = 360;   // ~3 s at 120 fps; ini AutoPadStillFrames
+
+void UpdateAutoPad() {
+    if (!g_autoPad) return;
+    if (!g_xrInputReady) return;
+
+    const bool held = g_handHeld[0] || g_handHeld[1];
+    if (held) g_handStillFrames = 0; else ++g_handStillFrames;
+
+    const bool padOn = InterlockedCompareExchange(&g_padEmu, 0, 0) != 0;
+
+    if (padOn && !held && g_handStillFrames >= g_handStillFramesToDisable) {
+        InterlockedExchange(&g_padEmu, 0);
+        ClearPad();
+        g_autoPadDisabled = true;
+        Log("auto-pad: controllers still for %.1f s -> gamepad UNPLUGGED from the game",
+            g_handStillFramesToDisable / 120.0);
+    } else if (!padOn && held && g_autoPadDisabled) {
+        InterlockedExchange(&g_padEmu, 1);
+        g_autoPadDisabled = false;
+        Log("auto-pad: controller picked up -> gamepad plugged back in"
+            " (the game re-enumerates, so give it a second or two)");
+    }
+}
+volatile LONG g_xrInputOff = 0;     // numpad / - kill all controller input work
+int g_syncFailFrames = 0;           // frames where xrSyncActions did not return XR_SUCCESS
+
+// ---- ✅ run 67 RESULT: it is ours, and now it gets timed rather than guessed at ----
+//
+// Confirmed by the cheap control: controllers DOWN + input ON = juddering; controllers DOWN +
+// input OFF (numpad /) = normal. So the cost is inside SyncXRInput, and it appears only while the
+// controllers are asleep. The haptics gate added the same run did NOT fix it, which eliminates the
+// most obvious candidate outright.
+//
+// ⚠️ SyncXRInput is currently one undifferentiated lump inside "our work" - which is precisely the
+// situation run 56 spent a day inside when xrEndFrame hid a 189 ms stall in that same residual.
+// STATUS says it in as many words: "our work" is not a measurement, it is the residual, and it
+// will absorb any amount of someone else's latency while looking exactly like your own bug.
+//
+// So break it into its four phases before touching a line of it. There are ~16 runtime calls here
+// per frame - one sync, thirteen action-state reads, two space locations - and any of them could be
+// the one that goes slow on a sleeping controller. Guessing picks one in sixteen; timing names it.
+double g_msSyncActions = 0.0, g_msActionStates = 0.0, g_msPoses = 0.0, g_msHaptics = 0.0;
+double g_pkSyncActions = 0.0, g_pkActionStates = 0.0, g_pkPoses = 0.0, g_pkHaptics = 0.0;
+int    g_syncSamples = 0;
+
+// ---- the controller correlation, bucketed rather than remembered (run 68) ----
+//
+// Run 67's timing came back at under 0.1 ms peak across all four phases. That EXONERATES the input
+// calls: whatever costs the judder, it is not xrSyncActions, the action-state reads, the pose
+// locations or the haptics. Something real is happening - it was reproduced three times by hand -
+// but the mechanism is not where it was looked for.
+//
+// It also came back from a run that did not contain the experiment: `NUMPAD/` was never pressed
+// and the controllers were never BOTH asleep, so there was no controllers-down sample to compare
+// against. Asking someone in a headset to hold a four-cell protocol in their head while playing is
+// not a reasonable instrument, and this is the second run it has cost.
+//
+// ⚠️ And there is a 99 ms worst-frame XR submit in that same log, with 38 ms and 17 ms behind it.
+// That is the documented WIRELESS LINK signature - STATUS: "If the worst frame is tens of ms, the
+// dips are the streaming path and no change to the render code will help." The link is also
+// exactly what burned this project in run 56, where three conclusions drawn from A/Bs taken across
+// it all had to be retracted, and where the identical binary measured 4% and 84% of windows over
+// 15 ms in one evening. **A by-hand controllers-up/down comparison is not safe against that.**
+//
+// So stop comparing two moments and compare two POPULATIONS. Every frame is bucketed by the state
+// it was rendered in, and the buckets are reported side by side with their sample counts. Link
+// noise lands in both buckets and averages out; a real effect does not.
+// ---- ⚠️ run 68 came back BACKWARDS, and the reason is a confound, not a mystery ----
+//
+//     input ON,  controllers AWAKE  : 76.0 fps, residual 10.93 ms, 5171 frames
+//     input ON,  controllers ASLEEP : 113.5 fps, residual  4.21 ms,  862 frames
+//     input OFF, controllers ASLEEP : 119.2 fps, residual  3.81 ms, 1106 frames
+//
+// The slow case is controllers AWAKE - the opposite of the reported symptom. And the one clean
+// comparison in there, asleep with input on vs off, differs by 0.4 ms, which is the input cost
+// already measured plus noise. XR submit stays under 1.6 ms in every bucket, so the link is not
+// involved either.
+//
+// The confound: **an awake controller means the player is playing.** Sticks live, walking through
+// the level, fighting - which draws more, streams more and costs more, for reasons that have
+// nothing to do with the controller being awake. A sleeping controller means standing still. The
+// bucket labelled "controllers awake" is really labelled "busy scene", and it was never going to
+// answer the question.
+//
+// The second problem is worse, and it is mine: **mean fps is not judder.** Judder is missed
+// deadlines and frame-time spread. A run that averages 113 fps while dropping one frame in twenty
+// looks fine in this table and awful in a headset, which is precisely the gap between what the
+// numbers said and what was reported. So count what actually judders - frames over the display
+// period, and the worst one - and carry draws/frame alongside so the activity confound is VISIBLE
+// in the table rather than left to be argued about.
+struct StateBucket {
+    double frameMs, waitMs, xrSubmitMs, maxFrameMs, drawsSum;
+    int frames, missed;
+};
+// Three binary conditions now, and all three have to be separable: is the game being fed a pad at
+// all (NUMPAD3), are we publishing controller state into it (NUMPAD/), and are the controllers in
+// a hand or on the desk (measured by motion). Eight rows is a small price for never again having
+// two conditions welded together the way run 68 welded "awake" to "input running".
+StateBucket g_bucket[8]{};   // [padEmu*4 + notFeeding*2 + onDesk]
+
+const char* BucketName(int i) {
+    static char buf[8][80];
+    _snprintf_s(buf[i], sizeof(buf[i]), _TRUNCATE, "pad %s, feed %s, controllers %s",
+                (i & 4) ? "ON " : "off",
+                (i & 2) ? "off" : "ON ",
+                (i & 1) ? "ON DESK" : "in hand");
+    return buf[i];
+}
+
+// ---- Raven's 360 layout, read out of the game's own config (run 61b) ----
+//
+// `RvGame\CookedPC\Coalesced_INT.bin` is UE3's coalesced config archive, and it carries the
+// shipped binding table as UTF-16 text. No guessing was needed after all:
+//
+//     RT  Fire          LT  Aim              A  Jump        B  Crouch
+//     X   Use/reload    Y   CycleWeapon      LB AgeYoung    RB Impulse
+//     LSt Dash          RSt AntiGrav         START ShowMenu BACK Scoreboard
+//     D-pad up  HEALTH       D-pad down  Flashlight       D-pad left/right  unassigned
+//
+// Two facts that change the mapping rather than merely confirm it:
+//
+//   - **D-pad up is the health item.** That is what the run-61 weapon-switch mapping actually hit.
+//   - **There is no next/prev weapon, only CYCLE** - one button, and the mouse wheel is bound to
+//     the same command in both directions. A two-way stick gesture would have been wrong by
+//     construction, so the stick's other direction is free and now carries health.
+//
+// ⚠️ Method note worth more than the table: the button probe could confirm a binding but could not
+// refute one. X, Y, LB and the thumbstick clicks all read as "nothing happened" simply because
+// Use, CycleWeapon and the TMD powers do nothing without a target, a second weapon or a charge -
+// and D-pad up read as nothing at full health, having demonstrably worked ten minutes earlier.
+// **The instrument could only ever report the positive case.** The config file was the better
+// instrument and it was sitting in the install the whole time.
+//
+// Masks stay ini-editable regardless. Values are the standard XINPUT_GAMEPAD_* constants: A=0x1000
+// B=0x2000 X=0x4000 Y=0x8000 START=0x0010 BACK=0x0020 LB=0x0100 RB=0x0200 LSTICK=0x0040
+// RSTICK=0x0080 DPAD up/down/left/right = 0x0001/0x0002/0x0004/0x0008.
+struct PadButtonAction {
+    const char* name;        // OpenXR action name (lower case, no spaces - the spec requires it)
+    const char* localised;
+    const char* path;        // Touch-profile binding. Booleans on `squeeze/value` are legal:
+                             // the runtime thresholds a float source for a boolean action.
+    const char* iniKey;
+    WORD        mask;
+    XrAction    action;
+    bool        isMenu;      // handled specially - see the long-press note in SyncXRInput
+};
+
+// ⚠️ `menu/click` exists on the LEFT hand only in the Touch profile, and `system/click` on the
+// right is reserved by the runtime. Both have caught people out; neither is a runtime error, the
+// binding is just silently ignored.
+PadButtonAction g_padButtons[] = {
+    { "jump",       "Jump",           "/user/hand/right/input/a/click",          "Jump",       XI_A,         XR_NULL_HANDLE, false },
+    { "crouch",     "Crouch",         "/user/hand/right/input/b/click",          "Crouch",     XI_B,         XR_NULL_HANDLE, false },
+    { "use",        "Use / reload",   "/user/hand/right/input/squeeze/value",    "Use",        XI_X,         XR_NULL_HANDLE, false },
+    { "antigrav",   "Anti-gravity",   "/user/hand/right/input/thumbstick/click", "AntiGrav",   XI_RTHUMB,    XR_NULL_HANDLE, false },
+    { "impulse",    "Impulse",        "/user/hand/left/input/squeeze/value",     "Impulse",    XI_RSHOULDER, XR_NULL_HANDLE, false },
+    { "ageyoung",   "Age / renovate", "/user/hand/left/input/x/click",           "AgeYoung",   XI_LSHOULDER, XR_NULL_HANDLE, false },
+    { "flashlight", "Flashlight",     "/user/hand/left/input/y/click",           "Flashlight", XI_DPAD_DOWN, XR_NULL_HANDLE, false },
+    { "dash",       "Dash",           "/user/hand/left/input/thumbstick/click",  "Dash",       XI_LTHUMB,    XR_NULL_HANDLE, false },
+    { "menu",       "Menu",           "/user/hand/left/input/menu/click",        "Menu",       XI_START,     XR_NULL_HANDLE, true  },
+};
+const int kPadButtonCount = (int)(sizeof(g_padButtons) / sizeof(g_padButtons[0]));
+
+// Turn. Snap steps the yaw base directly rather than driving the look stick, because the engine's
+// own turn ramp is exactly what snap must not have: instant and exact is the whole point. Smooth
+// goes through the pad instead and inherits Raven's curve, which is what you want there.
+int   g_turnMode     = 1;      // ini TurnMode: 0 smooth, 1 snap
+float g_turnAngleDeg = 30.0f;  // ini TurnAngle
+int   g_turnSign     = 1;      // ini TurnSign - one edit if right turns left
+bool  g_snapArmed    = true;
+
+int32_t g_padTurnAccum = 0;    // snap steps waiting to be folded in, in FRotator units
+
+bool XrPathOf(const char* s, XrPath* out) {
+    return XR_SUCCEEDED(xrStringToPath(g_xrInstance, s, out));
+}
+
+bool InitXRInput() {
+    if (g_xrInstance == XR_NULL_HANDLE || g_xrSession == XR_NULL_HANDLE) return false;
+
+    {
+        char path[MAX_PATH]{};
+        if (IniPath(path)) {
+            g_turnMode     = GetPrivateProfileIntA("Input", "TurnMode",  1, path);
+            g_turnAngleDeg = (float)GetPrivateProfileIntA("Input", "TurnAngle", 30, path);
+            g_turnSign     = GetPrivateProfileIntA("Input", "TurnSign",  1, path) >= 0 ? 1 : -1;
+            g_stickUpMask   = (WORD)GetPrivateProfileIntA("Input", "StickUp",   g_stickUpMask,   path);
+            g_stickDownMask = (WORD)GetPrivateProfileIntA("Input", "StickDown", g_stickDownMask, path);
+            g_walkDirection = GetPrivateProfileIntA("Input", "WalkDirection", 1, path);
+            g_walkSign      = GetPrivateProfileIntA("Input", "WalkSign", 1, path) >= 0 ? 1 : -1;
+            g_autoPad       = GetPrivateProfileIntA("Input", "AutoPad", 1, path);
+            g_handStillFramesToDisable =
+                GetPrivateProfileIntA("Input", "AutoPadStillFrames", 360, path);
+            for (int i = 0; i < kPadButtonCount; ++i)
+                g_padButtons[i].mask = (WORD)GetPrivateProfileIntA(
+                    "Input", g_padButtons[i].iniKey, g_padButtons[i].mask, path);
+        }
+    }
+
+    XrActionSetCreateInfo asci{ XR_TYPE_ACTION_SET_CREATE_INFO };
+    strcpy_s(asci.actionSetName, "gameplay");
+    strcpy_s(asci.localizedActionSetName, "Gameplay");
+    if (XR_FAILED(xrCreateActionSet(g_xrInstance, &asci, &g_actionSet))) {
+        Log("xrinput: xrCreateActionSet failed - controllers unavailable, gamepad probe still usable");
+        return false;
+    }
+
+    auto mkAction = [&](const char* n, const char* loc, XrActionType t, XrAction* out) -> bool {
+        XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
+        strcpy_s(aci.actionName, n);
+        strcpy_s(aci.localizedActionName, loc);
+        aci.actionType = t;
+        return XR_SUCCEEDED(xrCreateAction(g_actionSet, &aci, out));
+    };
+
+    XrPathOf("/user/hand/left",  &g_handSubPath[0]);
+    XrPathOf("/user/hand/right", &g_handSubPath[1]);
+
+    // One vibration action with two subaction paths, rather than two actions. The subaction path
+    // is what xrApplyHapticFeedback selects on, so this is the shape the API wants.
+    {
+        XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
+        strcpy_s(aci.actionName, "haptic");
+        strcpy_s(aci.localizedActionName, "Haptic");
+        aci.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
+        aci.countSubactionPaths = 2;
+        aci.subactionPaths = g_handSubPath;
+        if (XR_FAILED(xrCreateAction(g_actionSet, &aci, &g_actHaptic)))
+            g_actHaptic = XR_NULL_HANDLE;   // haptics only; input carries on
+    }
+
+    {
+        XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
+        strcpy_s(aci.actionName, "handpose");
+        strcpy_s(aci.localizedActionName, "Hand pose");
+        aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
+        aci.countSubactionPaths = 2;
+        aci.subactionPaths = g_handSubPath;
+        if (XR_FAILED(xrCreateAction(g_actionSet, &aci, &g_actHandPose)))
+            g_actHandPose = XR_NULL_HANDLE;   // poses only; the rest of input carries on
+    }
+
+    bool ok = true;
+    ok &= mkAction("move",    "Move",     XR_ACTION_TYPE_VECTOR2F_INPUT, &g_actMove);
+    ok &= mkAction("turn",    "Turn",     XR_ACTION_TYPE_VECTOR2F_INPUT, &g_actTurn);
+    ok &= mkAction("fire",    "Fire",     XR_ACTION_TYPE_FLOAT_INPUT,    &g_actFire);
+    ok &= mkAction("altfire", "Alt fire", XR_ACTION_TYPE_FLOAT_INPUT,    &g_actAltFire);
+    for (int i = 0; i < kPadButtonCount; ++i)
+        ok &= mkAction(g_padButtons[i].name, g_padButtons[i].localised,
+                       XR_ACTION_TYPE_BOOLEAN_INPUT, &g_padButtons[i].action);
+    if (!ok) { Log("xrinput: xrCreateAction failed - controllers unavailable"); return false; }
+
+    // 4 fixed + one per button + 2 haptic outputs. Sized from the same constants that fill it, so
+    // adding a row to g_padButtons cannot silently overrun this.
+    // 4 fixed + one per button + 2 haptic outputs + 2 hand poses. Sized from the same constants
+    // that fill it, so adding a row to g_padButtons cannot silently overrun this.
+    XrActionSuggestedBinding binds[4 + kPadButtonCount + 2 + 2]{};
+    uint32_t nb = 0;
+    struct { XrAction a; const char* p; } fixed[] = {
+        { g_actMove,    "/user/hand/left/input/thumbstick"    },
+        { g_actTurn,    "/user/hand/right/input/thumbstick"   },
+        { g_actFire,    "/user/hand/right/input/trigger/value" },
+        { g_actAltFire, "/user/hand/left/input/trigger/value"  },
+    };
+    for (auto& f : fixed) {
+        XrPath p;
+        if (XrPathOf(f.p, &p)) { binds[nb].action = f.a; binds[nb].binding = p; ++nb; }
+    }
+    for (int i = 0; i < kPadButtonCount; ++i) {
+        XrPath p;
+        if (XrPathOf(g_padButtons[i].path, &p)) {
+            binds[nb].action = g_padButtons[i].action; binds[nb].binding = p; ++nb;
+        }
+    }
+    if (g_actHaptic != XR_NULL_HANDLE) {
+        const char* hp[2] = { "/user/hand/left/output/haptic", "/user/hand/right/output/haptic" };
+        for (int i = 0; i < 2; ++i) {
+            XrPath p;
+            if (XrPathOf(hp[i], &p)) { binds[nb].action = g_actHaptic; binds[nb].binding = p; ++nb; }
+        }
+    }
+    if (g_actHandPose != XR_NULL_HANDLE) {
+        // `aim`, not `grip`: aim is the runtime's own pointing ray for the controller, which is
+        // what a weapon direction wants. grip is where the hand holds it, and using that would
+        // mean re-deriving the pointing axis ourselves for no gain.
+        const char* pp[2] = { "/user/hand/left/input/aim/pose", "/user/hand/right/input/aim/pose" };
+        for (int i = 0; i < 2; ++i) {
+            XrPath p;
+            if (XrPathOf(pp[i], &p)) { binds[nb].action = g_actHandPose; binds[nb].binding = p; ++nb; }
+        }
+    }
+
+    XrPath profile;
+    if (!XrPathOf("/interaction_profiles/oculus/touch_controller", &profile)) {
+        Log("xrinput: Touch profile path failed"); return false;
+    }
+    XrInteractionProfileSuggestedBinding sb{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+    sb.interactionProfile = profile;
+    sb.suggestedBindings = binds;
+    sb.countSuggestedBindings = nb;
+    XrResult sr = xrSuggestInteractionProfileBindings(g_xrInstance, &sb);
+    if (XR_FAILED(sr)) {
+        // ⚠️ This fails as a WHOLE if any single binding path is not valid for the profile - it is
+        // not a per-binding filter. So a typo in one path silently costs every control, which is
+        // why the count and the result are both logged rather than assumed.
+        Log("xrinput: xrSuggestInteractionProfileBindings failed (%d) for %u bindings"
+            " - one bad path rejects them all", (int)sr, nb);
+        return false;
+    }
+
+    XrSessionActionSetsAttachInfo ai{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+    ai.countActionSets = 1;
+    ai.actionSets = &g_actionSet;
+    if (XR_FAILED(xrAttachSessionActionSets(g_xrSession, &ai))) {
+        Log("xrinput: xrAttachSessionActionSets failed - controllers unavailable"); return false;
+    }
+
+    // After attach, deliberately: some runtimes reject xrCreateActionSpace before the action set
+    // is attached to the session, and the spec does not require them to accept it.
+    if (g_actHandPose != XR_NULL_HANDLE) {
+        for (int i = 0; i < 2; ++i) {
+            XrActionSpaceCreateInfo sci{ XR_TYPE_ACTION_SPACE_CREATE_INFO };
+            sci.action = g_actHandPose;
+            sci.subactionPath = g_handSubPath[i];
+            sci.poseInActionSpace.orientation.w = 1.0f;
+            if (XR_FAILED(xrCreateActionSpace(g_xrSession, &sci, &g_handSpace[i])))
+                g_handSpace[i] = XR_NULL_HANDLE;
+        }
+    }
+
+    g_xrInputReady = true;
+    Log("xrinput: %u bindings attached. Turn mode %s, %.0f degrees. Walk direction %s."
+        " Hand poses %s.", nb, g_turnMode ? "SNAP" : "smooth", g_turnAngleDeg,
+        g_walkDirection ? "OFF-HAND" : "head-relative",
+        (g_handSpace[0] && g_handSpace[1]) ? "available" : "UNAVAILABLE");
+    return true;
+}
+
+// Turns controller state into the synthetic pad. Called once per frame from UpdateFromHeadset,
+// on the same thread as everything else that touches g_baseYaw.
+void SyncXRInput(XrTime displayTime) {
+    if (!g_xrInputReady) return;
+
+    // ⚠️ INSTRUMENT BUG, run 68: this used to return here and force g_handTracked to false, which
+    // made "input OFF, controllers AWAKE" a state the log could not physically record - and that
+    // was the one row the experiment needed. A control that destroys the label it is being compared
+    // against is not a control.
+    //
+    // So the switch now means what it should have meant: keep READING the controllers, stop FEEDING
+    // the game. The reads are measured at 0.005 ms and were never the suspect; what the game does
+    // with a live pad has never been isolated at all. This is the better experiment and it keeps
+    // the state labels valid on both sides of it.
+    const bool feedGame = InterlockedCompareExchange(&g_xrInputOff, 0, 0) == 0;
+
+    XrActiveActionSet aas{ g_actionSet, XR_NULL_PATH };
+    XrActionsSyncInfo si{ XR_TYPE_ACTIONS_SYNC_INFO };
+    si.countActiveActionSets = 1;
+    si.activeActionSets = &aas;
+    LARGE_INTEGER tSync = Now();
+    const XrResult sr = xrSyncActions(g_xrSession, &si);
+    {
+        const double ms = MsSince(tSync);
+        g_msSyncActions += ms;
+        if (ms > g_pkSyncActions) g_pkSyncActions = ms;
+        ++g_syncSamples;
+    }
+    double msStates = 0.0;
+
+    // XR_SESSION_NOT_FOCUSED is a SUCCESS code, not a failure - the call worked and the actions
+    // are simply inactive. Zeroing here is what stops the player walking on for ever because the
+    // stick was held when the headset was taken off or a system overlay took focus.
+    if (sr != XR_SUCCESS) {
+        ++g_syncFailFrames;
+        InterlockedExchange(&g_padBtns, 0);
+        InterlockedExchange(&g_padLStick, PackStick(0, 0));
+        InterlockedExchange(&g_padRStick, PackStick(0, 0));
+        g_snapArmed = true;
+        // Silence the motors too, or taking the headset off mid-firefight leaves a controller
+        // buzzing on the desk with nothing left to turn it off.
+        InterlockedExchange(&g_rumbleL, 0);
+        InterlockedExchange(&g_rumbleR, 0);
+        if (g_actHaptic != XR_NULL_HANDLE) {
+            for (int hand = 0; hand < 2; ++hand) {
+                XrHapticActionInfo hai{ XR_TYPE_HAPTIC_ACTION_INFO };
+                hai.action = g_actHaptic;
+                hai.subactionPath = g_handSubPath[hand];
+                xrStopHapticFeedback(g_xrSession, &hai);
+            }
+        }
+        return;
+    }
+
+    auto getVec2 = [&](XrAction a, float* x, float* y) {
+        *x = *y = 0.0f;
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = a;
+        XrActionStateVector2f st{ XR_TYPE_ACTION_STATE_VECTOR2F };
+        if (XR_SUCCEEDED(xrGetActionStateVector2f(g_xrSession, &gi, &st)) && st.isActive) {
+            *x = st.currentState.x; *y = st.currentState.y;
+        }
+    };
+    auto getFloat = [&](XrAction a) -> float {
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = a;
+        XrActionStateFloat st{ XR_TYPE_ACTION_STATE_FLOAT };
+        if (XR_SUCCEEDED(xrGetActionStateFloat(g_xrSession, &gi, &st)) && st.isActive)
+            return st.currentState;
+        return 0.0f;
+    };
+    auto getBool = [&](XrAction a) -> bool {
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = a;
+        XrActionStateBoolean st{ XR_TYPE_ACTION_STATE_BOOLEAN };
+        return XR_SUCCEEDED(xrGetActionStateBoolean(g_xrSession, &gi, &st)) &&
+               st.isActive && st.currentState;
+    };
+
+    float mx, my, tx, ty;
+    LARGE_INTEGER tSt = Now();
+    getVec2(g_actMove, &mx, &my);
+    getVec2(g_actTurn, &tx, &ty);
+    msStates += MsSince(tSt);
+
+    // ---- radial deadzone: the run-70 fix, and it is a correctness fix, not a comfort one ----
+    //
+    // RADIAL rather than per-axis: a per-axis deadzone leaves a live axis whenever the other one is
+    // pushed, so a stick held forward still jitters in x and the state still changes every frame -
+    // which is the exact failure being removed. Killing the whole vector when its MAGNITUDE is
+    // small is what makes a resting stick bit-identical between frames.
+    //
+    // Rescaled from the deadzone edge so the response stays continuous: without that, movement
+    // starts abruptly at 22% speed the moment the stick leaves the zone.
+    auto radialDeadzone = [](float* x, float* y, float dz) {
+        const float m = sqrtf((*x) * (*x) + (*y) * (*y));
+        if (m <= dz) { *x = 0.0f; *y = 0.0f; return; }
+        const float s = ((m - dz) / (1.0f - dz)) / m;
+        *x *= s; *y *= s;
+    };
+    // Raven's own config asks for 0.3 on the move stick and 0.2 on look
+    // (`Axis aStrafe Speed=1.0 DeadZone=0.3`), so the engine expects a pad that has already been
+    // conditioned. Matching those keeps the feel the game was tuned for.
+    radialDeadzone(&mx, &my, 0.30f);
+    radialDeadzone(&tx, &ty, 0.20f);
+
+    // ---- where the hands are ----
+    LARGE_INTEGER tPose = Now();
+    for (int i = 0; i < 2; ++i) {
+        g_handPoseValid[i] = false;
+        g_handTracked[i] = false;
+        if (g_handSpace[i] == XR_NULL_HANDLE) continue;
+        XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+        if (XR_FAILED(xrLocateSpace(g_handSpace[i], g_xrSpace, displayTime, &loc))) continue;
+        // TRACKED, not merely VALID. A set-down controller keeps reporting a valid last-known
+        // pose long after it has stopped being tracked, so the valid bit alone cannot tell a live
+        // controller from a sleeping one - which is exactly the distinction under investigation.
+        g_handTracked[i] = (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) != 0;
+        if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) continue;
+        const XrQuaternionf& q = loc.pose.orientation;
+        // The same Y-X-Z decomposition the head uses, so hand and head angles are directly
+        // comparable rather than two separately-derived conventions that agree by luck.
+        float sinp = 2.0f * (q.w * q.x - q.y * q.z);
+        if (sinp >  1.0f) sinp =  1.0f;
+        if (sinp < -1.0f) sinp = -1.0f;
+        g_handPitchRad[i] = asinf(sinp);
+        g_handYawRad[i] = atan2f(2.0f * (q.w * q.y + q.z * q.x),
+                                 1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        // Held or on a desk, decided by movement. The threshold is well above sensor noise for a
+        // stationary controller and far below anything a hand does, even a still one - a hand at
+        // rest still drifts by millimetres a frame, and a desk does not.
+        if (g_handHavePos[i]) {
+            const float dx = loc.pose.position.x - g_handLastPos[i].x;
+            const float dy = loc.pose.position.y - g_handLastPos[i].y;
+            const float dz = loc.pose.position.z - g_handLastPos[i].z;
+            const float d = sqrtf(dx*dx + dy*dy + dz*dz);
+            g_handSpeed[i] = g_handSpeed[i] * 0.95f + d * 0.05f;
+            // ⚠️ Raised 10x from 0.05 mm after run 72 logged "IN HAND" for essentially the whole
+            // session, including stretches the controllers spent on the desk. A stationary
+            // controller's tracking noise clears 0.05 mm easily, so the old threshold made the
+            // label a constant - and a bucket dimension that never varies cannot discriminate
+            // anything. It silently collapsed the correlation table to one row.
+            g_handHeld[i] = g_handSpeed[i] > 0.0005f;    // 0.5 mm/frame smoothed
+        }
+        g_handLastPos[i] = loc.pose.position;
+        g_handHavePos[i] = true;
+
+        g_handPoseValid[i] = true;
+    }
+    {
+        const double ms = MsSince(tPose);
+        g_msPoses += ms;
+        if (ms > g_pkPoses) g_pkPoses = ms;
+    }
+
+    // ---- off-hand-relative movement ----
+    //
+    // The engine's aBaseY/aStrafe are relative to PlayerController.Rotation, which head tracking
+    // currently drives - so movement is HEAD-relative by construction today. Pointing it at the
+    // left hand instead is one rotation of the stick vector by the angle between them, which is
+    // exact because both angles are known.
+    //
+    // This also happens to be the check that the pose plumbing is correct: if walking follows your
+    // left hand rather than sliding off at an angle, the conventions are right.
+    if (g_walkDirection && g_handPoseValid[0] && (mx != 0.0f || my != 0.0f)) {
+        float d = g_walkSign * (g_handYawRad[0] - g_headYawRad);
+        while (d >  3.14159265f) d -= 6.2831853f;
+        while (d < -3.14159265f) d += 6.2831853f;
+        const float c = cosf(d), s = sinf(d);
+        const float rx = mx * c - my * s;
+        const float ry = mx * s + my * c;
+        mx = rx; my = ry;
+    }
+
+    WORD btns = 0;
+    bool menuHeld = false;
+    WORD menuMask = 0;
+    tSt = Now();
+    for (int i = 0; i < kPadButtonCount; ++i) {
+        const bool down = getBool(g_padButtons[i].action);
+        if (g_padButtons[i].isMenu) { menuHeld = down; menuMask = g_padButtons[i].mask; continue; }
+        if (down) btns |= g_padButtons[i].mask;
+    }
+    msStates += MsSince(tSt);
+
+    // ---- recentre, which had no controller binding at all ----
+    //
+    // F8 recentres, and F8 cannot be found by feel inside a headset - so in practice the mod could
+    // not be recentred while it was being worn, which is the only time it is ever needed.
+    //
+    // Every button on both controllers is spoken for, so this is a long press rather than a new
+    // binding: hold MENU for a second to recentre, tap it for the pause menu. The tap has to fire
+    // on RELEASE for that to work, which also happens to be what Raven's own config does with this
+    // button (`|onrelease showmenu`).
+    static int  menuFrames = 0;
+    static bool menuConsumed = false;
+    static int  menuTapPulse = 0;
+    const int kMenuLongFrames = 120;        // ~1 s at 120 fps, ~2 s at 60 - deliberately generous
+    if (menuHeld) {
+        if (++menuFrames >= kMenuLongFrames && !menuConsumed) {
+            g_haveCentre = false;
+            menuConsumed = true;
+            Log("menu held: recentred");
+        }
+    } else {
+        if (menuFrames > 0 && !menuConsumed) menuTapPulse = 8;   // short press -> pause menu
+        menuFrames = 0;
+        menuConsumed = false;
+    }
+    if (menuTapPulse > 0) { btns |= menuMask; --menuTapPulse; }
+
+    // Weapon cycle (up) and health (down) on the look stick's vertical axis. It is free in both
+    // turn modes - smooth turn only ever feeds X to the look stick, because a thumbstick that
+    // pitches the view is the one control VR reliably makes people ill with.
+    //
+    // ⚠️ Held for several frames rather than pulsed for one. Both commands are
+    // `PressChainButton | OnRelease ReleaseChainButton` pairs in Raven's config, so the engine
+    // wants a press AND a release, and a one-frame flick can land between its own input ticks.
+    static bool stickArmed = true;
+    static int  stickHold = 0;
+    static WORD stickMask = 0;
+    if (fabsf(ty) > 0.7f && stickArmed) {
+        stickMask = (ty > 0) ? g_stickUpMask : g_stickDownMask;
+        stickHold = 8;
+        stickArmed = false;
+    } else if (fabsf(ty) < 0.4f) {
+        stickArmed = true;
+    }
+    if (stickHold > 0) { btns |= stickMask; --stickHold; }
+
+    // ---- turn ----
+    //
+    // Snap only works while head tracking owns yaw: with it off, the engine owns the rotation
+    // outright and stepping our base would move nothing at all - silently. Falling back to smooth
+    // there means the stick always turns, whatever else is switched on.
+    const bool headOwnsYaw = InterlockedCompareExchange(&g_enabled, 0, 0) != 0;
+    float lookX = 0.0f;
+    if (g_turnMode && headOwnsYaw) {
+        if (fabsf(tx) > 0.7f && g_snapArmed) {
+            const int32_t step = (int32_t)(g_turnAngleDeg * (65536.0f / 360.0f));
+            g_padTurnAccum += (tx > 0 ? 1 : -1) * g_turnSign * step;
+            g_snapArmed = false;
+        } else if (fabsf(tx) < 0.4f) {
+            g_snapArmed = true;
+        }
+    } else {
+        lookX = tx;
+    }
+
+    tSt = Now();
+    float lt = getFloat(g_actAltFire), rt = getFloat(g_actFire);
+    msStates += MsSince(tSt);
+    // Triggers get the same treatment for the same reason: a resting trigger reporting 0.004 turns
+    // into a byte that flickers between 0 and 1, and that is a state change every frame.
+    if (lt < 0.10f) lt = 0.0f;
+    if (rt < 0.10f) rt = 0.0f;
+    g_msActionStates += msStates;
+    if (msStates > g_pkActionStates) g_pkActionStates = msStates;
+    const LONG packedBtns = (LONG)btns
+                          | ((LONG)(BYTE)(lt * 255.0f) << 16)
+                          | ((LONG)(BYTE)(rt * 255.0f) << 24);
+
+    auto toAxis = [](float v) -> int16_t {
+        if (v >  1.0f) v =  1.0f;
+        if (v < -1.0f) v = -1.0f;
+        return (int16_t)(v * 32767.0f);
+    };
+    if (feedGame) {
+        InterlockedExchange(&g_padBtns, packedBtns);
+        InterlockedExchange(&g_padLStick, PackStick(toAxis(mx), toAxis(my)));
+        InterlockedExchange(&g_padRStick, PackStick(toAxis(lookX), 0));
+    } else {
+        ClearPad();
+    }
+
+    // ---- play whatever rumble the game asked for ----
+    //
+    // Not re-sent every frame: at 120 Hz that is 120 haptic calls a second per hand for a value
+    // that mostly is not changing, and each one crosses into the runtime. Sent on a meaningful
+    // change, and refreshed periodically so a sustained effect does not expire mid-rumble.
+    LARGE_INTEGER tHap = Now();
+    if (g_actHaptic != XR_NULL_HANDLE) {
+        static float lastAmp[2] = { -1.0f, -1.0f };
+        static int   refresh = 0;
+        ++refresh;
+        const LONG raw[2] = { InterlockedCompareExchange(&g_rumbleL, 0, 0),
+                              InterlockedCompareExchange(&g_rumbleR, 0, 0) };
+        for (int hand = 0; hand < 2; ++hand) {
+            // Nothing sent to a controller that is not being tracked. A sleeping Touch controller
+            // is a plausible source of a slow runtime call, and this mod asks for haptics every
+            // time the game rumbles - which in combat is constantly. Cheap to rule out, and
+            // correct on its own terms regardless: buzzing a controller on a desk helps nobody.
+            const float amp = (feedGame && g_handHeld[hand]) ? (float)raw[hand] / 65535.0f : 0.0f;
+            const bool changed = fabsf(amp - lastAmp[hand]) > 0.02f;
+            const bool expiring = amp > 0.0f && (refresh % 15) == 0;
+            if (!changed && !expiring) continue;
+            lastAmp[hand] = amp;
+
+            XrHapticActionInfo hai{ XR_TYPE_HAPTIC_ACTION_INFO };
+            hai.action = g_actHaptic;
+            hai.subactionPath = g_handSubPath[hand];
+            if (amp <= 0.0f) {
+                xrStopHapticFeedback(g_xrSession, &hai);
+            } else {
+                XrHapticVibration hv{ XR_TYPE_HAPTIC_VIBRATION };
+                hv.duration  = 200LL * 1000000LL;      // 200 ms in ns - longer than the refresh
+                hv.frequency = XR_FREQUENCY_UNSPECIFIED;
+                hv.amplitude = amp;
+                xrApplyHapticFeedback(g_xrSession, &hai,
+                                      reinterpret_cast<const XrHapticBaseHeader*>(&hv));
+            }
+        }
+    }
+    {
+        const double ms = MsSince(tHap);
+        g_msHaptics += ms;
+        if (ms > g_pkHaptics) g_pkHaptics = ms;
+    }
+}
 
 void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
     if (!g_xrReady) return;
@@ -2021,9 +3596,27 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
 
     XrFrameState fs{ XR_TYPE_FRAME_STATE };
     LARGE_INTEGER tWait = Now();
-    if (XR_FAILED(xrWaitFrame(g_xrSession, nullptr, &fs))) return;
+    if (XR_FAILED(xrWaitFrame(g_xrSession, nullptr, &fs))) {
+        // Not merely a skipped frame: returning without clearing would leave the pad latched at
+        // whatever was last published, and the player walking.
+        ClearPad();
+        return;
+    }
     g_msWaitFrame += MsSince(tWait);
     ++g_waitFrames;
+
+    // After xrWaitFrame because locating the hands needs its predicted display time, and before
+    // xrLocateViews so the yaw base is settled for the whole frame that follows - the 6-DOF
+    // transform below reads g_baseYaw too, and a snap applied between the two would rotate the
+    // view and the positional frame by different amounts for one frame.
+    SyncXRInput(fs.predictedDisplayTime);
+    if (g_padTurnAccum) {
+        // Discarded rather than applied before the first centre: g_baseYaw is seeded from the
+        // game's own yaw at that moment, so anything accumulated beforehand would be overwritten
+        // and a snap pressed during a load would appear to do nothing.
+        if (g_haveCentre) g_baseYaw += g_padTurnAccum;
+        g_padTurnAccum = 0;
+    }
     // The pacing target, measured rather than assumed. A frame time that sits at an exact
     // multiple of this is the signature of missing the deadline and waiting out a whole extra
     // display period - a very different problem from being uniformly slow, and the fix for it
@@ -2175,6 +3768,9 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 g_eyeDeltaUU[2] = dy * kMetresToUU;
             }
         }
+        // Published for next frame's walk-direction transform - see the note on g_headYawRad.
+        g_headYawRad = yawRad;
+
         float dYaw = yawRad - g_centreYaw;
         while (dYaw >  3.14159265f) dYaw -= 6.2831853f;
         while (dYaw < -3.14159265f) dYaw += 6.2831853f;
@@ -2185,6 +3781,40 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         g_wantPitch = p;
         g_wantYaw   = g_baseYaw + (int32_t)(g_yawSign * dYaw * kRadToUU);
         g_haveWant  = true;
+
+        // The split. The matrix is handed exactly the angles the engine would have been handed,
+        // so the signs are inherited from code already known to be right rather than guessed
+        // again - which is most of why this is expected to be a no-op rather than hoped to be.
+        //
+        // The engine is aimed as far towards the BODY's facing as the deviation clamp allows, and
+        // the matrix supplies whatever is left over. At N = 0 the engine gets the full head angle
+        // and the matrix rotation is identically zero, so the split collapses to today's
+        // behaviour - which makes N = 0 a genuine control rather than a nominal one.
+        {
+            int stepIdx = (int)InterlockedCompareExchange(&g_devStep, 0, 0);
+            if (InterlockedCompareExchange(&g_devFlicker, 0, 0)) {
+                // ~15 frames per phase: 4 Hz at 120 fps, which is squarely in the band the eye
+                // picks up involuntarily. Much faster reads as shimmer, much slower stops being
+                // motion and goes back to being an absence.
+                static int fc = 0;
+                const int phase = ((++fc / 15) & 1);
+                if (phase != g_devPhase) { g_devPhase = phase; g_devPhaseAge = 0; }
+                else ++g_devPhaseAge;
+                if (g_devPhase == 0) stepIdx = 0;
+            } else {
+                g_devPhase = 1;
+                g_devPhaseAge = 999;
+            }
+            const int32_t maxDev = (int32_t)(kDevSteps[stepIdx] * (65536.0f / 360.0f));
+            g_matDesYawUU   = g_wantYaw;
+            g_matDesPitchUU = g_wantPitch;
+            g_matCurYawUU   = g_wantYaw   + ClampDev(g_baseYaw - g_wantYaw, maxDev);
+            g_matCurPitchUU = g_wantPitch + ClampDev(0         - g_wantPitch, maxDev);
+            if (InterlockedCompareExchange(&g_matrixRot, 0, 0)) {
+                g_wantYaw   = g_matCurYawUU;
+                g_wantPitch = g_matCurPitchUU;
+            }
+        }
 
         // Roll rides with head tracking, so it stops when F9 does and the matrix path has one
         // flag to read rather than two. Written unconditionally when off so a stale angle can
@@ -2513,6 +4143,36 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         ++g_injCount;
         memcpy(scratch, data, copyVecs * 4 * sizeof(float));
         Reg4* m = reinterpret_cast<Reg4*>(scratch + j * 4);
+        // Before ApplyOffset, deliberately - see the order note above ApplyHeadRotation. Gated on
+        // head tracking as well as the split, so turning tracking off cannot leave the matrix
+        // rotating by a stale angle the engine no longer knows about.
+        if (InterlockedCompareExchange(&g_matrixRot, 0, 0) &&
+            InterlockedCompareExchange(&g_enabled, 0, 0)) {
+            // Once per frame, and here rather than in Present: by this point the engine's camera
+            // update has run, so this is the rotation THIS frame is being drawn with. Reading it
+            // in Present would be a frame stale, which is the same class of error we are chasing.
+            if (InterlockedExchange(&g_camRotDirty, 0) &&
+                g_camera && Readable((void*)(g_camera + ACTOR_ROTATION), 12)) {
+                const int32_t* rr = reinterpret_cast<const int32_t*>(g_camera + ACTOR_ROTATION);
+                g_camPitchUU = rr[0];
+                g_camYawUU   = rr[1];
+                g_camRotKnown = true;
+                int32_t d = g_camYawUU - g_matCurYawUU;
+                while (d >  32768) d -= 65536;
+                while (d < -32768) d += 65536;
+                const double deg = fabs(d) * (360.0 / 65536.0);
+                g_residSum += deg;
+                if (deg > g_residMax) g_residMax = deg;
+                ++g_residN;
+            }
+            const float kUUToRad = 6.2831853f / 65536.0f;
+            // Compensate against where the camera REALLY is. Falling back to what we asked for
+            // only while the camera has never been read, which is the first frame or two.
+            const float curPitch = (g_camRotKnown ? g_camPitchUU : g_matCurPitchUU) * kUUToRad;
+            const float curYaw   = (g_camRotKnown ? g_camYawUU   : g_matCurYawUU)   * kUUToRad;
+            ApplyHeadRotation(m, c, curPitch, curYaw,
+                              g_matDesPitchUU * kUUToRad, g_matDesYawUU * kUUToRad);
+        }
         if (inject) ApplyOffset(m, c, o);
         if (forceProj) {
             // lockTanX/Y were measured from the arriving matrix by the verify block above, so the
@@ -3048,7 +4708,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
 // draw from a thread that does not own the device is wrong whether or not it explains the hang.
 // But it was never established that these calls arrive off the render thread at all - that was
 // inferred. g_upOffThread settles it for the cost of one write, ever.
-DWORD g_mainThreadId = 0;        // set on the first Present
+// (declared up with the Sleep hook, which needs it too)
 volatile LONG g_upOffThread = 0; // set once if a user-pointer draw ever arrives off that thread
 
 inline bool OnRenderThread() {
@@ -4122,6 +5782,13 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     g_mainThreadId = GetCurrentThreadId();
     if (InterlockedExchange(&g_initTried, 1) == 0) { InstallViewHook(); InitXR(); }
 
+    // Retry until it takes. DllMain gets first refusal, but XINPUT1_3.dll is a sibling static
+    // import and the loader owes us no ordering, so the first attempt can legitimately find it
+    // absent. Returns true once there is nothing left to do, including the failure cases - a
+    // retry loop that never terminates on failure would log once per frame forever.
+    static bool xiDone = false;
+    if (!xiDone) xiDone = InstallXInputHook();
+
     static bool p9=false,p8=false,p5=false,p4=false,p2=false;
     bool k9=(GetAsyncKeyState(VK_F9)&0x8000)!=0, k8=(GetAsyncKeyState(VK_F8)&0x8000)!=0;
     bool k5=(GetAsyncKeyState(VK_F5)&0x8000)!=0, k4=(GetAsyncKeyState(VK_F4)&0x8000)!=0;
@@ -4199,6 +5866,152 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             g_rollSign);
     }
     pNum1 = kNum1; pNum2 = kNum2;
+
+    // NUMPAD3 / NUMPAD4 / NUMPAD5: the gamepad probe. See the note above Hook_XInputGetState.
+    //
+    // Three keys rather than one because they answer three separate questions and the answers are
+    // only useful apart. If NUMPAD3 alone changes the HUD prompts, the game has noticed the pad
+    // without any stick moving - which is already most of what we need to know about the menus.
+    static bool pNum3 = false, pNum4 = false, pNum5 = false;
+    bool kNum3 = (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) != 0;
+    bool kNum4 = (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) != 0;
+    bool kNum5 = (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) != 0;
+    if (kNum3 && !pNum3) {
+        LONG was = InterlockedCompareExchange(&g_padEmu, 0, 0);
+        InterlockedExchange(&g_padEmu, was ? 0 : 1);
+        // A manual press takes the wheel. Otherwise auto-pad would undo it within a few frames and
+        // the key would look broken.
+        g_autoPad = 0;
+        g_autoPadDisabled = false;
+        Log("NUMPAD3 pressed - auto-pad is now OFF for this run, manual control only");
+        // Sticks are cleared on the way out so the game cannot be left holding a phantom input
+        // from a test that is no longer running.
+        if (was) { InterlockedExchange(&g_padWalkTest, 0);
+                   InterlockedExchange(&g_padLookTest, 0);
+                   ClearPad(); }
+        Log("NUMPAD3: gamepad emulation %s", was ? "OFF (real ports reported again)"
+            : "ON - a 360 pad is now 'plugged in' on port 0. Watch for button prompts in the HUD"
+              " and a highlighted item in the menus.");
+    }
+    if (kNum4 && !pNum4) {
+        LONG was = InterlockedCompareExchange(&g_padWalkTest, 0, 0);
+        InterlockedExchange(&g_padWalkTest, was ? 0 : 1);
+        Log("NUMPAD4: walk test %s - the player should %s", was ? "OFF" : "ON",
+            was ? "stop" : "walk FORWARD on his own. If he does, the whole gamepad route works.");
+    }
+    if (kNum5 && !pNum5) {
+        LONG was = InterlockedCompareExchange(&g_padLookTest, 0, 0);
+        InterlockedExchange(&g_padLookTest, was ? 0 : 1);
+        Log("NUMPAD5: look test %s - the view should %s", was ? "OFF" : "ON",
+            was ? "stop turning"
+                : "turn RIGHT while head tracking still works. If it SNAPS BACK instead, the"
+                  " run-12 fold-in does not cover engine-driven turning and that is the next bug.");
+    }
+    pNum3 = kNum3; pNum4 = kNum4; pNum5 = kNum5;
+
+    // NUMPAD6: press the next 360 button and say which one it was. NUMPAD7: start over.
+    //
+    // One key, fourteen presses, and Raven's whole console layout is on the record - which is
+    // cheaper than the third guess at it and cannot be wrong about the installed build.
+    static bool pNum6 = false, pNum7 = false;
+    bool kNum6 = (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) != 0;
+    bool kNum7 = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
+    if (kNum6 && !pNum6) {
+        // Named `btn`, not `b`: `b` is Hook_Present's third RECT parameter and is live right here.
+        // The file already carries one comment about exactly this shadowing mistake.
+        const XiButtonName& btn = kXiButtonNames[g_btnProbeIdx];
+        g_btnProbeMask = btn.mask;
+        g_btnProbeFrames = 8;
+        Log("NUMPAD6: pressing >>> %s <<< (mask 0x%04X, %d of %d)"
+            " - note what the game did, then press NUMPAD6 again for the next one",
+            btn.name, (unsigned)btn.mask, g_btnProbeIdx + 1, kXiButtonNameCount);
+        g_btnProbeIdx = (g_btnProbeIdx + 1) % kXiButtonNameCount;
+        if (g_btnProbeIdx == 0) Log("NUMPAD6: that was the last button - wrapping back to A");
+    }
+    if (kNum7 && !pNum7) { g_btnProbeIdx = 0; Log("NUMPAD7: button probe reset to A"); }
+    pNum6 = kNum6; pNum7 = kNum7;
+
+    // NUMPAD8: move head yaw/pitch out of the engine's rotation and into the view matrix.
+    static bool pNum8 = false;
+    bool kNum8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
+    if (kNum8 && !pNum8) {
+        LONG was = InterlockedCompareExchange(&g_matrixRot, 0, 0);
+        InterlockedExchange(&g_matrixRot, was ? 0 : 1);
+        Log("NUMPAD8: view rotation in the MATRIX %s. Deviation clamp is %d degrees"
+            " - at 0 this is identical to OFF by construction. NUMPAD9 raises it.",
+            was ? "OFF (engine rotation carries the head, as before)" : "ON",
+            kDevSteps[InterlockedCompareExchange(&g_devStep, 0, 0)]);
+    }
+    pNum8 = kNum8;
+
+    // NUMPAD9: how far the engine's camera may point away from the view. The measurement that
+    // decides whether aim decoupling is reachable this way at all - see the note on kDevSteps.
+    static bool pNum9 = false;
+    bool kNum9 = (GetAsyncKeyState(VK_NUMPAD9) & 0x8000) != 0;
+    if (kNum9 && !pNum9) {
+        LONG next = (InterlockedCompareExchange(&g_devStep, 0, 0) + 1) % kDevStepCount;
+        InterlockedExchange(&g_devStep, next);
+        Log("NUMPAD9: deviation clamp %d degrees - turn your head that far off your body and watch"
+            " for geometry vanishing at the edges. The largest value with NO popping is the answer.",
+            kDevSteps[next]);
+    }
+    pNum9 = kNum9;
+
+    // NUMPAD * : the flicker. The clamp cycles the angle; this is what makes the answer visible.
+    static bool pMul = false;
+    bool kMul = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
+    if (kMul && !pMul) {
+        LONG was = InterlockedCompareExchange(&g_devFlicker, 0, 0);
+        InterlockedExchange(&g_devFlicker, was ? 0 : 1);
+        g_devDraws[0] = g_devDraws[1] = 0.0;
+        g_devDrawFrames[0] = g_devDrawFrames[1] = 0;
+        Log("NUMPAD*: culling flicker %s (alternating clamp 0 <-> %d degrees at ~4 Hz)",
+            was ? "OFF" : "ON", kDevSteps[InterlockedCompareExchange(&g_devStep, 0, 0)]);
+    }
+    pMul = kMul;
+
+    // NUMPAD / : turn ALL of this mod's XR input work off. The cheap control for run 67 - if the
+    // judder survives this, it is not our input code and no amount of tuning it will help.
+    static bool pDiv = false;
+    bool kDiv = (GetAsyncKeyState(VK_DIVIDE) & 0x8000) != 0;
+    if (kDiv && !pDiv) {
+        LONG was = InterlockedCompareExchange(&g_xrInputOff, 0, 0);
+        InterlockedExchange(&g_xrInputOff, was ? 0 : 1);
+        Log("NUMPAD/: XR controller input %s - if the judder is unchanged either way, it is NOT"
+            " this mod's input code and the runtime or the link is the place to look",
+            was ? "back ON" : "OFF (no sync, no poses, no haptics)");
+    }
+    pDiv = kDiv;
+
+    // NUMPAD - : freeze dwPacketNumber. Splits "the engine re-processes input on every change"
+    // from "the engine costs this much simply because a pad exists". Controls stop responding
+    // while it is on, by design.
+    static bool pSub = false;
+    bool kSub = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
+    if (kSub && !pSub) {
+        LONG was = InterlockedCompareExchange(&g_freezePacket, 0, 0);
+        InterlockedExchange(&g_freezePacket, was ? 0 : 1);
+        Log("NUMPAD-: packet number %s - the pad stays connected and keeps reporting real sticks,"
+            " but the engine is told nothing ever changes. Your controls WILL stop working."
+            " If the frame rate recovers, the cost is UE3's input processing; if it does not,"
+            " the cost is the pad merely existing (force feedback is the next suspect)",
+            was ? "advancing normally again" : "FROZEN");
+    }
+    pSub = kSub;
+
+    // NUMPAD + : neutralise UE3's frame-rate governor on the render thread.
+    static bool pAdd = false;
+    bool kAdd = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+    if (kAdd && !pAdd) {
+        LONG was = InterlockedCompareExchange(&g_killSleep, 0, 0);
+        InterlockedExchange(&g_killSleep, was ? 0 : 1);
+        Log("NUMPAD+: frame-rate governor %s - if the frame rate jumps to 120 and STAYS there,"
+            " `bSmoothFrameRate=TRUE` was holding it down and everything else this session was"
+            " measured through that", was ? "restored" : "NEUTRALISED (render-thread sleeps -> 0)");
+    }
+    pAdd = kAdd;
+
+    LogXInputStats();
 
     // BACKSPACE: the whole mod on or off in one key. See SetVrMode.
     static bool pBack = false;
@@ -4333,9 +6146,54 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         static int dupPeak = 0, totPeak = 0, offsetPeak = 0, offscreenPeak = 0, monoPeak = 0, upPeak = 0;
         if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
         LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-        if (last.QuadPart) accum += double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
+        double thisFrameMs = 0.0;
+        if (last.QuadPart) {
+            const double dt = double(now.QuadPart - last.QuadPart) / double(freq.QuadPart);
+            accum += dt;
+            thisFrameMs = dt * 1000.0;
+        }
         last = now;
         if (g_drawsTotal > totPeak) totPeak = g_drawsTotal;
+
+        // Bucket this frame by the state it was rendered in. Both controllers must be tracked to
+        // count as awake - one hand down is the ambiguous case and would only blur the comparison.
+        //
+        // xrWaitFrame and XR submit come from the running totals as per-frame deltas, so the
+        // link's own contribution can be read separately inside each bucket. Those totals are
+        // zeroed once a second by the block below, which makes one delta per second negative -
+        // that frame is dropped rather than corrected, because one frame in 120 is not worth the
+        // bookkeeping.
+        {
+            static double lastWait = 0.0, lastSubmit = 0.0;
+            const double dWait   = g_msWaitFrame - lastWait;
+            const double dSubmit = g_msXrSubmit  - lastSubmit;
+            lastWait = g_msWaitFrame; lastSubmit = g_msXrSubmit;
+            if (thisFrameMs > 0.0 && thisFrameMs < 500.0 && dWait >= 0.0 && dSubmit >= 0.0) {
+                const int idx = (InterlockedCompareExchange(&g_padEmu, 0, 0) ? 4 : 0)
+                              + (InterlockedCompareExchange(&g_xrInputOff, 0, 0) ? 2 : 0)
+                              + ((g_handHeld[0] || g_handHeld[1]) ? 0 : 1);
+                g_bucket[idx].frameMs    += thisFrameMs;
+                g_bucket[idx].waitMs     += dWait;
+                g_bucket[idx].xrSubmitMs += dSubmit;
+                g_bucket[idx].drawsSum   += g_drawsTotal;
+                if (thisFrameMs > g_bucket[idx].maxFrameMs) g_bucket[idx].maxFrameMs = thisFrameMs;
+                // A missed deadline, not a slow average. 1.5x the display period is comfortably
+                // past the point where the compositor has to reproject a stale frame, which is
+                // what judder actually is.
+                const double period = g_displayPeriodMs > 0.0 ? g_displayPeriodMs : 8.33;
+                if (thisFrameMs > period * 1.5) ++g_bucket[idx].missed;
+                ++g_bucket[idx].frames;
+            }
+        }
+
+        // Frames near a phase change are dropped rather than attributed. The phase is set in
+        // UpdateFromHeadset and the draws it governs are counted a frame or so later, and rather
+        // than reason about that alignment - which is exactly the sort of thing that is wrong
+        // silently - discard the boundary. Each phase runs 15 frames, so losing 3 costs nothing.
+        if (InterlockedCompareExchange(&g_devFlicker, 0, 0) && g_devPhaseAge >= 3) {
+            g_devDraws[g_devPhase] += g_drawsTotal;
+            ++g_devDrawFrames[g_devPhase];
+        }
         if (g_drawsDuped > dupPeak) dupPeak = g_drawsDuped;
         if (g_drawsDupedOffset > offsetPeak) offsetPeak = g_drawsDupedOffset;
         if (g_drawsOffscreen > offscreenPeak) offscreenPeak = g_drawsOffscreen;
@@ -4385,6 +6243,115 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 frames / (accum > 0 ? accum : 1.0), (accum * 1000.0) / frames, totPeak, dupPeak,
                 offsetPeak, dupPeak - offsetPeak, offscreenPeak, monoPeak, upPeak, g_framesNoIdent,
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? " [TRUE STEREO ON]" : "");
+            // ---- the four buckets, side by side ----
+            //
+            // CUMULATIVE, deliberately: these are never reset, so every second of play adds
+            // evidence and the comparison only gets stronger. A per-second version would be back
+            // to comparing two moments across a link that varies by 20x within an evening.
+            //
+            // Read MISSED first - that is what judders. Read draws/frame second: if it moves with
+            // the bucket, the comparison is contaminated by what the player was doing and the rest
+            // of the row means little. Only compare rows whose draw counts are close.
+            //
+            // The row that matters most is the one run 68 never collected: **input OFF with
+            // controllers AWAKE**. Without it there is no way to separate "the controllers are
+            // awake" from "the input code is running", because in run 68 those were the same
+            // condition. Pressing NUMPAD/ while holding the controllers is the whole experiment.
+            {
+                bool any = false;
+                for (int i = 0; i < 8; ++i) if (g_bucket[i].frames > 30) any = true;
+                if (any) {
+                    Log("    ---- controller/input correlation (cumulative) ----");
+                    for (int i = 0; i < 8; ++i) {
+                        // `bk`, not `b` - Hook_Present's third RECT parameter is `b` and is live
+                        // here. Second time this file has caught me doing it.
+                        const StateBucket& bk = g_bucket[i];
+                        if (bk.frames <= 30) continue;   // too few to mean anything
+                        const double n = (double)bk.frames;
+                        const double fr = bk.frameMs / n;
+                        const double wt = bk.waitMs / n;
+                        const double sb = bk.xrSubmitMs / n;
+                        Log("      %s : %.1f fps | residual %.2f | MISSED %.1f%% of frames"
+                            " (worst %.0f ms) | %.0f draws/frame | %d frames"
+                            " [wait %.2f, submit %.2f]",
+                            BucketName(i), 1000.0 / fr, fr - wt - sb,
+                            (100.0 * bk.missed) / n, bk.maxFrameMs, bk.drawsSum / n,
+                            bk.frames, wt, sb);
+                    }
+                }
+            }
+
+            // The governor, in milliseconds per second of wall clock. If this is thousands of ms
+            // while the frame rate sits at a suspiciously round number, the engine is holding the
+            // frame rate down on purpose and none of "our work" was ever our work.
+            {
+                const LONG sc = InterlockedExchange(&g_sleepCalls, 0);
+                const LONG sm = InterlockedExchange(&g_sleepMs, 0);
+                if (sc > 0)
+                    Log("    frame-rate governor: %ld render-thread sleeps totalling %ld ms in the"
+                        " last second%s", sc, sm,
+                        InterlockedCompareExchange(&g_killSleep, 0, 0) ? " [NEUTRALISED]" : "");
+            }
+
+            // Controller state, on the same line cadence as the frame budget, so a run where the
+            // controllers were picked up and set down a few times shows the correlation directly
+            // instead of depending on anyone remembering when they did it.
+            // Speeds in MICROMETRES per frame, printed next to the verdict they produced. The
+            // threshold is 500 um; if the two states do not separate cleanly either side of that,
+            // the number is wrong and this line says so without another run being needed.
+            Log("    controllers: left %s (%.0f um/frame), right %s (%.0f um/frame), pad %s%s,"
+                " XR input %s, sync-fail %d",
+                g_handHeld[0] ? "IN HAND" : "on desk", g_handSpeed[0] * 1.0e6f,
+                g_handHeld[1] ? "IN HAND" : "on desk", g_handSpeed[1] * 1.0e6f,
+                InterlockedCompareExchange(&g_padEmu, 0, 0) ? "ON" : "OFF",
+                g_autoPadDisabled ? " (auto)" : "",
+                InterlockedCompareExchange(&g_xrInputOff, 0, 0) ? "OFF (numpad /)" : "on",
+                g_syncFailFrames);
+            g_syncFailFrames = 0;
+
+            // The four phases of SyncXRInput, so the stall has a NAME rather than a suspect list.
+            // Worst-frame matters more than the mean here: a single 8 ms frame is a dropped frame
+            // and reads as judder, and a one-second average buries it completely.
+            if (g_syncSamples > 0) {
+                const double n = (double)g_syncSamples;
+                Log("    xrinput cost: xrSyncActions %.3f ms (peak %.3f) | action states %.3f"
+                    " (peak %.3f) | hand poses %.3f (peak %.3f) | haptics %.3f (peak %.3f)"
+                    " over %d frames - the PEAK column is the one that judders",
+                    g_msSyncActions / n, g_pkSyncActions, g_msActionStates / n, g_pkActionStates,
+                    g_msPoses / n, g_pkPoses, g_msHaptics / n, g_pkHaptics, g_syncSamples);
+                g_msSyncActions = g_msActionStates = g_msPoses = g_msHaptics = 0.0;
+                g_pkSyncActions = g_pkActionStates = g_pkPoses = g_pkHaptics = 0.0;
+                g_syncSamples = 0;
+            }
+
+            // The residual: how far the engine's camera actually is from where we told it to go.
+            // At clamp 0 this should be ~0. Anything else there means the camera actor is not the
+            // thing the view matrix is built from, and a lot of this design rests on it being so.
+            if (InterlockedCompareExchange(&g_matrixRot, 0, 0) && g_residN > 0) {
+                Log("engine-vs-asked residual: mean %.2f deg, WORST %.2f deg over %d frames"
+                    " (clamp %d). Near zero at clamp 0 = the camera adopts what we write."
+                    " Large after a clamp change = it is SMOOTHING, and the matrix is compensating"
+                    " for a rotation the camera has not taken yet.",
+                    g_residSum / g_residN, g_residMax, g_residN,
+                    kDevSteps[InterlockedCompareExchange(&g_devStep, 0, 0)]);
+                g_residSum = 0.0; g_residMax = 0.0; g_residN = 0;
+            }
+
+            if (InterlockedCompareExchange(&g_devFlicker, 0, 0) &&
+                g_devDrawFrames[0] > 0 && g_devDrawFrames[1] > 0) {
+                const double base = g_devDraws[0] / g_devDrawFrames[0];
+                const double test = g_devDraws[1] / g_devDrawFrames[1];
+                Log("culling flicker @ %d deg: clamp 0 -> %.0f draws/frame, clamp %d -> %.0f"
+                    " (%+.1f%%). The NUMBER is an upper bound - it counts the engine's whole"
+                    " frustum. The VERDICT is what you can see: anything flickering is geometry"
+                    " culled at this angle, and nothing flickering means nothing visible was lost.",
+                    kDevSteps[InterlockedCompareExchange(&g_devStep, 0, 0)], base,
+                    kDevSteps[InterlockedCompareExchange(&g_devStep, 0, 0)], test,
+                    base > 0.0 ? (test - base) * 100.0 / base : 0.0);
+                g_devDraws[0] = g_devDraws[1] = 0.0;
+                g_devDrawFrames[0] = g_devDrawFrames[1] = 0;
+            }
+
             // ---- the frame copy, broken into its three phases (run 31) ----
             //
             // This is the number that decides whether the D3D9Ex + MANAGED-pool wrapper is worth
@@ -4680,6 +6647,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     p7 = k7;
 
     UpdateFromHeadset(s);
+    ApplyPadTestOverrides();   // must follow SyncXRInput - see the note on the function
+    UpdateAutoPad();           // and after that, so a test override is never what keeps it awake
+    InterlockedExchange(&g_camRotDirty, 1);   // re-read the camera's real rotation next frame
 
     // Yaw is not carried by the detour's seam, so write it directly - the mechanism proven
     // in the earlier spike. Pitch deliberately left alone here; the detour owns it.
@@ -5155,6 +7125,11 @@ BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
         }
         if (!LoadReal()) { Log("FATAL: real d3d9.dll not loadable"); return FALSE; }
         InstallAutoResolution();
+        // Earliest possible attempt, for the same reason the command line needs one: if UE3
+        // enumerates input devices during startup and caches "no pad", a hook installed at the
+        // first Present is already too late. If XINPUT1_3.dll is not mapped yet this does nothing
+        // and Present retries.
+        InstallXInputHook();
     }
     return TRUE;
 }
