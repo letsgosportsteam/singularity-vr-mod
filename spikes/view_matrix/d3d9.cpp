@@ -6985,7 +6985,29 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     //
     // Writing the camera for a few microseconds cannot disturb the view: the view matrix for this
     // frame was built long before, and Present rewrites the camera every frame regardless.
-    const bool mode9 = (aimMode == 9) && fnIdx >= 0;
+    // ---- ⭐ run 101: mode 10 is mode 9 with the WRITE removed ----
+    //
+    // Reported: "it feels like it's cycling between the views your test is setting." That is a
+    // better description than anything I had, and it is not recoil - recoil does not alternate
+    // between two specific orientations.
+    //
+    // But three builds have now been aimed at "the camera moves when I shoot" without ever
+    // establishing that the mod causes it. So this is the control, built in rather than asked for:
+    // mode 10 runs the identical window - same functions, same hook, same nesting, same logging,
+    // same seqlock - and writes NOTHING.
+    //
+    //   view still cycles in mode 10  -> it is not our value. The window is innocent and the cause
+    //                                    is the game (recoil) or something else entirely.
+    //   view steady in mode 10, moves in mode 9 -> it IS our write reaching the view, and no
+    //                                    amount of narrowing which field will fix that, because
+    //                                    the engine reads these fields for the view later in the
+    //                                    same tick.
+    //
+    // Either answer ends a line of work rather than extending one, which is the thing the last
+    // three runs did not do.
+    const bool mode10 = (aimMode == 10) && fnIdx >= 0;
+    const bool mode9 = ((aimMode == 9) || mode10) && fnIdx >= 0;
+    const bool nullWindow = mode10;
     bool firedWindow = false;
     int32_t savedCtl[3] = {}, savedCam[3] = {}, savedPov[3] = {};
     bool haveCtl = false, haveCam = false, havePov = false;
@@ -7008,17 +7030,20 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
             if (fireCtl && Readable((void*)(fireCtl + ACTOR_ROTATION), 12)) {
                 int32_t* r = reinterpret_cast<int32_t*>(fireCtl + ACTOR_ROTATION);
                 savedCtl[0] = r[0]; savedCtl[1] = r[1]; savedCtl[2] = r[2];
-                r[0] = hp; r[1] = hy; haveCtl = true;
+                if (!nullWindow) { r[0] = hp; r[1] = hy; }
+                haveCtl = true;
             }
             if (g_aimFieldSet >= 2 && fireCam && Readable((void*)(fireCam + ACTOR_ROTATION), 12)) {
                 int32_t* r = reinterpret_cast<int32_t*>(fireCam + ACTOR_ROTATION);
                 savedCam[0] = r[0]; savedCam[1] = r[1]; savedCam[2] = r[2];
-                r[0] = hp; r[1] = hy; haveCam = true;
+                if (!nullWindow) { r[0] = hp; r[1] = hy; }
+                haveCam = true;
             }
             if (g_aimFieldSet >= 1 && fireCam && Readable((void*)(fireCam + CAM_POV_ROT), 12)) {
                 int32_t* r = reinterpret_cast<int32_t*>(fireCam + CAM_POV_ROT);
                 savedPov[0] = r[0]; savedPov[1] = r[1]; savedPov[2] = r[2];
-                r[0] = hp; r[1] = hy; havePov = true;
+                if (!nullWindow) { r[0] = hp; r[1] = hy; }
+                havePov = true;
             }
 
             // ---- run 98: and every OTHER field that tracks the view rotation ----
@@ -7038,7 +7063,8 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                     if (!fireCtl) break;
                     extraAddr[nExtra] = r;
                     extraSaved[nExtra][0] = r[0]; extraSaved[nExtra][1] = r[1];
-                    r[0] = hp; r[1] = hy; ++nExtra;
+                    if (!nullWindow) { r[0] = hp; r[1] = hy; }
+                    ++nExtra;
                 }
                 // Camera fields only at set 2. This is the loop that moved the view: one of these
                 // is very likely a desired-rotation the engine interpolates toward.
@@ -7047,7 +7073,8 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
                     int32_t* r = reinterpret_cast<int32_t*>(fireCam + g_camRotOffs[i]);
                     extraAddr[nExtra] = r;
                     extraSaved[nExtra][0] = r[0]; extraSaved[nExtra][1] = r[1];
-                    r[0] = hp; r[1] = hy; ++nExtra;
+                    if (!nullWindow) { r[0] = hp; r[1] = hy; }
+                    ++nExtra;
                 }
             }
             firedWindow = haveCtl || haveCam || havePov || nExtra > 0;
@@ -7683,7 +7710,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Mode 8 is CUT from the cycle: it puts the hand into the view permanently via PlayerMove
         // and inverts head tracking, so hitting it by accident costs a restart. Kept in source as
         // the record, exactly as modes 4 and 5 were.
-        static const LONG kAimCycle[] = { 0, 9, 1, 2, 3 };
+        static const LONG kAimCycle[] = { 0, 9, 10, 1, 2, 3 };
         const int kAimCycleLen = (int)(sizeof(kAimCycle) / sizeof(kAimCycle[0]));
         LONG cur = InterlockedCompareExchange(&g_aimMode, 0, 0);
         int at = 0;
@@ -7722,6 +7749,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     break;
             case 3: Log("NUMPAD.: aim mode 3 - view and culling on your HEAD, weapon aim from your"
                         " HAND via +0x05D4. Dead end: run 80 proved that field deflects nothing.");
+                    break;
+            case 10: Log("NUMPAD.: aim mode 10 - NULL WINDOW, the control for mode 9."
+                        " Identical in every way - same fire functions, same hook, same nesting,"
+                        " same seqlock, same log lines - except that it WRITES NOTHING."
+                        " >>> FIRE SEVERAL SHOTS AND WATCH THE VIEW, NOT THE BULLET. <<<"
+                        " View still cycles = it is NOT this mod. The window is innocent and the"
+                        " cause is the game itself, recoil most likely."
+                        " View steady here but moving in mode 9 = our write IS reaching the view,"
+                        " and narrowing WHICH field cannot fix that - the engine reads these"
+                        " fields for the view later in the same tick."
+                        " The bullet will not track your hand in this mode. That is the point.");
                     break;
             case 9: Log("NUMPAD.: aim mode 9 - THE WINDOW IS THE SHOT. The view, the culling and the"
                         " gun all stay exactly as normal on your HEAD - that is the design, not a"
@@ -8618,8 +8656,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // nothing once decided. It must run BEFORE rot[1] is overwritten below - after that
             // write the field we are matching against is the one we just set, and every offset
             // holding a stale value would silently drop out.
-            if (InterlockedCompareExchange(&g_aimMode, 0, 0) == 9)
+            {
+                const LONG am = InterlockedCompareExchange(&g_aimMode, 0, 0);
+                if (am == 9 || am == 10)
                 ScanViewRotFields(ctl, g_camera, g_wantPitch, g_wantYaw);
+            }
             InterlockedExchange(&g_aimYawForXi, g_aimYawUU);
             InterlockedExchange(&g_aimPitchForXi, g_aimPitchUU);
 
