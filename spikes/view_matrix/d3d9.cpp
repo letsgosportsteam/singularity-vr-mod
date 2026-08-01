@@ -945,6 +945,12 @@ uintptr_t g_camClass = 0, g_camera = 0;
 // Writing them was proven useless in spike 8 - the render does not read them back.
 const int ACTOR_LOCATION   = 0x0054;   // FVector, 3 floats
 const int CAM_POV_LOC      = 0x0420;   // mCurrentPOV location
+// ---- ⭐ run 97: mCurrentPOV.Rotation, DERIVED rather than guessed ----
+// UE3's FPOV is { vector Location; rotator Rotation; float FOV; } - 12 + 12 + 4 bytes. Location is
+// known to be 0x0420 and FOV known to be 0x0438, and 0x0420 + 12 = 0x042C, 0x042C + 12 = 0x0438.
+// The two offsets already proven bracket this one exactly, so it is the only value the struct can
+// have. That is a different kind of claim from +0x14, which was one observation treated as a fact.
+const int CAM_POV_ROT      = 0x042C;   // mCurrentPOV rotation - pitch, yaw, roll
 const int CAM_POV_FOV      = 0x0438;   // mCurrentPOV FOV - proven to steer the projection
 const int CAM_DESIRED_FOV  = 0x0470;   // mDesiredPOV FOV, the interpolation target
 const int CAM_CURRENT_FOV  = 0x0490;   // mCurrentFOV
@@ -6852,30 +6858,66 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // ⚠️ This is the third time the time split has been tried, so the difference is worth stating
     // plainly rather than asserted. Modes 4 and 5 held the hand for a whole FRAME. Mode 8 held it
     // for a whole TICK, which still contained the view update. This holds it for one shot.
+    // ---- run 97: the window was right, the FIELD was wrong ----
+    //
+    // Run 96 put the hand in Controller.Rotation for the duration of the shot - the log confirms
+    // it, including StartFire -> BeginFire nesting restoring correctly at each level - and the
+    // bullet still went down the crosshair. So the trace does not read Controller.Rotation.
+    //
+    // UE3's GetAdjustedAimFor commonly returns the view point rather than the controller's own
+    // rotation, and GetPlayerViewPoint reads the CAMERA: the camera actor's Rotation and
+    // mCurrentPOV.Rotation. This mod already owns both objects. So the window now swaps all three
+    // and restores all three, which covers every field the aim can be read from without touching
+    // anything for longer than one call.
+    //
+    // Writing the camera for a few microseconds cannot disturb the view: the view matrix for this
+    // frame was built long before, and Present rewrites the camera every frame regardless.
     const bool mode9 = (aimMode == 9) && fnIdx >= 0;
     bool firedWindow = false;
-    int32_t fireSavedPitch = 0, fireSavedYaw = 0;
-    uintptr_t fireCtl = 0;
+    int32_t savedCtl[3] = {}, savedCam[3] = {}, savedPov[3] = {};
+    bool haveCtl = false, haveCam = false, havePov = false;
+    uintptr_t fireCtl = 0, fireCam = 0;
 
     if (mode9) {
         bool isFireFn = false;
         for (int fk = kFnFireFirst; fk <= kFnFireLast; ++fk)
             if (FnIdx(fk) >= 0 && fnIdx == FnIdx(fk)) { isFireFn = true; break; }
         if (isFireFn) {
+            const int32_t hp = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
+            const int32_t hy = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
             fireCtl = (uintptr_t)InterlockedCompareExchange(&g_ctlForXi, 0, 0);
+            fireCam = g_camera;
+
             if (fireCtl && Readable((void*)(fireCtl + ACTOR_ROTATION), 12)) {
-                int32_t* rot = reinterpret_cast<int32_t*>(fireCtl + ACTOR_ROTATION);
-                fireSavedPitch = rot[0]; fireSavedYaw = rot[1];
-                rot[0] = InterlockedCompareExchange(&g_aimPitchForXi, 0, 0);
-                rot[1] = InterlockedCompareExchange(&g_aimYawForXi, 0, 0);
-                firedWindow = true;
-                static volatile LONG shots = 0;
-                if (InterlockedIncrement(&shots) <= 6) {
-                    char nm[96]{};
-                    NameFromIndex(fnIdx, nm, sizeof(nm));
-                    Log("aim mode 9: %s - rotation swapped head(p %d y %d) -> hand(p %d y %d)"
-                        " for this call only", nm, fireSavedPitch, fireSavedYaw, rot[0], rot[1]);
-                }
+                int32_t* r = reinterpret_cast<int32_t*>(fireCtl + ACTOR_ROTATION);
+                savedCtl[0] = r[0]; savedCtl[1] = r[1]; savedCtl[2] = r[2];
+                r[0] = hp; r[1] = hy; haveCtl = true;
+            }
+            if (fireCam && Readable((void*)(fireCam + ACTOR_ROTATION), 12)) {
+                int32_t* r = reinterpret_cast<int32_t*>(fireCam + ACTOR_ROTATION);
+                savedCam[0] = r[0]; savedCam[1] = r[1]; savedCam[2] = r[2];
+                r[0] = hp; r[1] = hy; haveCam = true;
+            }
+            if (fireCam && Readable((void*)(fireCam + CAM_POV_ROT), 12)) {
+                int32_t* r = reinterpret_cast<int32_t*>(fireCam + CAM_POV_ROT);
+                savedPov[0] = r[0]; savedPov[1] = r[1]; savedPov[2] = r[2];
+                r[0] = hp; r[1] = hy; havePov = true;
+            }
+            firedWindow = haveCtl || haveCam || havePov;
+
+            // Cap raised to 24: run 96 capped at 6 and spent them all on StartFire/BeginFire, so
+            // the log could not show whether FireAmmunition - the one that actually matters - ever
+            // opened the window at all.
+            static volatile LONG shots = 0;
+            if (InterlockedIncrement(&shots) <= 24) {
+                char nm[96]{};
+                NameFromIndex(fnIdx, nm, sizeof(nm));
+                Log("aim mode 9: %-16s hand(p %d y %d) | ctl %s was(p %d y %d) | cam %s was(p %d y %d)"
+                    " | POV %s was(p %d y %d)",
+                    nm, hp, hy,
+                    haveCtl ? "SET" : "--", savedCtl[0], savedCtl[1],
+                    haveCam ? "SET" : "--", savedCam[0], savedCam[1],
+                    havePov ? "SET" : "--", savedPov[0], savedPov[1]);
             }
         }
     }
@@ -6918,9 +6960,22 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // means a nested fire function (StartFire -> BeginFire -> FireAmmunition) puts back the hand
     // for the outer call and the head only when the outermost one returns - no depth counter
     // needed, and no way for an unbalanced nesting to leave the hand stuck in the field.
-    if (firedWindow && Readable((void*)(fireCtl + ACTOR_ROTATION), 12)) {
-        int32_t* rot = reinterpret_cast<int32_t*>(fireCtl + ACTOR_ROTATION);
-        rot[0] = fireSavedPitch; rot[1] = fireSavedYaw;
+    if (firedWindow) {
+        // Restore what was READ at each level, so nested fire calls (StartFire -> BeginFire ->
+        // FireAmmunition) unwind correctly and the head only comes back when the outermost
+        // returns. Confirmed working in run 96's log.
+        if (haveCtl) {
+            int32_t* r = reinterpret_cast<int32_t*>(fireCtl + ACTOR_ROTATION);
+            r[0] = savedCtl[0]; r[1] = savedCtl[1]; r[2] = savedCtl[2];
+        }
+        if (haveCam) {
+            int32_t* r = reinterpret_cast<int32_t*>(fireCam + ACTOR_ROTATION);
+            r[0] = savedCam[0]; r[1] = savedCam[1]; r[2] = savedCam[2];
+        }
+        if (havePov) {
+            int32_t* r = reinterpret_cast<int32_t*>(fireCam + CAM_POV_ROT);
+            r[0] = savedPov[0]; r[1] = savedPov[1]; r[2] = savedPov[2];
+        }
     }
     if (mode9) return;
 
