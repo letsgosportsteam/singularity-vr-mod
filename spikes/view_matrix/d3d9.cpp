@@ -6072,9 +6072,7 @@ PFN_ProcessEvent g_origProcessEvent = nullptr;
 // during which AActor::Rotation holds the hand. That is why the run 76-89 conclusion - "there is
 // no instant where the hand can sit in that field without the view taking it too" - is true and
 // does not apply here. Nothing is written to the field at all.
-const int FFRAME_NODE = 0x14;   // FFrame::Node, the UStruct being executed. Run 87 found this by
-                                // scanning every pointer slot; it was the only one that named a
-                                // real script function ('SeeMonster') across many calls.
+// FFrame::Node is no longer a constant - run 92 votes on it at runtime. See ScriptFuncNameIdx.
 
 // The FName index of the script function this frame is executing, or -1.
 //
@@ -6085,13 +6083,84 @@ const int FFRAME_NODE = 0x14;   // FFrame::Node, the UStruct being executed. Run
 // Index 0 is rejected, not accepted as 'None': run 87 established that a slot holding zero and a
 // non-object whose +0x2C happens to be zero both resolve to 'None' perfectly legitimately, so it
 // is noise that looks like data.
+// ---- ⭐ run 92: the offset is MEASURED, not assumed ----
+//
+// +0x14 came from run 87 and it is not reliable: in the run 91 log one frame gave
+// +0x14 -> 'SeeMonster' and the very next had +0x14 holding zero. A fixed offset that works on
+// some frames and not others produces exactly what run 91 saw - no match, no rejection, no
+// evidence, and nothing to distinguish it from the function not being on the path.
+//
+// So vote. For the first kNodeSampleTarget calls, test EVERY pointer slot in the frame against
+// the same filter run 87 used, and tally which ones name a real script function. The right slot
+// identifies itself by winning across hundreds of different calls; one hit was always a
+// coincidence and that is how +0x14 got adopted from six samples during level load.
+//
+// Guessing offsets on this object has now cost three runs. This is the last time it costs one.
+const int kNodeSlots = 16;
+const int kNodeSampleTarget = 300;
+volatile LONG g_nodeOffset  = -1;   // learned byte offset of FFrame::Node, -1 until decided
+volatile LONG g_nodeSamples = 0;
+volatile LONG g_nodeVotes[kNodeSlots] = {};
+volatile LONG g_nodeDecided = 0;
+
 static int32_t ScriptFuncNameIdx(void* frame) {
-    if (!frame || !Readable(frame, FFRAME_NODE + 4)) return -1;
-    const uintptr_t node = *reinterpret_cast<const uintptr_t*>(
-                               reinterpret_cast<uintptr_t>(frame) + FFRAME_NODE);
-    if (!node || !Readable((void*)node, OBJ_NAME + 4)) return -1;
-    const int32_t idx = *reinterpret_cast<const int32_t*>(node + OBJ_NAME);
-    return idx > 0 ? idx : -1;
+    if (!frame || !Readable(frame, kNodeSlots * 4)) return -1;
+    const uintptr_t f = reinterpret_cast<uintptr_t>(frame);
+
+    const LONG off = InterlockedCompareExchange(&g_nodeOffset, 0, 0);
+    if (off >= 0) {
+        const uintptr_t node = *reinterpret_cast<const uintptr_t*>(f + off);
+        if (!node || !Readable((void*)node, OBJ_NAME + 4)) return -1;
+        const int32_t idx = *reinterpret_cast<const int32_t*>(node + OBJ_NAME);
+        return idx > 0 ? idx : -1;
+    }
+
+    // ---- learning phase ----
+    const LONG n = InterlockedIncrement(&g_nodeSamples);
+    if (n <= kNodeSampleTarget) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(f);
+        for (int i = 0; i < kNodeSlots; ++i) {
+            const uintptr_t v = w[i];
+            if (v < 0x01000000 || v > 0x7FFF0000) continue;
+            if (v > f - 0x10000 && v < f + 0x10000) continue;      // a stack address, not a UObject
+            if (!Readable((void*)v, OBJ_NAME + 4)) continue;
+            if (*reinterpret_cast<const int32_t*>(v + OBJ_NAME) <= 0) continue;   // 'None' is noise
+            char nm[64]{};
+            if (NameOf(v, nm, sizeof(nm)) && nm[0]) InterlockedIncrement(&g_nodeVotes[i]);
+        }
+        return -1;
+    }
+
+    // ---- decide, once ----
+    if (InterlockedExchange(&g_nodeDecided, 1) == 0) {
+        int best = -1;
+        LONG bestVotes = 0;
+        for (int i = 0; i < kNodeSlots; ++i) {
+            const LONG v = InterlockedCompareExchange(&g_nodeVotes[i], 0, 0);
+            if (v > bestVotes) { bestVotes = v; best = i; }
+        }
+        Log("FFrame::Node vote over %d calls:", kNodeSampleTarget);
+        for (int i = 0; i < kNodeSlots; ++i) {
+            const LONG v = InterlockedCompareExchange(&g_nodeVotes[i], 0, 0);
+            if (v) Log("    +0x%02X  named a script function %ld times (%.0f%%)",
+                       i * 4, v, 100.0 * v / kNodeSampleTarget);
+        }
+        // A winner has to be convincing. A slot that names something a third of the time is not
+        // FFrame::Node, it is some other object pointer that happens to be a UObject sometimes -
+        // and adopting it would repeat exactly the mistake being fixed here.
+        if (best >= 0 && bestVotes * 2 >= kNodeSampleTarget) {
+            InterlockedExchange(&g_nodeOffset, best * 4);
+            Log("  -> FFrame::Node is at +0x%02X (%ld of %d). Aim modes 6 and 7 are live from here.",
+                best * 4, bestVotes, kNodeSampleTarget);
+        } else {
+            Log("  *** NO SLOT WINS. Best was +0x%02X with %ld of %d. This object is not an FFrame,"
+                " or it is not laid out the way every UE3 build is - either way aim modes 6 and 7"
+                " cannot work through this hook and the hook itself is the thing to replace.",
+                best * 4, bestVotes, kNodeSampleTarget);
+            InterlockedExchange(&g_nodeOffset, -2);   // decided: give up, stop resampling
+        }
+    }
+    return -1;
 }
 
 // ---- the script functions, named out of the game's own package (run 91) ----
@@ -6152,11 +6221,14 @@ static LONG FnIdx(int i) { return InterlockedCompareExchange(&g_scriptFns[i].idx
 // the game's own values next to ours - one run's log is enough to set them exactly. A wrong scale
 // makes the gun under- or over-swing; a wrong sign makes it swing the wrong way. Both are obvious
 // on sight and neither is dangerous.
-const int FFRAME_LOCALS = 0x20;   // Node is +0x14 (run 87), and UE3's FFrame runs
-                                  // Node, Object, Code, Locals - so Locals is +0x20.
-                                  // ⚠️ A PREDICTION. Validated on every use, never trusted: see
-                                  // RewriteSetAimParams. Guessing offsets on this object has cost
-                                  // this project a run each time.
+// UE3's FFrame runs Node, Object, Code, Locals - so Locals sits 0xC past Node. Node is no longer
+// a guess as of run 92, it is voted on at runtime, so this rides on the measured value instead of
+// carrying a second hardcoded offset. Still validated on every use, because "0xC past Node" is
+// itself an assumption even when Node is not.
+static int LocalsOffset() {
+    const LONG node = InterlockedCompareExchange(&g_nodeOffset, 0, 0);
+    return node >= 0 ? (int)node + 0xC : -1;
+}
 LONG  g_aimPoseUUPer1 = 16384;    // engine units per 1.0 of anim aim. 16384 = 90 deg.
 float g_aimPoseSignX  = 1.0f;
 float g_aimPoseSignY  = 1.0f;
@@ -6171,9 +6243,11 @@ volatile LONG g_aimPoseWrites = 0, g_aimPoseRejects = 0;
 // in that range is the parameter block and anything else is not. NaN fails the test by
 // construction, since every comparison against NaN is false.
 static void RewriteSetAimParams(void* frame) {
-    if (!frame || !Readable(frame, FFRAME_LOCALS + 4)) return;
+    const int localsOff = LocalsOffset();
+    if (localsOff < 0) return;                       // Node not decided yet - nothing to ride on
+    if (!frame || !Readable(frame, localsOff + 4)) return;
     float* p = *reinterpret_cast<float**>(
-                   reinterpret_cast<uintptr_t>(frame) + FFRAME_LOCALS);
+                   reinterpret_cast<uintptr_t>(frame) + localsOff);
     if (!p || !Readable(p, 8)) return;
 
     const bool plausible = p[0] > -1.5f && p[0] < 1.5f && p[1] > -1.5f && p[1] < 1.5f;
@@ -6184,7 +6258,7 @@ static void RewriteSetAimParams(void* frame) {
             Log("aim pose: FFrame+0x%02X does not point at two normalised floats (%.3f, %.3f)."
                 " Locals is at a different offset in this build - NOTHING written. The gun will"
                 " not follow your hand and that is this message, not a failed rewrite.",
-                FFRAME_LOCALS, p[0], p[1]);
+                localsOff, p[0], p[1]);
         return;
     }
 
@@ -6265,6 +6339,10 @@ PeSlot g_peSlots[kPeSlots]{};
 volatile LONG g_peCensus = 0;      // only counts while armed - the table is useless if it fills up
                                    // with menu and startup traffic before the test begins
 volatile LONG g_peCalls = 0;
+// Run 92: free of the census gate on purpose. These count every call the hook sees while any
+// route-2 mode or the census is on, and their RATIO is what separates "the hook is blind" from
+// "the hook works and the name source is wrong" - see the note at the call site.
+volatile LONG g_peSeen = 0, g_peUnnamed = 0;
 volatile LONG g_peFiringCalls = 0; // ⚠️ if this stays 0 the split never happened and the whole
                                    // table means nothing - run 82 dumped a census of 5544 calls
                                    // with zero firing samples and reported "nothing", which reads
@@ -6346,7 +6424,38 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
         }
     }
 
-    if (InterlockedCompareExchange(&g_peCensus, 0, 0) && Function) {
+    // ---- ⭐ run 92: resolve the name ONCE, and MEASURE how often it fails ----
+    //
+    // Run 91's test produced no rewrite and no rejection: neither GetAdjustedAim nor SetAim ever
+    // matched. Two completely different causes, needing opposite fixes:
+    //
+    //   A. the hook is not on the general script path (it is an opcode handler, not ProcessInternal)
+    //   B. the hook IS on the path but FFrame::Node is not reliably at +0x14, so nothing is named
+    //
+    // The run 91 log already hints at B - among the first 30 frames, one gave +0x14 -> 'SeeMonster'
+    // and another had +0x14 holding ZERO - but a hint from six samples during level load is not a
+    // finding. `unnamed` below is the measurement: if most calls fail to name anything, the name
+    // source is wrong and no census could ever have worked. If nearly all of them DO name
+    // something, the source is fine and the answer is A.
+    //
+    // Combined with the Tick control in the dump, one run now separates A from B. Previously the
+    // census could only ever have reported "the functions are absent", which is what both look
+    // like from the outside.
+    //
+    // Resolving once also HALVES the cost: ScriptFuncNameIdx calls Readable(), which is a
+    // VirtualQuery, and this is the hottest function in the process. It used to run twice per call
+    // whenever a route-2 mode was on.
+    const LONG aimMode = InterlockedCompareExchange(&g_aimMode, 0, 0);
+    const bool routeTwo = (aimMode == 6 || aimMode == 7);
+    const bool censusOn = InterlockedCompareExchange(&g_peCensus, 0, 0) != 0;
+    int32_t fnIdx = -1;
+    if ((censusOn || routeTwo) && Function) {
+        fnIdx = ScriptFuncNameIdx(Function);
+        InterlockedIncrement(&g_peSeen);
+        if (fnIdx < 0) InterlockedIncrement(&g_peUnnamed);
+    }
+
+    if (censusOn && Function) {
         InterlockedIncrement(&g_peCalls);
         // ---- ⚠️ run 84: the name indices came out as HEAP POINTERS, so this is reading the
         // wrong object ----
@@ -6369,7 +6478,7 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
         // and what the four lines of comment above have been describing while the code below read
         // the wrong object anyway.
         {
-            const int32_t idx = ScriptFuncNameIdx(Function);
+            const int32_t idx = fnIdx;
             if (idx >= 0) {
                 // ⚠️ Run 82: this used to read the published pad's trigger byte, and came back
                 // with ZERO firing samples out of 5544 calls. Two ways that happens and both are
@@ -6402,12 +6511,6 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Function, void* P
     // The name is checked BEFORE the original call so the common case costs one integer compare,
     // and the buffer is touched only AFTER it, because the value being replaced is the one the
     // original just wrote.
-    // The name is resolved ONCE here and reused, rather than per test: it walks two pointers and
-    // this is the hottest function in the process.
-    const LONG aimMode = InterlockedCompareExchange(&g_aimMode, 0, 0);
-    const bool routeTwo = (aimMode == 6 || aimMode == 7);
-    const int32_t fnIdx = routeTwo ? ScriptFuncNameIdx(Function) : -1;
-
     const bool wantAim = routeTwo
                       && FnIdx(kFnGetAdjustedAim) >= 0
                       && fnIdx == FnIdx(kFnGetAdjustedAim);
@@ -6511,6 +6614,30 @@ void DumpProcessEventCensus() {
         if (tickIdx >= 0)
             for (int i = 0; i < kPeSlots; ++i)
                 if (g_peSlots[i].nameIdx == tickIdx) tickSeen = g_peSlots[i].idle + g_peSlots[i].firing;
+
+        // ---- run 92: the name source's own hit rate, printed BEFORE the control ----
+        //
+        // This has to come first because it decides whether the control below is even readable. If
+        // the name source is failing, Tick would read zero for a reason that has nothing to do with
+        // which function the hook sits on, and the control would be misinterpreted as proving the
+        // hook is blind.
+        {
+            const LONG seen = InterlockedCompareExchange(&g_peSeen, 0, 0);
+            const LONG unnamed = InterlockedCompareExchange(&g_peUnnamed, 0, 0);
+            const double pct = seen ? (100.0 * unnamed / (double)seen) : 0.0;
+            Log("  --- NAME SOURCE: %ld calls seen, %ld could not be named (%.1f%%) ---",
+                seen, unnamed, pct);
+            if (seen == 0)
+                Log("      *** the hook was never called while armed. Nothing below means anything.");
+            else if (pct > 50.0)
+                Log("      *** MOST CALLS CANNOT BE NAMED. FFrame::Node is NOT reliably at +0x%02X"
+                    " in this build, so the census could never have found any function by name and"
+                    " neither could aim mode 6 or 7. Fix the offset before reading anything else"
+                    " below - the Tick control included.", (int)InterlockedCompareExchange(&g_nodeOffset, 0, 0));
+            else
+                Log("      name source is working - a low miss rate is normal (native calls and"
+                    " frames still being set up). The control below is readable.");
+        }
 
         Log("  --- CONTROL: Tick seen %u times ---", tickSeen);
         if (tickIdx < 0)
@@ -7032,6 +7159,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             memset(g_peSlots, 0, sizeof(g_peSlots));
             InterlockedExchange(&g_peCalls, 0);
             InterlockedExchange(&g_peFiringCalls, 0);
+            InterlockedExchange(&g_peSeen, 0);
+            InterlockedExchange(&g_peUnnamed, 0);
             // Resolve before arming, not at dump time: the Tick control and the five named aim
             // functions are useless if their indices are still -1 when the table is read, and
             // arming is the moment the user is definitely in gameplay with packages loaded.
