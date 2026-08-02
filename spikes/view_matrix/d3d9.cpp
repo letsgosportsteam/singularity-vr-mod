@@ -978,6 +978,8 @@ int g_camRotOffs[kRotFieldMax], g_camRotCount = 0;
 // The hand-minus-head deviation in engine rotation units, measured directly from the two poses
 // in the same XR frame - see run 112. This is what the trace rotation uses.
 volatile LONG g_handDevYawUU = 0, g_handDevPitchUU = 0, g_handDevValid = 0;
+volatile LONG g_handDevRollUU = 0;
+volatile LONG g_handOffX = 0, g_handOffY = 0, g_handOffZ = 0;   // hand minus head, world UU
 volatile LONG g_fireDepth = 0;
 volatile LONG g_fireSeq = 0;
 
@@ -3049,6 +3051,7 @@ XrSpace  g_handSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 bool     g_handPoseValid[2] = { false, false };
 float    g_handYawRad[2] = { 0.0f, 0.0f };
 float    g_handPitchRad[2] = { 0.0f, 0.0f };
+float    g_handRollRad[2] = { 0.0f, 0.0f };
 
 // The right hand's resting offset from the head, captured at recentre. See the note where it is
 // captured - this is what makes the deviation clamp symmetric.
@@ -3060,6 +3063,8 @@ bool  g_haveHandOffset = false;
 // depends on the DIFFERENCE between hand and head yaw, and turning your body moves both together,
 // so the difference changes slowly even when both are moving fast.
 float g_headYawRad = 0.0f;
+float g_headRollRad = 0.0f;
+float g_headPosXR[3] = { 0.0f, 0.0f, 0.0f };
 
 int g_walkDirection = 1;   // ini WalkDirection: 0 = head-relative, 1 = off-hand-relative
 int g_walkSign      = 1;   // ini WalkSign - handedness has been guessed wrong on three axes here
@@ -3364,6 +3369,7 @@ bool XrPathOf(const char* s, XrPath* out) {
 extern LONG  g_aimPoseUUPer1;
 extern LONG  g_aimFieldSet;
 extern LONG  g_traceSignYaw, g_traceSignPitch;
+extern LONG  g_gunSignYaw, g_gunSignPitch, g_gunSignRoll, g_gunFollowPos;
 extern float g_aimPoseSignX, g_aimPoseSignY;
 
 bool InitXRInput() {
@@ -3394,6 +3400,12 @@ bool InitXRInput() {
             // Mode 11 trace rotation: flip if the shot deflects the wrong way.
             g_traceSignYaw   = GetPrivateProfileIntA("Input", "AimTraceSignYaw", 1, path) >= 0 ? 1 : -1;
             g_traceSignPitch = GetPrivateProfileIntA("Input", "AimTraceSignPitch", 1, path) >= 0 ? 1 : -1;
+            // Aim mode gun visual: signs and whether the gun follows the hand POSITION as well as
+            // its direction. Up/down came back reversed, hence the -1 default on pitch.
+            g_gunSignYaw   = GetPrivateProfileIntA("Input", "GunSignYaw",   1, path) >= 0 ? 1 : -1;
+            g_gunSignPitch = GetPrivateProfileIntA("Input", "GunSignPitch", -1, path) >= 0 ? 1 : -1;
+            g_gunSignRoll  = GetPrivateProfileIntA("Input", "GunSignRoll",  1, path) >= 0 ? 1 : -1;
+            g_gunFollowPos = GetPrivateProfileIntA("Input", "GunFollowPosition", 1, path);
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             for (int i = 0; i < kPadButtonCount; ++i)
@@ -3707,6 +3719,10 @@ void SyncXRInput(XrTime displayTime) {
         g_handPitchRad[i] = asinf(sinp);
         g_handYawRad[i] = atan2f(2.0f * (q.w * q.y + q.z * q.x),
                                  1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        // Run 123: the third angle of the same Y-X-Z decomposition. Without it, twisting the
+        // controller does nothing to the gun - which is one of the three axes reported missing.
+        g_handRollRad[i] = atan2f(2.0f * (q.w * q.z + q.x * q.y),
+                                  1.0f - 2.0f * (q.x * q.x + q.z * q.z));
         // Held or on a desk, decided by movement. The threshold is well above sensor noise for a
         // stationary controller and far below anything a hand does, even a still one - a hand at
         // rest still drifts by millimetres a frame, and a desk does not.
@@ -4105,6 +4121,8 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             float ox = hp.x - g_centrePos[0];
             float oy = hp.y - g_centrePos[1];
             float oz = hp.z - g_centrePos[2];
+            // Run 123: the head position in XR space, so the hand can be expressed relative to it.
+            g_headPosXR[0] = hp.x; g_headPosXR[1] = hp.y; g_headPosXR[2] = hp.z;
 
             const float sc = sinf(g_centreYaw), cc = cosf(g_centreYaw);
             float fwdAmt   = -(ox * sc) - (oz * cc);   // along the head's centre forward
@@ -4133,6 +4151,7 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         }
         // Published for next frame's walk-direction transform - see the note on g_headYawRad.
         g_headYawRad = yawRad;
+        g_headRollRad = rollRad;
 
         // ---- ⭐ run 112: the hand's deviation from the head, measured directly ----
         //
@@ -4172,6 +4191,33 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             // the yaw sign at runtime and the bullet deflection follows it.
             InterlockedExchange(&g_handDevYawUU,   (LONG)(g_yawSign   * dvy * kRadToUU));
             InterlockedExchange(&g_handDevPitchUU, (LONG)(g_pitchSign * dvp * kRadToUU));
+            // ---- run 123: roll, and the hand's POSITION relative to the head ----
+            //
+            // Reported: the gun tracks left, right, up and down but not forward, back or twist.
+            // Both gaps are the same omission - only yaw and pitch were ever computed, so the
+            // transform could only ever swing the gun around a sphere centred on the eye.
+            //
+            // Roll is the third angle of the decomposition the hands already use. Position goes
+            // through the SAME two-stage basis as the head offset above - centre-yaw to get the
+            // head's own frame, then body yaw to get world - so hand and head are expressed the
+            // same way rather than by two conventions that agree by luck.
+            float dvr = g_handRollRad[1] - g_headRollRad;
+            while (dvr >  3.14159265f) dvr -= 6.2831853f;
+            while (dvr < -3.14159265f) dvr += 6.2831853f;
+            InterlockedExchange(&g_handDevRollUU, (LONG)(dvr * kRadToUU));
+            {
+                const float hx = g_handLastPos[1].x - g_headPosXR[0];
+                const float hy = g_handLastPos[1].y - g_headPosXR[1];
+                const float hz = g_handLastPos[1].z - g_headPosXR[2];
+                const float sc2 = sinf(g_centreYaw), cc2 = cosf(g_centreYaw);
+                const float fwd   = -(hx * sc2) - (hz * cc2);
+                const float right =  (hx * cc2) - (hz * sc2);
+                const float byr = g_baseYaw * (6.2831853f / 65536.0f);
+                const float bc2 = cosf(byr), bs2 = sinf(byr);
+                InterlockedExchange(&g_handOffX, (LONG)((bc2 * fwd - bs2 * right) * kMetresToUU));
+                InterlockedExchange(&g_handOffY, (LONG)((bs2 * fwd + bc2 * right) * kMetresToUU));
+                InterlockedExchange(&g_handOffZ, (LONG)(hy * kMetresToUU));
+            }
             InterlockedExchange(&g_handDevValid, 1);
         } else {
             // No hand, no deviation. Falling back to zero means the shot goes where you look,
@@ -5128,8 +5174,12 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
                 static const float kPivotOrigin[3] = { 0.0f, 0.0f, 0.0f };
                 float C[4][4];
                 BuildGunTransform(C, kPivotOrigin,
-                                  (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0),
-                                  (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0));
+                    (int32_t)(g_gunSignYaw   * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
+                    (int32_t)(g_gunSignPitch * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
+                    (int32_t)(g_gunSignRoll  * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
+                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffX, 0, 0) : 0.0f,
+                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffY, 0, 0) : 0.0f,
+                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffZ, 0, 0) : 0.0f);
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
             }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
@@ -5155,8 +5205,12 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
                 static const float kPivotOrigin2[3] = { 0.0f, 0.0f, 0.0f };   // see the note above
                 float C[4][4];
                 BuildGunTransform(C, kPivotOrigin2,
-                                  (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0),
-                                  (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0));
+                    (int32_t)(g_gunSignYaw   * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
+                    (int32_t)(g_gunSignPitch * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
+                    (int32_t)(g_gunSignRoll  * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
+                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffX, 0, 0) : 0.0f,
+                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffY, 0, 0) : 0.0f,
+                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffZ, 0, 0) : 0.0f);
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
             }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
@@ -5364,23 +5418,51 @@ static void ApplyWorldMatrix(Reg4* m, int conv, const float C[4][4]) {
 
 // Rotate about `p` by yaw then pitch, both in engine rotation units. UE3 is X forward, Y right,
 // Z up: yaw turns about Z, pitch about Y.
-static void BuildGunTransform(float C[4][4], const float p[3], int32_t yawUU, int32_t pitchUU) {
+// ---- ⭐ run 123: all six degrees of freedom ----
+//
+// Reported: the gun tracks left, right, up and down, but not forward, back or twist. Both gaps are
+// the same omission - only yaw and pitch were ever computed, so the transform could do nothing but
+// swing the gun around a sphere centred on the eye. Rotation alone has no forward component and no
+// roll, which is exactly the three axes named.
+//
+// So: roll joins the rotation, and the hand's POSITION relative to the head joins as a translation.
+// Composed as R = Rx * Ry * Rz in row-vector form, i.e. roll applied first in the gun's own frame,
+// which is what makes twisting the controller twist the barrel rather than swing the muzzle.
+//
+// Signs are ini-overridable. Up/down came back reversed, and rather than negate it in place - which
+// is how a convention gets buried - it goes through the same kind of key the trace rotation uses.
+LONG g_gunSignYaw = 1, g_gunSignPitch = -1, g_gunSignRoll = 1, g_gunFollowPos = 1;
+
+static void Mul3(float out[3][3], const float a[3][3], const float b[3][3]) {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            out[i][j] = a[i][0]*b[0][j] + a[i][1]*b[1][j] + a[i][2]*b[2][j];
+}
+
+static void BuildGunTransform(float C[4][4], const float p[3],
+                              int32_t yawUU, int32_t pitchUU, int32_t rollUU,
+                              float tx, float ty, float tz) {
     const float kUUToRad = 6.2831853f / 65536.0f;
-    const float ca = cosf(yawUU * kUUToRad),   sa = sinf(yawUU * kUUToRad);
-    const float cb = cosf(pitchUU * kUUToRad), sb = sinf(pitchUU * kUUToRad);
-    // R = Rz * Ry in row-vector form.
-    const float R[3][3] = {
-        {  ca * cb,  sa,  -ca * sb },
-        { -sa * cb,  ca,   sa * sb },
-        {  sb,       0.0f, cb      },
-    };
+    const float a = yawUU   * kUUToRad;      // about Z, UE3 up
+    const float b = pitchUU * kUUToRad;      // about Y
+    const float c = rollUU  * kUUToRad;      // about X, the forward axis
+    const float Rz[3][3] = { { cosf(a), sinf(a), 0 }, { -sinf(a), cosf(a), 0 }, { 0, 0, 1 } };
+    const float Ry[3][3] = { { cosf(b), 0, -sinf(b) }, { 0, 1, 0 }, { sinf(b), 0, cosf(b) } };
+    const float Rx[3][3] = { { 1, 0, 0 }, { 0, cosf(c), sinf(c) }, { 0, -sinf(c), cosf(c) } };
+    float t1[3][3], R[3][3];
+    Mul3(t1, Rx, Ry);
+    Mul3(R, t1, Rz);
+
     for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < 3; ++j) C[i][j] = R[i][j];
         C[i][3] = 0.0f;
     }
-    // bottom row = p - p*R, which is what makes the rotation happen about p rather than the origin
-    for (int j = 0; j < 3; ++j)
-        C[3][j] = p[j] - (p[0]*R[0][j] + p[1]*R[1][j] + p[2]*R[2][j]);
+    // bottom row = p - p*R + T. With p at the origin - which is where the camera sits in
+    // translated-world space - this reduces to the translation, but the pivot stays in the
+    // expression so a future anchor offset does not need the maths rederived.
+    C[3][0] = p[0] - (p[0]*R[0][0] + p[1]*R[1][0] + p[2]*R[2][0]) + tx;
+    C[3][1] = p[1] - (p[0]*R[0][1] + p[1]*R[1][1] + p[2]*R[2][1]) + ty;
+    C[3][2] = p[2] - (p[0]*R[0][2] + p[1]*R[1][2] + p[2]*R[2][2]) + tz;
     C[3][3] = 1.0f;
 }
 
