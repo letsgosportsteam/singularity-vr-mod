@@ -209,6 +209,39 @@ logs that it did.
 > against `HudStereo`. Found by asking whether run 55 predated the router rather than by re-running
 > anything — the dates were already in this file.
 
+### Audit of the contaminated window (07-31 09:00 → 19:19)
+
+The link was diagnosed at **07-31 19:19** (`86c6cbd`). Every decision taken that day before then was
+measured across it. Two were performance-gated; the rest was feature and diagnostic work.
+
+| decision | commit | verdict |
+|---|---|---|
+| `HookUserPointerDraws` → 0 | `fa02fb1` 09:39 | ⛔ **RETRACTED.** Cited "mean 104 → 94 fps, floor 27 → 17". An fps *floor* of 17 is the link's signature, not a draw-call cost. 120.0 locked today at the same setting |
+| **Stage 4B rejected** | `cfff0b5` 10:44 | ⚠️ **Probably holds — but it is the only other one.** See below |
+
+**Stage 4B is better protected than it looks**, which is why it is not retracted here. Its
+conclusion is a *differential* with an A→B→A control that agrees to 0.6%:
+
+```
+off (control)          8.70 ms/frame   work  5.54   idle 3.09
+L2 bind + 1x1 Clear   10.71            work 10.49   idle 0.17
+off (control, after)   8.65
+```
+
+For the link to have produced that, it would have had to degrade during L2 and recover for the
+after-control. The bracket makes that unlikely.
+
+⚠️ **The one caveat:** "work" was a *residual* at that moment — XR submit was not broken out until
+`86c6cbd` that same evening — so the +4.95 ms attributed to render-target switching could in
+principle contain link latency. Re-pricing it means rebuilding the probe: **`NUMPAD3` has since
+been reassigned to pad emulation**, so the Stage 4B instrument no longer exists.
+
+**What did NOT get thrown away.** The day's *code* survived — `UserPtrMinPrims`, the primitive
+histogram, and the vertex-range quad classifier are all still in the build, and the HUD fix in
+run 151 is built directly on them. Only the *setting* was reverted, and only that setting. The one
+`revert:` commit in the window (`71f4212`) is a genuine bug fix, a probe allocating 70 MB
+unconditionally, not a performance retreat.
+
 ## Runs 139–143: smooth turning, a settings panel, and why it is not in the game's menu
 
 ### Smooth turning — `TurnMode=2`
