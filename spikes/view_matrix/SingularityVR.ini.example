@@ -503,3 +503,36 @@ GpuFenceProbe=1
 ; [Input]
 ; AimFieldSet=0
 ; ---------------------------------------------------------------------------
+
+; ---------------------------------------------------------------------------
+; [Input] - the gun visual (aim mode 11/12 + APPS)
+;
+; These are DEFAULTS IN CODE, so a missing key is not a bug - it just means the
+; built-in value is used. They are listed here because tuning them is easier
+; when they exist in the file to edit.
+;
+; Signs are 1 or -1. Do NOT hunt them by editing and restarting: CAPS LOCK
+; cycles all eight rotation-sign combinations at runtime and logs each one, so
+; the right combination is found inside a single session and written here
+; afterwards to make it stick.
+;
+; [Input]
+; GunSignYaw=1
+; GunSignPitch=-1
+; GunSignRoll=1
+; GunSignPosZ=-1
+; GunFollowPosition=1     ; 0 freezes position, so rotation can be tuned alone
+;
+; The anchor is where the gun sits relative to your eye, in engine units
+; (1 unit is about 1.9 cm), measured forward / right / up. It is the point the
+; gun ROTATES ABOUT. Getting it near the grip is what stops the gun swinging
+; through an arc when you turn your wrist - rotating about the eye instead of
+; the handle was run 124's bug.
+;
+;   gun orbits a point IN FRONT of it  -> increase GunAnchorFwd
+;   gun orbits a point BEHIND it       -> decrease GunAnchorFwd
+;
+; GunAnchorFwd=25
+; GunAnchorRight=8
+; GunAnchorUp=-8
+; ---------------------------------------------------------------------------
