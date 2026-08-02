@@ -185,8 +185,29 @@ draw calls at worst — noise. That answers whether per-eye UI is affordable, wh
 
 The UI only reaches us through the user-pointer draws, so with those off the setting would do
 nothing, silently — the failure mode that cost runs 133, 137 and 138. It raises the level to 3 and
-logs that it did. ⚠️ Run 55 had reverted that hook to 0 on frame-time grounds; the HUD needs it, and
-the measured cost above is the case for accepting it.
+logs that it did.
+
+> ### ⛔ RETRACTED: run 55's "level 3 is not a win" was measured on the shared link
+>
+> Run 55 reverted `HookUserPointerDraws` to 0 on frame-time grounds. **The dedicated router landed
+> in run 56 — the very next run.** So that decision was taken during the session where `xrEndFrame`
+> was hiding a **189 ms** stall inside "our work", against a wireless link that measured 4% and 84%
+> of windows over 15 ms within one evening.
+>
+> This is the fourth conclusion to fall to that link, and the method note two sections up predicted
+> it: *"Three separate conclusions were 'confirmed' by A/Bs taken across it and all three had to be
+> retracted."*
+>
+> Measured today at level 3, with ~197 user-pointer draws a frame:
+>
+> ```
+> perf: 120.0 fps (8.33 ms/frame)  user-ptr 197
+> perf: 120.0 fps (8.33 ms/frame)  user-ptr 196
+> ```
+>
+> Locked at 120. **Level 3 costs nothing measurable post-router**, and there is no frame-time case
+> against `HudStereo`. Found by asking whether run 55 predated the router rather than by re-running
+> anything — the dates were already in this file.
 
 ## Runs 139–143: smooth turning, a settings panel, and why it is not in the game's menu
 
