@@ -5447,6 +5447,18 @@ static void Mul3(float out[3][3], const float a[3][3], const float b[3][3]) {
 // The eight rotation-sign combinations, cycled by CAPS LOCK so the right one is found in ONE run
 // instead of one restart per guess. Three axes reported wrong in three separate runs is what this
 // is for - a sign is not worth a headset session each.
+// ---- ⚠️ run 126: bit 3 turns the view-frame conjugation OFF ----
+//
+// Run 125 changed the frame AND baked a new pitch sign in the same build, so the result could not
+// say which caused what - the one-factor-at-a-time rule, broken by me after this project had
+// already recorded it twice. It also renumbered the combos, so "combo 2 was best" stopped being
+// reproducible between the two runs.
+//
+// So the frame change joins the cycle as a fourth bit instead of being a decision already taken.
+// Sixteen states on one key, and the log names each one, so a single session settles both
+// questions - which signs, and whether the conjugation helps at all.
+static bool GunViewFrame() { return (InterlockedCompareExchange(&g_gunSignCombo, 0, 0) & 8) == 0; }
+
 static void GunSigns(int& sy, int& sp, int& sr) {
     const LONG c = InterlockedCompareExchange(&g_gunSignCombo, 0, 0);
     sy = (c & 1) ? -(int)g_gunSignYaw   : (int)g_gunSignYaw;
@@ -5522,9 +5534,10 @@ static void BuildGunC(float C[4][4]) {
         (int32_t)(sy * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
         (int32_t)(sp * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
         (int32_t)(sr * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
-        // The gun currently faces along the view, so the view yaw is the frame its pitch and roll
-        // have to be expressed in.
-        g_wantYaw,
+        // The gun faces along the view, so the view yaw is the frame its pitch and roll belong in -
+        // unless the cycle has it switched off, which is what makes run 125 testable rather than
+        // assumed.
+        GunViewFrame() ? g_wantYaw : 0,
         H[0] - G[0], H[1] - G[1], H[2] - G[2]);
 }
 
@@ -8956,10 +8969,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         static bool pCaps = false;
         const bool kCaps = (GetAsyncKeyState(VK_CAPITAL) & 0x8000) != 0;
         if (kCaps && !pCaps) {
-            const LONG combo = (InterlockedCompareExchange(&g_gunSignCombo, 0, 0) + 1) & 7;
+            const LONG combo = (InterlockedCompareExchange(&g_gunSignCombo, 0, 0) + 1) & 15;
             InterlockedExchange(&g_gunSignCombo, combo);
             int sy, sp, sr; GunSigns(sy, sp, sr);
-            Log("CAPS: gun signs combo %ld - yaw %+d pitch %+d roll %+d", combo, sy, sp, sr);
+            Log("CAPS: combo %ld - yaw %+d pitch %+d roll %+d, view-frame %s",
+                combo, sy, sp, sr, GunViewFrame() ? "ON" : "OFF");
         }
         pCaps = kCaps;
     }
