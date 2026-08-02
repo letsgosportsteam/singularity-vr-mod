@@ -30,7 +30,7 @@ dropped beside the game exe. No game files modified.
 | **Performance** | ✅ **120 fps locked**, 4.35 ms idle per frame |
 | **Controller input** | ✅ **working** — full Touch mapping, menus, haptics, snap turn, off-hand movement |
 | **Aim decoupling** | ✅ **SOLVED via route 2** — the bullet follows the controller, the view never moves, and it costs NOTHING in culling or LOD. Aim mode 11 |
-| **Gun follows the controller** | 🔧 mechanism works, calibrating the pivot. APPS toggles it |
+| **Gun follows the controller** | ✅ **working** — 6-DOF, arms hidden, anchor tuned. APPS toggles it |
 
 ### If you are picking this up cold, read these three things
 
@@ -47,28 +47,18 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **Tune the gun anchor. One run, no code.** Everything else on the gun rung works. The anchor is
-   the point the gun rotates about, and getting it onto the grip is what stops it swinging through
-   an arc when you turn your wrist. It is pure eyeball and it is on the arrow keys.
-
-   1. Load a save, **BACKSPACE**, **NUMPAD .** twice (aim mode 11), **APPS** three times (gun +
-      arms hidden).
-   2. Point the gun straight, then rotate your wrist and watch **what stays still**.
-   3. **LEFT/RIGHT** pick the axis, **UP/DOWN** move it. Read the values off the fourth line of the
-      on-screen readout.
-
-   | Symptom | Fix |
-   |---|---|
-   | gun orbits a point **in front** of it | increase Forward |
-   | gun orbits a point **behind** it | decrease Forward |
-   | swings sideways when it should turn in place | Right |
-   | rises or drops when it should turn in place | Up |
-
-   Starting point is `F25 R8 U-8`. When it settles, write the three numbers into
-   `GunAnchorFwd/Right/Up` in the ini to persist them.
-
-   ⚠️ **Judge one thing at a time.** `GunFollowPosition=0` freezes the gun's position so rotation
-   can be assessed alone. Tuning rotation and position together is how two earlier runs got muddled.
+1. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
+   weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
+   correctly aligned**, so they are not one system and whatever anchors the flash is not what
+   anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
+   not. Likely another mesh in the foreground pass, or a screen-space effect drawn after it.
+2. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
+   animation, so they are absent from the foreground list when the counts are latched. The fix is
+   probably to latch a SET of counts rather than two, or to match on something steadier than
+   vertex count.
+3. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+   by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
+   point in the game, and `Singularity.exe <map>` makes reaching one practical.
 2. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
@@ -149,10 +139,11 @@ swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Bod
 **add**, exactly as VR wants. That was the open question gating the whole input design and it is
 answered.
 
-## 🔧 Runs 114–128: the gun on the controller — mechanism proven, calibration in progress
+## ✅ Runs 114–132: THE GUN FOLLOWS THE CONTROLLER
 
-**Where to pick up: tune the anchor.** Everything else on this rung works. See "Next session" at
-the top.
+**Done and confirmed in play.** Bullet and gun both follow the right controller in 6-DOF, the arms
+are hidden, the view never moves, and it costs nothing in culling or LOD. Anchor tuned to
+`F30 R9 U-13` and confirmed.
 
 ### ✅ Aim decoupling is DONE and confirmed in play
 
@@ -237,7 +228,7 @@ sessions and nothing on screen could have said so.
 effective pitch sign from the "combo 2" of two runs earlier — set via a **starting combo** key
 rather than by changing sign defaults, because changing those renumbers the combos.
 
-### 📋 Known issues, deliberately not chased yet
+### 📋 Known issues, deliberately not chased yet — these are now the top of the list
 
 - **Muzzle flash / smoke still tied to screen centre.** Barely visible in the headset, obvious on
   the monitor. A separate effect that does not follow the gun.
