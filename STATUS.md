@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 137). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 143). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -33,6 +33,8 @@ dropped beside the game exe. No game files modified.
 | **Gun follows the controller** | ✅ **working** — 6-DOF, arms hidden, anchor tuned. APPS toggles it |
 | **Cutscene head tracking** | ✅ **working, automatic** — run 138. `SetCinematicMode` drives it; look around freely during a cutscene, normal turning restored on exit |
 | **`D3D9ExMode=1` texture corruption** | ✅ **fixed** — run 139. Zero-copy is usable again; visuals match `D3D9ExMode=0` |
+| **Smooth turning** | ✅ run 140 — `TurnMode=2`, degrees per second, works during cutscenes |
+| **VR settings panel** | ✅ run 142 — hold Y 1.3s anywhere; live changes, saved to the ini on close |
 
 ### If you are picking this up cold, read these three things
 
@@ -49,12 +51,29 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
+1. **🔴 THE GAME'S HUD AND MENUS STRADDLE THE EYE SEAM.** The biggest remaining alpha item. Health,
+   ammo, the crosshair, `PAUSED`, the menu rows, `WARNING` — all drawn ONCE at full-frame
+   coordinates, so half lands in the left eye and half in the right. Unreadable in the headset.
+   - **⚠️ `HookUserPointerDraws=3` DOES NOT FIX THIS, and it looks like it should.** `StereoPair`
+     duplicates a draw with a per-eye SCISSOR and re-uploads the camera matrices. A HUD element
+     ignores both — run 42's own comment says it: *"the quad is not remapped by c0 (its vertex
+     shader never reads the view matrix)"*. Splitting it draws the same full-frame geometry twice,
+     clipped, and each eye still sees only its half. Do not spend a run on that setting.
+   - **The fix is a TRANSFORM, not a split.** Scale clip-space x by 0.5 and offset by ∓0.5 per eye.
+     Tractable because these are `DrawPrimitiveUP` calls, so **the vertex data is a CPU pointer we
+     already hold** — copy, transform x, draw, twice.
+   - **Order of work:** one diagnostic run at `HookUserPointerDraws=1` with `DumpUserPtrVertex` to
+     enumerate what the HUD submits and confirm the vertex layout. `UserPtrQuad` already separates
+     small NDC quads from world geometry, which is most of the identification. Then the transform.
+   - **The crosshair falls out of this.** Once HUD draws are enumerated individually, skipping one
+     is trivial. Doing it before the HUD fix means guessing which draw it is, and the alignment
+     question cannot even be judged while the HUD is split across the seam.
+2. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
    weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
    correctly aligned**, so they are not one system and whatever anchors the flash is not what
    anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
    not.
-2. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
+3. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
    option on, **the hidden arms turn BLACK instead of staying invisible.** So whatever hides the
    first-person meshes is not reaching the pass that HQ Decals enables — the arms are still being
    drawn there, at their original position. That is a much sharper lead than "decals are broken":
@@ -99,14 +118,14 @@ dropped beside the game exe. No game files modified.
 >   the wrapper had already been proven defective on the soldier by then. **An independently
 >   confirmed defect should not be dismissed on a one-line argument.**
 
-3. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
+4. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
    animation, so they are absent from the foreground list when the counts are latched. The fix is
    probably to latch a SET of counts rather than two, or to match on something steadier than
    vertex count.
-4. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+5. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-5. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+6. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
 
@@ -122,6 +141,85 @@ dropped beside the game exe. No game files modified.
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## Runs 139–143: smooth turning, a settings panel, and why it is not in the game's menu
+
+### Smooth turning — `TurnMode=2`
+
+Mode 0 was always labelled "smooth" but it only hands the stick to the engine's look axis, so the
+rate is Raven's sensitivity curve — which this mod cannot see or set, making "turn speed" an
+unanswerable setting. Mode 2 steps `g_baseYaw` continuously, exactly as snap steps it in jumps:
+
+- the rate is `TurnSpeed` degrees per second regardless of the game's sensitivity,
+- frame-rate independent (real elapsed time, clamped so a load hitch cannot fling the view),
+- **it keeps working during cutscenes** — `g_baseYaw` never passes through the engine, unlike
+  modes 0 and 1.
+
+Deflection is squared for fine control near centre. `TurnSpeed` defaults to 120 (90 was tried and
+reported too slow) and is clamped 10–360 — it multiplies elapsed time, so a typo'd 9000 is not a
+bad setting, it is an experience the player cannot stop by letting go.
+
+### The VR settings panel
+
+**Hold Y for 1.3 s** — anywhere: main menu, pause menu, or mid-game. Left stick navigates, values
+apply live, the ini is written on close (so a value you corrected never reaches the file).
+`WritePrivateProfileString` edits in place and preserves comments.
+
+Only settings consulted **every frame from a global** are in it. Anything read once at device
+creation — `D3D9ExMode`, `ZeroCopy`, resolution — would appear to change and silently do nothing
+until a relaunch, which is worse than not offering it.
+
+Two things learned the hard way in the same session:
+
+- **The panel drew twice in mono.** The backbuffer is only side-by-side while duplication is on;
+  with it off — the state at the main menu, and the most likely place to open the panel — two
+  half-width copies read as two panels. Copy count and width now both follow `g_dupDraws`. **The
+  state readout had the identical bug** and nobody had noticed, because it is only ever read with
+  VR mode on.
+- **The `TURNING` row wrapped 2 → 0.** One press past SMOOTH landed in the engine's own turning,
+  which was reported as *"I could not move left or right after loading my save"* and looked like a
+  broken save. It clamps now, matching the numeric rows, which always did.
+
+### Why the settings are NOT in the game's menu — the Scaleform spike
+
+Time-boxed and stopped deliberately. What it established:
+
+- Singularity uses the **old, thin** UE3 GFx bridge: `GFxMovie` with `Invoke` and `SetVariable*`.
+  **No `GFxClikWidget`, no `DataProvider`, no `CreateArray`** — a 2010 build predating Epic's CLIK
+  layer.
+- So **there is no data-driven option list to append to.** "Add data, not widgets", which would
+  have given native-looking rows for free, is dead. The rows exist only in ActionScript.
+- The only runtime way in is `Invoke`, which needs Raven's ActionScript API, which means reading
+  the menu SWF. `UI_*_SF.xxx` are **chunk-compressed** and `uedecompress` handles fully-compressed
+  packages only — `GFxUI.xxx` opened, `UI_SinglePlayer_SF.xxx` did not.
+
+⚠️ **Not established: that the menu SWF lacks an addable row.** Only that reaching it needs a
+decompressor for chunked packages, then SWF extraction, then ActionScript decompilation — three
+tools before the first line of the feature. That distinction is what the time-box was for.
+
+Reusable from it: `GFxUI.u` extracts cleanly, and `GFxMovie.Invoke`/`SetVariable` are confirmed
+reachable if anyone revisits this.
+
+### Pause detection, and why the panel does not use it
+
+Of six candidates (`ShowMenu`, `OpenMenu`, `OpenMenuDelayed`, `IsAnyMenuOpen`, `IsMenuOpen`,
+`SetPause`) **only `SetPause` ever fires** — the rest are script→script and invisible to a hook
+that only sees native→script entry points. Its bool argument reads cleanly, so `PAUSED` is a
+trustworthy state.
+
+**It is not used for the panel.** The main menu reports `PAUSED NO` — correctly, there is no game
+running to pause — and the main menu is exactly where someone sets comfort options before playing.
+Gating on pause would have locked them out of it. The 1.3 s hold needs no state at all.
+
+Kept anyway: it is cheap, and it tells us whether the world is running.
+
+### Movement direction — head-relative is now the default
+
+`WalkDirection=0`, and it is also the cheaper path: it skips the rotation entirely, because the
+engine's movement axes are already relative to `PlayerController.Rotation` and head tracking drives
+that. Off-hand (`=1`) is the *added* transform. Exposed in the panel as `MOVE DIRECTION HEAD/HAND`,
+which says `HAND (NO TRACKING)` when the left controller is not tracked — selecting it without a
+pose would otherwise silently do nothing.
 
 ## Runs 133–136: three defects, and one instrument that had been lying
 

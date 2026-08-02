@@ -3128,7 +3128,16 @@ float g_headYawRad = 0.0f;
 float g_headRollRad = 0.0f;
 float g_headPosXR[3] = { 0.0f, 0.0f, 0.0f };
 
-int g_walkDirection = 1;   // ini WalkDirection: 0 = head-relative, 1 = off-hand-relative
+// ---- ⭐ run 143: head-relative is now the DEFAULT ----
+//
+// 0 is also the cheaper path: it skips the rotation below entirely, because the engine's
+// aBaseY/aStrafe are already relative to PlayerController.Rotation and head tracking drives that.
+// So head-relative is what the engine does when left alone, and off-hand is the added transform.
+//
+// Named MOVE DIRECTION / HEAD vs HAND in the settings panel, which is the convention most VR
+// titles use for this choice. That naming is from familiarity rather than a survey - say if you
+// want it checked against what specific games call it.
+int g_walkDirection = 0;   // ini WalkDirection: 0 = head-relative (default), 1 = off-hand-relative
 int g_walkSign      = 1;   // ini WalkSign - handedness has been guessed wrong on three axes here
 
 // ---- ⚠️ THE CONTROLLERS THEMSELVES ARE A VARIABLE, AND EVERY TEST SO FAR RAN INSIDE IT ----
@@ -3394,31 +3403,182 @@ struct PadButtonAction {
     WORD        mask;
     XrAction    action;
     bool        isMenu;      // handled specially - see the long-press note in SyncXRInput
+    bool        isPanel;     // ditto: tap passes through, a 2-second hold opens the VR settings
 };
+
+// ---- ⭐ run 142: the VR settings panel ----
+//
+// Opened by HOLDING the panel button for two seconds, the same tap-versus-hold trick MENU already
+// uses for recentre. That was chosen over gating on the pause state, which run 141 measured and
+// which turned out to be the wrong shape: the main menu reports PAUSED NO - correctly, there is no
+// game running to pause - and the main menu is exactly where someone wants to set comfort options
+// before they start playing. A hold works identically in gameplay, in the pause menu and on the
+// main menu, and needs no state detection at all.
+volatile LONG g_panelOpen = 0;
+int  g_panelRow = 0;
+bool g_panelDirty = false;      // has anything changed since it was opened?
+
+// Only settings that are consulted EVERY FRAME from a global belong here. Anything read once at
+// device creation - D3D9ExMode, ZeroCopy, the resolution - would appear to change and silently do
+// nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
+const int kPanelRows = 6;
+enum { PR_MOVEDIR = 0, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_HEADROLL };
+
+// The turn settings are defined further down, beside the turn code they belong to. Declared here
+// rather than moved, so the settings stay next to the logic that reads them every frame.
+extern int   g_turnMode;
+extern float g_turnAngleDeg;
+extern float g_turnSpeedDeg;
+extern int   g_turnSign;
+
+// Written on CLOSE, not on every change. Changes apply live so turn speed can be felt while the
+// stick is moving, but the file only ever receives a value that was settled on - a mis-set number
+// you immediately corrected never reaches the ini at all.
+void PanelSave() {
+    char path[MAX_PATH]{};
+    if (!IniPath(path)) { Log("VR panel: no ini path - settings NOT saved"); return; }
+    char v[32];
+    // WritePrivateProfileString edits in place: comments, ordering and unrelated keys all survive.
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_turnMode);
+    WritePrivateProfileStringA("Input", "TurnMode",  v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%.0f", g_turnSpeedDeg);
+    WritePrivateProfileStringA("Input", "TurnSpeed", v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%.0f", g_turnAngleDeg);
+    WritePrivateProfileStringA("Input", "TurnAngle", v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_turnSign);
+    WritePrivateProfileStringA("Input", "TurnSign",  v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_rollOn, 0, 0));
+    WritePrivateProfileStringA("Render", "HeadRoll", v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_walkDirection);
+    WritePrivateProfileStringA("Input", "WalkDirection", v, path);
+    Log("VR panel: saved to %s", path);
+}
+
+// One row's text, label and value together. Rows that do not apply in the current turn mode say so
+// rather than showing a number that does nothing - a greyed-out control is not available here, so
+// the value column carries the explanation instead.
+void PanelRowText(int row, char* out, size_t cap) {
+    switch (row) {
+        case PR_MOVEDIR:
+            // HAND is meaningless without a tracked left controller, and silently doing nothing is
+            // the failure mode this project keeps getting caught by - so it says so.
+            _snprintf_s(out, cap, _TRUNCATE, "MOVE DIRECTION %s",
+                        g_walkDirection == 0    ? "HEAD" :
+                        g_handPoseValid[0]      ? "HAND" : "HAND (NO TRACKING)");
+            break;
+        case PR_TURNMODE:
+            // "GAME TURN" rather than "GAME DEFAULT": it is not this mod's default and calling it
+            // one invites exactly the press that caused run 143's report.
+            _snprintf_s(out, cap, _TRUNCATE, "TURNING        %s",
+                        g_turnMode == 1 ? "SNAP" : g_turnMode == 2 ? "SMOOTH" : "GAME TURN");
+            break;
+        case PR_TURNSPEED:
+            if (g_turnMode == 2) _snprintf_s(out, cap, _TRUNCATE, "TURN SPEED     %.0f DEG SEC",
+                                             g_turnSpeedDeg);
+            else                 _snprintf_s(out, cap, _TRUNCATE, "TURN SPEED     SMOOTH ONLY");
+            break;
+        case PR_SNAPANGLE:
+            if (g_turnMode == 1) _snprintf_s(out, cap, _TRUNCATE, "SNAP ANGLE     %.0f DEG",
+                                             g_turnAngleDeg);
+            else                 _snprintf_s(out, cap, _TRUNCATE, "SNAP ANGLE     SNAP ONLY");
+            break;
+        case PR_TURNDIR:
+            _snprintf_s(out, cap, _TRUNCATE, "TURN DIRECTION %s",
+                        g_turnSign >= 0 ? "NORMAL" : "INVERTED");
+            break;
+        default:
+            _snprintf_s(out, cap, _TRUNCATE, "HEAD ROLL      %s",
+                        InterlockedCompareExchange(&g_rollOn, 0, 0) ? "ON" : "OFF");
+            break;
+    }
+}
+
+void PanelAdjust(int row, int dir) {
+    switch (row) {
+        case PR_MOVEDIR:
+            g_walkDirection = g_walkDirection ? 0 : 1;
+            break;
+        case PR_TURNMODE:
+            // ---- ⚠️ CLAMPED, not wrapped (run 143) ----
+            //
+            // This wrapped 2 -> 0, and one press too many on SMOOTH landed the player in GAME
+            // DEFAULT - the mode with no speed control - which was reported as "I could not turn
+            // any more" and looked like a broken save. A settings list that can teleport from one
+            // end to the other on a single press is a trap; the numeric rows already clamp, and
+            // this now matches them.
+            //
+            // Mode 0 stays REACHABLE, deliberately: it is the engine's own turning and the right
+            // answer for anyone whose runtime or controller makes ours behave oddly. It just has
+            // to be walked to rather than arrived at.
+            g_turnMode += dir;
+            if (g_turnMode < 0) g_turnMode = 0;
+            if (g_turnMode > 2) g_turnMode = 2;
+            break;
+        case PR_TURNSPEED:
+            if (g_turnMode != 2) return;            // nothing to change; do not mark dirty
+            g_turnSpeedDeg += dir * 10.0f;
+            if (g_turnSpeedDeg < 10.0f)  g_turnSpeedDeg = 10.0f;
+            if (g_turnSpeedDeg > 360.0f) g_turnSpeedDeg = 360.0f;
+            break;
+        case PR_SNAPANGLE:
+            if (g_turnMode != 1) return;
+            g_turnAngleDeg += dir * 5.0f;
+            if (g_turnAngleDeg < 10.0f) g_turnAngleDeg = 10.0f;
+            if (g_turnAngleDeg > 90.0f) g_turnAngleDeg = 90.0f;
+            break;
+        case PR_TURNDIR:
+            g_turnSign = -g_turnSign;
+            break;
+        default:
+            InterlockedExchange(&g_rollOn,
+                                InterlockedCompareExchange(&g_rollOn, 0, 0) ? 0 : 1);
+            break;
+    }
+    g_panelDirty = true;
+}
 
 // ⚠️ `menu/click` exists on the LEFT hand only in the Touch profile, and `system/click` on the
 // right is reserved by the runtime. Both have caught people out; neither is a runtime error, the
 // binding is just silently ignored.
 PadButtonAction g_padButtons[] = {
-    { "jump",       "Jump",           "/user/hand/right/input/a/click",          "Jump",       XI_A,         XR_NULL_HANDLE, false },
-    { "crouch",     "Crouch",         "/user/hand/right/input/b/click",          "Crouch",     XI_B,         XR_NULL_HANDLE, false },
-    { "use",        "Use / reload",   "/user/hand/right/input/squeeze/value",    "Use",        XI_X,         XR_NULL_HANDLE, false },
-    { "antigrav",   "Anti-gravity",   "/user/hand/right/input/thumbstick/click", "AntiGrav",   XI_RTHUMB,    XR_NULL_HANDLE, false },
-    { "impulse",    "Impulse",        "/user/hand/left/input/squeeze/value",     "Impulse",    XI_RSHOULDER, XR_NULL_HANDLE, false },
-    { "ageyoung",   "Age / renovate", "/user/hand/left/input/x/click",           "AgeYoung",   XI_LSHOULDER, XR_NULL_HANDLE, false },
-    { "flashlight", "Flashlight",     "/user/hand/left/input/y/click",           "Flashlight", XI_DPAD_DOWN, XR_NULL_HANDLE, false },
-    { "dash",       "Dash",           "/user/hand/left/input/thumbstick/click",  "Dash",       XI_LTHUMB,    XR_NULL_HANDLE, false },
-    { "menu",       "Menu",           "/user/hand/left/input/menu/click",        "Menu",       XI_START,     XR_NULL_HANDLE, true  },
+    { "jump",       "Jump",           "/user/hand/right/input/a/click",          "Jump",       XI_A,         XR_NULL_HANDLE, false, false },
+    { "crouch",     "Crouch",         "/user/hand/right/input/b/click",          "Crouch",     XI_B,         XR_NULL_HANDLE, false, false },
+    { "use",        "Use / reload",   "/user/hand/right/input/squeeze/value",    "Use",        XI_X,         XR_NULL_HANDLE, false, false },
+    { "antigrav",   "Anti-gravity",   "/user/hand/right/input/thumbstick/click", "AntiGrav",   XI_RTHUMB,    XR_NULL_HANDLE, false, false },
+    { "impulse",    "Impulse",        "/user/hand/left/input/squeeze/value",     "Impulse",    XI_RSHOULDER, XR_NULL_HANDLE, false, false },
+    { "ageyoung",   "Age / renovate", "/user/hand/left/input/x/click",           "AgeYoung",   XI_LSHOULDER, XR_NULL_HANDLE, false, false },
+    { "flashlight", "Flashlight",     "/user/hand/left/input/y/click",           "Flashlight", XI_DPAD_DOWN, XR_NULL_HANDLE, false, true  },
+    { "dash",       "Dash",           "/user/hand/left/input/thumbstick/click",  "Dash",       XI_LTHUMB,    XR_NULL_HANDLE, false, false },
+    { "menu",       "Menu",           "/user/hand/left/input/menu/click",        "Menu",       XI_START,     XR_NULL_HANDLE, true,  false },
 };
 const int kPadButtonCount = (int)(sizeof(g_padButtons) / sizeof(g_padButtons[0]));
 
 // Turn. Snap steps the yaw base directly rather than driving the look stick, because the engine's
 // own turn ramp is exactly what snap must not have: instant and exact is the whole point. Smooth
 // goes through the pad instead and inherits Raven's curve, which is what you want there.
-int   g_turnMode     = 1;      // ini TurnMode: 0 smooth, 1 snap
-float g_turnAngleDeg = 30.0f;  // ini TurnAngle
+// ---- ⭐ run 140: three turn modes, not two ----
+//
+// Mode 0 was always called "smooth" but it is really "hand the stick to the engine": it feeds X to
+// the game's look axis and inherits Raven's sensitivity and acceleration curve, neither of which
+// this mod can see or set. That makes "smooth turning speed" unanswerable as a setting.
+//
+// Mode 2 is smooth turning done HERE, in degrees per second, by stepping g_baseYaw exactly the way
+// snap does - just continuously instead of in jumps. That buys three things beyond a speed knob:
+// the rate is what the ini says regardless of the game's own sensitivity, it is frame-rate
+// independent, and because g_baseYaw never passes through the engine it is immune to the yaw
+// fold-in and keeps working during cutscenes, where the engine ignores input entirely.
+//
+// Default stays 1 (snap) so an existing ini keeps behaving exactly as it did.
+int   g_turnMode     = 1;      // ini TurnMode: 0 engine look-stick, 1 snap, 2 smooth (ours)
+float g_turnAngleDeg = 30.0f;  // ini TurnAngle - degrees per snap
+float g_turnSpeedDeg = 120.0f; // ini TurnSpeed - degrees per second, mode 2 only. 90 was tried
+                               // first and reported too slow; 120 is a three-second full turn.
 int   g_turnSign     = 1;      // ini TurnSign - one edit if right turns left
 bool  g_snapArmed    = true;
+// Sub-unit remainder for mode 2. At 90 deg/s and 120 fps a frame is 0.75 deg = 136 FRotator units,
+// but at low stick deflection the per-frame step falls below 1 unit and integer truncation would
+// stall the turn completely. Carrying the fraction is what makes slow turning possible at all.
+float g_smoothTurnRem = 0.0f;
 
 int32_t g_padTurnAccum = 0;    // snap steps waiting to be folded in, in FRotator units
 
@@ -3443,11 +3603,17 @@ bool InitXRInput() {
         char path[MAX_PATH]{};
         if (IniPath(path)) {
             g_turnMode     = GetPrivateProfileIntA("Input", "TurnMode",  1, path);
+            if (g_turnMode < 0 || g_turnMode > 2) g_turnMode = 1;
             g_turnAngleDeg = (float)GetPrivateProfileIntA("Input", "TurnAngle", 30, path);
+            // Clamped rather than trusted. This one multiplies elapsed time, so a typo'd 9000 is
+            // not a bad setting, it is a physical experience the player cannot stop by letting go.
+            g_turnSpeedDeg = (float)GetPrivateProfileIntA("Input", "TurnSpeed", 120, path);
+            if (g_turnSpeedDeg < 10.0f)  g_turnSpeedDeg = 10.0f;
+            if (g_turnSpeedDeg > 360.0f) g_turnSpeedDeg = 360.0f;
             g_turnSign     = GetPrivateProfileIntA("Input", "TurnSign",  1, path) >= 0 ? 1 : -1;
             g_stickUpMask   = (WORD)GetPrivateProfileIntA("Input", "StickUp",   g_stickUpMask,   path);
             g_stickDownMask = (WORD)GetPrivateProfileIntA("Input", "StickDown", g_stickDownMask, path);
-            g_walkDirection = GetPrivateProfileIntA("Input", "WalkDirection", 1, path);
+            g_walkDirection = GetPrivateProfileIntA("Input", "WalkDirection", 0, path);
             g_walkSign      = GetPrivateProfileIntA("Input", "WalkSign", 1, path) >= 0 ? 1 : -1;
             g_autoPad       = GetPrivateProfileIntA("Input", "AutoPad", 1, path);
             // ---- aim mode 7's gun pose, the two numbers that need calibrating ----
@@ -3660,10 +3826,15 @@ bool InitXRInput() {
     }
 
     g_xrInputReady = true;
-    Log("xrinput: %u bindings attached. Turn mode %s, %.0f degrees. Walk direction %s."
-        " Hand poses %s.", nb, g_turnMode ? "SNAP" : "smooth", g_turnAngleDeg,
+    Log("xrinput: %u bindings attached. Turn mode %s (%s). Walk direction %s. Hand poses %s.", nb,
+        g_turnMode == 1 ? "SNAP" : g_turnMode == 2 ? "SMOOTH" : "engine look-stick",
+        g_turnMode == 1 ? "TurnAngle degrees per flick" :
+        g_turnMode == 2 ? "TurnSpeed degrees per second, applied here" :
+                          "the game's own sensitivity - TurnSpeed does nothing in this mode",
         g_walkDirection ? "OFF-HAND" : "head-relative",
         (g_handSpace[0] && g_handSpace[1]) ? "available" : "UNAVAILABLE");
+    if (g_turnMode == 1) Log("    TurnAngle=%.0f deg", g_turnAngleDeg);
+    if (g_turnMode == 2) Log("    TurnSpeed=%.0f deg/sec", g_turnSpeedDeg);
     return true;
 }
 
@@ -3751,6 +3922,12 @@ void SyncXRInput(XrTime displayTime) {
     getVec2(g_actMove, &mx, &my);
     getVec2(g_actTurn, &tx, &ty);
     msStates += MsSince(tSt);
+
+    // ⚠️ The panel navigates on the LEFT stick, and it has to use these raw values rather than
+    // mx/my. By the time the panel block runs, mx/my have been rotated into the off-hand or
+    // head-relative walking frame - so "up" on the stick would mean a different direction on the
+    // menu depending on where your hand happened to be pointing.
+    const float panelX = mx, panelY = my;
 
     // ---- radial deadzone: the run-70 fix, and it is a correctness fix, not a comfort one ----
     //
@@ -3868,10 +4045,51 @@ void SyncXRInput(XrTime displayTime) {
     bool menuHeld = false;
     WORD menuMask = 0;
     tSt = Now();
+    bool panelHeld = false;
+    WORD panelMask = 0;
     for (int i = 0; i < kPadButtonCount; ++i) {
         const bool down = getBool(g_padButtons[i].action);
-        if (g_padButtons[i].isMenu) { menuHeld = down; menuMask = g_padButtons[i].mask; continue; }
+        if (g_padButtons[i].isMenu)  { menuHeld  = down; menuMask  = g_padButtons[i].mask; continue; }
+        if (g_padButtons[i].isPanel) { panelHeld = down; panelMask = g_padButtons[i].mask; continue; }
         if (down) btns |= g_padButtons[i].mask;
+    }
+
+    // ---- ⭐ run 142: hold the panel button for two seconds to open VR settings ----
+    //
+    // Real elapsed time, not a frame count. The MENU long-press next to this uses 120 frames and
+    // documents itself as "~1 s at 120 fps, ~2 s at 60" - which means the gesture changes length
+    // with the frame rate, and two seconds was asked for, not "some number of frames".
+    //
+    // The tap fires on RELEASE, which is what makes the split possible at all: a press cannot know
+    // yet whether it will become a hold.
+    {
+        static LARGE_INTEGER heldSince{};
+        static bool consumed = false;
+        static int  tapPulse = 0;
+        const double kHoldSeconds = 1.3;    // 2.0 was tried first and felt like waiting
+        if (panelHeld) {
+            if (!heldSince.QuadPart) QueryPerformanceCounter(&heldSince);
+            if (!consumed && MsSince(heldSince) >= kHoldSeconds * 1000.0) {
+                const LONG was = InterlockedCompareExchange(&g_panelOpen, 0, 0);
+                InterlockedExchange(&g_panelOpen, was ? 0 : 1);
+                if (was) { if (g_panelDirty) PanelSave(); g_panelDirty = false; }
+                else     { g_panelRow = 0; }
+                consumed = true;                // one toggle per hold, not one per frame
+                Log("VR panel %s", was ? "CLOSED" : "OPENED");
+            }
+        } else {
+            // A hold that already toggled must not also fire the tap on the way out.
+            if (heldSince.QuadPart && !consumed) tapPulse = 8;
+            heldSince.QuadPart = 0;
+            consumed = false;
+        }
+        // While the panel is open the button belongs to the panel, so the tap never reaches the
+        // game either - otherwise closing it would flash the torch.
+        if (tapPulse > 0 && !InterlockedCompareExchange(&g_panelOpen, 0, 0)) {
+            btns |= panelMask; --tapPulse;
+        } else if (tapPulse > 0) {
+            --tapPulse;
+        }
     }
     msStates += MsSince(tSt);
 
@@ -3925,15 +4143,63 @@ void SyncXRInput(XrTime displayTime) {
     // Snap only works while head tracking owns yaw: with it off, the engine owns the rotation
     // outright and stepping our base would move nothing at all - silently. Falling back to smooth
     // there means the stick always turns, whatever else is switched on.
+    // ---- the panel owns the stick while it is open ----
+    //
+    // Navigation is read here and the game is given NOTHING - see the ClearPad below. That is what
+    // makes the panel unable to conflict with whatever is on screen behind it: the pause menu, the
+    // main menu and the player all see a controller that is not being touched.
+    if (InterlockedCompareExchange(&g_panelOpen, 0, 0)) {
+        static bool armedY = true, armedX = true;
+        if (fabsf(panelY) > 0.6f && armedY) {
+            g_panelRow += (panelY > 0) ? -1 : 1;    // stick up moves UP the list
+            if (g_panelRow < 0) g_panelRow = kPanelRows - 1;
+            if (g_panelRow >= kPanelRows) g_panelRow = 0;
+            armedY = false;
+        } else if (fabsf(panelY) < 0.3f) armedY = true;
+
+        if (fabsf(panelX) > 0.6f && armedX) {
+            PanelAdjust(g_panelRow, (panelX > 0) ? +1 : -1);
+            armedX = false;
+        } else if (fabsf(panelX) < 0.3f) armedX = true;
+
+        ClearPad();
+        return;                                     // no turning, no walking, no buttons
+    }
+
     const bool headOwnsYaw = InterlockedCompareExchange(&g_enabled, 0, 0) != 0;
     float lookX = 0.0f;
-    if (g_turnMode && headOwnsYaw) {
+    if (g_turnMode == 1 && headOwnsYaw) {
         if (fabsf(tx) > 0.7f && g_snapArmed) {
             const int32_t step = (int32_t)(g_turnAngleDeg * (65536.0f / 360.0f));
             g_padTurnAccum += (tx > 0 ? 1 : -1) * g_turnSign * step;
             g_snapArmed = false;
         } else if (fabsf(tx) < 0.4f) {
             g_snapArmed = true;
+        }
+    } else if (g_turnMode == 2 && headOwnsYaw) {
+        // Real elapsed time, not the display period: a dropped frame must not silently turn the
+        // player less than the ini says. Clamped, because a load hitch measured as dt would fling
+        // the view across the room - and in VR that is not a glitch, it is a person feeling sick.
+        static LARGE_INTEGER sPrev{};
+        double dt = sPrev.QuadPart ? (MsSince(sPrev) / 1000.0) : 0.0;
+        QueryPerformanceCounter(&sPrev);
+        if (dt > 0.10) dt = 0.10;
+
+        // Deadzone first, then rescale so the usable range still reaches full speed - without the
+        // rescale the top of the stick would only ever reach (1 - deadzone) of the set rate.
+        const float kDead = 0.20f;
+        const float a = fabsf(tx);
+        if (a > kDead && dt > 0.0) {
+            float mag = (a - kDead) / (1.0f - kDead);
+            mag *= mag;                     // squared: fine control near centre, full rate at the top
+            const float deg = g_turnSpeedDeg * mag * (float)dt
+                            * ((tx > 0) ? 1.0f : -1.0f) * (float)g_turnSign;
+            g_smoothTurnRem += deg * (65536.0f / 360.0f);
+            const int32_t whole = (int32_t)g_smoothTurnRem;
+            g_padTurnAccum   += whole;
+            g_smoothTurnRem  -= (float)whole;
+        } else {
+            g_smoothTurnRem = 0.0f;         // no creep once the stick is centred
         }
     } else {
         lookX = tx;
@@ -7160,6 +7426,32 @@ ScriptFn g_scriptFns[] = {
     { "SetCinematicMode",   -1 },   // [15]
     { "SetViewTarget",      -1 },   // [16]
     { "ClientSetCameraMode",-1 },   // [17]
+    // ---- ⭐ run 141: which call means "the pause menu is open"? ----
+    //
+    // The VR settings overlay opens on hold-Y WHILE the game's pause menu is up, which needs a
+    // signal for that state. These six are every menu-ish name in RvGame.u; the run says which
+    // actually fire and in what order. ShowMenu is the favourite - Raven's own config binds the
+    // pause button as `|onrelease showmenu`, and an exec function reached from native input
+    // handling is exactly the kind this hook can see.
+    //
+    // Watched together and reported by NAME rather than latched into a boolean, because which of
+    // them opens and which closes is the thing being measured. Guessing that now and latching on
+    // it is how the last three cutscene runs were wasted.
+    // ---- ⭐ run 141 RESULT: only SetPause fires. The other five never arrive ----
+    //
+    // Measured, not assumed: through repeated menu opens, closes and screen changes, ShowMenu,
+    // OpenMenu, OpenMenuDelayed, IsAnyMenuOpen and IsMenuOpen were never once seen. They are
+    // script->script or unused, and this hook only ever sees native->script entry points.
+    //
+    // They stay in the table. Five integer compares on the hot path is nothing, and a negative
+    // recorded in the code is worth more than a negative recorded nowhere - the alternative is
+    // somebody adding `ShowMenu` again in six months because it sounds like the obvious candidate.
+    { "ShowMenu",           -1 },   // [18] never fires
+    { "OpenMenu",           -1 },   // [19] never fires
+    { "OpenMenuDelayed",    -1 },   // [20] never fires
+    { "IsAnyMenuOpen",      -1 },   // [21] never fires
+    { "IsMenuOpen",         -1 },   // [22] never fires
+    { "SetPause",           -1 },   // [23] ⭐ THE ONE. Fires on every pause transition.
 };
 const int kFnGetAdjustedAim = 0;
 const int kFnTick           = 5;
@@ -7173,7 +7465,31 @@ const int kFnPreBeginPlay   = 14;
 const int kFnCineFirst      = 15;   // [15..17] the cutscene candidates
 const int kFnSetCinematic   = 15;
 const int kFnCineLast       = 17;
+const int kFnMenuFirst      = 18;   // [18..23] the pause-menu candidates
+const int kFnMenuLast       = 23;
+const int kFnSetPause       = 23;   // the only one that fires - see the table
 const int kScriptFnCount    = (int)(sizeof(g_scriptFns) / sizeof(g_scriptFns[0]));
+
+// Which menu candidate fired last, and how many frames ago. The readout shows it by NAME so the
+// answer is legible in the headset the moment the pause menu opens - no log reading, no guessing
+// which of the six it was.
+volatile LONG g_lastMenuFn = -1;
+volatile LONG g_lastMenuAge = 0;
+volatile LONG g_menuFnHits[6] = { 0, 0, 0, 0, 0, 0 };
+
+// ---- run 142: SetPause's argument turns the EVENT into the STATE ----
+//
+// Run 141 established that SetPause fires on every transition - entering gameplay, opening the
+// menu, and changing screen within the menu. That makes it an event, and the overlay needs a
+// state: "is the game paused right now". SetPause carries exactly that as its first parameter,
+// read the same way SetCinematicMode's bool is (frame locals, first dword).
+//
+// ⚠️ This is "the game is PAUSED", which is not identical to "the pause menu is open" - anything
+// else that pauses will read the same. That is the honest signal available, and it is the right
+// one for the overlay anyway: opening VR settings while the game is running would leave the player
+// standing still with a neutral pad while the world carries on.
+volatile LONG g_gamePaused = 0;
+volatile LONG g_pauseArgRaw = 0;
 
 // What the candidates have actually done, so the log can say which one is usable rather than
 // leaving three plausible names and no evidence. Counts are cumulative for the run.
@@ -8104,6 +8420,8 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // Cost: ScriptFuncNameIdx is two pointer dereferences with no VirtualQuery on this path (run
     // 94 made sure of that), against a few thousand script calls a second. The heartbeat below
     // measures it rather than leaving it asserted.
+    // The menu watch rides on the same gate - it needs fnIdx for exactly the same reason, and
+    // forgetting that is what made run 137's cutscene watch silently mute.
     const bool cineWatch = InterlockedCompareExchange(&g_cutsceneAuto, 0, 0) != 0 &&
                            FnIdx(kFnSetCinematic) >= 0;
     int32_t fnIdx = -1;
@@ -8209,6 +8527,35 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
         if (ci == kFnSetCinematic && n <= 20)
             Log("    arg raw 0x%08lX -> CINE %s", InterlockedCompareExchange(&g_cineArgRaw, 0, 0),
                 InterlockedCompareExchange(&g_inCinematic, 0, 0) ? "ON" : "OFF");
+        break;
+    }
+
+    // ---- run 141: the pause-menu candidates, reported by name ----
+    for (int mi = kFnMenuFirst; mi <= kFnMenuLast; ++mi) {
+        if (FnIdx(mi) < 0 || fnIdx != FnIdx(mi)) continue;
+        const LONG n = InterlockedIncrement(&g_menuFnHits[mi - kFnMenuFirst]);
+        InterlockedExchange(&g_lastMenuFn, mi);
+        InterlockedExchange(&g_lastMenuAge, 0);
+        if (mi == kFnSetPause) {
+            const int localsOff = LocalsOffset();
+            if (localsOff >= 0 && Stack && Readable(Stack, localsOff + 4)) {
+                uint8_t* p = *reinterpret_cast<uint8_t**>(
+                                 reinterpret_cast<uintptr_t>(Stack) + localsOff);
+                if (p && Readable(p, 4)) {
+                    const LONG raw = (LONG)(*reinterpret_cast<uint32_t*>(p));
+                    InterlockedExchange(&g_pauseArgRaw, raw);
+                    InterlockedExchange(&g_gamePaused, raw ? 1 : 0);
+                    // Same check the cutscene latch got, for the same reason: if this is ever
+                    // something other than 0 or 1 the frame layout assumption is wrong and the
+                    // state is meaningless even when it happens to look right.
+                    if (n <= 10) Log("    SetPause arg raw 0x%08lX -> PAUSED %s", raw,
+                                     raw ? "YES" : "NO");
+                }
+            }
+        }
+        // The first few of EACH, not the first few overall - IsAnyMenuOpen may well be polled every
+        // frame, and letting it flood the budget would hide the one that fires once on open.
+        if (n <= 6) Log("menu watch: %s fired (#%ld)", g_scriptFns[mi].name, n);
         break;
     }
 
@@ -8978,6 +9325,88 @@ static int AnchorMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
     return n;
 }
 
+// ---- ⭐ run 142: the VR settings panel, drawn ----
+//
+// Same machinery as the state readout - a 5x7 bitmap font turned into Clear() rectangles, drawn
+// once per eye - but larger, on a dark plate, with the selected row marked. No font, no vertex
+// buffer, no shader; the only device state touched is the scissor, saved and restored.
+//
+// Drawn AFTER the game's own frame, including its menus, so it always sits on top. That is the
+// other half of why this cannot conflict with the pause menu: the game never sees the input, and
+// the panel is never drawn under anything.
+static void DrawVrPanel(IDirect3DDevice9* dev) {
+    if (!dev || !g_srcW || !g_srcH) return;
+
+    char rows[kPanelRows][40];
+    for (int i = 0; i < kPanelRows; ++i) PanelRowText(i, rows[i], sizeof(rows[i]));
+
+    DWORD oldScissor = FALSE;
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+
+    // ---- ⚠️ how many copies, and how wide is one ----
+    //
+    // Reported in run 142 as "two split images". The backbuffer is only side-by-side while draw
+    // duplication is ON. With it off - which is the state at the main menu before BACKSPACE, and
+    // the state this panel is most likely to be opened in - the frame is a single mono image, and
+    // drawing two half-width copies puts two panels next to each other in the middle of it.
+    //
+    // So the number of copies and the width of one both follow duplication. The state readout has
+    // exactly the same bug; it was never noticed because it is only ever read with VR mode on.
+    const bool dup   = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    const int  eyes  = dup ? 2 : 1;
+    const LONG halfW = dup ? (LONG)g_srcW / 2 : (LONG)g_srcW;
+    // Everything below - line height, box width and height, the highlight bar - is derived from
+    // px, so this single number is the panel's scale. Halved from g_srcH/170 in run 142: at full
+    // headset resolution the first version filled the view.
+    int px = (int)(g_srcH / 340);
+    if (px < 1) px = 1;                              // a zero here would draw nothing at all
+    const int  lh    = (kGlyphH + 4) * px;
+    const int  cols  = 30;                           // widest row plus margin
+    const int  boxW  = cols * (kGlyphW + 1) * px;
+    const int  boxH  = lh * (kPanelRows + 3);
+    const int  y0    = (int)(g_srcH / 2) - boxH / 2;
+
+    const int kCap = 8192;
+    static D3DRECT r[kCap];
+
+    // The plate first, as one rectangle per eye.
+    int n = 0;
+    for (int eye = 0; eye < 2 && n < kCap; ++eye) {
+        const int cx = (int)(eye * halfW + halfW / 2);
+        r[n].x1 = cx - boxW / 2 - px * 4; r[n].y1 = y0 - px * 4;
+        r[n].x2 = cx + boxW / 2 + px * 4; r[n].y2 = y0 + boxH + px * 4;
+        ++n;
+    }
+    if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(8, 12, 16), 0.0f, 0);
+
+    // The selected row's highlight bar, so the cursor is visible without a glyph for it.
+    n = 0;
+    for (int eye = 0; eye < eyes && n < kCap; ++eye) {
+        const int cx = (int)(eye * halfW + halfW / 2);
+        const int ry = y0 + lh * (2 + g_panelRow);
+        r[n].x1 = cx - boxW / 2 - px * 2; r[n].y1 = ry - px;
+        r[n].x2 = cx + boxW / 2 + px * 2; r[n].y2 = ry + (kGlyphH + 1) * px;
+        ++n;
+    }
+    if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 60, 40), 0.0f, 0);
+
+    // Title, rows, and the key hint - the hint matters because nothing else on screen says how to
+    // get out, and a panel you cannot close is worse than no panel.
+    n = 0;
+    for (int eye = 0; eye < eyes; ++eye) {
+        const int x0 = (int)(eye * halfW + halfW / 2) - boxW / 2;
+        n = TextRects(r, n, kCap, x0, y0, px, "VR SETTINGS");
+        for (int i = 0; i < kPanelRows; ++i)
+            n = TextRects(r, n, kCap, x0, y0 + lh * (2 + i), px, rows[i]);
+        n = TextRects(r, n, kCap, x0, y0 + lh * (kPanelRows + 2), px,
+                      "LEFT STICK   HOLD Y TO CLOSE");
+    }
+    if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
+
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
+}
+
 static void DrawStateReadout(IDirect3DDevice9* dev) {
     if (!dev || !g_srcW || !g_srcH) return;
     const LONG combo = InterlockedCompareExchange(&g_gunSignCombo, 0, 0);
@@ -9053,6 +9482,23 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     // until it reads what the first was frozen at, and the frozen value once pinned. Wrapped to
     // 0-359 because a raw FRotator wraps through negatives and reads as two different numbers for
     // the same direction.
+    // ---- run 141: which menu function fired, by name, with an age ----
+    //
+    // The age is the point. A name alone cannot distinguish "this fires once when the menu opens"
+    // from "this is polled every frame" - and those two want completely different treatment. A
+    // counter that visibly sits at 0 is a poll; one that ticks up and stops is an event.
+    char l10[40];
+    {
+        const LONG fn  = InterlockedCompareExchange(&g_lastMenuFn, 0, 0);
+        const LONG age = InterlockedCompareExchange(&g_lastMenuAge, 0, 0);
+        const char* paused = InterlockedCompareExchange(&g_gamePaused, 0, 0) ? "YES" : "NO";
+        if (fn < kFnMenuFirst || fn > kFnMenuLast)
+            _snprintf_s(l10, sizeof(l10), _TRUNCATE, "PAUSED %s  MENU NONE YET", paused);
+        else
+            _snprintf_s(l10, sizeof(l10), _TRUNCATE, "PAUSED %s  %s %ld", paused,
+                        g_scriptFns[fn].name, age > 999 ? 999 : age);
+    }
+
     char l9[40];
     {
         const bool frozen = InterlockedCompareExchange(&g_freezeView, 0, 0) != 0;
@@ -9096,7 +9542,11 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
 
-    const LONG halfW = (LONG)g_srcW / 2;
+    // Same duplication-dependent geometry as DrawVrPanel - see the note there. With duplication
+    // off the frame is one mono image, and two half-width copies read as two panels side by side.
+    const bool dup   = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    const int  eyes  = dup ? 2 : 1;
+    const LONG halfW = dup ? (LONG)g_srcW / 2 : (LONG)g_srcW;
     const int  px = (int)(g_srcH / 260);            // pixel size, scaled to the target
     const int  lh = (kGlyphH + 2) * px;
     const int  y0 = (int)(g_srcH / 7);
@@ -9111,19 +9561,20 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     //
     // So size it so overrun is impossible rather than unlikely: a 5x7 glyph has at most three runs
     // of set pixels per row (10101), so 21 rectangles per character is the true worst case, and
-    // the line buffers bound the character count. 9 lines x 39 chars x 2 eyes x 21 = 14742.
-    const int kCap = 16384;
+    // the line buffers bound the character count. 10 lines x 39 chars x 2 eyes x 21 = 16380.
+    const int kCap = 20480;
     static D3DRECT r[kCap];
     int n = 0;
-    for (int eye = 0; eye < 2; ++eye) {
+    for (int eye = 0; eye < eyes; ++eye) {
         const int x0 = (int)(eye * halfW + halfW / 2) - 11 * (kGlyphW + 1) * px;
         n = TextRects(r, n, kCap, x0, y0,          px, l1);
         n = TextRects(r, n, kCap, x0, y0 + lh,     px, l2);
-        n = TextRects(r, n, kCap, x0, y0 + 7 * lh, px, l3);
-        n = TextRects(r, n, kCap, x0, y0 + 8 * lh, px, l4);
+        n = TextRects(r, n, kCap, x0, y0 + 8 * lh, px, l3);
+        n = TextRects(r, n, kCap, x0, y0 + 9 * lh, px, l4);
         n = TextRects(r, n, kCap, x0, y0 + 4 * lh, px, l7);
         n = TextRects(r, n, kCap, x0, y0 + 5 * lh, px, l8);
         n = TextRects(r, n, kCap, x0, y0 + 6 * lh, px, l9);
+        n = TextRects(r, n, kCap, x0, y0 + 7 * lh, px, l10);
         // The two cutscene lines go THIRD and FOURTH on screen, above the gun-tuning ones: they
         // are what a cutscene test reads, and burying them under the anchor numbers is how a
         // readout gets ignored.
@@ -9153,7 +9604,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // Whoever calls Present owns the device. Recorded so the user-pointer draw hooks can tell
     // render-thread calls from movie-playback-thread ones and stay completely inert on the latter.
     g_mainThreadId = GetCurrentThreadId();
+    // Age the menu indicator once per frame. Without this a name that fired a minute ago looks
+    // identical to one firing right now, which is the whole distinction the readout exists to show.
+    InterlockedIncrement(&g_lastMenuAge);
     if (InterlockedCompareExchange(&g_readoutOn, 0, 0)) DrawStateReadout(s);
+    if (InterlockedCompareExchange(&g_panelOpen, 0, 0)) DrawVrPanel(s);
     if (InterlockedExchange(&g_initTried, 1) == 0) {
         InstallViewHook(); InstallProcessEventHook(); InitXR();
     }
@@ -10367,6 +10822,20 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // means the hook is installed, running, and naming calls - so a silent CINE genuinely
             // means no cutscene started. Zero means the watch is not working and nothing it
             // reports means anything.
+            // The menu tally. Counts are CUMULATIVE, so a name that fires once per menu open stays
+            // readable next to one that is polled thousands of times a second - which is exactly
+            // the distinction this run has to make.
+            {
+                char mb[240]; int mn = 0; bool any = false;
+                for (int mi = kFnMenuFirst; mi <= kFnMenuLast && mn < 200; ++mi) {
+                    const LONG h = InterlockedCompareExchange(&g_menuFnHits[mi - kFnMenuFirst], 0, 0);
+                    if (!h) continue;
+                    any = true;
+                    mn += sprintf_s(mb + mn, sizeof(mb) - mn, "%s%s=%ld",
+                                    mn ? "  " : "", g_scriptFns[mi].name, h);
+                }
+                if (any) Log("    menu watch: %s", mb);
+            }
             if (InterlockedCompareExchange(&g_cutsceneAuto, 0, 0)) {
                 const LONG seen = InterlockedExchange(&g_peSeen, 0);
                 const LONG unnamed = InterlockedExchange(&g_peUnnamed, 0);

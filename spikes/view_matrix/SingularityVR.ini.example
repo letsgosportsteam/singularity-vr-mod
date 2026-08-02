@@ -536,3 +536,31 @@ GpuFenceProbe=1
 ; GunAnchorRight=9
 ; GunAnchorUp=-13
 ; ---------------------------------------------------------------------------
+
+; ---------------------------------------------------------------------------
+; [Input] - turning with the right thumbstick
+;
+; TurnMode picks HOW the stick turns you. All three are motion-controller
+; turning; they differ in who owns the rate.
+;
+;   0  hand the stick to the engine's own look axis. Smooth, but the speed is
+;      Raven's sensitivity curve, which this mod cannot see or set - so
+;      TurnSpeed does nothing in this mode.
+;   1  SNAP (default). Flick the stick, jump TurnAngle degrees. The most
+;      comfortable option for most people, and the one to keep if you are at
+;      all prone to motion sickness.
+;   2  SMOOTH, done by the mod at exactly TurnSpeed degrees per second. Frame
+;      rate independent, and it keeps working during cutscenes - modes 0 and 1
+;      both go through paths the engine ignores while a scripted camera runs.
+;
+; Stick deflection is squared in mode 2, so a small push turns slowly and the
+; top of the stick gives the full rate. TurnSpeed is clamped to 10-360.
+;
+; TurnSign=-1 if right turns you left. It applies to all three modes.
+;
+; [Input]
+; TurnMode=1
+; TurnAngle=30       ; degrees per flick, mode 1 only
+; TurnSpeed=120      ; degrees per second, mode 2 only
+; TurnSign=1
+; ---------------------------------------------------------------------------
