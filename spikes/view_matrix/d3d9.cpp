@@ -8528,55 +8528,139 @@ void SetVrMode(bool on) {
         on ? "ON" : "OFF - plain game");
 }
 
-// ================= ⭐ run 127: an on-screen readout, at last ===============================
+// ================= ⭐ run 127: an on-screen readout, in WORDS ===============================
 //
-// Every mode, count and setting in this mod goes to a log file, so the only way to check state
-// while wearing the headset has been to take it off. That gap was named several runs ago and then
-// left alone; it has since cost a run to "combo 2" meaning different things in two sessions.
+// Every mode and setting in this mod goes to a log file, so the only way to check state while
+// wearing the headset has been to take it off. That gap was named several runs ago and left alone,
+// and it has since cost a run - "combo 2" meant different things in two sessions and nothing on
+// screen could have said so.
 //
-// Clear() with a rectangle list is the cheapest possible readout: no font, no vertex buffer, no
-// shader, no state to restore beyond the scissor. Four bright-or-dark squares spell the CAPS combo
-// in binary, high bit on the left, and two below it give the APPS mode. Drawn into BOTH eye halves
-// so it is readable however the image is split.
+// The first attempt spelled the state in binary squares. That was a bad answer to a good request:
+// it moved the decoding from the log into the reader's head. So this draws actual text.
 //
-// It is drawn at the top of Present, before the mod copies the frame to the headset, which is what
-// puts it in front of your eyes rather than only on the desktop mirror.
+// No font is available - the Windows SDK does not ship D3DX - so the glyphs are a 5x7 bitmap and
+// each row of set pixels becomes one rectangle in a Clear() list. Runs of adjacent pixels are
+// merged into a single rectangle, which keeps a full line of text to a few dozen rectangles rather
+// than one per pixel. No vertex buffer, no shader, and the only device state touched is the
+// scissor, saved and restored.
+//
+// Drawn at the top of Present, before the frame is copied to the headset, which is what puts it in
+// front of your eyes rather than only on the desktop mirror.
+const int kGlyphW = 5, kGlyphH = 7;
+static const unsigned char kFont[][kGlyphH] = {
+    {0,0,0,0,0,0,0},                                    // space
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},               // A
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},               // B
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},               // C
+    {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},               // D
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},               // E
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},               // F
+    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F},               // G
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},               // H
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F},               // I
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C},               // J
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11},               // K
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},               // L
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11},               // M
+    {0x11,0x19,0x15,0x13,0x11,0x11,0x11},               // N
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},               // O
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},               // P
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},               // Q
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},               // R
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E},               // S
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},               // T
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},               // U
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},               // V
+    {0x11,0x11,0x11,0x15,0x15,0x1B,0x11},               // W
+    {0x11,0x0A,0x04,0x04,0x04,0x0A,0x11},               // X
+    {0x11,0x0A,0x04,0x04,0x04,0x04,0x04},               // Y
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},               // Z
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},               // 0
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},               // 1
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},               // 2
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},               // 3
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},               // 4
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},               // 5
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},               // 6
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},               // 7
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},               // 8
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},               // 9
+    {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},               // +
+    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},               // -
+};
+
+static int GlyphIndex(char ch) {
+    if (ch == ' ') return 0;
+    if (ch >= 'A' && ch <= 'Z') return 1 + (ch - 'A');
+    if (ch >= 'a' && ch <= 'z') return 1 + (ch - 'a');
+    if (ch >= '0' && ch <= '9') return 27 + (ch - '0');
+    if (ch == '+') return 37;
+    if (ch == '-') return 38;
+    return 0;
+}
+
+// Append the rectangles for one line of text. Adjacent set pixels in a row are merged, so "COMBO"
+// costs about twenty rectangles rather than seventy.
+static int TextRects(D3DRECT* r, int n, int cap, int x0, int y0, int px, const char* s) {
+    for (int ci = 0; s[ci]; ++ci) {
+        const unsigned char* g = kFont[GlyphIndex(s[ci])];
+        const int cx = x0 + ci * (kGlyphW + 1) * px;
+        for (int row = 0; row < kGlyphH; ++row) {
+            int col = 0;
+            while (col < kGlyphW) {
+                if (!(g[row] & (0x10 >> col))) { ++col; continue; }
+                int run = 0;
+                while (col + run < kGlyphW && (g[row] & (0x10 >> (col + run)))) ++run;
+                if (n < cap) {
+                    r[n].x1 = cx + col * px;
+                    r[n].y1 = y0 + row * px;
+                    r[n].x2 = cx + (col + run) * px;
+                    r[n].y2 = y0 + (row + 1) * px;
+                    ++n;
+                }
+                col += run;
+            }
+        }
+    }
+    return n;
+}
+
 static void DrawStateReadout(IDirect3DDevice9* dev) {
     if (!dev || !g_srcW || !g_srcH) return;
     const LONG combo = InterlockedCompareExchange(&g_gunSignCombo, 0, 0);
     const LONG mode  = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    const LONG aim   = InterlockedCompareExchange(&g_aimMode, 0, 0);
+
+    int sy, sp, sr; GunSigns(sy, sp, sr);
+    char l1[32], l2[32], l3[32];
+    _snprintf_s(l1, sizeof(l1), _TRUNCATE, "COMBO %d  FRAME %s",
+                (int)combo, GunViewFrame() ? "ON" : "OFF");
+    _snprintf_s(l2, sizeof(l2), _TRUNCATE, "YAW %c PITCH %c ROLL %c",
+                sy > 0 ? '+' : '-', sp > 0 ? '+' : '-', sr > 0 ? '+' : '-');
+    const char* what = (mode == 1) ? "GUN" : (mode == 2) ? "ARMS"
+                     : (mode == 3) ? "GUN ARMS" : "NONE";
+    _snprintf_s(l3, sizeof(l3), _TRUNCATE, "AIM %d  MOVING %s", (int)aim, what);
 
     DWORD oldScissor = FALSE;
     dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
 
     const LONG halfW = (LONG)g_srcW / 2;
-    const LONG sz = (LONG)(g_srcH / 40);          // square size, scaled to the target
-    const LONG gap = sz / 3;
-    const LONG y0 = (LONG)(g_srcH / 6);
+    const int  px = (int)(g_srcH / 260);            // pixel size, scaled to the target
+    const int  lh = (kGlyphH + 2) * px;
+    const int  y0 = (int)(g_srcH / 7);
 
-    // Two passes: dark squares for clear bits, bright for set ones. Two Clear calls total.
-    for (int pass = 0; pass < 2; ++pass) {
-        D3DRECT r[12]; int n = 0;
-        for (int eye = 0; eye < 2; ++eye) {
-            const LONG x0 = eye * halfW + halfW / 2 - (4 * (sz + gap)) / 2;
-            for (int bit = 0; bit < 4; ++bit) {           // CAPS combo, high bit left
-                const bool on = (combo & (8 >> bit)) != 0;
-                if (on != (pass == 1)) continue;
-                const LONG x = x0 + bit * (sz + gap);
-                r[n].x1 = x; r[n].y1 = y0; r[n].x2 = x + sz; r[n].y2 = y0 + sz; ++n;
-            }
-            for (int bit = 0; bit < 2; ++bit) {           // APPS mode below
-                const bool on = (mode & (2 >> bit)) != 0;
-                if (on != (pass == 1)) continue;
-                const LONG x = x0 + bit * (sz + gap);
-                r[n].x1 = x; r[n].y1 = y0 + sz + gap * 2;
-                r[n].x2 = x + sz; r[n].y2 = y0 + 2 * sz + gap * 2; ++n;
-            }
-        }
-        if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET,
-                          pass ? D3DCOLOR_XRGB(0, 255, 80) : D3DCOLOR_XRGB(40, 40, 40), 0.0f, 0);
+    const int kCap = 900;
+    static D3DRECT r[kCap];
+    int n = 0;
+    for (int eye = 0; eye < 2; ++eye) {
+        const int x0 = (int)(eye * halfW + halfW / 2) - 11 * (kGlyphW + 1) * px;
+        n = TextRects(r, n, kCap, x0, y0,          px, l1);
+        n = TextRects(r, n, kCap, x0, y0 + lh,     px, l2);
+        n = TextRects(r, n, kCap, x0, y0 + 2 * lh, px, l3);
     }
+    if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
+
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
 }
 
