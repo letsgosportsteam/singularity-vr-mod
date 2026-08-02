@@ -8753,7 +8753,8 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
                 sy > 0 ? '+' : '-', sp > 0 ? '+' : '-', sr > 0 ? '+' : '-');
     const char* what = (mode == 1) ? "GUN" : (mode == 2) ? "ARMS"
                      : (mode == 3) ? "GUN ARMS" : "NONE";
-    _snprintf_s(l3, sizeof(l3), _TRUNCATE, "AIM %d  MOVING %s", (int)aim, what);
+    _snprintf_s(l3, sizeof(l3), _TRUNCATE, "AIM %d  MOVING %s  POS %s", (int)aim, what,
+                g_gunFollowPos ? "ON" : "OFF");
     const LONG ax = InterlockedCompareExchange(&g_anchorAxis, 0, 0);
     char l4[40];
     // ⚠️ Brackets, not a leading dash. The dash used to mark the selected axis and it read as a
@@ -9229,6 +9230,26 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         }
     }
     pDec = kDec;
+
+    // ---- TAB: freeze the gun's POSITION so the pivot can be tuned on its own ----
+    //
+    // G does two jobs in v' = (v - G) * R + G + (H - G), which reduces to (v - G) * R + H: it is
+    // the rotation pivot AND the reference the translation subtracts. So moving the anchor forward
+    // lands the gun further BACK - correct arithmetic, and useless for tuning, because one knob
+    // moves two things in opposite directions.
+    //
+    // With position following off, H = G and the translation term vanishes, leaving pure rotation
+    // about G. Then the anchor can be placed by eye without the gun sliding away from it.
+    {
+        static bool pTab = false;
+        const bool kTab = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+        if (kTab && !pTab) {
+            g_gunFollowPos = g_gunFollowPos ? 0 : 1;
+            Log("TAB: gun position following %s%s", g_gunFollowPos ? "ON" : "OFF",
+                g_gunFollowPos ? "" : " - pure rotation about the anchor, for tuning it");
+        }
+        pTab = kTab;
+    }
 
     // ---- ARROW KEYS: tune the gun anchor, the point it rotates about ----
     //
