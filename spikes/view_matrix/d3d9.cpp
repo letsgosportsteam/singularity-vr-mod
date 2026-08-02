@@ -5109,6 +5109,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
             const CamMatSlot& cs = g_camMats[slots[i]];
             memcpy(mat, cs.m, sizeof(mat));
             ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), cs.conv, -0.5f);
+            if (g_thisDrawMoved) ApplyWorldOffset(reinterpret_cast<Reg4*>(mat), cs.conv, 30.0f, 0.0f, 0.0f);
             g_origSetVSConstF(dev, cs.reg, mat, 4);
         }
         hr = draw();
@@ -5125,6 +5126,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
             // move and must happen before clip space is rescaled.
             ApplyOffset(reinterpret_cast<Reg4*>(mat), cs.conv, g_eyeDeltaUU);
             ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), cs.conv, +0.5f);
+            if (g_thisDrawMoved) ApplyWorldOffset(reinterpret_cast<Reg4*>(mat), cs.conv, 30.0f, 0.0f, 0.0f);
             g_origSetVSConstF(dev, cs.reg, mat, 4);
         }
         HRESULT hr2 = draw();
@@ -5210,6 +5212,20 @@ volatile LONG g_inForeground = 0;      // set by the late depth clear, reset eac
 // of it. If a mesh vanishes completely and you can see through where it was, nothing of it is
 // left unaccounted for.
 volatile LONG g_hideMeshIdx = 0;       // 0 none, 1..3 index into the learned signatures
+
+// ---- ⭐ run 119: MOVE the selected mesh instead of hiding it ----
+//
+// Stage 3 is answered: [1]=5799 is the gun, [2]=3314 is the arms, and they are separable. Hiding
+// leaves black because the foreground pass draws into its own target and the composite is masked,
+// so removing geometry leaves the mask with nothing to show. That is an artefact of HIDING and it
+// does not matter, because the goal was never to hide the gun - it is to move it, and moved
+// geometry is still drawn.
+//
+// This is the mechanism test, deliberately crude: shift the selected mesh a fixed 30 world units
+// (about 57 cm) so a success is unmistakable and no controller maths can be blamed for a failure.
+// The controller pose replaces the constant only once this is proven.
+volatile LONG g_fgMoveOn = 0;          // APPS selects a mesh; this says move it rather than hide it
+bool g_thisDrawMoved = false;          // set per draw on the render thread, read inside StereoPair
 volatile LONG g_fgDrawCount = 0;       // how many draws landed in the pass this frame
 
 // ---- run 116: are these meshes drawn ANYWHERE ELSE in the frame? ----
@@ -5245,6 +5261,27 @@ static void FgLearnSignature(UINT verts) {
 }
 
 // True when this mesh is the one currently being hidden, wherever in the frame it is drawn.
+// Shift world positions by (tx,ty,tz) inside an already-uploaded view-projection.
+//
+// ROW: registers are the rows of M and clip = v * M, so translating the world by T adds
+//      T.x*row0 + T.y*row1 + T.z*row2 into row3, the translation row.
+// COL: registers are the columns of M and clip.k = dot(reg[k], v), so the same translation adds
+//      dot(reg[k].xyz, T) to reg[k].w.
+//
+// Both are exact - this is a change of the transform, not an approximation of one - and doing it
+// AFTER ApplyEyeRemap means the per-eye offset is preserved.
+static void ApplyWorldOffset(Reg4* m, int conv, float tx, float ty, float tz) {
+    if (conv == CONV_ROW) {
+        m[3].x += tx * m[0].x + ty * m[1].x + tz * m[2].x;
+        m[3].y += tx * m[0].y + ty * m[1].y + tz * m[2].y;
+        m[3].z += tx * m[0].z + ty * m[1].z + tz * m[2].z;
+        m[3].w += tx * m[0].w + ty * m[1].w + tz * m[2].w;
+    } else {
+        for (int k = 0; k < 4; ++k)
+            m[k].w += tx * m[k].x + ty * m[k].y + tz * m[k].z;
+    }
+}
+
 static bool FgHidden(UINT verts) {
     const LONG h = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
     if (h <= 0 || h > kFgSigMax) return false;
@@ -5350,9 +5387,12 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         DpgRecord(4, 0.0f, 0.0f, (uint32_t)InterlockedCompareExchange(&g_frameDrawIdx, 0, 0),
                   numVertices, primCount, 0);
     }
-    return StereoPair(dev, [&] {
+    g_thisDrawMoved = InterlockedCompareExchange(&g_fgMoveOn, 0, 0) && FgHidden(numVertices);
+    const HRESULT dhr = StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
     });
+    g_thisDrawMoved = false;
+    return dhr;
 }
 
 // ---- âš ï¸ the run-24/25 startup hang was file I/O in a draw hook ----
@@ -8643,9 +8683,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             const LONG next = (InterlockedCompareExchange(&g_hideMeshIdx, 0, 0) + 1) % (n + 1);
             InterlockedExchange(&g_hideMeshIdx, next);
             InterlockedExchange(&g_dpgProbeFrames, 3);
+            InterlockedExchange(&g_fgMoveOn, 1);   // run 119: move, do not hide
             if (next == 0) Log("APPS: all first-person meshes VISIBLE");
-            else Log("APPS: hiding first-person mesh %ld of %ld (verts %ld) - everywhere it is"
-                     " drawn, prime pass included", next, n,
+            else Log("APPS: MOVING first-person mesh %ld of %ld (verts %ld) by 30 world units in +X"
+                     " - every draw of it, prime pass included. 1=gun 2=arms.", next, n,
                      InterlockedCompareExchange(&g_fgSigVerts[next - 1], 0, 0));
         }
         pApps = kApps;
