@@ -8649,8 +8649,13 @@ static int TextRects(D3DRECT* r, int n, int cap, int x0, int y0, int px, const c
 //
 // Returns false when the point is behind the eye - w <= 0 - because projecting that gives a
 // mirrored position on screen, which would be a confident lie.
+// ⚠️ The width here is the FULL target, not the eye half. ApplyEyeRemap has already compressed
+// clip-space x into this eye's half - clip.x becomes 0.5*clip.x -+ 0.5*clip.w - so the NDC range
+// coming out of it already IS that half. Mapping it through halfW as well squeezes the marker into
+// a QUARTER of the screen, at a different wrong place in each eye, so the two never fuse and you
+// see two crosses instead of one.
 static bool ProjectToScreen(const float* mat, int conv, const float p[3],
-                            LONG eyeX0, LONG eyeW, LONG h, LONG& sx, LONG& sy) {
+                            LONG fullW, LONG h, LONG& sx, LONG& sy) {
     const Reg4* r = reinterpret_cast<const Reg4*>(mat);
     float cx, cy, cw;
     if (conv == CONV_ROW) {
@@ -8665,7 +8670,7 @@ static bool ProjectToScreen(const float* mat, int conv, const float p[3],
     if (cw <= 0.001f) return false;
     const float ndcX = cx / cw, ndcY = cy / cw;
     if (ndcX < -1.5f || ndcX > 1.5f || ndcY < -1.5f || ndcY > 1.5f) return false;
-    sx = eyeX0 + (LONG)((ndcX * 0.5f + 0.5f) * eyeW);
+    sx = (LONG)((ndcX * 0.5f + 0.5f) * fullW);
     sy = (LONG)((0.5f - ndcY * 0.5f) * h);
     return true;
 }
@@ -8681,7 +8686,6 @@ static int AnchorMarkerRects(D3DRECT* r, int n, int cap) {
     for (int i = 0; i < kMaxCamMats; ++i) if (g_camMats[i].valid) { slot = i; break; }
     if (slot < 0) return n;                      // no live matrix this frame - draw nothing
 
-    const LONG halfW = (LONG)g_srcW / 2;
     const LONG arm = (LONG)(g_srcH / 90), th = (LONG)(g_srcH / 400) + 1;
     for (int eye = 0; eye < 2; ++eye) {
         float m[16];
@@ -8689,7 +8693,7 @@ static int AnchorMarkerRects(D3DRECT* r, int n, int cap) {
         ApplyEyeRemap(reinterpret_cast<Reg4*>(m), g_camMats[slot].conv, eye ? +0.5f : -0.5f);
         LONG sx = 0, sy = 0;
         if (!ProjectToScreen(m, g_camMats[slot].conv, G,
-                             eye * halfW, halfW, (LONG)g_srcH, sx, sy)) continue;
+                             (LONG)g_srcW, (LONG)g_srcH, sx, sy)) continue;
         if (n + 2 > cap) break;
         r[n].x1 = sx - arm; r[n].y1 = sy - th; r[n].x2 = sx + arm; r[n].y2 = sy + th; ++n;
         r[n].x1 = sx - th;  r[n].y1 = sy - arm; r[n].x2 = sx + th; r[n].y2 = sy + arm; ++n;
