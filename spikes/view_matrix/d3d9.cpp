@@ -5113,8 +5113,21 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
                 // Pivot on the camera: the gun hangs off the view, so turning it about the eye is
                 // what makes it point where the controller points. Pivoting on the world origin
                 // would fling it across the level.
+                // ---- ⚠️ run 122: the pivot is the ORIGIN, not the camera position ----
+                //
+                // The gun vanished, and ENGINE_NOTES already said why: UE3 of this vintage uploads
+                // a TRANSLATED-WORLD to clip matrix, pre-subtracting the view origin on the CPU to
+                // protect float precision at large world coordinates. In that space THE CAMERA IS
+                // AT THE ORIGIN, so pivoting about g_camPos - about (18993, -22941, 180) - shifted
+                // the gun twenty thousand units and out of the world.
+                //
+                // The fixed +30 test worked because a pure translation is identical in both
+                // spaces. The moment a pivot was introduced the space started to matter, and this
+                // file has recorded which space it is since the matrix scan probed
+                // "origin(translated-world)" as a candidate point.
+                static const float kPivotOrigin[3] = { 0.0f, 0.0f, 0.0f };
                 float C[4][4];
-                BuildGunTransform(C, g_camPos,
+                BuildGunTransform(C, kPivotOrigin,
                                   (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0),
                                   (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0));
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
@@ -5139,8 +5152,9 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
                 // Pivot on the camera: the gun hangs off the view, so turning it about the eye is
                 // what makes it point where the controller points. Pivoting on the world origin
                 // would fling it across the level.
+                static const float kPivotOrigin2[3] = { 0.0f, 0.0f, 0.0f };   // see the note above
                 float C[4][4];
-                BuildGunTransform(C, g_camPos,
+                BuildGunTransform(C, kPivotOrigin2,
                                   (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0),
                                   (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0));
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
@@ -5284,6 +5298,17 @@ volatile LONG g_fgSigCount = 0;
 volatile LONG g_fgStableVerts[kFgSigMax] = {};
 volatile LONG g_fgStableCount = 0;
 
+// ---- 💥 run 122: latch the mesh by its VERTEX COUNT, not its position in the list ----
+//
+// Reported: the gun and arms flash back to normal for a moment when firing. That is the list
+// changing - muzzle-flash geometry joins the foreground pass, so [1] stops being the gun for those
+// frames and the transform lands on whatever took its place, or on nothing.
+//
+// An index into a list that is rebuilt every frame was never a stable handle. The vertex count is:
+// 5799 identifies that mesh whatever else is on screen. So the counts are LATCHED when a mode is
+// selected and matched by value from then on.
+volatile LONG g_gunVerts = 0, g_armsVerts = 0;
+
 static void FgLearnSignature(UINT verts) {
     const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
@@ -5388,12 +5413,14 @@ static bool FgIsMesh(UINT verts, int idx1) {          // idx1 is 1-based into th
 
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
-    return (m == 2 || m == 3) && FgIsMesh(verts, 2);
+    const LONG a = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+    return (m == 2 || m == 3) && a && (UINT)a == verts;
 }
 
 static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
     const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
-    return (m == 1 || m == 3) && FgIsMesh(verts, 1);
+    const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+    return (m == 1 || m == 3) && g && (UINT)g == verts;
 }
 
 // Any first-person mesh, wherever it is drawn - used to catch the near-plane depth prime at
@@ -8791,6 +8818,15 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (kApps && !pApps) {
             const LONG next = (InterlockedCompareExchange(&g_hideMeshIdx, 0, 0) + 1) % 4;
             InterlockedExchange(&g_hideMeshIdx, next);
+            // Latch the two meshes by vertex count at the moment of selection, so the transform
+            // keeps hold of them when the foreground list changes under fire.
+            if (next == 1) {
+                InterlockedExchange(&g_gunVerts,  InterlockedCompareExchange(&g_fgStableVerts[0], 0, 0));
+                InterlockedExchange(&g_armsVerts, InterlockedCompareExchange(&g_fgStableVerts[1], 0, 0));
+                Log("APPS: latched gun=%ld verts, arms=%ld verts",
+                    InterlockedCompareExchange(&g_gunVerts, 0, 0),
+                    InterlockedCompareExchange(&g_armsVerts, 0, 0));
+            }
             InterlockedExchange(&g_dpgProbeFrames, 3);
             static const char* kWhat[4] = {
                 "0 - normal, nothing touched",
