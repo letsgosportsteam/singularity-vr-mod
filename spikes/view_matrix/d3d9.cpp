@@ -4849,6 +4849,14 @@ PFN_SetVSConstF g_origSetVSConstF = nullptr;
 const UINT kMaxScanWindows = 32;
 const UINT kScratchVecs    = 256;   // vs_3_0's full float-constant file
 
+// Defined with the user-pointer draw hooks, ~3000 lines down. Declared here rather than moved,
+// because they belong beside the HUD probe that consumes them, not beside the constant hook that
+// merely feeds it.
+extern volatile LONG g_vsWriteMask;
+extern int           g_upXformDump;
+extern volatile LONG g_hudConstsWritten;
+extern bool          g_inHudRemap;
+
 HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                                            const float* data, UINT vec4Count) {
     bool scan = InterlockedCompareExchange(&g_scanArmed, 0, 0) != 0;
@@ -4867,6 +4875,24 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     const bool posOffset = InterlockedCompareExchange(&g_sixDof, 0, 0) != 0 ||
                            InterlockedCompareExchange(&g_stereo, 0, 0) != 0 || dup;
     const bool inject = posOffset || InterlockedCompareExchange(&g_injectOn, 0, 0) != 0;
+
+    // ---- run 146: note which registers the game writes, for the HUD probe ----
+    //
+    // Before the vec4Count<4 bail below, deliberately: GFx sets its transform in small uploads and
+    // a 4-vector minimum would filter out exactly the writes being looked for.
+    // The UI marker. Cheap enough for the hot path - a range test and a store - and deliberately
+    // not gated on the probe, because it now drives the feature rather than a diagnostic.
+    if (!g_inHudRemap && startReg <= 8 && startReg + vec4Count > 5)
+        InterlockedExchange(&g_hudConstsWritten, 1);
+
+    if (g_upXformDump > 0 && startReg < 32) {
+        LONG add = 0;
+        const UINT last = (startReg + vec4Count > 32) ? 32 : startReg + vec4Count;
+        for (UINT i = startReg; i < last; ++i) add |= (1L << i);
+        LONG cur, want;
+        do { cur = InterlockedCompareExchange(&g_vsWriteMask, 0, 0); want = cur | add; }
+        while (InterlockedCompareExchange(&g_vsWriteMask, want, cur) != cur);
+    }
 
     // Nothing below may touch `data` before this. The verify block used to dereference it three
     // lines above the null check that guards it.
@@ -6195,6 +6221,132 @@ int g_upHist[6] = {};        // primitive-count histogram: 1, 2, 3-4, 5-8, 9-16,
 // in this codebase to take an access violation.
 int g_upVtxDumped[6] = {};
 
+// ---- ⭐ run 144: WHAT transforms a HUD draw? ----
+//
+// The vertex samples settled that HUD/menu text arrives as stride-20 DrawPrimUP in a stage space
+// of GFx's own - v0.x of 5534 on a 2560-wide backbuffer is neither NDC nor pixels. So something at
+// draw time maps stage space to the screen, and THAT mapping is what a per-eye HUD has to modify.
+// Two candidates, and 2010-era GFx could use either:
+//
+//   * a vertex shader, in which case the mapping is in its constants (c0-c3 by convention), or
+//   * the FIXED-FUNCTION pipeline, in which case it is in GetTransform(WORLD/VIEW/PROJECTION)
+//     and GetVertexShader returns NULL.
+//
+// Read, not hooked: a handful of GetVertexShaderConstantF / GetTransform calls on the next few
+// stride-20 draws after '[' is pressed. The NULL-or-not answer alone decides which mechanism the
+// per-eye transform goes through.
+int g_upXformDump = 0;
+
+// ---- run 145: find the STABLE registers, do not assume which they are ----
+//
+// Run 144 probed c0-c3 on the convention that a transform lives there, and the data refuted it:
+// two consecutive HUD draws in the SAME re-arm reported different c0. A stage-to-screen mapping
+// cannot change between two HUD draws of one frame, so c0-c3 are not it - most likely scene camera
+// residue, since at level 3 these draws pass through StereoPair, which uploads camera matrices.
+//
+// The real question is which registers hold something IDENTICAL across HUD draws, so this answers
+// that mechanically rather than by eye: snapshot c0-c31 on the first sampled draw, then diff every
+// later one against it and report only the registers that survived. Anything that changes between
+// two HUD draws is disqualified as the mapping by definition.
+// ---- ⭐ run 146: stop inferring which registers matter - watch the game SET them ----
+//
+// Run 145 narrowed the mapping to roughly c5-c12 by elimination, which is progress but still
+// leaves the layout to be guessed from four samples. There is a direct answer available: GFx sets
+// its constants through SetVertexShaderConstantF, and this mod already hooks that call. So record
+// which registers are written between one HUD draw and the next, and the shader's own constant
+// footprint is named rather than deduced.
+//
+// A bitmask over c0-c31, set in the constant hook and reported (and cleared) at the next stride-20
+// user-pointer draw. Costs one OR per constant upload.
+volatile LONG g_vsWriteMask = 0;
+
+// ---- ⭐ run 148: identify a HUD draw by its CONSTANTS, not its vertex stride ----
+//
+// Run 147 remapped stride-20 draws and the message TEXT landed correctly in both eyes - so the
+// c5-c8 finding and the ROW convention are both right. But the message's border lines, the
+// crosshair and part of the ammo readout were untouched: they are the same UI submitted with a
+// different vertex format, and a stride test cannot see that they belong together.
+//
+// The signal that does generalise is the one runs 145-146 actually measured: the game sets c5-c8
+// immediately before each of these draws. So flag that write and treat any user-pointer draw
+// following it as UI. Strides stop mattering.
+//
+// ⚠️ HudStereoPair writes c5-c8 itself, so without a guard it would re-arm its own flag and every
+// draw after a HUD element would be treated as UI too.
+volatile LONG g_hudConstsWritten = 0;
+bool g_inHudRemap = false;
+
+// How many draws took the per-eye UI path last frame. On the readout because the main menu behaves
+// differently from the in-game HUD - it comes out as two menus INSIDE each eye - and the first
+// thing worth knowing is whether it is being remapped twice as often as it should be, or the same
+// number of times with a transform that means something different there.
+volatile LONG g_hudDraws = 0, g_hudDrawsLast = 0;
+
+const int kUpConstRegs = 32;
+float g_upConstSnap[kUpConstRegs * 4] = {};
+bool  g_upConstStable[kUpConstRegs] = {};
+bool  g_upConstHaveSnap = false;
+
+inline void DumpUserPtrTransform(IDirect3DDevice9* dev, UINT stride, const char* which) {
+    if (g_upXformDump <= 0 || stride != 20 || !dev) return;
+    --g_upXformDump;
+    IDirect3DVertexShader9* vs = nullptr;
+    dev->GetVertexShader(&vs);
+    if (!vs) {
+        // Kept: if a build ever draws these fixed-function, the mapping is in the transforms and
+        // the whole approach changes. Run 144 measured a shader, so this is the unexpected branch.
+        D3DMATRIX p{};
+        dev->GetTransform(D3DTS_PROJECTION, &p);
+        Log("    UP transform [%s] FIXED FUNCTION - projection row0 %.4f %.4f %.4f %.4f",
+            which, p.m[0][0], p.m[0][1], p.m[0][2], p.m[0][3]);
+        return;
+    }
+    vs->Release();
+
+    float c[kUpConstRegs * 4]{};
+    if (FAILED(dev->GetVertexShaderConstantF(0, c, kUpConstRegs))) return;
+
+    if (!g_upConstHaveSnap) {
+        memcpy(g_upConstSnap, c, sizeof(c));
+        for (int i = 0; i < kUpConstRegs; ++i) g_upConstStable[i] = true;
+        g_upConstHaveSnap = true;
+        Log("    UP const snapshot taken from the first stride-20 draw [%s]", which);
+        return;
+    }
+    // What the game WROTE since the previous HUD draw. This is the shader's real constant
+    // footprint, as opposed to the elimination above which can only say what did not change.
+    {
+        const LONG mask = InterlockedExchange(&g_vsWriteMask, 0);
+        char b[160]; int n = 0;
+        for (int i = 0; i < kUpConstRegs && n < 140; ++i)
+            if (mask & (1L << i)) n += sprintf_s(b + n, sizeof(b) - n, "%sc%d", n ? " " : "", i);
+        Log("    UP consts WRITTEN since the last HUD draw: %s", n ? b : "(none)");
+    }
+
+    int stable = 0;
+    for (int i = 0; i < kUpConstRegs; ++i) {
+        if (!g_upConstStable[i]) continue;
+        for (int k = 0; k < 4; ++k)
+            if (fabsf(c[i*4+k] - g_upConstSnap[i*4+k]) > 1e-5f) { g_upConstStable[i] = false; break; }
+        if (g_upConstStable[i]) ++stable;
+    }
+    Log("    UP consts: %d of %d registers still identical across HUD draws [%s]",
+        stable, kUpConstRegs, which);
+    if (g_upXformDump == 0) {
+        // Last sample - print the survivors. These are the only candidates for the mapping.
+        for (int i = 0; i < kUpConstRegs; ++i) {
+            if (!g_upConstStable[i]) continue;
+            Log("      STABLE c%-2d = %10.4f %10.4f %10.4f %10.4f", i,
+                g_upConstSnap[i*4+0], g_upConstSnap[i*4+1],
+                g_upConstSnap[i*4+2], g_upConstSnap[i*4+3]);
+        }
+        D3DVIEWPORT9 vp{};
+        if (SUCCEEDED(dev->GetViewport(&vp)))
+            Log("      viewport %ux%u at (%u,%u) - the mapping's scale should relate to this",
+                vp.Width, vp.Height, vp.X, vp.Y);
+    }
+}
+
 inline void DumpUserPtrVertex(UINT primCount, const void* vtxData, UINT stride, const char* which) {
     const int b = primCount <= 1 ? 0 : primCount == 2 ? 1 : primCount <= 4 ? 2
                 : primCount <= 8 ? 3 : primCount <= 16 ? 4 : 5;
@@ -6240,6 +6392,119 @@ inline bool UserPtrQuad(UINT primCount, const void* vtxData, UINT stride) {
     return quad;
 }
 
+// ---- ⭐ run 147: draw the HUD into BOTH eyes ----
+//
+// The game's UI is submitted once at full-frame coordinates, so it straddles the seam - half in
+// each eye, unreadable. StereoPair cannot fix it: that duplicates with a per-eye SCISSOR and
+// remaps the CAMERA matrix, and a HUD element reads neither. It has to be TRANSFORMED.
+//
+// Runs 144-146 found where the transform lives, by three narrowing steps: the draws are stride-20
+// DrawPrimUP with a vertex shader (not fixed function), the mapping is not in c0-c3 (two HUD draws
+// in one frame disagreed there), and the game's own uploads before every HUD draw are consistently
+// **c5-c8**. So the same clip-space squash the scene geometry gets is applied to those four
+// registers instead.
+//
+// The convention was unknown and is now measured: run 147 offered ROW and COL as a key cycle, and
+// ROW put the message text correctly in both eyes while COL produced a white diagonal streak
+// across the frame. COL is gone; ' is now a plain on/off.
+//
+// Draw counts per remapped element go up, obviously - each UI draw becomes two. Measured at ~640
+// draws/frame with a message on screen against ~671 without the remap, so it is in the noise.
+int g_hudRemap = 0;
+
+template <typename DrawFn>
+HRESULT HudStereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
+    if (!g_hudRemap || !InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
+
+    float c[16];
+    D3DVIEWPORT9 vp{};
+    if (FAILED(dev->GetVertexShaderConstantF(5, c, 4)) || FAILED(dev->GetViewport(&vp)))
+        return draw();
+    // ---- ⭐ run 151: never remap a draw aimed at an OFFSCREEN target ----
+    //
+    // This is what broke the main menu, and the evidence was in the screenshots the whole time:
+    // with the remap OFF the menu renders CORRECTLY in both eyes already. It never needed us.
+    //
+    // Singularity's main menu is diegetic - drawn on a monitor inside the scene. GFx renders the
+    // menu into an offscreen TEXTURE, and the world geometry showing that texture was always being
+    // split properly by StereoPair via the camera matrix. Squashing the offscreen render put two
+    // copies inside the texture, and the monitor then faithfully displayed a doubled menu.
+    //
+    // StereoPair has guarded this since the shadow-map work - `if (!g_rtIsScene) return draw()` -
+    // and HudStereoPair simply did not inherit it. Same rule, same reason: a draw into a target
+    // that is not the scene has no eye halves to be split between.
+    if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) return draw();
+
+    // ---- run 150: only ORTHOGRAPHIC UI may be squashed in clip space ----
+    //
+    // ⚠️ This guard has NEVER FIRED - zero occurrences across every run since it was added. It was
+    // written on the theory that the main menu was world-space UI with a perspective transform,
+    // and that theory was wrong: the menu's transform is orthographic like every other UI element,
+    // and the render target was the real difference. Kept because squashing a perspective
+    // transform in clip space genuinely would be invalid, but it is NOT what fixed the menu and
+    // nothing has ever exercised it.
+    //
+    // The main menu came out as two menus inside each eye, and the draw count ruled out the
+    // obvious explanation: 29 remapped draws there against 31 for a quit-confirmation popup that
+    // renders correctly, so nothing is being processed twice. The difference is the transform.
+    //
+    // Singularity's main menu is DIEGETIC - it is drawn on monitors inside a 3D scene, not as a
+    // flat overlay. That transform carries a real perspective divide, and halving clip x about the
+    // eye centre is only valid for geometry that has none: with a live w column the shift term
+    // rides on a varying w and the element lands somewhere different at every depth.
+    //
+    // The test is exact rather than heuristic. A 2D overlay's w column is (0,0,0,1) - measured on
+    // the in-game HUD - so anything else is world-space and belongs on the normal StereoPair path
+    // where the camera matrix is what gets remapped.
+    {
+        const Reg4* r = reinterpret_cast<const Reg4*>(c);
+        const bool ortho = fabsf(r[0].w) < 1e-4f && fabsf(r[1].w) < 1e-4f &&
+                           fabsf(r[2].w) < 1e-4f && fabsf(r[3].w - 1.0f) < 1e-3f;
+        if (!ortho) {
+            static int once = 0;
+            if (once < 3) {
+                ++once;
+                Log("HUD remap SKIPPED - w column (%.4f %.4f %.4f %.4f) is not orthographic, so"
+                    " this is world-space UI (the diegetic main menu) and clip-space squashing"
+                    " would not be valid.", r[0].w, r[1].w, r[2].w, r[3].w);
+            }
+            return draw();
+        }
+    }
+
+    g_inHudRemap = true;      // our own c5-c8 writes below must not re-arm the UI marker
+    InterlockedIncrement(&g_hudDraws);
+
+    RECT  oldRect{};
+    DWORD oldOn = FALSE;
+    dev->GetScissorRect(&oldRect);
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldOn);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
+
+    const LONG halfW = (LONG)vp.Width / 2;
+    HRESULT hr = S_OK;
+    for (int eye = 0; eye < 2; ++eye) {
+        float m[16];
+        memcpy(m, c, sizeof(m));
+        ApplyEyeRemap(reinterpret_cast<Reg4*>(m), CONV_ROW, eye ? +0.5f : -0.5f);
+        // The scissor is belt and braces: with the transform right the geometry already lands in
+        // its own half, and with it wrong this stops the failure spilling across the whole frame.
+        RECT r = { (LONG)vp.X + (eye ? halfW : 0), (LONG)vp.Y,
+                   (LONG)vp.X + (eye ? (LONG)vp.Width : halfW), (LONG)(vp.Y + vp.Height) };
+        dev->SetScissorRect(&r);
+        dev->SetVertexShaderConstantF(5, m, 4);
+        hr = draw();
+    }
+    // Restore everything. GFx sets c5-c8 per draw so it would recover anyway, but leaving a
+    // modified constant behind for whatever draws next is the kind of thing that surfaces three
+    // runs later as an unrelated mystery.
+    dev->SetVertexShaderConstantF(5, c, 4);
+    dev->SetScissorRect(&oldRect);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldOn);
+    g_inHudRemap = false;
+    return hr;
+}
+
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
     if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
@@ -6248,7 +6513,22 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     ++g_drawsUP;
     if (g_userPtrHookLevel == 2) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     DumpUserPtrVertex(primCount, vtxData, vtxStride, "DrawPrimUP");
-    if (UserPtrQuad(primCount, vtxData, vtxStride)) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
+    DumpUserPtrTransform(dev, vtxStride, "DrawPrimUP");
+    // ---- ⚠️ run 149: the fullscreen composite must be excluded, or the frame quadruples ----
+    //
+    // Run 148 armed the HUD remap on any c5-c8 write and tested it BEFORE the quad classifier.
+    // Scene constant uploads overlap that register range, so the marker armed for the scene's
+    // fullscreen composite quad - a user-pointer draw - which then got squashed to half width and
+    // drawn twice. That takes the ALREADY side-by-side frame and puts a copy in each half: four
+    // panels, with every UI element visible in all of them because the whole image was duplicated.
+    //
+    // The classifier that separates a fullscreen quad from real geometry already exists and is the
+    // project's established tool for this. It just has to run FIRST.
+    const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
+    const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
+    if (hudArmed && g_hudRemap && !quad)
+        return HudStereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
+    if (quad) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
@@ -6266,7 +6546,15 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     DumpUserPtrVertex(primCount, vtxData, vtxStride, "DrawIndexedPrimUP");
-    if (UserPtrQuad(primCount, vtxData, vtxStride)) {
+    DumpUserPtrTransform(dev, vtxStride, "DrawIndexedPrimUP");
+    // Quad test first - see the note in Hook_DrawPrimUP for what happens when it is not.
+    const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
+    const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
+    if (hudArmed && g_hudRemap && !quad)
+        return HudStereoPair(dev, [&] {
+            return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
+                                           idxData, idxFormat, vtxData, vtxStride); });
+    if (quad) {
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     }
@@ -9509,7 +9797,9 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     }
 
     char l8[40];
-    _snprintf_s(l8, sizeof(l8), _TRUNCATE, "EYE %uX%u  DRAWS %d",
+    _snprintf_s(l8, sizeof(l8), _TRUNCATE, "HUD %s %ld  EYE %uX%u  DRAWS %d",
+                g_hudRemap ? "ON " : "OFF",
+                InterlockedCompareExchange(&g_hudDrawsLast, 0, 0),
                 InterlockedCompareExchange(&g_dupDraws, 0, 0) ? g_srcW / 2 : g_srcW, g_srcH,
                 g_drawsTotal);
 
@@ -10310,6 +10600,41 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     }
     pFreeze = kFreeze;
 
+    // ---- ⭐ run 144: '[' re-arms the user-pointer vertex sampler ----
+    //
+    // The sampler takes two vertices per primitive-count bucket and then stops FOR THE WHOLE RUN.
+    // That was fine when it was answering "what shape are these draws in general", and useless for
+    // the HUD: it fires during startup and the buckets are full long before there is a health bar
+    // on screen. Every sample would describe the loading screen.
+    //
+    // So it re-arms on a key, and the samples then come from whatever is in front of you when you
+    // press it. The classification counters clear with it, for the same reason - a cumulative
+    // quad/split ratio dominated by menu geometry says nothing about the HUD.
+    static bool pReArm = false;
+    bool kReArm = (GetAsyncKeyState(VK_OEM_4) & 0x8000) != 0;      // '['
+    if (kReArm && !pReArm) {
+        for (int i = 0; i < 6; ++i) { g_upVtxDumped[i] = 0; g_upHist[i] = 0; }
+        g_drawsUPQuad = 0; g_drawsUPSplit = 0;
+        // Enough draws to disqualify registers that merely happen to match once. The survivors are
+        // printed on the last one, so this count also decides when the answer appears.
+        g_upXformDump = 12;
+        g_upConstHaveSnap = false;
+        Log("[: user-pointer vertex sampler RE-ARMED - the next two draws in each primitive-count"
+            " bucket will be dumped, and the quad/split counters are cleared. Whatever is on"
+            " screen now is what gets described.");
+    }
+    pReArm = kReArm;
+
+    // ' : the HUD per-eye remap. On/off now that the convention is settled - run 147 measured ROW
+    // correct and COL producing a white diagonal streak across the frame.
+    static bool pHud = false;
+    bool kHud = (GetAsyncKeyState(VK_OEM_7) & 0x8000) != 0;
+    if (kHud && !pHud) {
+        g_hudRemap = g_hudRemap ? 0 : 1;
+        Log("': HUD per-eye remap %s", g_hudRemap ? "ON" : "OFF - the UI spans the seam, as before");
+    }
+    pHud = kHud;
+
     // INSERT: blank one half. Whichever eye goes black tells us the half-to-eye mapping for
     // certain, which reading the code did not settle.
     static bool pIns = false;
@@ -10953,6 +11278,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // Reset the per-frame diagnostics AFTER reporting them, so each report covers one frame.
     g_capTanMin = 1e9f; g_capTanMax = -1e9f; g_injCount = 0;
     g_lockUploads = 0; g_lockRejects = 0;
+    InterlockedExchange(&g_hudDrawsLast, InterlockedExchange(&g_hudDraws, 0));
     g_drawsTotal = 0; g_drawsDuped = 0; g_drawsDupedOffset = 0; g_drawsOffscreen = 0; g_drawsMonoFallback = 0; g_drawsUP = 0;
 
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
@@ -11393,6 +11719,29 @@ void LoadIniSettings() {
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;
+
+    // ---- ⭐ run 151: the HUD in both eyes ----
+    //
+    // ON by default: without it the game's health, ammo, crosshair, prompts and menus are drawn
+    // once at full-frame coordinates and straddle the eye seam - half in each eye, unreadable.
+    //
+    // ⚠️ It REQUIRES the user-pointer draw hooks, because that is how the UI reaches the GPU. With
+    // those off this setting would do exactly nothing, silently - the failure mode that has cost
+    // this project more runs than any other. So it raises the level itself and says so, rather
+    // than leaving two settings that have to be right together.
+    LONG hudIni = GetPrivateProfileIntA("Render", "HudStereo", 1, path);
+    if (hudIni < 0 || hudIni > 1) hudIni = 1;
+    g_hudRemap = (int)hudIni;
+    if (g_hudRemap && g_userPtrHookLevel < 3) {
+        Log("ini: HudStereo=1 needs HookUserPointerDraws=3 (was %d) - raising it, because the UI"
+            " only reaches us through those draws and this would otherwise do nothing at all.",
+            g_userPtrHookLevel);
+        g_userPtrHookLevel = 3;
+    }
+    Log("ini: HudStereo=%d (%s)", g_hudRemap,
+        g_hudRemap ? "the game's HUD and menus are drawn into BOTH eyes"
+                   : "off - the UI spans the seam, half in each eye");
+
     g_hookUserPtrDraws = g_userPtrHookLevel > 0;
     Log("ini: HookUserPointerDraws=%d (%s)", g_userPtrHookLevel,
         g_userPtrHookLevel == 0 ? "not hooked - known good" :

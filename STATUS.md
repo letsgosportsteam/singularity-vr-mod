@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 143). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 151). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -35,6 +35,7 @@ dropped beside the game exe. No game files modified.
 | **`D3D9ExMode=1` texture corruption** | ✅ **fixed** — run 139. Zero-copy is usable again; visuals match `D3D9ExMode=0` |
 | **Smooth turning** | ✅ run 140 — `TurnMode=2`, degrees per second, works during cutscenes |
 | **VR settings panel** | ✅ run 142 — hold Y 1.3s anywhere; live changes, saved to the ini on close |
+| **The game's HUD and menus in both eyes** | ✅ run 151 — health, ammo, crosshair, prompts, pause menu. `HudStereo=1` |
 
 ### If you are picking this up cold, read these three things
 
@@ -51,23 +52,10 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **🔴 THE GAME'S HUD AND MENUS STRADDLE THE EYE SEAM.** The biggest remaining alpha item. Health,
-   ammo, the crosshair, `PAUSED`, the menu rows, `WARNING` — all drawn ONCE at full-frame
-   coordinates, so half lands in the left eye and half in the right. Unreadable in the headset.
-   - **⚠️ `HookUserPointerDraws=3` DOES NOT FIX THIS, and it looks like it should.** `StereoPair`
-     duplicates a draw with a per-eye SCISSOR and re-uploads the camera matrices. A HUD element
-     ignores both — run 42's own comment says it: *"the quad is not remapped by c0 (its vertex
-     shader never reads the view matrix)"*. Splitting it draws the same full-frame geometry twice,
-     clipped, and each eye still sees only its half. Do not spend a run on that setting.
-   - **The fix is a TRANSFORM, not a split.** Scale clip-space x by 0.5 and offset by ∓0.5 per eye.
-     Tractable because these are `DrawPrimitiveUP` calls, so **the vertex data is a CPU pointer we
-     already hold** — copy, transform x, draw, twice.
-   - **Order of work:** one diagnostic run at `HookUserPointerDraws=1` with `DumpUserPtrVertex` to
-     enumerate what the HUD submits and confirm the vertex layout. `UserPtrQuad` already separates
-     small NDC quads from world geometry, which is most of the identification. Then the transform.
-   - **The crosshair falls out of this.** Once HUD draws are enumerated individually, skipping one
-     is trivial. Doing it before the HUD fix means guessing which draw it is, and the alignment
-     question cannot even be judged while the HUD is split across the seam.
+1. **Hide the crosshair when aiming with the Touch controllers.** Now tractable: UI draws are
+   individually intercepted, so skipping one is easy — what is missing is a *signature* for which
+   draw is the crosshair, the way the foreground meshes needed vertex counts. Worth doing as a
+   panel setting rather than a hardcode.
 2. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
    weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
    correctly aligned**, so they are not one system and whatever anchors the flash is not what
@@ -141,6 +129,64 @@ dropped beside the game exe. No game files modified.
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## Runs 144–151: the HUD in both eyes
+
+**Fixed.** Health, ammo, crosshair, pickup prompts, message text and borders, the pause menu and
+the quit confirmation are all drawn into each eye. `HudStereo=1` by default.
+
+### How the UI was found, in four narrowing steps
+
+Each step killed an assumption rather than confirming one:
+
+1. **The draws are `DrawPrimUP`, stride 20, with a vertex shader** — not fixed function. Positions
+   like `(5534, 141)` on a 2560-wide target, so neither NDC nor pixels: GFx's own stage space.
+2. **The transform is NOT in `c0`–`c3`.** Two HUD draws in the same frame reported different `c0`,
+   and a stage-to-screen mapping cannot change between them. Those were scene camera residue.
+3. **It is in `c5`–`c8`**, established by watching the game *set* them — `SetVertexShaderConstantF`
+   is already hooked, so the registers written between one HUD draw and the next name the shader's
+   footprint directly instead of being deduced from what did not change.
+4. **The convention is ROW**, settled by offering both as a key cycle. ROW put the message text
+   correctly in both eyes; COL produced a white diagonal streak across the frame.
+
+The fix is `ApplyEyeRemap` — the same clip-space squash scene geometry gets — applied to `c5`–`c8`,
+with the draw issued once per eye.
+
+### ⚠️ Two guards it must have, both learned by breaking things
+
+- **Exclude fullscreen quads.** Keying on "did the game write `c5`–`c8`" arms for the scene's
+  fullscreen composite too, because scene constant uploads overlap that range. Remapping *that*
+  takes the already side-by-side frame and puts a copy in each half: **four panels**. The existing
+  `UserPtrQuad` classifier separates them; it just has to run FIRST.
+- **Exclude offscreen render targets.** Singularity's main menu is **diegetic** — GFx renders it
+  into a texture and the game maps that onto a monitor in the scene. Squashing the offscreen render
+  put two copies inside the texture, and the monitor faithfully displayed a doubled menu.
+  `StereoPair` has guarded this since the shadow-map work (`if (!g_rtIsScene) return draw()`);
+  `HudStereoPair` did not inherit it.
+
+**The evidence for the second one was in a screenshot for three exchanges before I read it:** with
+the remap OFF the main menu rendered *correctly*. That means it never needed remapping, not that
+the remap was broken there. Two hypotheses were spent guessing (a stale viewport, double
+processing) before the draw COUNT settled it — 29 remapped draws at the menu against 31 for a
+popup that renders fine, so nothing was being processed twice and the difference had to be
+elsewhere. **Ask for the number before the third guess, not after it.**
+
+Also dead: an "only orthographic UI may be squashed" guard, added on the theory that the diegetic
+menu carried a perspective transform. It has **never fired**. The menu's transform is orthographic
+like every other UI element; the render target was the whole difference. Kept as a correctness
+guard, annotated so nobody mistakes it for load-bearing.
+
+### Cost, measured
+
+12–16 UI draws a frame in gameplay, 23–31 in menus, against `DRAWS` of 700–1800. Roughly 30 extra
+draw calls at worst — noise. That answers whether per-eye UI is affordable, which nobody had asked.
+
+### `HudStereo` raises `HookUserPointerDraws` itself
+
+The UI only reaches us through the user-pointer draws, so with those off the setting would do
+nothing, silently — the failure mode that cost runs 133, 137 and 138. It raises the level to 3 and
+logs that it did. ⚠️ Run 55 had reverted that hook to 0 on frame-time grounds; the HUD needs it, and
+the measured cost above is the case for accepting it.
 
 ## Runs 139–143: smooth turning, a settings panel, and why it is not in the game's menu
 

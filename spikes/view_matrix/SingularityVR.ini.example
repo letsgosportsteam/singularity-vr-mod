@@ -564,3 +564,31 @@ GpuFenceProbe=1
 ; TurnSpeed=120      ; degrees per second, mode 2 only
 ; TurnSign=1
 ; ---------------------------------------------------------------------------
+
+; ---------------------------------------------------------------------------
+; HudStereo  -- the game's HUD and menus in BOTH eyes (run 151)
+;
+; Without it, health, ammo, the crosshair, pickup prompts and the menus are
+; drawn ONCE at full-frame coordinates, so half lands in each eye and none of
+; it is readable in the headset.
+;
+; The UI is Scaleform, submitted through DrawPrimitiveUP with its stage->clip
+; matrix in vs c5-c8. This applies the same per-eye clip-space squash the scene
+; geometry gets to those four registers and issues the draw once per eye.
+;
+; Two things are deliberately EXCLUDED, and both were learned by breaking them:
+;   * fullscreen quads - remapping the scene's composite quad puts the whole
+;     side-by-side frame into each half, i.e. four panels.
+;   * offscreen render targets - the main menu is diegetic, rendered into a
+;     texture and mapped onto a monitor in the scene. Squashing that put two
+;     menus inside the texture.
+;
+; Costs 12-31 extra draw calls a frame against 700-1800, i.e. nothing.
+;
+; ⚠️ Requires HookUserPointerDraws=3 - that is how the UI reaches us at all -
+; and raises it automatically rather than silently doing nothing.
+;
+;   1 = HUD and menus in both eyes                                <- default
+;   0 = off, the UI spans the seam
+; ---------------------------------------------------------------------------
+; HudStereo=1
