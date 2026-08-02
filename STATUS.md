@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-07-31** (end of run 59). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 128). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -29,7 +29,8 @@ dropped beside the game exe. No game files modified.
 | **FOV / aspect / resolution** | ✅ **100% of the headset's pixels, automatic** |
 | **Performance** | ✅ **120 fps locked**, 4.35 ms idle per frame |
 | **Controller input** | ✅ **working** — full Touch mapping, menus, haptics, snap turn, off-hand movement |
-| **Aim decoupling** | ✅ **working (run 90)** — engine follows the hand, 30° clamp, 4× culling headroom. Costs some LOD pop |
+| **Aim decoupling** | ✅ **SOLVED via route 2** — the bullet follows the controller, the view never moves, and it costs NOTHING in culling or LOD. Aim mode 11 |
+| **Gun follows the controller** | 🔧 mechanism works, calibrating the pivot. APPS toggles it |
 
 ### If you are picking this up cold, read these three things
 
@@ -46,10 +47,28 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **Aim decoupling, route 2 — one headset run from an answer.** Run 91 named the function out of
-   the game's own script: `RvWeaponShared.GetAdjustedAim`. Apply the unapplied `FFrame::Node` fix
-   to the census (see run 91), gate it on that name, and the run answers yes/no. Route 1 already
-   works and stays as the fallback; route 2 costs no LOD.
+1. **Tune the gun anchor. One run, no code.** Everything else on the gun rung works. The anchor is
+   the point the gun rotates about, and getting it onto the grip is what stops it swinging through
+   an arc when you turn your wrist. It is pure eyeball and it is on the arrow keys.
+
+   1. Load a save, **BACKSPACE**, **NUMPAD .** twice (aim mode 11), **APPS** three times (gun +
+      arms hidden).
+   2. Point the gun straight, then rotate your wrist and watch **what stays still**.
+   3. **LEFT/RIGHT** pick the axis, **UP/DOWN** move it. Read the values off the fourth line of the
+      on-screen readout.
+
+   | Symptom | Fix |
+   |---|---|
+   | gun orbits a point **in front** of it | increase Forward |
+   | gun orbits a point **behind** it | decrease Forward |
+   | swings sideways when it should turn in place | Right |
+   | rises or drops when it should turn in place | Up |
+
+   Starting point is `F25 R8 U-8`. When it settles, write the three numbers into
+   `GunAnchorFwd/Right/Up` in the ini to persist them.
+
+   ⚠️ **Judge one thing at a time.** `GunFollowPosition=0` freezes the gun's position so rotation
+   can be assessed alone. Tuning rotation and position together is how two earlier runs got muddled.
 2. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
@@ -129,6 +148,105 @@ the **thumbstick** too: with the look stick held over, `head yaw` stayed within 
 swept 152058 → 174083 → 16333, wrapping cleanly through the 65536 space. Body-turn and head-turn
 **add**, exactly as VR wants. That was the open question gating the whole input design and it is
 answered.
+
+## 🔧 Runs 114–128: the gun on the controller — mechanism proven, calibration in progress
+
+**Where to pick up: tune the anchor.** Everything else on this rung works. See "Next session" at
+the top.
+
+### ✅ Aim decoupling is DONE and confirmed in play
+
+Aim mode 11. Bullet follows the controller in both axes, view perfectly still, culling headroom
+stays at 1.0. **The tracer is visible and correct** — the earlier "I can't see the bullet" was the
+mirrored yaw sending it somewhere there was no reason to look, and it resolved itself once
+`g_yawSign` was applied. Nothing further needed here.
+
+### The first-person pass, and how it was found
+
+UE3 draws the weapon and arms in a **foreground depth-priority group**. The boundary is a
+**depth+stencil `Clear` late in the frame**, after which come exactly six draws:
+
+```
+Clear ZBUFFER|STENCIL          <- boundary
+  #1 5799 verts   #2 3314   #3 390
+SetViewport
+  #4 5799         #5 3314   #6 390     <- same three meshes, second pass
+Clear TARGET                   <- post / HUD
+```
+
+| Mesh | Verts | Is |
+|---|---|---|
+| 1 | **5799** | **the gun** |
+| 2 | **3314** | **the arms** |
+| 3 | 390 | no visible contribution |
+
+The pass also renders into **its own target** (`0x2B480760`) and is composited, which is why
+*hiding* a mesh leaves a black silhouette rather than transparency — the mask has nothing to show.
+Moving it has no such problem, because moved geometry is still drawn. Two of the meshes are also
+drawn at **draws 2–3** under `SetViewport MinZ 0 MaxZ 0` — a near-plane depth prime — and that copy
+must be transformed along with the foreground one or it leaves a hole where the gun was.
+
+### The transform
+
+`VP' = C · VP` substituted per draw, after `ApplyEyeRemap` so stereo survives. `C` is
+`v' = (v − G)·R + G + (H − G)`: rotate about the gun's anchor `G`, translate it to the hand `H`.
+
+- **ROW**: registers are rows of M, `clip = v·M`, so `M' = C·M`
+- **COL**: `clip.k = dot(reg[k], v)`, so `reg'[k].i = dot(reg[k], C_i)`
+
+`R = Rz(−t)·Rx(roll)·Ry(pitch)·Rz(t + yaw)` — pitch and roll are **conjugated by the view yaw `t`**
+because they belong in the view's frame, not the world's.
+
+### ⚠️ Four traps, each of which cost a run
+
+- **The pivot lives in TRANSLATED-WORLD space.** ENGINE_NOTES already recorded that UE3 of this
+  vintage pre-subtracts the view origin, so **the camera is at the origin**. Pivoting about
+  `g_camPos` flung the gun twenty thousand units away. A pure translation is identical in both
+  spaces, which is why the fixed-offset test passed and hid this until a pivot was introduced.
+- **A mesh index is not a handle.** The foreground list is rebuilt every frame, and muzzle-flash
+  geometry joins it while firing — so index `[1]` stopped being the gun and the gun flashed back to
+  normal mid-shot. Meshes are now **latched by vertex count**.
+- **The signature table must be double-buffered.** Session-wide, it filled with menu geometry;
+  reset per frame, it was empty when the depth-prime draws arrived at the start of the frame and
+  hiding left a silhouette. Learn into one list, **match against a copy promoted at end of frame**.
+- **A 360° period is a frame error.** "Fine facing forward, droops as I spin, correct after a full
+  circle" named its own cause: pitch applied about world Y instead of the view's right axis.
+
+### 🚦 In-headset tooling added, and why it was overdue
+
+Every setting went to a log file, so state could only be read by taking the headset off. That gap
+was named early and left alone, and it **cost a run**: "combo 2" meant different signs in two
+sessions and nothing on screen could have said so.
+
+- **On-screen readout** — real text (5×7 bitmap, drawn as `Clear` rectangle runs; the SDK ships no
+  D3DX). Shows the combo, **the derived signs**, the aim mode, and the anchor with the selected
+  axis marked.
+- **CAPS LOCK** — cycles 16 states: bits 0–2 flip yaw/pitch/roll, **bit 3 turns the view-frame
+  conjugation off**. Signs are found by moving your hand; the frame bit is found by spinning.
+- **Arrow keys** — LEFT/RIGHT pick an anchor axis, UP/DOWN move it one engine unit.
+- **APPS** — 0 normal · 1 gun moved · 2 arms hidden · 3 both.
+- **Hold PAUSE ~1s** — quit. `WM_CLOSE`, not `ExitProcess`, because every copy of the game shares
+  one save profile. A hold, because SCROLL LOCK is adjacent and arms the census.
+- **Launch straight into gameplay**: `Singularity.exe SP_RL_p` (also `SP_RT_p`, `SP_SL_p`,
+  `SP_VIL_p`, `SP_WL_p`). The mod **appends** its resolution args, so parity survives. A fresh map
+  may spawn you unarmed — `RvCheatManager` exists if so.
+
+### Current calibration
+
+`GunSignCombo=2` → yaw **+**, pitch **−**, roll **+**, view-frame **ON**. Note this is a *different*
+effective pitch sign from the "combo 2" of two runs earlier — set via a **starting combo** key
+rather than by changing sign defaults, because changing those renumbers the combos.
+
+### 📋 Known issues, deliberately not chased yet
+
+- **Muzzle flash / smoke still tied to screen centre.** Barely visible in the headset, obvious on
+  the monitor. A separate effect that does not follow the gun.
+- **Barrel smoke IS correctly aligned** — so the effects are not one system, and whatever anchors
+  the flash is not what anchors the smoke.
+- **Leftover arm/hand pieces appear during reload.** Extra meshes present only in the reload
+  animation, so they are not in the list when the counts are latched.
+- **The TMD** (left-hand device, later in the game) will need the same treatment driven by the
+  **left** controller. Unverifiable until that point in the game is reached.
 
 ## ✅ Runs 103–112: ROUTE 2 WORKS — rotate the trace, not the rotation
 
