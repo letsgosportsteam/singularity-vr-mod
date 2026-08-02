@@ -5146,7 +5146,8 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
 // Defined with the foreground-pass probe below; the draw hooks need it first.
 HWND g_gameWindow = nullptr;
 extern volatile LONG g_frameDrawIdx;
-extern volatile LONG g_inForeground, g_hideForeground, g_fgDrawCount;
+extern volatile LONG g_inForeground, g_hideMeshIdx, g_fgDrawCount;
+static bool FgHidden(UINT verts);
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
@@ -5155,7 +5156,6 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, 0, count, (uint32_t)t);
-        if (InterlockedCompareExchange(&g_hideForeground, 0, 0)) return D3D_OK;
     }
     return StereoPair(dev, [&] { return g_origDrawPrim(dev, t, start, count); });
 }
@@ -5197,7 +5197,19 @@ void DumpDpgProbe();
 // this will trip early and the log will show it as a foreground run of hundreds of draws rather
 // than six - which is a visible, diagnosable wrong answer instead of a silently wrong one.
 volatile LONG g_inForeground = 0;      // set by the late depth clear, reset each Present
-volatile LONG g_hideForeground = 0;    // VK_APPS toggles: skip the foreground draws entirely
+// ---- run 117: hide ONE mesh at a time, everywhere it is drawn ----
+//
+// Both explanations for "black but still occluding" turned out to be true. The foreground pass
+// renders into its own target (0x2B480760) and is composited, AND two of the three meshes are
+// drawn again at draws 2-3 under SetViewport MinZ 0 MaxZ 0 - a depth-prime at the near plane, the
+// standard trick that stops a first-person weapon clipping into walls.
+//
+// So moving the gun means transforming BOTH copies, and the first thing needed is to know which of
+// the three meshes IS the gun. Hiding one at a time by vertex count answers that in one run, and
+// hiding it EVERYWHERE - prime pass included - doubles as the proof that we can reach every draw
+// of it. If a mesh vanishes completely and you can see through where it was, nothing of it is
+// left unaccounted for.
+volatile LONG g_hideMeshIdx = 0;       // 0 none, 1..3 index into the learned signatures
 volatile LONG g_fgDrawCount = 0;       // how many draws landed in the pass this frame
 
 // ---- run 116: are these meshes drawn ANYWHERE ELSE in the frame? ----
@@ -5220,6 +5232,13 @@ static void FgLearnSignature(UINT verts) {
     if (n >= kFgSigMax) return;
     InterlockedExchange(&g_fgSigVerts[n], (LONG)verts);
     InterlockedIncrement(&g_fgSigCount);
+}
+
+// True when this mesh is the one currently being hidden, wherever in the frame it is drawn.
+static bool FgHidden(UINT verts) {
+    const LONG h = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    if (h <= 0 || h > kFgSigMax) return false;
+    return verts && (UINT)InterlockedCompareExchange(&g_fgSigVerts[h - 1], 0, 0) == verts;
 }
 
 static bool FgMatchesSignature(UINT verts) {
@@ -5287,7 +5306,7 @@ void DumpDpgProbe() {
                 (e.a & D3DCLEAR_STENCIL) ? " STENCIL" : "", e.z0);
     }
     Log("    foreground draws this frame: %ld%s", InterlockedCompareExchange(&g_fgDrawCount, 0, 0),
-        InterlockedCompareExchange(&g_hideForeground, 0, 0) ? "  [HIDDEN - VK_APPS is ON]" : "");
+        "");
     Log("    A depth-only Clear or a MinZ/MaxZ change LATE in the frame brackets the first-person"
         " pass. The draws after it are the arms and the weapon.");
 }
@@ -5296,13 +5315,13 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                                                INT baseVertex, UINT minIndex, UINT numVertices,
                                                UINT startIndex, UINT primCount) {
     InterlockedIncrement(&g_frameDrawIdx);
+    if (FgHidden(numVertices)) return D3D_OK;   // hidden everywhere, prime pass included
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         FgLearnSignature(numVertices);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, numVertices, primCount, (uint32_t)t);
         // Returning S_OK without drawing is how the mod already drops draws elsewhere - the
         // device state is untouched, so the next draw behaves normally.
-        if (InterlockedCompareExchange(&g_hideForeground, 0, 0)) return D3D_OK;
     } else if (FgMatchesSignature(numVertices)) {
         // The same mesh, drawn OUTSIDE the foreground pass. This is the whole question.
         DpgRecord(4, 0.0f, 0.0f, (uint32_t)InterlockedCompareExchange(&g_frameDrawIdx, 0, 0),
@@ -8597,10 +8616,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         static bool pApps = false;
         const bool kApps = (GetAsyncKeyState(VK_APPS) & 0x8000) != 0;
         if (kApps && !pApps) {
-            const LONG on = InterlockedCompareExchange(&g_hideForeground, 0, 0) ? 0 : 1;
-            InterlockedExchange(&g_hideForeground, on);
+            const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+            const LONG next = (InterlockedCompareExchange(&g_hideMeshIdx, 0, 0) + 1) % (n + 1);
+            InterlockedExchange(&g_hideMeshIdx, next);
             InterlockedExchange(&g_dpgProbeFrames, 3);
-            Log("APPS: first-person pass %s", on ? "HIDDEN" : "shown");
+            if (next == 0) Log("APPS: all first-person meshes VISIBLE");
+            else Log("APPS: hiding first-person mesh %ld of %ld (verts %ld) - everywhere it is"
+                     " drawn, prime pass included", next, n,
+                     InterlockedCompareExchange(&g_fgSigVerts[next - 1], 0, 0));
         }
         pApps = kApps;
     }
