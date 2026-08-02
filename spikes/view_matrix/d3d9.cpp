@@ -5531,11 +5531,33 @@ static void BuildGunTransform(float C[4][4], const float p[3],
 // G is the anchor in the head's frame (forward, right, up) turned into world axes by the body yaw,
 // the same conversion the hand offset goes through - so both live in the same space and the
 // subtraction below is meaningful rather than two conventions differenced by luck.
+// ---- 💥 run 131: the anchor belongs in the VIEW's frame, not the BODY's ----
+//
+// Reported: moving your head moves the gun and the arms but leaves the anchor behind, so tuning it
+// meant holding your head rigid from the moment the level loaded.
+//
+// That is a real defect. G was built from g_baseYaw - the BODY yaw - and had no pitch term at all,
+// while the engine draws the gun attached to the VIEW. Turn your head and the gun moves and the
+// anchor does not; look up or down and they separate completely, since body yaw cannot express
+// pitch at all.
+//
+// So the offset is now rotated by the view's full orientation - yaw AND pitch - which is also the
+// more intuitive thing to tune against: "forward from where I am looking".
+static void GunAnchorWorld(float G[3]) {
+    const float kUUToRad = 6.2831853f / 65536.0f;
+    const float y = g_wantYaw   * kUUToRad;
+    const float p = g_wantPitch * kUUToRad;
+    const float cy = cosf(y), sy = sinf(y), cp = cosf(p), sp = sinf(p);
+    // UE3 basis for a (pitch, yaw) orientation: X forward, Y right, Z up.
+    const float F[3] = {  cp * cy,  cp * sy, sp };
+    const float R[3] = { -sy,       cy,      0.0f };
+    const float U[3] = { -sp * cy, -sp * sy, cp };
+    const float af = (float)g_gunAnchorFwd, ar = (float)g_gunAnchorRight, au = (float)g_gunAnchorUp;
+    for (int i = 0; i < 3; ++i) G[i] = af * F[i] + ar * R[i] + au * U[i];
+}
+
 static void BuildGunC(float C[4][4]) {
-    const float byr = g_baseYaw * (6.2831853f / 65536.0f);
-    const float bc = cosf(byr), bs = sinf(byr);
-    const float af = (float)g_gunAnchorFwd, ar = (float)g_gunAnchorRight;
-    const float G[3] = { bc * af - bs * ar, bs * af + bc * ar, (float)g_gunAnchorUp };
+    float G[3]; GunAnchorWorld(G);
 
     float H[3] = { G[0], G[1], G[2] };          // no position following -> translation cancels
     if (g_gunFollowPos) {
@@ -8687,11 +8709,7 @@ static bool ProjectToScreen(const float* mat, int conv, const float p[3],
 // Showing only one of them made the transform look wrong when it was the instructions that were.
 // So both are drawn: MAGENTA is the pivot G, CYAN is the destination H.
 static int AnchorMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
-    // The anchor in the same space the transform uses: head frame turned into world by body yaw.
-    const float byr = g_baseYaw * (6.2831853f / 65536.0f);
-    const float bc = cosf(byr), bs = sinf(byr);
-    const float af = (float)g_gunAnchorFwd, ar = (float)g_gunAnchorRight;
-    float G[3] = { bc * af - bs * ar, bs * af + bc * ar, (float)g_gunAnchorUp };
+    float G[3]; GunAnchorWorld(G);
     if (wantHand) {
         G[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0);
         G[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0);
