@@ -5136,6 +5136,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
 }
 
 // Defined with the foreground-pass probe below; the draw hooks need it first.
+HWND g_gameWindow = nullptr;
 extern volatile LONG g_frameDrawIdx;
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
@@ -8498,6 +8499,36 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     }
     pDec = kDec;
 
+    // ---- PAUSE held for a second: quit the game ----
+    //
+    // A test loop that ends in taking the headset off, finding the mouse and clicking through a
+    // menu costs more than the test does. One key, reachable by feel at the top right.
+    //
+    // It is a HOLD, not a tap, for two reasons. SCROLL LOCK sits directly beside PAUSE and arms
+    // the census, so a mis-hit in a headset is likely; and an accidental quit costs a whole run.
+    // The mod already uses hold-versus-tap for the controller MENU button, so the idiom is not new.
+    //
+    // WM_CLOSE rather than ExitProcess: it is the same shutdown path as clicking the window X, so
+    // the engine saves and exits normally. ENVIRONMENT.md records that every copy of this game
+    // shares ONE save profile - killing the process mid-write is a real way to lose it.
+    {
+        static ULONGLONG heldSince = 0;
+        const bool kPause = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
+        if (!kPause) {
+            heldSince = 0;
+        } else {
+            const ULONGLONG now = GetTickCount64();
+            if (!heldSince) heldSince = now;
+            else if (now - heldSince >= 800) {
+                heldSince = 0;
+                Log("PAUSE held: closing the game (WM_CLOSE to 0x%p) - clean shutdown, saves"
+                    " normally.", (void*)g_gameWindow);
+                if (g_gameWindow) PostMessageA(g_gameWindow, WM_CLOSE, 0, 0);
+                else              PostQuitMessage(0);
+            }
+        }
+    }
+
     // NUMPAD7 (or SCROLL LOCK): arm the script-call census, then press again to dump it.
     //
     // ⚠️ Run 83 was lost to this. SCROLL LOCK alone looked free, but the log recorded no press at
@@ -9511,6 +9542,11 @@ void LoadIniSettings() {
 HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYPE t, HWND w, DWORD f,
                                             D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
     LoadIniSettings();
+    // Kept for the PAUSE-to-quit key. The focus window is the game's real top-level window, so
+    // WM_CLOSE through it is the same shutdown path as clicking the X - the engine saves and
+    // exits normally. That matters here: ENVIRONMENT.md records that every copy of the game
+    // shares ONE save profile, so killing the process mid-write is a real way to lose it.
+    if (w) g_gameWindow = w;
 
     HRESULT hr;
     if (g_d3d9ExMode && g_d3d9ex) {
