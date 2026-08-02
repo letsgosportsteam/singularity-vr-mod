@@ -3370,6 +3370,7 @@ extern LONG  g_aimPoseUUPer1;
 extern LONG  g_aimFieldSet;
 extern LONG  g_traceSignYaw, g_traceSignPitch;
 extern LONG  g_gunSignYaw, g_gunSignPitch, g_gunSignRoll, g_gunFollowPos;
+extern LONG  g_gunSignPosZ, g_gunAnchorFwd, g_gunAnchorRight, g_gunAnchorUp;
 extern float g_aimPoseSignX, g_aimPoseSignY;
 
 bool InitXRInput() {
@@ -3406,6 +3407,13 @@ bool InitXRInput() {
             g_gunSignPitch = GetPrivateProfileIntA("Input", "GunSignPitch", -1, path) >= 0 ? 1 : -1;
             g_gunSignRoll  = GetPrivateProfileIntA("Input", "GunSignRoll",  1, path) >= 0 ? 1 : -1;
             g_gunFollowPos = GetPrivateProfileIntA("Input", "GunFollowPosition", 1, path);
+            g_gunSignPosZ    = GetPrivateProfileIntA("Input", "GunSignPosZ", -1, path) >= 0 ? 1 : -1;
+            // Where the gun sits relative to your eye, in engine units - forward, right, up. This
+            // is the point it ROTATES ABOUT, so getting it near the grip is what stops the gun
+            // swinging through an arc when you turn your wrist.
+            g_gunAnchorFwd   = GetPrivateProfileIntA("Input", "GunAnchorFwd",   25, path);
+            g_gunAnchorRight = GetPrivateProfileIntA("Input", "GunAnchorRight",  8, path);
+            g_gunAnchorUp    = GetPrivateProfileIntA("Input", "GunAnchorUp",    -8, path);
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             for (int i = 0; i < kPadButtonCount; ++i)
@@ -5171,15 +5179,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
                 // spaces. The moment a pivot was introduced the space started to matter, and this
                 // file has recorded which space it is since the matrix scan probed
                 // "origin(translated-world)" as a candidate point.
-                static const float kPivotOrigin[3] = { 0.0f, 0.0f, 0.0f };
-                float C[4][4];
-                BuildGunTransform(C, kPivotOrigin,
-                    (int32_t)(g_gunSignYaw   * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
-                    (int32_t)(g_gunSignPitch * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
-                    (int32_t)(g_gunSignRoll  * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
-                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffX, 0, 0) : 0.0f,
-                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffY, 0, 0) : 0.0f,
-                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffZ, 0, 0) : 0.0f);
+                float C[4][4]; BuildGunC(C);
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
             }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
@@ -5202,15 +5202,7 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
                 // Pivot on the camera: the gun hangs off the view, so turning it about the eye is
                 // what makes it point where the controller points. Pivoting on the world origin
                 // would fling it across the level.
-                static const float kPivotOrigin2[3] = { 0.0f, 0.0f, 0.0f };   // see the note above
-                float C[4][4];
-                BuildGunTransform(C, kPivotOrigin2,
-                    (int32_t)(g_gunSignYaw   * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
-                    (int32_t)(g_gunSignPitch * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
-                    (int32_t)(g_gunSignRoll  * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
-                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffX, 0, 0) : 0.0f,
-                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffY, 0, 0) : 0.0f,
-                    g_gunFollowPos ? (float)InterlockedCompareExchange(&g_handOffZ, 0, 0) : 0.0f);
+                float C[4][4]; BuildGunC(C);
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
             }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
@@ -5431,12 +5423,35 @@ static void ApplyWorldMatrix(Reg4* m, int conv, const float C[4][4]) {
 //
 // Signs are ini-overridable. Up/down came back reversed, and rather than negate it in place - which
 // is how a convention gets buried - it goes through the same kind of key the trace rotation uses.
+// ---- ⭐ run 124: the pivot must be the GUN, not the eye ----
+//
+// Reported: rotating right sends the gun right and then DOWN-right as the rotation grows, and the
+// centre of rotation is not where the handle is. That is the signature of rotating about the wrong
+// point: we pivot at the origin, which in translated-world space is the EYE, so the gun swings
+// through an arc half a metre long instead of turning in place.
+//
+// The correct transform is v' = (v - G) * R + G + (H - G), where G is the gun's own anchor and H
+// is the hand. G is not knowable from here, so it is an ini offset in the head's own frame -
+// forward, right, up in engine units - defaulting to roughly where a held pistol sits.
 LONG g_gunSignYaw = 1, g_gunSignPitch = -1, g_gunSignRoll = 1, g_gunFollowPos = 1;
+LONG g_gunSignPosZ = -1;                       // vertical translation came back flipped too
+LONG g_gunAnchorFwd = 25, g_gunAnchorRight = 8, g_gunAnchorUp = -8;   // engine units from the eye
+volatile LONG g_gunSignCombo = 0;              // CAPS LOCK cycles the eight rotation-sign combos
 
 static void Mul3(float out[3][3], const float a[3][3], const float b[3][3]) {
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             out[i][j] = a[i][0]*b[0][j] + a[i][1]*b[1][j] + a[i][2]*b[2][j];
+}
+
+// The eight rotation-sign combinations, cycled by CAPS LOCK so the right one is found in ONE run
+// instead of one restart per guess. Three axes reported wrong in three separate runs is what this
+// is for - a sign is not worth a headset session each.
+static void GunSigns(int& sy, int& sp, int& sr) {
+    const LONG c = InterlockedCompareExchange(&g_gunSignCombo, 0, 0);
+    sy = (c & 1) ? -(int)g_gunSignYaw   : (int)g_gunSignYaw;
+    sp = (c & 2) ? -(int)g_gunSignPitch : (int)g_gunSignPitch;
+    sr = (c & 4) ? -(int)g_gunSignRoll  : (int)g_gunSignRoll;
 }
 
 static void BuildGunTransform(float C[4][4], const float p[3],
@@ -5464,6 +5479,33 @@ static void BuildGunTransform(float C[4][4], const float p[3],
     C[3][1] = p[1] - (p[0]*R[0][1] + p[1]*R[1][1] + p[2]*R[2][1]) + ty;
     C[3][2] = p[2] - (p[0]*R[0][2] + p[1]*R[1][2] + p[2]*R[2][2]) + tz;
     C[3][3] = 1.0f;
+}
+
+// Build the gun transform: rotate about the gun's OWN anchor, then translate that anchor to the
+// hand. v' = (v - G) * R + G + (H - G), which BuildGunTransform expresses as pivot G plus
+// translation (H - G).
+//
+// G is the anchor in the head's frame (forward, right, up) turned into world axes by the body yaw,
+// the same conversion the hand offset goes through - so both live in the same space and the
+// subtraction below is meaningful rather than two conventions differenced by luck.
+static void BuildGunC(float C[4][4]) {
+    const float byr = g_baseYaw * (6.2831853f / 65536.0f);
+    const float bc = cosf(byr), bs = sinf(byr);
+    const float af = (float)g_gunAnchorFwd, ar = (float)g_gunAnchorRight;
+    const float G[3] = { bc * af - bs * ar, bs * af + bc * ar, (float)g_gunAnchorUp };
+
+    float H[3] = { G[0], G[1], G[2] };          // no position following -> translation cancels
+    if (g_gunFollowPos) {
+        H[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0);
+        H[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0);
+        H[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0));
+    }
+    int sy, sp, sr; GunSigns(sy, sp, sr);
+    BuildGunTransform(C, G,
+        (int32_t)(sy * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
+        (int32_t)(sp * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
+        (int32_t)(sr * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
+        H[0] - G[0], H[1] - G[1], H[2] - G[2]);
 }
 
 static void ApplyWorldOffset(Reg4* m, int conv, float tx, float ty, float tz) {
@@ -8885,6 +8927,22 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         }
     }
     pDec = kDec;
+
+    // ---- CAPS LOCK: cycle the eight gun rotation-sign combinations ----
+    //
+    // Three axes have come back wrong in three separate runs, each costing a restart to test one
+    // guess. Eight combinations on one key finds the right one inside a single session.
+    {
+        static bool pCaps = false;
+        const bool kCaps = (GetAsyncKeyState(VK_CAPITAL) & 0x8000) != 0;
+        if (kCaps && !pCaps) {
+            const LONG combo = (InterlockedCompareExchange(&g_gunSignCombo, 0, 0) + 1) & 7;
+            InterlockedExchange(&g_gunSignCombo, combo);
+            int sy, sp, sr; GunSigns(sy, sp, sr);
+            Log("CAPS: gun signs combo %ld - yaw %+d pitch %+d roll %+d", combo, sy, sp, sr);
+        }
+        pCaps = kCaps;
+    }
 
     // ---- VK_APPS: hide the first-person pass ----
     //
