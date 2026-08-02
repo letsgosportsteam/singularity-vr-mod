@@ -5109,7 +5109,16 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
             const CamMatSlot& cs = g_camMats[slots[i]];
             memcpy(mat, cs.m, sizeof(mat));
             ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), cs.conv, -0.5f);
-            if (g_thisDrawMoved) ApplyWorldOffset(reinterpret_cast<Reg4*>(mat), cs.conv, 30.0f, 0.0f, 0.0f);
+            if (g_thisDrawMoved) {
+                // Pivot on the camera: the gun hangs off the view, so turning it about the eye is
+                // what makes it point where the controller points. Pivoting on the world origin
+                // would fling it across the level.
+                float C[4][4];
+                BuildGunTransform(C, g_camPos,
+                                  (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0),
+                                  (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0));
+                ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
+            }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
         }
         hr = draw();
@@ -5126,7 +5135,16 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
             // move and must happen before clip space is rescaled.
             ApplyOffset(reinterpret_cast<Reg4*>(mat), cs.conv, g_eyeDeltaUU);
             ApplyEyeRemap(reinterpret_cast<Reg4*>(mat), cs.conv, +0.5f);
-            if (g_thisDrawMoved) ApplyWorldOffset(reinterpret_cast<Reg4*>(mat), cs.conv, 30.0f, 0.0f, 0.0f);
+            if (g_thisDrawMoved) {
+                // Pivot on the camera: the gun hangs off the view, so turning it about the eye is
+                // what makes it point where the controller points. Pivoting on the world origin
+                // would fling it across the level.
+                float C[4][4];
+                BuildGunTransform(C, g_camPos,
+                                  (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0),
+                                  (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0));
+                ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
+            }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
         }
         HRESULT hr2 = draw();
@@ -5285,6 +5303,62 @@ static void FgLearnSignature(UINT verts) {
 //
 // Both are exact - this is a change of the transform, not an approximation of one - and doing it
 // AFTER ApplyEyeRemap means the per-eye offset is preserved.
+// ---- ⭐ run 121: a full transform, so the gun can be ROTATED and not just shifted ----
+//
+// Stage 4a proved the mechanism with a fixed translation. Pointing the gun where the controller
+// points needs a rotation about a pivot, which a translate-only shortcut cannot express, so the
+// transform becomes a real 4x4 composed into the uploaded matrix.
+//
+// C is row-vector form: v' = v * C. Rotating about pivot p by R is T(-p) * R * T(p), which in
+// row form is the 3x3 R in the top-left and (p - p*R) as the bottom row.
+//
+// ROW  registers are rows of M and clip = v*M, so M' = C*M: row i of M' is sum_k C[i][k]*row_k(M)
+// COL  registers give clip.k = dot(reg[k], v), so reg'[k].i = dot(reg[k], row_i(C))
+//
+// Both are exact. Applied AFTER ApplyEyeRemap so the per-eye offset survives.
+static void ApplyWorldMatrix(Reg4* m, int conv, const float C[4][4]) {
+    Reg4 out[4];
+    if (conv == CONV_ROW) {
+        for (int i = 0; i < 4; ++i) {
+            out[i].x = C[i][0]*m[0].x + C[i][1]*m[1].x + C[i][2]*m[2].x + C[i][3]*m[3].x;
+            out[i].y = C[i][0]*m[0].y + C[i][1]*m[1].y + C[i][2]*m[2].y + C[i][3]*m[3].y;
+            out[i].z = C[i][0]*m[0].z + C[i][1]*m[1].z + C[i][2]*m[2].z + C[i][3]*m[3].z;
+            out[i].w = C[i][0]*m[0].w + C[i][1]*m[1].w + C[i][2]*m[2].w + C[i][3]*m[3].w;
+        }
+    } else {
+        for (int k = 0; k < 4; ++k) {
+            const float v[4] = { m[k].x, m[k].y, m[k].z, m[k].w };
+            out[k].x = v[0]*C[0][0] + v[1]*C[0][1] + v[2]*C[0][2] + v[3]*C[0][3];
+            out[k].y = v[0]*C[1][0] + v[1]*C[1][1] + v[2]*C[1][2] + v[3]*C[1][3];
+            out[k].z = v[0]*C[2][0] + v[1]*C[2][1] + v[2]*C[2][2] + v[3]*C[2][3];
+            out[k].w = v[0]*C[3][0] + v[1]*C[3][1] + v[2]*C[3][2] + v[3]*C[3][3];
+        }
+    }
+    for (int i = 0; i < 4; ++i) m[i] = out[i];
+}
+
+// Rotate about `p` by yaw then pitch, both in engine rotation units. UE3 is X forward, Y right,
+// Z up: yaw turns about Z, pitch about Y.
+static void BuildGunTransform(float C[4][4], const float p[3], int32_t yawUU, int32_t pitchUU) {
+    const float kUUToRad = 6.2831853f / 65536.0f;
+    const float ca = cosf(yawUU * kUUToRad),   sa = sinf(yawUU * kUUToRad);
+    const float cb = cosf(pitchUU * kUUToRad), sb = sinf(pitchUU * kUUToRad);
+    // R = Rz * Ry in row-vector form.
+    const float R[3][3] = {
+        {  ca * cb,  sa,  -ca * sb },
+        { -sa * cb,  ca,   sa * sb },
+        {  sb,       0.0f, cb      },
+    };
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) C[i][j] = R[i][j];
+        C[i][3] = 0.0f;
+    }
+    // bottom row = p - p*R, which is what makes the rotation happen about p rather than the origin
+    for (int j = 0; j < 3; ++j)
+        C[3][j] = p[j] - (p[0]*R[0][j] + p[1]*R[1][j] + p[2]*R[2][j]);
+    C[3][3] = 1.0f;
+}
+
 static void ApplyWorldOffset(Reg4* m, int conv, float tx, float ty, float tz) {
     if (conv == CONV_ROW) {
         m[3].x += tx * m[0].x + ty * m[1].x + tz * m[2].x;
@@ -8720,9 +8794,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_dpgProbeFrames, 3);
             static const char* kWhat[4] = {
                 "0 - normal, nothing touched",
-                "1 - GUN MOVED 30 units sideways (arms untouched)",
+                "1 - GUN ROTATED to follow your controller (arms untouched)",
                 "2 - ARMS HIDDEN (gun untouched)",
-                "3 - GUN MOVED and ARMS HIDDEN - the target configuration" };
+                "3 - GUN follows your controller and ARMS HIDDEN - the target configuration" };
             Log("APPS: %s", kWhat[next & 3]);
         }
         pApps = kApps;
