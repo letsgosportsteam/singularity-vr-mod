@@ -5135,13 +5135,92 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
     return hr;
 }
 
+// Defined with the foreground-pass probe below; the draw hooks need it first.
+extern volatile LONG g_frameDrawIdx;
+
 HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                         UINT start, UINT count) {
+    InterlockedIncrement(&g_frameDrawIdx);
     return StereoPair(dev, [&] { return g_origDrawPrim(dev, t, start, count); });
 }
+// ================= ⭐ run 114: find the FOREGROUND pass =======================================
+//
+// The first-person weapon and arms are drawn in their own depth-priority group - a pass rendered
+// after the main scene so the gun never clips into walls. `GetForegroundDPGOverrides` in the run-95
+// census confirms this build has one. That means the geometry is ALREADY separated by the engine
+// and we do not have to invent a way to tell it apart; we only have to find the boundary.
+//
+// Two independent signals, because either one alone could be absent:
+//
+//   * SetViewport with a changed MinZ/MaxZ - the classic depth-range compression for a foreground
+//     group, so the gun occupies the near slice of the depth buffer.
+//   * a mid-frame Clear of the DEPTH buffer only - the other classic separator.
+//
+// If either brackets a contiguous run of draws near the end of the frame, that run is the arms and
+// the weapon.
+//
+// ⚠️ NOTHING IS LOGGED FROM INSIDE THESE HOOKS. Run 24/25 lost two runs to a startup hang that was
+// a fopen/fwrite/fclose inside a draw hook, and the note on that sits a few lines below. Events go
+// into a fixed array and Present prints them.
+struct DpgEvent { uint8_t kind; uint32_t drawIdx; float z0, z1; uint32_t a, b, c, d; };
+const int kDpgMax = 64;
+DpgEvent g_dpgEvents[kDpgMax];
+volatile LONG g_dpgCount = 0;
+volatile LONG g_dpgProbeFrames = 0;
+volatile LONG g_frameDrawIdx = 0;
+void DumpDpgProbe();
+
+static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    if (InterlockedCompareExchange(&g_dpgProbeFrames, 0, 0) <= 0) return;
+    const LONG i = InterlockedIncrement(&g_dpgCount) - 1;
+    if (i < 0 || i >= kDpgMax) return;
+    g_dpgEvents[i].kind = kind;
+    g_dpgEvents[i].drawIdx = (uint32_t)InterlockedCompareExchange(&g_frameDrawIdx, 0, 0);
+    g_dpgEvents[i].z0 = z0; g_dpgEvents[i].z1 = z1;
+    g_dpgEvents[i].a = a; g_dpgEvents[i].b = b; g_dpgEvents[i].c = c; g_dpgEvents[i].d = d;
+}
+
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetViewport)(IDirect3DDevice9*, const D3DVIEWPORT9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Clear)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD,
+                                               D3DCOLOR, float, DWORD);
+PFN_SetViewport g_origSetViewport = nullptr;
+PFN_Clear       g_origClear = nullptr;
+
+HRESULT STDMETHODCALLTYPE Hook_SetViewport(IDirect3DDevice9* dev, const D3DVIEWPORT9* vp) {
+    if (vp) DpgRecord(0, vp->MinZ, vp->MaxZ, vp->X, vp->Y, vp->Width, vp->Height);
+    return g_origSetViewport(dev, vp);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_Clear(IDirect3DDevice9* dev, DWORD count, const D3DRECT* rects,
+                                     DWORD flags, D3DCOLOR colour, float z, DWORD stencil) {
+    DpgRecord(1, z, 0.0f, flags, count, 0, 0);
+    return g_origClear(dev, count, rects, flags, colour, z, stencil);
+}
+
+void DumpDpgProbe() {
+    const LONG n = InterlockedCompareExchange(&g_dpgCount, 0, 0);
+    const LONG draws = InterlockedCompareExchange(&g_frameDrawIdx, 0, 0);
+    Log("--- foreground-pass probe: %ld draws this frame, %ld event(s) ---", draws, n);
+    for (LONG i = 0; i < n && i < kDpgMax; ++i) {
+        const DpgEvent& e = g_dpgEvents[i];
+        if (e.kind == 0)
+            Log("    after draw %-5u  SetViewport  MinZ %.3f MaxZ %.3f  rect %u,%u %ux%u",
+                e.drawIdx, e.z0, e.z1, e.a, e.b, e.c, e.d);
+        else
+            Log("    after draw %-5u  Clear        flags 0x%X%s%s%s  Z %.3f",
+                e.drawIdx, e.a,
+                (e.a & D3DCLEAR_TARGET)  ? " TARGET"  : "",
+                (e.a & D3DCLEAR_ZBUFFER) ? " ZBUFFER" : "",
+                (e.a & D3DCLEAR_STENCIL) ? " STENCIL" : "", e.z0);
+    }
+    Log("    A depth-only Clear or a MinZ/MaxZ change LATE in the frame brackets the first-person"
+        " pass. The draws after it are the arms and the weapon.");
+}
+
 HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                                INT baseVertex, UINT minIndex, UINT numVertices,
                                                UINT startIndex, UINT primCount) {
+    InterlockedIncrement(&g_frameDrawIdx);
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
     });
@@ -8270,6 +8349,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Run 93: find the real ProcessInternal and move the hook onto it. Both are no-ops once
         // they have succeeded, so cycling modes does not re-walk GObjects.
         if (mode >= 6) { FindProcessInternal(); RepointScriptHook(); ProbeTraceNative(); InstallLineCheckHook(); InstallSingleLineCheckHook(); }
+        // Arm the foreground-pass probe for three frames on any mode change - the user presses
+        // this to reach aim mode 11 anyway, so it costs no extra keypress and no extra run.
+        InterlockedExchange(&g_dpgProbeFrames, 3);
         // Mode 1 is the only one that needs the view taken out of the engine's rotation. Modes 2
         // and 3 want the plain arrangement back, so they clear it - otherwise the leftover split
         // would be silently steering the view during a test of something else entirely.
@@ -9227,6 +9309,15 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // hook only ever reads three interlocked words.
             InterlockedExchange(&g_ctlForXi, (LONG)ctl);
 
+            // Run 114: dump the foreground-pass probe once per armed frame, from PRESENT - never
+            // from inside the draw, viewport or clear hooks.
+            if (InterlockedCompareExchange(&g_dpgProbeFrames, 0, 0) > 0) {
+                DumpDpgProbe();
+                InterlockedDecrement(&g_dpgProbeFrames);
+            }
+            InterlockedExchange(&g_dpgCount, 0);
+            InterlockedExchange(&g_frameDrawIdx, 0);
+
             // Run 98: find every field holding the view rotation, while we still know what the
             // view rotation IS. Runs only in mode 9 and stops after four samples, so it costs
             // nothing once decided. It must run BEFORE rot[1] is overwritten below - after that
@@ -9514,6 +9605,11 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         // 81 = DrawPrimitive, 82 = DrawIndexedPrimitive - the two the scene passes use.
         g_origDrawPrim        = (PFN_DrawPrim)PatchVTable(*out, 81, (void*)&Hook_DrawPrim);
         g_origDrawIndexedPrim = (PFN_DrawIndexedPrim)PatchVTable(*out, 82, (void*)&Hook_DrawIndexedPrim);
+        // 43 = Clear, 47 = SetViewport. Same vtable indexing already proven by Present at 17,
+        // SetRenderTarget at 37 and DrawPrimitive at 81 - these two sit between them and need no
+        // separate verification. Both only RECORD; see the note on DpgRecord.
+        g_origClear       = (PFN_Clear)PatchVTable(*out, 43, (void*)&Hook_Clear);
+        g_origSetViewport = (PFN_SetViewport)PatchVTable(*out, 47, (void*)&Hook_SetViewport);
         // 83/84 = the user-pointer draw forms, VERIFIED against d3d9.h rather than from memory:
         // enumerating IDirect3DDevice9's declarations and anchoring on the slots already known to
         // work (Present 17, SetRenderTarget 37, DrawPrimitive 81, SetVertexShaderConstantF 94)
