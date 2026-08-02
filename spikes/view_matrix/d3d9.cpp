@@ -85,7 +85,12 @@ bool g_stageLockReady = false;
 //
 // So the previous logs are rotated rather than overwritten. Three back is enough for the
 // three-launch comparisons this project actually runs.
-const int kLogKeep = 3;
+// ⚠️ Raised from 3 in run 136. Three spares is under an hour of testing, and it cost a result:
+// the full-resolution half of a resolution A/B had rotated out by the time the pair was compared,
+// leaving four logs that were all 1440p. An A/B whose two halves are separate launches needs
+// enough history to survive the relaunches BETWEEN them plus whatever is run afterwards, and these
+// are a few hundred KB each.
+const int kLogKeep = 12;
 
 void LogInit() {
     InitializeCriticalSection(&g_lock);
@@ -848,6 +853,18 @@ int32_t g_wantPitch = 0, g_wantYaw = 0;
 // folded in rather than overwritten. See the note at the write site.
 int32_t g_lastWrittenYaw = 0;
 bool    g_haveLastWrittenYaw = false;
+// ']' - absorb engine-side yaw changes as player input, or ignore them. ON is the shipped
+// behaviour and the only reason mouse and stick turning coexist with head tracking. See the
+// note at the fold-in itself for why a cutscene makes it turn on the head instead.
+volatile LONG g_yawFoldIn = 1;
+// How often the engine keeps the yaw we wrote, over the last report window. The cutscene detector
+// candidate that replaced the dead ProcessEvent route - see the note at the measurement site.
+volatile LONG g_yawHeld = 0, g_yawChecked = 0;
+volatile LONG g_yawHeldPct = -1;    // -1 = not measured yet, so the readout can say so
+// ']' - pin the view to the engine's own camera so a measurement is not at the mercy of how still
+// someone can hold their head. See the note where it is applied.
+volatile LONG g_freezeView = 0;
+int32_t g_frozenYaw = 0, g_frozenPitch = 0;
 bool    g_haveWant = false;
 int     g_hookHits = 0;
 
@@ -2856,6 +2873,37 @@ float g_wantRollRad = 0.0f;
 // separate step: it is a refactor with a visible no-op, so the mechanism can be proved before
 // anything is decoupled. Once it holds, the engine's rotation is free to carry the weapon.
 volatile LONG g_matrixRot = 0;
+
+// ---- ⭐ run 133: the cutscene yaw test, as ONE key ----
+//
+// The two flags that matter for it are independent, so the honest test is their 2x2. Asking for
+// that as two separate keys put the burden of tracking which cell you are in on someone wearing a
+// headset - so NUMPAD8 walks the four combinations in order instead, and the readout names the
+// cell. One key, four presses, back where you started.
+//
+// ⚠️ The mode number is DERIVED from the live flags, never stored. g_matrixRot has another owner
+// (the aim-mode path sets it directly), and a remembered cycle index would keep confidently
+// reporting a cell the flags had since left. Derived, a disagreement is impossible by
+// construction: whatever the flags say IS the mode.
+//
+//   1  ROT ENGINE  FOLD ON    the shipped behaviour
+//   2  ROT MATRIX  FOLD ON    the matrix carries rotation; the fold-in still cancels yaw
+//   3  ROT MATRIX  FOLD OFF   predicted to be the one where looking left and right works
+//   4  ROT ENGINE  FOLD OFF   isolates the fold-in from the matrix path
+inline int CutsceneMode() {
+    const bool mat  = InterlockedCompareExchange(&g_matrixRot, 0, 0) != 0;
+    const bool fold = InterlockedCompareExchange(&g_yawFoldIn, 0, 0) != 0;
+    if (!mat &&  fold) return 1;
+    if ( mat &&  fold) return 2;
+    if ( mat && !fold) return 3;
+    return 4;
+}
+
+inline void SetCutsceneMode(int m) {
+    InterlockedExchange(&g_matrixRot, (m == 2 || m == 3) ? 1 : 0);
+    InterlockedExchange(&g_yawFoldIn, (m == 1 || m == 2) ? 1 : 0);
+}
+
 // NUMPAD . - point the engine's rotation at the right hand instead of the body. Needs g_matrixRot,
 // since without the split the engine's rotation IS the view and aiming it at your hand would swing
 // the camera with your hand.
@@ -4366,6 +4414,27 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                         ? g_rollSign * rollRad : 0.0f;
         const float rollDeg = fabsf(g_wantRollRad) * 57.2957795f;
         if (rollDeg > g_maxRollDeg) g_maxRollDeg = rollDeg;
+
+        // ---- ⭐ run 136: freeze the view, so an A/B can be taken from ONE camera ----
+        //
+        // draws/frame moves more with a few degrees of head rotation than with the effect being
+        // measured, which made "stand in exactly the same spot facing exactly the same way across
+        // two launches" the limiting factor of the whole test - and an unreasonable thing to ask
+        // of someone wearing a headset.
+        //
+        // Freezing pins the view to the ENGINE's own camera: no head rotation, no roll, no 6-DOF
+        // offset. That is deliberately the game's unmodified viewpoint rather than "wherever the
+        // head was when the key was pressed", because the game's camera comes from the save and is
+        // therefore reproducible across launches, while a head pose is not.
+        //
+        // ⚠️ g_eyeDeltaUU is NOT frozen. It is the interpupillary separation, not head movement,
+        // and zeroing it would collapse the stereo pair - which is one of the things under test.
+        if (InterlockedCompareExchange(&g_freezeView, 0, 0)) {
+            g_wantYaw     = g_frozenYaw;
+            g_wantPitch   = g_frozenPitch;
+            g_wantRollRad = 0.0f;
+            g_hmdOffset[0] = g_hmdOffset[1] = g_hmdOffset[2] = 0.0f;
+        }
 
         if (++g_tick % 180 == 0)
             Log("head pitch %.1f yaw %.1f roll %.1f -> want pitch %d yaw %d roll %.1f deg (hook hits %d)",
@@ -6993,6 +7062,24 @@ ScriptFn g_scriptFns[] = {
     { "BeginFire",          -1 },   // [12]
     { "StartFire",          -1 },   // [13]
     { "PreBeginPlay",       -1 },   // [14] run 107 - every spawn, in or out of the window
+    // ---- ⭐ run 133: is a cutscene running? ----
+    //
+    // Needed because the cutscene yaw fix cannot be left on during play. Mode 3 works by turning
+    // OFF the yaw fold-in, and the fold-in is precisely the mechanism that lets mouse and gamepad
+    // turning coexist with head tracking - so shipping it always-on would break the keyboard/mouse
+    // and Xbox control schemes before they are written. It has to be scoped to cutscenes.
+    //
+    // These are native->script entry points, which is the only kind this hook can see (run 94:
+    // 87 distinct functions, every one an entry point). SetCinematicMode is UE3's canonical
+    // "a scripted sequence is taking over" call; the other two are here as fallbacks in case
+    // Raven's cutscenes drive the camera without it.
+    //
+    // ⚠️ Watched and LOGGED ONLY at this stage. Nothing acts on the result yet. A detector that
+    // misfires during play silently breaks turning, which is a far worse failure than the bug it
+    // fixes, so it gets measured against a real cutscene before it is allowed to control anything.
+    { "SetCinematicMode",   -1 },   // [15]
+    { "SetViewTarget",      -1 },   // [16]
+    { "ClientSetCameraMode",-1 },   // [17]
 };
 const int kFnGetAdjustedAim = 0;
 const int kFnTick           = 5;
@@ -7003,7 +7090,20 @@ const int kFnMaskLast       = 10;
 const int kFnFireFirst      = 11;   // [11..13] open the mode 9 window
 const int kFnFireLast       = 13;
 const int kFnPreBeginPlay   = 14;
+const int kFnCineFirst      = 15;   // [15..17] the cutscene candidates
+const int kFnSetCinematic   = 15;
+const int kFnCineLast       = 17;
 const int kScriptFnCount    = (int)(sizeof(g_scriptFns) / sizeof(g_scriptFns[0]));
+
+// What the candidates have actually done, so the log can say which one is usable rather than
+// leaving three plausible names and no evidence. Counts are cumulative for the run.
+volatile LONG g_cineCalls[3] = { 0, 0, 0 };
+// SetCinematicMode's argument, as last seen. UE3 passes script parameters at the head of the
+// frame's local buffer, so the bool is the first dword - but that is a claim about layout, and
+// the raw dword is logged next to it so a wrong guess is visible rather than silently latching
+// the state backwards.
+volatile LONG g_cineArgRaw = 0;
+volatile LONG g_inCinematic = 0;
 
 static LONG FnIdx(int i) { return InterlockedCompareExchange(&g_scriptFns[i].idx, 0, 0); }
 
@@ -7737,18 +7837,25 @@ void ResolveScriptNames() {
     if (!Readable((void*)kGNamesTArray, 12)) { Log("script names: GNames not readable yet"); return; }
     const int32_t nc = *reinterpret_cast<int32_t*>(kGNamesTArray + 4);
     int found = 0;
-    for (int i = 0; i < kScriptFnCount; ++i) {
-        if (FnIdx(i) >= 0) { ++found; continue; }
-        for (int32_t n = 0; n < nc; ++n) {
-            char nm[96]{};
-            if (!NameFromIndex(n, nm, sizeof(nm))) continue;
+    // ---- ⭐ run 133: ONE walk over GNames, not one per unresolved name ----
+    //
+    // This used to loop the table on the outside and GNames on the inside, so an unresolved name
+    // cost a full walk of its own - 18 names against ~100k entries. That was affordable while this
+    // only ever ran on a keypress. It now also runs automatically (see the caller in Present), and
+    // a name that never resolves would have made every retry walk the whole table again for
+    // nothing. Inverting the loops makes a retry cost one walk regardless of how many are missing.
+    for (int32_t n = 0; n < nc; ++n) {
+        char nm[96]{};
+        if (!NameFromIndex(n, nm, sizeof(nm))) continue;
+        for (int i = 0; i < kScriptFnCount; ++i) {
+            if (FnIdx(i) >= 0) continue;
             if (_stricmp(nm, g_scriptFns[i].name) == 0) {
                 InterlockedExchange(&g_scriptFns[i].idx, n);
-                ++found;
                 break;
             }
         }
     }
+    for (int i = 0; i < kScriptFnCount; ++i) if (FnIdx(i) >= 0) ++found;
     Log("script names: %d of %d resolved against %d GNames entries", found, kScriptFnCount, nc);
     for (int i = 0; i < kScriptFnCount; ++i)
         Log("    %-22s %s", g_scriptFns[i].name,
@@ -7972,6 +8079,41 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // ---- mode 7: the gun's pose. On the way IN, because the callee consumes its parameters ----
     if (aimMode == 7 && FnIdx(kFnSetAim) >= 0 && fnIdx == FnIdx(kFnSetAim))
         RewriteSetAimParams(Stack);
+
+    // ---- ⭐ run 133: watch for a cutscene starting. Observation only ----
+    //
+    // Three integer compares on a hot path, and only when the names resolved. Nothing here
+    // changes engine state or mod behaviour - it counts, latches and logs, so one run through the
+    // opening cutscene says which of the three candidates fires and whether its argument reads
+    // the way the layout note predicts.
+    for (int ci = kFnCineFirst; ci <= kFnCineLast; ++ci) {
+        if (FnIdx(ci) < 0 || fnIdx != FnIdx(ci)) continue;
+        const LONG n = InterlockedIncrement(&g_cineCalls[ci - kFnCineFirst]);
+        if (ci == kFnSetCinematic) {
+            // The bool argument, read the same way mode 7 reads SetAim's floats - through the
+            // frame's locals pointer. Logged raw as well as interpreted, because "the first dword
+            // is the bool" is an assumption about UE3's frame layout and not something this run
+            // has verified. If the raw value is neither 0 nor 1 the assumption is wrong and the
+            // latch below must not be trusted.
+            const int localsOff = LocalsOffset();
+            if (localsOff >= 0 && Stack && Readable(Stack, localsOff + 4)) {
+                uint8_t* p = *reinterpret_cast<uint8_t**>(
+                                 reinterpret_cast<uintptr_t>(Stack) + localsOff);
+                if (p && Readable(p, 4)) {
+                    const LONG raw = (LONG)(*reinterpret_cast<uint32_t*>(p));
+                    InterlockedExchange(&g_cineArgRaw, raw);
+                    InterlockedExchange(&g_inCinematic, raw ? 1 : 0);
+                }
+            }
+        }
+        if (n <= 20)
+            Log("cutscene watch: %s fired (#%ld)%s", g_scriptFns[ci].name, n,
+                ci == kFnSetCinematic ? "" : " - fallback candidate, no argument read");
+        if (ci == kFnSetCinematic && n <= 20)
+            Log("    arg raw 0x%08lX -> CINE %s", InterlockedCompareExchange(&g_cineArgRaw, 0, 0),
+                InterlockedCompareExchange(&g_inCinematic, 0, 0) ? "ON" : "OFF");
+        break;
+    }
 
     // ================= ⭐ run 95: aim mode 8 - the MASKED time split ==============================
     //
@@ -8755,6 +8897,91 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
                      : (mode == 3) ? "GUN ARMS" : "NONE";
     _snprintf_s(l3, sizeof(l3), _TRUNCATE, "AIM %d  MOVING %s  POS %s", (int)aim, what,
                 g_gunFollowPos ? "ON" : "OFF");
+    // ---- run 133: the two toggles a cutscene test turns on, in words ----
+    //
+    // NUMPAD8 and F1 had no on-screen state, so an A/B across them was counted keypresses and
+    // hope: press it, look, press it again, and never learn whether the toggle registered at all.
+    // In a headset the log is unreadable, so a toggle with no readout is a toggle whose failure
+    // to fire is indistinguishable from the thing it controls having no effect.
+    //
+    // ROT is the one that matters for cutscenes. ENGINE means head yaw/pitch reach the view only
+    // by being written into the PlayerController's Rotation, which a matinee-driven camera never
+    // reads; MATRIX means the view-projection carries the rotation itself and the engine is not
+    // consulted. Position and roll are matrix-side either way, which is exactly why they keep
+    // working in a cutscene while looking around does not.
+    // The mode number AND the two flags it stands for, deliberately both. The number is what the
+    // test steps refer to; the flags are what it means, so a mode read off the screen never has to
+    // be looked up to be understood.
+    char l5[32], l6[32];
+    // PROJ is F6 - whether the VR frustum is being forced into the matrix at all. It belongs next
+    // to FOV and CULL: run 134 eliminated engine-side culling across a 0.35x-6x sweep of what the
+    // engine is ASKED for, which leaves what we FORCE as the remaining difference between a
+    // rendered FOV that shows the fires and one that does not. Testing that without being able to
+    // see its state is how the last three runs went wrong.
+    _snprintf_s(l5, sizeof(l5), _TRUNCATE, "MODE %d  ROT %s  PROJ %s", CutsceneMode(),
+                InterlockedCompareExchange(&g_matrixRot, 0, 0) ? "MATRIX" : "ENGINE",
+                InterlockedCompareExchange(&g_vrProjection, 0, 0) ? "ON" : "OFF");
+    // CINE is the candidate cutscene detector, shown but not acting. Watching it agree with what
+    // is on screen IS the test - if it says ON through the opening and OFF through play, it can be
+    // trusted to drive the mode automatically; if it never moves, SetCinematicMode is not the
+    // signal Raven uses and the fallbacks in the watch table are the next thing to read.
+    // ---- ⭐ run 133: the FOV knobs, on screen ----
+    //
+    // Run 133 produced seven screenshots "at different PAGE DOWN levels" and not one of them
+    // recorded which level it was at, so the set could not be read as a comparison at all. Both
+    // knobs are integer percentages here: FOV is how much of the headset's field is rendered
+    // (PAGE DOWN), CULL is the extra field the engine is asked to cull against (PAGE UP). The
+    // font has no '.', so a decimal would render as a space and read as two numbers.
+    // ---- ⭐ run 135: per-eye resolution on screen ----
+    //
+    // Run 135 reported "more culling at 1440p than at full headset resolution", which makes the
+    // backbuffer size an experimental variable rather than a setting - and one that no screenshot
+    // records. Per EYE rather than the whole target, because that is the number an object's pixel
+    // coverage actually scales with under duplication.
+    // ---- ⭐ run 136: the draw count, live ----
+    //
+    // Shadows are out - a shadow failure cannot delete a particle system, and the fire goes with
+    // the floor. Rather than propose a fifth mechanism, split the space: DRAWS says whether the
+    // engine is still ISSUING the calls.
+    //
+    // Read at the top of Present, so this is the count for the frame that just finished - the
+    // per-frame reset happens at the bottom. Narrowing the FOV should LOWER it, because less is in
+    // view. So if the fires come back as FOV narrows and this count goes DOWN with them, they were
+    // being drawn all along and we are losing them after the draw call. If it goes UP, the engine
+    // was withholding them and the cause is engine-side after all.
+    // The alignment aid. Shows the LIVE camera yaw while unfrozen, so the second run can be turned
+    // until it reads what the first was frozen at, and the frozen value once pinned. Wrapped to
+    // 0-359 because a raw FRotator wraps through negatives and reads as two different numbers for
+    // the same direction.
+    char l9[40];
+    {
+        const bool frozen = InterlockedCompareExchange(&g_freezeView, 0, 0) != 0;
+        const int32_t uu = frozen ? g_frozenYaw : (g_camRotKnown ? g_camYawUU : g_wantYaw);
+        int deg = (int)(uu * (360.0 / 65536.0)) % 360;
+        if (deg < 0) deg += 360;
+        _snprintf_s(l9, sizeof(l9), _TRUNCATE, "FREEZE %s  YAW %d", frozen ? "ON" : "OFF", deg);
+    }
+
+    char l8[40];
+    _snprintf_s(l8, sizeof(l8), _TRUNCATE, "EYE %uX%u  DRAWS %d",
+                InterlockedCompareExchange(&g_dupDraws, 0, 0) ? g_srcW / 2 : g_srcW, g_srcH,
+                g_drawsTotal);
+
+    char l7[40];
+    const LONG heldPct = InterlockedCompareExchange(&g_yawHeldPct, 0, 0);
+    if (heldPct < 0)
+        _snprintf_s(l7, sizeof(l7), _TRUNCATE, "FOV %d  CULL %d  HELD NONE",
+                    (int)(g_renderFovScale * 100.0f + 0.5f), (int)(kFovHeadroom * 100.0f + 0.5f));
+    else
+        _snprintf_s(l7, sizeof(l7), _TRUNCATE, "FOV %d  CULL %d  HELD %ld",
+                    (int)(g_renderFovScale * 100.0f + 0.5f), (int)(kFovHeadroom * 100.0f + 0.5f),
+                    heldPct);
+
+    _snprintf_s(l6, sizeof(l6), _TRUNCATE, "FOLD %s  STEREO %s  CINE %s",
+                InterlockedCompareExchange(&g_yawFoldIn, 0, 0) ? "ON" : "OFF",
+                InterlockedCompareExchange(&g_dupDraws, 0, 0) ? "ON" : "OFF",
+                InterlockedCompareExchange(&g_inCinematic, 0, 0) ? "YES" : "NO");
+
     const LONG ax = InterlockedCompareExchange(&g_anchorAxis, 0, 0);
     char l4[40];
     // ⚠️ Brackets, not a leading dash. The dash used to mark the selected axis and it read as a
@@ -8774,15 +9001,41 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     const int  lh = (kGlyphH + 2) * px;
     const int  y0 = (int)(g_srcH / 7);
 
-    const int kCap = 1200;
+    // ---- ⚠️ this cap is a CORRECTNESS bound, not a budget ----
+    //
+    // At 1200 it was neither. TextRects drops silently once it is reached, and four lines across
+    // two eyes overran it partway through the right eye's last line - which is why the anchor
+    // readout appeared as "ANCHOR (F27) R9 U-13" in the left eye and "AN" in the right. That read
+    // as a text-clipping quirk for a whole run when it was the readout running out of rectangles,
+    // and the next line added would have been invisible in the right eye entirely.
+    //
+    // So size it so overrun is impossible rather than unlikely: a 5x7 glyph has at most three runs
+    // of set pixels per row (10101), so 21 rectangles per character is the true worst case, and
+    // the line buffers bound the character count. 9 lines x 39 chars x 2 eyes x 21 = 14742.
+    const int kCap = 16384;
     static D3DRECT r[kCap];
     int n = 0;
     for (int eye = 0; eye < 2; ++eye) {
         const int x0 = (int)(eye * halfW + halfW / 2) - 11 * (kGlyphW + 1) * px;
         n = TextRects(r, n, kCap, x0, y0,          px, l1);
         n = TextRects(r, n, kCap, x0, y0 + lh,     px, l2);
-        n = TextRects(r, n, kCap, x0, y0 + 2 * lh, px, l3);
-        n = TextRects(r, n, kCap, x0, y0 + 3 * lh, px, l4);
+        n = TextRects(r, n, kCap, x0, y0 + 7 * lh, px, l3);
+        n = TextRects(r, n, kCap, x0, y0 + 8 * lh, px, l4);
+        n = TextRects(r, n, kCap, x0, y0 + 4 * lh, px, l7);
+        n = TextRects(r, n, kCap, x0, y0 + 5 * lh, px, l8);
+        n = TextRects(r, n, kCap, x0, y0 + 6 * lh, px, l9);
+        // The two cutscene lines go THIRD and FOURTH on screen, above the gun-tuning ones: they
+        // are what a cutscene test reads, and burying them under the anchor numbers is how a
+        // readout gets ignored.
+        n = TextRects(r, n, kCap, x0, y0 + 2 * lh, px, l5);
+        n = TextRects(r, n, kCap, x0, y0 + 3 * lh, px, l6);
+    }
+    // Loud, not silent. If the bound above is ever wrong the readout must say so rather than
+    // quietly truncate - that failure mode already cost one run.
+    if (n >= kCap) {
+        static bool warned = false;
+        if (!warned) { warned = true; Log("*** state readout hit its %d-rect cap - text is being"
+                                          " TRUNCATED, raise kCap ***", kCap); }
     }
     if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
 
@@ -8960,11 +9213,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     static bool pNum8 = false;
     bool kNum8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
     if (kNum8 && !pNum8) {
-        LONG was = InterlockedCompareExchange(&g_matrixRot, 0, 0);
-        InterlockedExchange(&g_matrixRot, was ? 0 : 1);
-        Log("NUMPAD8: view rotation in the MATRIX %s. Deviation clamp is %d degrees"
-            " - at 0 this is identical to OFF by construction. NUMPAD9 raises it.",
-            was ? "OFF (engine rotation carries the head, as before)" : "ON",
+        const int next = (CutsceneMode() % 4) + 1;      // 1->2->3->4->1
+        SetCutsceneMode(next);
+        Log("NUMPAD8: cutscene mode %d - ROT %s, YAW FOLD %s. Deviation clamp is %d degrees"
+            " - at 0 the matrix carries the WHOLE rotation. NUMPAD9 raises it.",
+            next, (next == 2 || next == 3) ? "MATRIX (the view-projection carries the head)"
+                                           : "ENGINE (the controller's Rotation carries it)",
+            (next == 1 || next == 2) ? "ON (engine-side yaw changes absorbed as player input)"
+                                     : "OFF (engine-side yaw changes ignored - mouse turning stops)",
             kDevSteps[InterlockedCompareExchange(&g_devStep, 0, 0)]);
     }
     pNum8 = kNum8;
@@ -9397,6 +9653,57 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     bool kBack = (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
     if (kBack && !pBack) SetVrMode(InterlockedCompareExchange(&g_dupDraws, 0, 0) == 0);
     pBack = kBack;
+
+    // ---- ⭐ run 133: arm the cutscene watch WITHOUT a keypress ----
+    //
+    // Run 133 tested the CINE indicator through the whole opening sequence and it read NO
+    // throughout - not because no cutscene ran, but because the name table was never resolved.
+    // Resolution only happened on the aim-mode key or the census key, and neither is pressed
+    // before the opening cutscene, so every index was still -1 and the watch could not match
+    // anything. The indicator was reporting "not armed" in a way that reads exactly like "no
+    // cutscene". That is the same class of failure as the truncated readout: an instrument whose
+    // not-working state is indistinguishable from its negative result.
+    //
+    // So it resolves itself. Gated on the camera existing, which is the cheapest available proxy
+    // for "a level is loaded and GNames is populated" - before that there is nothing to find and
+    // the walk would be wasted. Retried on a slow tick rather than once, because the first
+    // attempt can land while packages are still streaming in, and capped so a name that genuinely
+    // does not exist in this build cannot cost a walk forever.
+    {
+        static int tick = 0, attempts = 0;
+        if (FnIdx(kFnSetCinematic) < 0 && attempts < 12 && (++tick % 240) == 0 && g_camera) {
+            ++attempts;
+            Log("auto-resolving script names (attempt %d) - arming the cutscene watch", attempts);
+            ResolveScriptNames();
+        }
+    }
+
+    // ']' : freeze the view. The key freed up when the yaw fold-in moved onto NUMPAD8's cycle.
+    //
+    // Latches the ENGINE's camera rotation, not the head's, so the frozen view is the one the save
+    // produces and two launches can be made to agree. The angle is logged and put on the readout
+    // in degrees precisely so they can be CHECKED to agree rather than assumed to.
+    static bool pFreeze = false;
+    bool kFreeze = (GetAsyncKeyState(VK_OEM_6) & 0x8000) != 0;
+    if (kFreeze && !pFreeze) {
+        const LONG was = InterlockedCompareExchange(&g_freezeView, 0, 0);
+        if (!was) {
+            // Prefer the camera actor's real rotation - that is what the frame is drawn with. Fall
+            // back to what we last asked for only if it has never been read, which is the first
+            // frame or two after a load.
+            g_frozenYaw   = g_camRotKnown ? g_camYawUU   : g_wantYaw;
+            g_frozenPitch = g_camRotKnown ? g_camPitchUU : g_wantPitch;
+        }
+        InterlockedExchange(&g_freezeView, was ? 0 : 1);
+        Log("]: view %s%s", was ? "UNFROZEN - head tracking resumes" : "FROZEN to the engine camera",
+            was ? "" : " - no head rotation, no roll, no 6-DOF offset. Stereo separation is kept.");
+        if (!was)
+            Log("    frozen at yaw %d (%.1f deg), pitch %d (%.1f deg) - MATCH THESE in the other"
+                " run or the comparison is between two different views",
+                g_frozenYaw, g_frozenYaw * (360.0f / 65536.0f),
+                g_frozenPitch, g_frozenPitch * (360.0f / 65536.0f));
+    }
+    pFreeze = kFreeze;
 
     // INSERT: blank one half. Whichever eye goes black tells us the half-to-eye mapping for
     // certain, which reading the code did not settle.
@@ -9903,6 +10210,20 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
             // flash, and g_bestRejectDot names the cause: near 0.99 is rotation lag against a
             // stale g_camFwd, far below it is a genuinely different matrix taking the register.
+            // The cutscene detector candidate. Snapshotted and reset here so the readout shows the
+            // last second rather than a cumulative average, which would smear the boundary this
+            // whole measurement exists to find.
+            {
+                const LONG ck = InterlockedExchange(&g_yawChecked, 0);
+                const LONG hd = InterlockedExchange(&g_yawHeld, 0);
+                if (ck > 0) {
+                    const LONG pct = (hd * 100) / ck;
+                    InterlockedExchange(&g_yawHeldPct, pct);
+                    Log("    yaw held: engine kept our written yaw on %ld of %ld frames (%ld%%)"
+                        " - near 100 is gameplay, near 0 is something else driving the camera",
+                        hd, ck, pct);
+                }
+            }
             if (g_framesNoIdent || g_bestRejectDot > -1.5f)
                 Log("    identification: %d of %d frames lost the matrix entirely; best rejected"
                     " dotFwd this window %+.4f (gate %.2f)",
@@ -10079,7 +10400,57 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             const bool windowRaced = (seqBefore != seqAfter)
                                   || InterlockedCompareExchange(&g_fireDepth, 0, 0) > 0;
 
+            // ---- ⭐ run 133: this fold-in is the prime suspect for cutscene yaw ----
+            //
+            // Reported: in the opening cutscene, looking LEFT and RIGHT does nothing, while
+            // looking up and down, leaning and head tilt all work - and yaw is dead in BOTH
+            // ROT ENGINE and ROT MATRIX. That asymmetry is the whole clue. Pitch, position and
+            // roll reach the view by three different routes and all three survive; the one
+            // mechanism that exists for yaw and for nothing else is this fold-in.
+            //
+            // The predicted mechanism, and what the toggle is here to confirm or kill: a
+            // scripted camera holds the controller's yaw at some value S. We write g_wantYaw,
+            // the engine puts S back, and next frame this code reads S, cannot tell a script
+            // from a mouse, and books the difference as player input - so g_baseYaw absorbs
+            // exactly the head's contribution and g_wantYaw settles at S every single frame.
+            // The head's yaw is then cancelled as fast as it is produced, which kills ENGINE
+            // mode (nothing is written that survives) and MATRIX mode alike (the matrix rotates
+            // from the camera's yaw to g_wantYaw, and those are now the same number).
+            //
+            // A diagnostic toggle rather than a fix, deliberately. The real fix has to tell a
+            // cutscene from a mouse, and guessing at that before the mechanism is confirmed is
+            // how a run gets spent proving the wrong thing.
+            // ---- ⭐ run 134: does the engine KEEP the yaw we write? ----
+            //
+            // The ProcessEvent route to detecting a cutscene is dead: all 18 names resolved and
+            // SetCinematicMode never fired once through the whole opening. Run 94 already
+            // established why - this hook only sees native->script ENTRY points, and a script
+            // calling SetCinematicMode is not one. SetViewTarget and ClientSetCameraMode were
+            // silent for the same reason.
+            //
+            // So detect the cutscene by its EFFECT instead, which mode 4 already demonstrated:
+            // during the opening, the engine does not honour our yaw write at all. Measured as an
+            // exact match, which is what makes it a binary signal rather than a threshold:
+            //
+            //   * gameplay, standing still - we write W, nothing else touches it, readback IS W.
+            //   * gameplay, turning - the engine ADDS the input to our W, so the readback differs
+            //     for that frame but our write still persisted underneath it.
+            //   * cutscene - the script SETS yaw outright, so the readback is unrelated to W and
+            //     an exact match essentially never happens.
+            //
+            // Measured only. Nothing acts on it yet, for the same reason as before: a detector
+            // that misfires in play silently breaks mouse and gamepad turning. What this run has
+            // to answer is whether the separation is clean - near 100% in play against near 0% in
+            // the cutscene - or whether ordinary turning drags it low enough to overlap.
             if (g_haveLastWrittenYaw && !windowRaced) {
+                InterlockedIncrement(&g_yawChecked);
+                if (observedYaw == g_lastWrittenYaw) InterlockedIncrement(&g_yawHeld);
+            }
+
+            if (!InterlockedCompareExchange(&g_yawFoldIn, 0, 0)) {
+                // Suppressed. The reference still advances below, so re-enabling mid-run does
+                // not fold in the whole accumulated difference as one jump.
+            } else if (g_haveLastWrittenYaw && !windowRaced) {
                 int32_t externalDelta = observedYaw - g_lastWrittenYaw;
                 if (externalDelta) {
                     g_baseYaw += externalDelta;

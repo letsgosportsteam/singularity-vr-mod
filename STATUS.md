@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 132). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 136). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -47,30 +47,181 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
+1. **The vanishing fire / black floor — the alpha's most visible defect.** Runs 134–136 eliminated
+   every culling explanation; see "Runs 133–136" below for the full elimination table. The one
+   surviving theory is a **screen-space pass reconstructing position from the depth buffer**. Test
+   it by making `ApplyProjection` consistent with whatever the depth-reading shaders assume, or by
+   finding the constant that carries `ScreenPositionScaleBias` and correcting it for the forced
+   frustum. ⚠️ `ScreenPositionScaleBias` is listed as a DEAD theory below — it was killed **for
+   decals**, against a different symptom. It is not dead for this one and must be re-tested, not
+   inherited.
+2. **Cutscene head yaw.** Cause found and fix known (mode 3: `ROT MATRIX` + `YAW FOLD OFF`). Blocked
+   only on detecting a cutscene — see below. Ships today as a manual NUMPAD8 cycle.
+3. **`D3D9ExMode=1` corrupts character textures.** Confirmed by A/B. Not free to turn off: it costs
+   the zero-copy path and several ms a frame at full resolution. Needs a real fix in the wrapper.
+4. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
    weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
    correctly aligned**, so they are not one system and whatever anchors the flash is not what
    anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
    not. Likely another mesh in the foreground pass, or a screen-space effect drawn after it.
-2. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
+   **Note the family resemblance to item 1** — a screen-centre anchor is what a screen-space pass
+   does when its position reconstruction is wrong. These may be one bug.
+5. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
    animation, so they are absent from the foreground list when the counts are latched. The fix is
    probably to latch a SET of counts rather than two, or to match on something steadier than
    vertex count.
-3. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+6. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-2. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+7. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
-3. **One object still culls early at distance.** Not occlusion — it vanished with the override ON
-   too. **PAGE DOWN** fixes it, which points at the run-21 mechanism: FOV inflation ×2.01 makes
-   objects project 3.4× smaller than the engine expects. The real fix is finding UE3's
-   draw-distance/LOD scale and compensating directly.
+
+> **RETRACTED (run 136).** This list used to end with *"one object still culls early at distance —
+> PAGE DOWN fixes it, which points at the run-21 mechanism: FOV inflation makes objects project
+> 3.4× smaller than the engine expects."* The run-21 mechanism is **not** the cause. Two
+> measurements kill it: sweeping the engine's asked FOV over 0.35×–6× changed nothing while the
+> engine demonstrably took the request, and the draw count is identical at two resolutions that
+> look completely different. PAGE DOWN "fixing" it was the coincidence that kept this alive —
+> PAGE DOWN changes the forced matrix as well as the ask, and it is the forced matrix that matters.
 
 **Watch this one:** MinHook now initialises in `DllMain` (run 59, for the command-line detour)
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## Runs 133–136: three defects, and one instrument that had been lying
+
+### 1. Cutscene head yaw — cause found, fix known, detection blocked
+
+**Symptom.** In the opening cutscene, looking left and right does nothing. Pitch, roll and leaning
+all work.
+
+**Cause.** Head yaw does not reach the renderer through the matrix — it is written into the
+PlayerController's `AActor::Rotation` every `Present`, and a matinee-driven camera never reads that.
+But the yaw **fold-in** is what actually kills it. That loop exists so mouse and stick turning can
+coexist with head tracking: it treats any engine-side change to the controller's yaw as player
+input and folds it into `g_baseYaw`. A scripted camera holding yaw at a fixed value is
+indistinguishable from that, so every frame it books the head's own contribution as "somebody else
+turned" and cancels it. Position and roll survive because they are applied to the matrix directly.
+
+**The 2×2 that proved it** (NUMPAD8 cycles all four; the mode number is derived from the flags, not
+stored, so it cannot disagree with them):
+
+| mode | ROT | YAW FOLD | cutscene yaw |
+|---|---|---|---|
+| 1 | ENGINE | ON | dead |
+| 2 | MATRIX | ON | dead |
+| 3 | MATRIX | OFF | **works** |
+| 4 | ENGINE | OFF | dead |
+
+Mode 4 failing is the important one: the engine does not honour our yaw write during a cutscene at
+all, so both halves of the fix are needed.
+
+**Why it cannot ship as a default.** The fold-in is exactly the mechanism the planned
+keyboard/mouse and Xbox control schemes will need. Turning it off globally breaks turning for them
+before they are written. **Touch stick turning is unaffected either way** — snap turn writes
+`g_baseYaw` directly and never passes through the engine.
+
+**Detection — what is dead and what is untested.**
+
+- ❌ **`SetCinematicMode` via the ProcessEvent hook.** All 18 script names resolved (`18 of 18
+  against 49615 GNames entries`) and it never fired once through the whole opening. Run 94 already
+  explains why: that hook only sees native→script **entry points**. `SetViewTarget` and
+  `ClientSetCameraMode` were silent for the same reason. This route is structurally dead, not
+  merely untried.
+- ❌ **Anything derived from camera yaw vs controller yaw vs written yaw.** The fold-in drags all
+  three into agreement, so during a cutscene they are as self-consistent as during play.
+- ❓ **`HELD`** (on the readout, and logged as `yaw held:`) — the percentage of frames where the
+  engine kept the yaw we wrote. Detects the cutscene by its *effect* rather than its name. Near 100
+  standing still in play, expected near 0 in a cutscene. **The open question is whether ordinary
+  mouse/stick turning drags it low enough to overlap.** Measured only; nothing acts on it.
+
+### 2. `D3D9ExMode=1` corrupts character textures
+
+The soldier in the opening helicopter renders flat, red and washed out. `D3D9ExMode=0` fixes him
+completely. This is not the FOV bug — it does not respond to FOV or resolution.
+
+⚠️ **The wrapper reports itself healthy while doing it**: `shadow failures 0, create failures 0,
+GetSurfaceLevel-on-shadowed 0`, no `UpdateTexture failed`. So the instrumentation is watching paths
+that are not the broken one. Whoever picks this up should log every lock landing on a shadowed
+texture with its format, level and rect, and find which one never reaches the DEFAULT copy.
+
+Not free to work around: `D3D9ExMode=0` also disables zero-copy, which costs ~3.4 ms/frame at
+2560×1440 and considerably more at full resolution.
+
+### 3. The vanishing fire and black floor — every culling theory is dead
+
+**Symptom.** At a burning dock, the fire effects vanish and the deck they light renders black.
+Worse with wider FOV, worse at lower resolution, worse with distance.
+
+**Eliminated, with the measurement that did it:**
+
+| theory | killed by |
+|---|---|
+| stereo draw split | black with `STEREO OFF` |
+| engine frustum / screen-size culling | `CULL` swept 0.35×–6×; log confirms the engine took the ask (112.5° asked → 108.5° read back), nothing changed |
+| hardware occlusion queries | `OcclusionQueryMode=1` no effect — and mode 0 had **already** been forcing visible in every prior test (`overridden to FULLY VISIBLE (15255 so far)`) |
+| the texture wrapper | it is FOV-dependent; a dropped upload would not be |
+| shadows | a shadow failure cannot delete a particle system, and the fire goes with the floor |
+| **the run-21 FOV-inflation mechanism** | see the retraction above |
+
+**The decisive measurement.** View frozen with `]` to the engine's own camera, same save, matched
+angles (yaw 88.7° vs 88.8°, pitch −6.2° vs −5.4°), `FOV 100 CULL 100`, TRUE STEREO ON in both:
+
+| | draws/frame | forced frustum | engine FOV | inflation |
+|---|---|---|---|---|
+| 4992×2688 | **2502**, constant every window | 93.8 × 98.0° | 124.5° | ×2.00 |
+| 2560×1440 | **2490–2493** | 91.3 × 98.0° | 122.7° | ×1.97 |
+
+0.4% apart, and the aspect difference (1.86 vs 1.78) accounts for that on its own. Same render
+targets in both (HDR `A16B16G16R16F` + LDR `A8R8G8B8`, both split). **The engine submits identical
+work at both resolutions and one of them looks broken.**
+
+⚠️ **The loophole in that test, stated so nobody has to rediscover it:** a draw call is issued
+whether or not it covers any pixels. An emitter LOD'd to zero particles still counts. So this rules
+out primitive *culling*; it does not prove the fire was submitted with fire in it.
+
+**The surviving theory.** A screen-space pass reconstructing position from the depth buffer.
+`ApplyProjection` forces the frustum by rescaling the matrix's x and y columns and leaving z alone,
+so any shader reconstructing view-space position from depth plus screen position is using constants
+the engine derived for *its* projection. One mechanism covers everything: soft particles fading to
+fully transparent (fire gone), the lighting pass leaving surfaces unlit (floor black),
+proportionality to how far we scale x/y (FOV dependence), `ScreenPositionScaleBias` moving with the
+buffer (resolution dependence), depth error growing with range (distance dependence), and complete
+immunity to every culling knob.
+
+### The instrument that had been lying, and the ones added because of it
+
+**The on-screen readout was silently truncating.** `TextRects` drops rectangles once its cap is
+reached, and four lines across two eyes overran a 1200-rect budget partway through the right eye's
+last line. That is why the anchor line read `ANCHOR (F27) R9 U-13` in the left eye and `AN` in the
+right — reported as a text-clipping quirk for a whole run when the readout had simply run out of
+rectangles. The cap is now a computed bound (21 rects per 5×7 glyph is the true worst case) and it
+**logs** if it is ever hit.
+
+That failure has a shape worth recognising, because three separate instruments had it this session:
+**an instrument whose not-working state is indistinguishable from its negative result.**
+
+- The readout dropped text instead of saying it was out of room.
+- `CINE` read `NO` through an entire cutscene because the name table was never resolved — the
+  resolve only ran on the aim-mode or census key, and neither is pressed before the opening
+  cutscene. It now auto-resolves once a camera exists, and says so in the log.
+- Seven screenshots were taken "at different PAGE DOWN levels" and not one recorded its level, so
+  the set could not be read as a comparison at all.
+
+Added in response, all on the readout: `MODE`/`ROT`/`PROJ`, `FOLD`, `CINE`, `FOV`, `CULL`, `HELD`,
+`EYE` (per-eye resolution), `DRAWS`, `FREEZE`, `YAW`.
+
+**`]` freezes the view** to the *engine's* camera — no head rotation, no roll, no 6-DOF offset,
+stereo separation kept. Pinning to the engine's camera rather than the head pose is what makes two
+launches comparable, because the engine's camera comes from the save and a head pose does not. The
+frozen yaw **and pitch** are logged, and that immediately earned its keep: the first attempt at the
+resolution A/B was 13.7° out in pitch and would have compared two different views.
+
+**`kLogKeep` raised 3 → 12.** Three spares is under an hour of testing. The full-resolution half of
+the first resolution A/B had already rotated out by the time the pair was compared, leaving four
+logs that were all 1440p.
 
 ### ⚠️ Method notes that cost the most to learn
 
