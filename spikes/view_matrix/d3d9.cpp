@@ -5251,6 +5251,21 @@ const int kFgSigMax = 8;
 volatile LONG g_fgSigVerts[kFgSigMax] = {};
 volatile LONG g_fgSigCount = 0;
 
+// ---- 💥 run 120: the per-frame reset broke hiding, and the earlier run was right ----
+//
+// Hiding the arms used to remove them CLEANLY. After the pollution fix it left them black, and the
+// regression is mine: the depth-prime copy is drawn at draws 2-3, at the very START of the frame.
+// With a session-wide table those draws matched and the prime was hidden too. With a table reset
+// every frame the list is empty when they arrive, so only the foreground copy is hidden and the
+// prime survives to write the silhouette.
+//
+// Both properties are wanted and they were never in conflict - I implemented them as if they were.
+// So: LEARN into one table, MATCH against a stable copy promoted at the end of each frame. The
+// stable copy is populated when draws 2-3 arrive, and it still cannot carry menu geometry into a
+// gameplay frame because it is replaced wholesale every frame rather than accumulated.
+volatile LONG g_fgStableVerts[kFgSigMax] = {};
+volatile LONG g_fgStableCount = 0;
+
 static void FgLearnSignature(UINT verts) {
     const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
@@ -5282,17 +5297,38 @@ static void ApplyWorldOffset(Reg4* m, int conv, float tx, float ty, float tz) {
     }
 }
 
-static bool FgHidden(UINT verts) {
-    const LONG h = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
-    if (h <= 0 || h > kFgSigMax) return false;
-    return verts && (UINT)InterlockedCompareExchange(&g_fgSigVerts[h - 1], 0, 0) == verts;
+// ---- run 120: the toggle now cycles the two things actually wanted, not a mesh walker ----
+//
+//   0  normal
+//   1  MOVE the gun 30 world units sideways   - does the transform reach it
+//   2  HIDE the arms                          - does skipping remove them cleanly again
+//   3  both                                   - the target configuration, in one press
+//
+// Walking meshes generically was right while we did not know which was which. Now that we do,
+// cycling the two operations is fewer presses in a headset and each state answers a real question.
+static bool FgIsMesh(UINT verts, int idx1) {          // idx1 is 1-based into the stable list
+    if (!verts || idx1 < 1 || idx1 > kFgSigMax) return false;
+    if (idx1 > InterlockedCompareExchange(&g_fgStableCount, 0, 0)) return false;
+    return (UINT)InterlockedCompareExchange(&g_fgStableVerts[idx1 - 1], 0, 0) == verts;
 }
 
+static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
+    const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    return (m == 2 || m == 3) && FgIsMesh(verts, 2);
+}
+
+static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
+    const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    return (m == 1 || m == 3) && FgIsMesh(verts, 1);
+}
+
+// Any first-person mesh, wherever it is drawn - used to catch the near-plane depth prime at
+// draws 2-3 so it is hidden or moved along with the foreground copy.
 static bool FgMatchesSignature(UINT verts) {
     if (!verts) return false;
-    const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+    const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
-        if ((UINT)InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0) == verts) return true;
+        if ((UINT)InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0) == verts) return true;
     return false;
 }
 
@@ -5353,11 +5389,11 @@ void DumpDpgProbe() {
                 (e.a & D3DCLEAR_STENCIL) ? " STENCIL" : "", e.z0);
     }
     {
-        const LONG sn = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+        const LONG sn = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
         char line[256]; int m = 0;
         for (LONG i = 0; i < sn && i < kFgSigMax; ++i)
             m += _snprintf_s(line + m, sizeof(line) - m, _TRUNCATE, " [%ld]=%ld",
-                             i + 1, InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0));
+                             i + 1, InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0));
         Log("    meshes this frame (APPS index = vertex count):%s", sn ? line : " (none)");
     }
     Log("    foreground draws this frame: %ld%s", InterlockedCompareExchange(&g_fgDrawCount, 0, 0),
@@ -5387,7 +5423,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         DpgRecord(4, 0.0f, 0.0f, (uint32_t)InterlockedCompareExchange(&g_frameDrawIdx, 0, 0),
                   numVertices, primCount, 0);
     }
-    g_thisDrawMoved = InterlockedCompareExchange(&g_fgMoveOn, 0, 0) && FgHidden(numVertices);
+    g_thisDrawMoved = FgMoved(numVertices);
     const HRESULT dhr = StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
     });
@@ -8679,15 +8715,15 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         static bool pApps = false;
         const bool kApps = (GetAsyncKeyState(VK_APPS) & 0x8000) != 0;
         if (kApps && !pApps) {
-            const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
-            const LONG next = (InterlockedCompareExchange(&g_hideMeshIdx, 0, 0) + 1) % (n + 1);
+            const LONG next = (InterlockedCompareExchange(&g_hideMeshIdx, 0, 0) + 1) % 4;
             InterlockedExchange(&g_hideMeshIdx, next);
             InterlockedExchange(&g_dpgProbeFrames, 3);
-            InterlockedExchange(&g_fgMoveOn, 1);   // run 119: move, do not hide
-            if (next == 0) Log("APPS: all first-person meshes VISIBLE");
-            else Log("APPS: MOVING first-person mesh %ld of %ld (verts %ld) by 30 world units in +X"
-                     " - every draw of it, prime pass included. 1=gun 2=arms.", next, n,
-                     InterlockedCompareExchange(&g_fgSigVerts[next - 1], 0, 0));
+            static const char* kWhat[4] = {
+                "0 - normal, nothing touched",
+                "1 - GUN MOVED 30 units sideways (arms untouched)",
+                "2 - ARMS HIDDEN (gun untouched)",
+                "3 - GUN MOVED and ARMS HIDDEN - the target configuration" };
+            Log("APPS: %s", kWhat[next & 3]);
         }
         pApps = kApps;
     }
@@ -9543,8 +9579,18 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_frameDrawIdx, 0);
             InterlockedExchange(&g_inForeground, 0);
             InterlockedExchange(&g_fgDrawCount, 0);
-            // The signature list is rebuilt from each frame, so it can never carry menu or
-            // loading-screen geometry into a gameplay frame.
+            // Promote this frame's learned list to the stable one the matchers use, THEN clear the
+            // learning list. The stable copy is therefore populated when the depth-prime draws
+            // arrive at the start of the next frame - which is what makes hiding remove a mesh
+            // completely instead of leaving a black silhouette - while still being replaced
+            // wholesale every frame rather than accumulating menu geometry.
+            {
+                const LONG sc = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+                for (LONG i = 0; i < kFgSigMax; ++i)
+                    InterlockedExchange(&g_fgStableVerts[i],
+                        i < sc ? InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0) : 0);
+                InterlockedExchange(&g_fgStableCount, sc);
+            }
             InterlockedExchange(&g_fgSigCount, 0);
 
             // Run 98: find every field holding the view rotation, while we still know what the
