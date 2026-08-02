@@ -3371,6 +3371,7 @@ extern LONG  g_aimFieldSet;
 extern LONG  g_traceSignYaw, g_traceSignPitch;
 extern LONG  g_gunSignYaw, g_gunSignPitch, g_gunSignRoll, g_gunFollowPos;
 extern LONG  g_gunSignPosZ, g_gunAnchorFwd, g_gunAnchorRight, g_gunAnchorUp;
+extern volatile LONG g_gunSignCombo;
 extern float g_aimPoseSignX, g_aimPoseSignY;
 
 bool InitXRInput() {
@@ -3414,6 +3415,11 @@ bool InitXRInput() {
             g_gunAnchorFwd   = GetPrivateProfileIntA("Input", "GunAnchorFwd",   25, path);
             g_gunAnchorRight = GetPrivateProfileIntA("Input", "GunAnchorRight",  8, path);
             g_gunAnchorUp    = GetPrivateProfileIntA("Input", "GunAnchorUp",    -8, path);
+            // Which sign combination to START in. Set from the ini rather than by changing the
+            // sign defaults, because changing those RENUMBERS the combos - which is what made
+            // "combo 2" mean two different things in two sessions and cost a run.
+            InterlockedExchange(&g_gunSignCombo,
+                GetPrivateProfileIntA("Input", "GunSignCombo", 0, path) & 15);
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             for (int i = 0; i < kPadButtonCount; ++i)
@@ -5438,6 +5444,13 @@ LONG g_gunSignPosZ = -1;                       // vertical translation came back
 LONG g_gunAnchorFwd = 25, g_gunAnchorRight = 8, g_gunAnchorUp = -8;   // engine units from the eye
 volatile LONG g_gunSignCombo = 0;
 volatile LONG g_readoutOn = 1;   // on-screen state squares - see DrawStateReadout
+
+// ---- run 128: which anchor axis the arrow keys adjust ----
+//
+// The anchor is the point the gun rotates about, and getting it onto the grip is pure eyeball -
+// exactly the kind of tuning that should never cost a restart per guess. LEFT/RIGHT pick the axis,
+// UP/DOWN change it, and all three values plus the selection are on screen.
+volatile LONG g_anchorAxis = 0;                // 0 forward, 1 right, 2 up
 
 static void Mul3(float out[3][3], const float a[3][3], const float b[3][3]) {
     for (int i = 0; i < 3; ++i)
@@ -8640,6 +8653,12 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     const char* what = (mode == 1) ? "GUN" : (mode == 2) ? "ARMS"
                      : (mode == 3) ? "GUN ARMS" : "NONE";
     _snprintf_s(l3, sizeof(l3), _TRUNCATE, "AIM %d  MOVING %s", (int)aim, what);
+    const LONG ax = InterlockedCompareExchange(&g_anchorAxis, 0, 0);
+    char l4[40];
+    _snprintf_s(l4, sizeof(l4), _TRUNCATE, "ANCHOR %sF%ld %sR%ld %sU%ld",
+                ax == 0 ? "-" : " ", g_gunAnchorFwd,
+                ax == 1 ? "-" : " ", g_gunAnchorRight,
+                ax == 2 ? "-" : " ", g_gunAnchorUp);
 
     DWORD oldScissor = FALSE;
     dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
@@ -8650,7 +8669,7 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     const int  lh = (kGlyphH + 2) * px;
     const int  y0 = (int)(g_srcH / 7);
 
-    const int kCap = 900;
+    const int kCap = 1200;
     static D3DRECT r[kCap];
     int n = 0;
     for (int eye = 0; eye < 2; ++eye) {
@@ -8658,6 +8677,7 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
         n = TextRects(r, n, kCap, x0, y0,          px, l1);
         n = TextRects(r, n, kCap, x0, y0 + lh,     px, l2);
         n = TextRects(r, n, kCap, x0, y0 + 2 * lh, px, l3);
+        n = TextRects(r, n, kCap, x0, y0 + 3 * lh, px, l4);
     }
     if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
 
@@ -9098,6 +9118,32 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         }
     }
     pDec = kDec;
+
+    // ---- ARROW KEYS: tune the gun anchor, the point it rotates about ----
+    //
+    // LEFT/RIGHT choose the axis, UP/DOWN move it by one engine unit (about 1.9 cm). All three
+    // values and the selection are on the readout, so this is adjust-and-look rather than
+    // edit-restart-look. Whatever it settles at goes into the ini to persist.
+    {
+        static bool pL = false, pR = false, pU = false, pD = false;
+        const bool kL = (GetAsyncKeyState(VK_LEFT)  & 0x8000) != 0;
+        const bool kR = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
+        const bool kU = (GetAsyncKeyState(VK_UP)    & 0x8000) != 0;
+        const bool kD = (GetAsyncKeyState(VK_DOWN)  & 0x8000) != 0;
+        if (kL && !pL) InterlockedExchange(&g_anchorAxis,
+                          (InterlockedCompareExchange(&g_anchorAxis, 0, 0) + 2) % 3);
+        if (kR && !pR) InterlockedExchange(&g_anchorAxis,
+                          (InterlockedCompareExchange(&g_anchorAxis, 0, 0) + 1) % 3);
+        if ((kU && !pU) || (kD && !pD)) {
+            const LONG step = (kU && !pU) ? 1 : -1;
+            const LONG ax = InterlockedCompareExchange(&g_anchorAxis, 0, 0);
+            if      (ax == 0) g_gunAnchorFwd   += step;
+            else if (ax == 1) g_gunAnchorRight += step;
+            else              g_gunAnchorUp    += step;
+            Log("ANCHOR: fwd %ld right %ld up %ld", g_gunAnchorFwd, g_gunAnchorRight, g_gunAnchorUp);
+        }
+        pL = kL; pR = kR; pU = kU; pD = kD;
+    }
 
     // ---- CAPS LOCK: cycle the eight gun rotation-sign combinations ----
     //
