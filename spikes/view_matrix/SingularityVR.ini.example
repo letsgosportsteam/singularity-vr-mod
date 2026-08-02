@@ -518,7 +518,7 @@ GpuFenceProbe=1
 ;
 ; [Input]
 ; GunSignYaw=1
-; GunSignPitch=-1
+; GunSignPitch=1     ; combo 2 in run 125 - found with CAPS LOCK, not by guessing
 ; GunSignRoll=1
 ; GunSignPosZ=-1
 ; GunFollowPosition=1     ; 0 freezes position, so rotation can be tuned alone

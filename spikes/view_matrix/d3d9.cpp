@@ -5454,19 +5454,36 @@ static void GunSigns(int& sy, int& sp, int& sr) {
     sr = (c & 4) ? -(int)g_gunSignRoll  : (int)g_gunSignRoll;
 }
 
+// ---- ⭐ run 125: pitch and roll are about the VIEW's axes, not the world's ----
+//
+// Reported: pointing straight ahead looks right, but spinning the character with the stick makes
+// the gun droop as it turns and come back correct after a full circle. A 360-degree period is the
+// signature of a frame error, and it names itself: pitch was applied about world Y, when it needs
+// to be about the VIEW'S RIGHT axis. Facing the start direction those coincide; ninety degrees
+// round, world Y has become the view's FORWARD, so what should be pitch acts partly as roll.
+//
+// Yaw was unaffected because yaw is about world Z in either frame - which is exactly why only
+// pitch misbehaved, and why the report distinguishes them.
+//
+// So the pitch/roll pair is conjugated by the view yaw: R = Rz(-t) * Rx * Ry * Rz(t + yaw). The
+// conjugation takes the gun into the view's frame, rotates it there, and brings it back.
 static void BuildGunTransform(float C[4][4], const float p[3],
                               int32_t yawUU, int32_t pitchUU, int32_t rollUU,
+                              int32_t viewYawUU,
                               float tx, float ty, float tz) {
     const float kUUToRad = 6.2831853f / 65536.0f;
-    const float a = yawUU   * kUUToRad;      // about Z, UE3 up
-    const float b = pitchUU * kUUToRad;      // about Y
-    const float c = rollUU  * kUUToRad;      // about X, the forward axis
-    const float Rz[3][3] = { { cosf(a), sinf(a), 0 }, { -sinf(a), cosf(a), 0 }, { 0, 0, 1 } };
+    const float a = yawUU   * kUUToRad;      // about Z, UE3 up - frame-independent
+    const float b = pitchUU * kUUToRad;      // about the view's right
+    const float c = rollUU  * kUUToRad;      // about the view's forward
+    const float t = viewYawUU * kUUToRad;
+    const float Rz[3][3] = { { cosf(a + t), sinf(a + t), 0 }, { -sinf(a + t), cosf(a + t), 0 }, { 0, 0, 1 } };
+    const float Rzi[3][3] = { { cosf(-t), sinf(-t), 0 }, { -sinf(-t), cosf(-t), 0 }, { 0, 0, 1 } };
     const float Ry[3][3] = { { cosf(b), 0, -sinf(b) }, { 0, 1, 0 }, { sinf(b), 0, cosf(b) } };
     const float Rx[3][3] = { { 1, 0, 0 }, { 0, cosf(c), sinf(c) }, { 0, -sinf(c), cosf(c) } };
-    float t1[3][3], R[3][3];
-    Mul3(t1, Rx, Ry);
-    Mul3(R, t1, Rz);
+    float t1[3][3], t2[3][3], R[3][3];
+    Mul3(t1, Rzi, Rx);
+    Mul3(t2, t1, Ry);
+    Mul3(R, t2, Rz);
 
     for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < 3; ++j) C[i][j] = R[i][j];
@@ -5505,6 +5522,9 @@ static void BuildGunC(float C[4][4]) {
         (int32_t)(sy * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
         (int32_t)(sp * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
         (int32_t)(sr * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
+        // The gun currently faces along the view, so the view yaw is the frame its pitch and roll
+        // have to be expressed in.
+        g_wantYaw,
         H[0] - G[0], H[1] - G[1], H[2] - G[2]);
 }
 
