@@ -532,7 +532,7 @@ GpuFenceProbe=1
 ;   gun orbits a point IN FRONT of it  -> increase GunAnchorFwd
 ;   gun orbits a point BEHIND it       -> decrease GunAnchorFwd
 ;
-; GunAnchorFwd=25
-; GunAnchorRight=8
-; GunAnchorUp=-8
+; GunAnchorFwd=30      ; tuned by eye in run 131 with the on-screen marker
+; GunAnchorRight=9
+; GunAnchorUp=-13
 ; ---------------------------------------------------------------------------

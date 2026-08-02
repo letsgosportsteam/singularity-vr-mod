@@ -8622,6 +8622,8 @@ static const unsigned char kFont[][kGlyphH] = {
     {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},               // 9
     {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},               // +
     {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},               // -
+    {0x02,0x04,0x04,0x04,0x04,0x04,0x02},               // ( 
+    {0x08,0x04,0x04,0x04,0x04,0x04,0x08},               // )
 };
 
 static int GlyphIndex(char ch) {
@@ -8631,6 +8633,8 @@ static int GlyphIndex(char ch) {
     if (ch >= '0' && ch <= '9') return 27 + (ch - '0');
     if (ch == '+') return 37;
     if (ch == '-') return 38;
+    if (ch == '(') return 39;
+    if (ch == ')') return 40;
     return 0;
 }
 
@@ -8752,10 +8756,13 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     _snprintf_s(l3, sizeof(l3), _TRUNCATE, "AIM %d  MOVING %s", (int)aim, what);
     const LONG ax = InterlockedCompareExchange(&g_anchorAxis, 0, 0);
     char l4[40];
-    _snprintf_s(l4, sizeof(l4), _TRUNCATE, "ANCHOR %sF%ld %sR%ld %sU%ld",
-                ax == 0 ? "-" : " ", g_gunAnchorFwd,
-                ax == 1 ? "-" : " ", g_gunAnchorRight,
-                ax == 2 ? "-" : " ", g_gunAnchorUp);
+    // ⚠️ Brackets, not a leading dash. The dash used to mark the selected axis and it read as a
+    // MINUS SIGN - "-R9" looks exactly like "R is -9" and was reported that way. A readout whose
+    // marker is indistinguishable from its data is worse than no marker.
+    _snprintf_s(l4, sizeof(l4), _TRUNCATE, "ANCHOR %sF%ld%s %sR%ld%s %sU%ld%s",
+                ax == 0 ? "(" : " ", g_gunAnchorFwd,   ax == 0 ? ")" : " ",
+                ax == 1 ? "(" : " ", g_gunAnchorRight, ax == 1 ? ")" : " ",
+                ax == 2 ? "(" : " ", g_gunAnchorUp,    ax == 2 ? ")" : " ");
 
     DWORD oldScissor = FALSE;
     dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
