@@ -6299,6 +6299,10 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_VolLockBox)(IDirect3DVolumeTexture9*, UI
 typedef HRESULT (STDMETHODCALLTYPE *PFN_VolUnlockBox)(IDirect3DVolumeTexture9*, UINT);
 typedef ULONG   (STDMETHODCALLTYPE *PFN_Release)(IUnknown*);
 
+// Lock traffic on shadowed textures, cumulative. See the note above FlushShadow - these exist to
+// PROVE which mechanism was swallowing the uploads rather than leave it inferred.
+volatile LONG g_texLocks = 0, g_texLocksNoDirty = 0, g_texLocksPartial = 0;
+
 PFN_TexLockRect    g_origTexLock = nullptr;
 PFN_TexUnlockRect  g_origTexUnlock = nullptr;
 PFN_Release        g_origTexRelease = nullptr;
@@ -6312,6 +6316,40 @@ PFN_Release        g_origVolRelease = nullptr;
 // Push the shadow's newly-dirtied regions up to the DEFAULT resource. SYSTEMMEM textures track
 // dirty rects themselves across LockRect, and UpdateTexture clears them as it copies, so calling
 // this per unlock moves only what that unlock touched rather than the whole chain each time.
+// ---- ⭐ run 139: THE BUG. UpdateTexture copies dirty REGIONS, and ours had none ----
+//
+// `D3D9ExMode=1` corrupted the soldier's colours, blacked out the dock floor and deleted the fire
+// - three symptoms, one cause, and the wrapper reported itself perfectly healthy throughout:
+// `shadow failures 0, create failures 0, GetSurfaceLevel-on-shadowed 0`, no `UpdateTexture failed`.
+//
+// UpdateTexture does not copy a texture. It copies the source's **dirty regions**. Ours ended up
+// with regions that did not cover what had actually been written, so it copied too little and
+// returned S_OK. Marking the shadow fully dirty at every unlock fixes it, confirmed visually:
+// with this in place `D3D9ExMode=1` is on par with `D3D9ExMode=0`.
+//
+// ⚠️ **WHY it was under-marked is NOT established, and the first explanation was wrong.** The
+// diagnosis when this was written was `D3DLOCK_NO_DIRTY_UPDATE` - the engine suppressing the
+// runtime's tracking and declaring regions itself on the texture it holds, which is the DEFAULT
+// one. The counter added in the same commit to prove that measured **NO_DIRTY_UPDATE 0 of 6716
+// locks, 0%**. The engine never passes it. That story is dead; do not repeat it.
+//
+// What is still true and still worth suspecting when someone returns to this:
+//   * `AddDirtyRect` appeared ZERO times in this file - never hooked, never called.
+//   * `e->dirty` is ONE flag for the whole texture while locks are per-LEVEL, and FlushShadow
+//     clears it after any copy. A texture locked on several levels before any unlock therefore
+//     copies on the first unlock and silently skips every later one. That is a real defect on
+//     inspection whether or not it is the one that was biting.
+//   * UpdateTexture clears the source's dirty regions as it copies, so anything written before a
+//     flush and re-read after it is gone.
+//
+// Done at each Unlock hook rather than here, because AddDirtyRect lives on the concrete types (and
+// takes a face for cubes, a box for volumes) while this only has the base pointer. NULL means the
+// whole level rather than the rect that was locked: correctness first, and the streaming cost is
+// measured rather than assumed.
+//
+// ⚠️ The failure this fixes is SILENT BY CONSTRUCTION - every API call involved succeeded. No
+// amount of checking return codes would ever have found it, which is why the counters said the
+// wrapper was fine for six runs.
 inline void FlushShadow(StageEntry* e) {
     if (!e || !e->shadow || !e->dirty || !g_gameDev) return;
     HRESULT hr = g_gameDev->UpdateTexture(e->shadow, e->key);
@@ -6328,6 +6366,15 @@ HRESULT STDMETHODCALLTYPE Hook_TexLockRect(IDirect3DTexture9* self, UINT level, 
     StageEntry* e = StageFind(self);
     IDirect3DTexture9* shadow = (e && e->shadow) ? (IDirect3DTexture9*)e->shadow : nullptr;
     if (shadow && !(flags & D3DLOCK_READONLY)) e->dirty = true;
+    // Evidence for the diagnosis above, rather than an inference from it. If NO_DIRTY_UPDATE is
+    // non-zero the engine was suppressing the runtime's own dirty tracking and intending to
+    // declare regions itself - which it did, on the wrong texture. If it is zero, the AddDirtyRect
+    // added at unlock is redundant and something else was eating the upload.
+    if (shadow) {
+        InterlockedIncrement(&g_texLocks);
+        if (flags & D3DLOCK_NO_DIRTY_UPDATE) InterlockedIncrement(&g_texLocksNoDirty);
+        if (rect) InterlockedIncrement(&g_texLocksPartial);
+    }
     LeaveCriticalSection(&g_stageLock);
     if (!shadow) return g_origTexLock(self, level, out, rect, flags);   // not ours - forward
     return g_origTexLock(shadow, level, out, rect, flags);
@@ -6338,6 +6385,8 @@ HRESULT STDMETHODCALLTYPE Hook_TexUnlockRect(IDirect3DTexture9* self, UINT level
     StageEntry* e = StageFind(self);
     IDirect3DTexture9* shadow = (e && e->shadow) ? (IDirect3DTexture9*)e->shadow : nullptr;
     HRESULT hr = shadow ? g_origTexUnlock(shadow, level) : S_OK;
+    // See the note above FlushShadow. Without this the copy below moves nothing.
+    if (shadow && e->dirty) shadow->AddDirtyRect(nullptr);
     if (shadow) FlushShadow(e);
     LeaveCriticalSection(&g_stageLock);
     if (!shadow) return g_origTexUnlock(self, level);
@@ -6398,6 +6447,8 @@ HRESULT STDMETHODCALLTYPE Hook_CubeUnlockRect(IDirect3DCubeTexture9* self, D3DCU
     StageEntry* e = StageFind(self);
     IDirect3DCubeTexture9* shadow = (e && e->shadow) ? (IDirect3DCubeTexture9*)e->shadow : nullptr;
     HRESULT hr = shadow ? g_origCubeUnlock(shadow, face, level) : S_OK;
+    // Per FACE here - a cube's dirty regions are tracked separately for each of the six.
+    if (shadow && e->dirty) shadow->AddDirtyRect(face, nullptr);
     if (shadow) FlushShadow(e);
     LeaveCriticalSection(&g_stageLock);
     if (!shadow) return g_origCubeUnlock(self, face, level);
@@ -6426,6 +6477,8 @@ HRESULT STDMETHODCALLTYPE Hook_VolUnlockBox(IDirect3DVolumeTexture9* self, UINT 
     StageEntry* e = StageFind(self);
     IDirect3DVolumeTexture9* shadow = (e && e->shadow) ? (IDirect3DVolumeTexture9*)e->shadow : nullptr;
     HRESULT hr = shadow ? g_origVolUnlock(shadow, level) : S_OK;
+    // Volumes use a BOX rather than a rect; NULL is still "the whole thing".
+    if (shadow && e->dirty) shadow->AddDirtyBox(nullptr);
     if (shadow) FlushShadow(e);
     LeaveCriticalSection(&g_stageLock);
     if (!shadow) return g_origVolUnlock(self, level);
@@ -6600,6 +6653,19 @@ void ReportPoolTranslation() {
         " GetSurfaceLevel-on-shadowed %ld",
         g_xlatTex, g_xlatCube, g_xlatVol, g_xlatVB, g_xlatIB,
         g_stageCount, g_stageMB, g_stageFailed, g_xlatFailed, g_surfLevelOnShadowed);
+    // The line that would have found the run-133..138 corruption on day one. Every counter above
+    // reads healthy while textures are visibly broken, because every API call involved SUCCEEDS -
+    // the uploads were simply copying nothing. NO_DIRTY_UPDATE is the mechanism; see FlushShadow.
+    {
+        const LONG lk = InterlockedCompareExchange(&g_texLocks, 0, 0);
+        const LONG nd = InterlockedCompareExchange(&g_texLocksNoDirty, 0, 0);
+        const LONG pr = InterlockedCompareExchange(&g_texLocksPartial, 0, 0);
+        Log("    shadowed-texture locks %ld | NO_DIRTY_UPDATE %ld (%.0f%%) | partial-rect %ld"
+            " -- AddDirtyRect(NULL) on every dirty unlock is what makes the copy cover what was"
+            " written. NO_DIRTY_UPDATE was the first theory and it measured 0%% - the mechanism"
+            " is still unidentified, only the fix is confirmed.",
+            lk, nd, lk ? (100.0 * nd) / lk : 0.0, pr);
+    }
 }
 
 // Refresh the camera position the detector substitutes. Runs once per frame in Present.

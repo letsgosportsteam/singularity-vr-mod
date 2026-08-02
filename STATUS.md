@@ -32,6 +32,7 @@ dropped beside the game exe. No game files modified.
 | **Aim decoupling** | ✅ **SOLVED via route 2** — the bullet follows the controller, the view never moves, and it costs NOTHING in culling or LOD. Aim mode 11 |
 | **Gun follows the controller** | ✅ **working** — 6-DOF, arms hidden, anchor tuned. APPS toggles it |
 | **Cutscene head tracking** | ✅ **working, automatic** — run 138. `SetCinematicMode` drives it; look around freely during a cutscene, normal turning restored on exit |
+| **`D3D9ExMode=1` texture corruption** | ✅ **fixed** — run 139. Zero-copy is usable again; visuals match `D3D9ExMode=0` |
 
 ### If you are picking this up cold, read these three things
 
@@ -48,28 +49,56 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **🔴 THE TEXTURE WRAPPER IS THE ALPHA BLOCKER, AND IT IS ONE BUG, NOT THREE.** Run 137 confirmed
-   that `D3D9ExMode=0` fixes **all** of it: the soldier's colours, the black dock floor, and the
-   vanishing fire. Everything below about culling was chasing a texture bug.
-   - **Why it looked like culling.** UE3 selects texture mips by projected screen size in *pixels*,
-     so which mips get requested moves with FOV, with resolution and with distance — all three of
-     the levers that appeared to be rendering knobs. Every one of those uploads goes through the
-     wrapper.
-   - **Why the symptoms differ by surface.** Fire is **additively blended**, so a zeroed upload
-     contributes nothing and the effect is *invisible* rather than miscoloured. The deck is opaque,
-     so the same failure renders **black**.
-   - **Why it was hard to see.** The wrapper reports itself perfectly healthy while doing it:
-     `shadow failures 0, create failures 0, GetSurfaceLevel-on-shadowed 0`, no `UpdateTexture
-     failed`. The instrumentation watches paths that are not the broken one.
-   - **The fix.** Log every lock landing on a shadowed texture with its format, level and rect, and
-     find which one never reaches the DEFAULT copy. `D3D9ExMode=0` is not a shippable workaround —
-     it also disables zero-copy, which costs ~3.4 ms/frame at 2560×1440 and considerably more at
-     full resolution.
-2. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
+1. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
    weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
    correctly aligned**, so they are not one system and whatever anchors the flash is not what
    anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
-   not. Likely another mesh in the foreground pass, or a screen-space effect drawn after it.
+   not.
+2. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
+   option on, **the hidden arms turn BLACK instead of staying invisible.** So whatever hides the
+   first-person meshes is not reaching the pass that HQ Decals enables — the arms are still being
+   drawn there, at their original position. That is a much sharper lead than "decals are broken":
+   it says the mesh-hiding rides on the locked view-projection register and this pass does not.
+   Connects directly to the unidentified **third scene-sized surface** and to `ExtraCamReg` (`vs
+   c13`), both of which are passes we do not remap. Workaround remains free: leave High Quality
+   Decals off.
+
+> ## ✅ FIXED (run 139): the texture wrapper. `D3D9ExMode=1` is now on par with `0`.
+>
+> One defect, three symptoms — the soldier's colours, the black dock floor and the vanishing fire.
+> `UpdateTexture` copies the source's **dirty regions**, not the source; ours did not cover what
+> had been written, so it copied too little and returned `S_OK`. Marking the shadow fully dirty at
+> every unlock (`AddDirtyRect(NULL)`, per-face for cubes, `AddDirtyBox` for volumes) fixes it.
+>
+> ⚠️ **The fix is confirmed. The mechanism is NOT, and the first explanation was wrong.** The
+> diagnosis was `D3DLOCK_NO_DIRTY_UPDATE`; the counter added to prove it measured **0 of 6716
+> locks**. The engine never passes that flag. Do not repeat that story — it is written up here
+> only so nobody re-derives it.
+>
+> Still true and still worth suspecting if this resurfaces:
+> - `AddDirtyRect` was never hooked and never called anywhere in the file.
+> - **`e->dirty` is one flag for the whole texture while locks are per-LEVEL**, and `FlushShadow`
+>   clears it after any copy — so a texture locked on several levels before any unlock copies once
+>   and silently skips the rest. A real defect on inspection, whether or not it was the one biting.
+> - `UpdateTexture` clears the source's dirty regions as it copies.
+>
+> **Cost not yet measured.** `AddDirtyRect(NULL)` marks the whole level, so streaming copies more
+> than it needs to. The locked rect is already recorded if it wants narrowing.
+
+> **Why it took five runs, kept because the reasoning error is the useful part.**
+> - **Why it looked like culling.** UE3 selects texture mips by projected screen size in *pixels*,
+>   so which mips get requested moves with FOV, with resolution and with distance — all three of
+>   the levers that looked like rendering knobs. Every one of those uploads goes through the
+>   wrapper.
+> - **Why the symptoms differ by surface.** Fire is **additively blended**, so an unwritten upload
+>   contributes nothing and the effect is *invisible* rather than miscoloured. The deck is opaque,
+>   so the same failure renders **black**.
+> - **The dismissal that cost the most.** The wrapper was ruled out in run 135 because *"the effect
+>   is FOV-dependent and a dropped upload wouldn't care about FOV"*. Mip selection **is**
+>   FOV-dependent, so the one fact that felt exculpatory was the one that most implicated it — and
+>   the wrapper had already been proven defective on the soldier by then. **An independently
+>   confirmed defect should not be dismissed on a one-line argument.**
+
 3. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
    animation, so they are absent from the foreground list when the counts are latched. The fix is
    probably to latch a SET of counts rather than two, or to match on something steadier than
