@@ -8638,6 +8638,65 @@ static int TextRects(D3DRECT* r, int n, int cap, int x0, int y0, int px, const c
     return n;
 }
 
+// ---- ⭐ run 129: show the anchor where it actually IS ----
+//
+// The anchor is a point in space, and tuning it by watching what swings is inference. Drawing it
+// makes it direct: put the marker on the grip and the pivot is right, with nothing to deduce.
+//
+// It is projected through the SAME cached view-projection the scene uses, with the SAME per-eye
+// remap, so the marker lands where that point genuinely is rather than at an estimate of it. If
+// the marker sits somewhere the gun is not, that is a real disagreement worth seeing.
+//
+// Returns false when the point is behind the eye - w <= 0 - because projecting that gives a
+// mirrored position on screen, which would be a confident lie.
+static bool ProjectToScreen(const float* mat, int conv, const float p[3],
+                            LONG eyeX0, LONG eyeW, LONG h, LONG& sx, LONG& sy) {
+    const Reg4* r = reinterpret_cast<const Reg4*>(mat);
+    float cx, cy, cw;
+    if (conv == CONV_ROW) {
+        cx = p[0]*r[0].x + p[1]*r[1].x + p[2]*r[2].x + r[3].x;
+        cy = p[0]*r[0].y + p[1]*r[1].y + p[2]*r[2].y + r[3].y;
+        cw = p[0]*r[0].w + p[1]*r[1].w + p[2]*r[2].w + r[3].w;
+    } else {
+        cx = r[0].x*p[0] + r[0].y*p[1] + r[0].z*p[2] + r[0].w;
+        cy = r[1].x*p[0] + r[1].y*p[1] + r[1].z*p[2] + r[1].w;
+        cw = r[3].x*p[0] + r[3].y*p[1] + r[3].z*p[2] + r[3].w;
+    }
+    if (cw <= 0.001f) return false;
+    const float ndcX = cx / cw, ndcY = cy / cw;
+    if (ndcX < -1.5f || ndcX > 1.5f || ndcY < -1.5f || ndcY > 1.5f) return false;
+    sx = eyeX0 + (LONG)((ndcX * 0.5f + 0.5f) * eyeW);
+    sy = (LONG)((0.5f - ndcY * 0.5f) * h);
+    return true;
+}
+
+static int AnchorMarkerRects(D3DRECT* r, int n, int cap) {
+    // The anchor in the same space the transform uses: head frame turned into world by body yaw.
+    const float byr = g_baseYaw * (6.2831853f / 65536.0f);
+    const float bc = cosf(byr), bs = sinf(byr);
+    const float af = (float)g_gunAnchorFwd, ar = (float)g_gunAnchorRight;
+    const float G[3] = { bc * af - bs * ar, bs * af + bc * ar, (float)g_gunAnchorUp };
+
+    int slot = -1;
+    for (int i = 0; i < kMaxCamMats; ++i) if (g_camMats[i].valid) { slot = i; break; }
+    if (slot < 0) return n;                      // no live matrix this frame - draw nothing
+
+    const LONG halfW = (LONG)g_srcW / 2;
+    const LONG arm = (LONG)(g_srcH / 90), th = (LONG)(g_srcH / 400) + 1;
+    for (int eye = 0; eye < 2; ++eye) {
+        float m[16];
+        memcpy(m, g_camMats[slot].m, sizeof(m));
+        ApplyEyeRemap(reinterpret_cast<Reg4*>(m), g_camMats[slot].conv, eye ? +0.5f : -0.5f);
+        LONG sx = 0, sy = 0;
+        if (!ProjectToScreen(m, g_camMats[slot].conv, G,
+                             eye * halfW, halfW, (LONG)g_srcH, sx, sy)) continue;
+        if (n + 2 > cap) break;
+        r[n].x1 = sx - arm; r[n].y1 = sy - th; r[n].x2 = sx + arm; r[n].y2 = sy + th; ++n;
+        r[n].x1 = sx - th;  r[n].y1 = sy - arm; r[n].x2 = sx + th; r[n].y2 = sy + arm; ++n;
+    }
+    return n;
+}
+
 static void DrawStateReadout(IDirect3DDevice9* dev) {
     if (!dev || !g_srcW || !g_srcH) return;
     const LONG combo = InterlockedCompareExchange(&g_gunSignCombo, 0, 0);
@@ -8680,6 +8739,10 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
         n = TextRects(r, n, kCap, x0, y0 + 3 * lh, px, l4);
     }
     if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
+
+    // The anchor cross, in magenta so it cannot be mistaken for the text.
+    int mn = AnchorMarkerRects(r, 0, kCap);
+    if (mn) dev->Clear((DWORD)mn, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 0, 200), 0.0f, 0);
 
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
 }
