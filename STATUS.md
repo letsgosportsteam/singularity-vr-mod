@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 136). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 137). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -47,33 +47,41 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **The vanishing fire / black floor — the alpha's most visible defect.** Runs 134–136 eliminated
-   every culling explanation; see "Runs 133–136" below for the full elimination table. The one
-   surviving theory is a **screen-space pass reconstructing position from the depth buffer**. Test
-   it by making `ApplyProjection` consistent with whatever the depth-reading shaders assume, or by
-   finding the constant that carries `ScreenPositionScaleBias` and correcting it for the forced
-   frustum. ⚠️ `ScreenPositionScaleBias` is listed as a DEAD theory below — it was killed **for
-   decals**, against a different symptom. It is not dead for this one and must be re-tested, not
-   inherited.
-2. **Cutscene head yaw.** Cause found and fix known (mode 3: `ROT MATRIX` + `YAW FOLD OFF`). Blocked
-   only on detecting a cutscene — see below. Ships today as a manual NUMPAD8 cycle.
-3. **`D3D9ExMode=1` corrupts character textures.** Confirmed by A/B. Not free to turn off: it costs
-   the zero-copy path and several ms a frame at full resolution. Needs a real fix in the wrapper.
-4. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
+1. **🔴 THE TEXTURE WRAPPER IS THE ALPHA BLOCKER, AND IT IS ONE BUG, NOT THREE.** Run 137 confirmed
+   that `D3D9ExMode=0` fixes **all** of it: the soldier's colours, the black dock floor, and the
+   vanishing fire. Everything below about culling was chasing a texture bug.
+   - **Why it looked like culling.** UE3 selects texture mips by projected screen size in *pixels*,
+     so which mips get requested moves with FOV, with resolution and with distance — all three of
+     the levers that appeared to be rendering knobs. Every one of those uploads goes through the
+     wrapper.
+   - **Why the symptoms differ by surface.** Fire is **additively blended**, so a zeroed upload
+     contributes nothing and the effect is *invisible* rather than miscoloured. The deck is opaque,
+     so the same failure renders **black**.
+   - **Why it was hard to see.** The wrapper reports itself perfectly healthy while doing it:
+     `shadow failures 0, create failures 0, GetSurfaceLevel-on-shadowed 0`, no `UpdateTexture
+     failed`. The instrumentation watches paths that are not the broken one.
+   - **The fix.** Log every lock landing on a shadowed texture with its format, level and rect, and
+     find which one never reaches the DEFAULT copy. `D3D9ExMode=0` is not a shippable workaround —
+     it also disables zero-copy, which costs ~3.4 ms/frame at 2560×1440 and considerably more at
+     full resolution.
+2. **Cutscene head yaw — should be DONE, needs one confirming run.** Cause found, fix known
+   (mode 3), and run 137 wired it to `SetCinematicMode`, which is confirmed engine-authoritative
+   (`arg raw 0x00000001` on entry, `0x00000000` on exit). ⚠️ The remaining risk is the **script
+   hook now installing at startup** instead of on the first NUMPAD-dot press — see the warning
+   below. `CutsceneAuto=0` reverts it without a rebuild.
+3. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
    weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
    correctly aligned**, so they are not one system and whatever anchors the flash is not what
    anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
    not. Likely another mesh in the foreground pass, or a screen-space effect drawn after it.
-   **Note the family resemblance to item 1** — a screen-centre anchor is what a screen-space pass
-   does when its position reconstruction is wrong. These may be one bug.
-5. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
+4. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
    animation, so they are absent from the foreground list when the counts are latched. The fix is
    probably to latch a SET of counts rather than two, or to match on something steadier than
    vertex count.
-6. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+5. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-7. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+6. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
 
@@ -132,7 +140,20 @@ before they are written. **Touch stick turning is unaffected either way** — sn
   merely untried.
 - ❌ **Anything derived from camera yaw vs controller yaw vs written yaw.** The fold-in drags all
   three into agreement, so during a cutscene they are as self-consistent as during play.
-- ❓ **`HELD`** (on the readout, and logged as `yaw held:`) — the percentage of frames where the
+- ✅ **`SetCinematicMode` WORKS — the hook was simply never installed.** Run 136 saw it fire cleanly
+  (`arg raw 0x00000001` entering a cutscene, `0x00000000` leaving), which is exactly the check the
+  frame-layout note asked for. It had failed earlier because the ProcessEvent hook is **not
+  installed at startup** — the log says so on line 25 of every run, and `RepointScriptHook()` only
+  runs when aim mode 6+ is selected. Run 136 only worked because the tester happened to press
+  NUMPAD-dot first. Run 137 installs it automatically once the names resolve, so CINE is live from
+  launch, and wires it to switch to mode 3 on the cutscene edge and restore the previous mode on
+  the way out. ⚠️ **This is the newest structural change in the build** — a detour on
+  `ProcessInternal` from startup rather than from a keypress, in the code run 102 crashed in.
+  `CutsceneAuto=0` reverts it with no rebuild, and it is the first thing to suspect if a launch
+  starts misbehaving.
+- ❓ **`HELD`** (on the readout, and logged as `yaw held:`) — no longer needed as a detector now
+  that `SetCinematicMode` works, but kept because it is a free measure of whether the engine is
+  honouring our yaw write. The percentage of frames where the
   engine kept the yaw we wrote. Detects the cutscene by its *effect* rather than its name. Near 100
   standing still in play, expected near 0 in a cutscene. **The open question is whether ordinary
   mouse/stick turning drags it low enough to overlap.** Measured only; nothing acts on it.
@@ -182,7 +203,24 @@ work at both resolutions and one of them looks broken.**
 whether or not it covers any pixels. An emitter LOD'd to zero particles still counts. So this rules
 out primitive *culling*; it does not prove the fire was submitted with fire in it.
 
-**The surviving theory.** A screen-space pass reconstructing position from the depth buffer.
+> ## ✅ ANSWERED (run 137): it was the texture wrapper all along.
+>
+> `D3D9ExMode=0` removes the black floor, the vanishing fire **and** the soldier's colours. One
+> defect, three symptoms, and the elimination table above was a two-day tour of the wrong subsystem.
+>
+> **The reasoning error worth keeping.** The wrapper was dropped as a suspect in run 135 on the
+> grounds that *"the effect is FOV-dependent and a dropped texture upload wouldn't care about
+> FOV"*. That is false: **UE3 selects mips by projected screen size in pixels**, so FOV, resolution
+> and distance all change which uploads happen. The one fact that felt like it ruled the wrapper
+> out was the fact that most strongly implicated it. It had already been confirmed as a real defect
+> on the soldier at that point — an independently-proven bug should not be dismissed on a
+> one-line argument.
+>
+> The identical-draw-count measurement was still right and still useful: the geometry IS submitted
+> at both resolutions. It just means the texture is broken, not that the draw is lost.
+
+**The theory that was wrong, kept because the arithmetic that killed it is reusable.** A
+screen-space pass reconstructing position from the depth buffer.
 `ApplyProjection` forces the frustum by rescaling the matrix's x and y columns and leaving z alone,
 so any shader reconstructing view-space position from depth plus screen position is using constants
 the engine derived for *its* projection. One mechanism covers everything: soft particles fading to
@@ -190,6 +228,13 @@ fully transparent (fire gone), the lighting pass leaving surfaces unlit (floor b
 proportionality to how far we scale x/y (FOV dependence), `ScreenPositionScaleBias` moving with the
 buffer (resolution dependence), depth error growing with range (distance dependence), and complete
 immunity to every culling knob.
+
+It is **dead**, killed by two sums on numbers already in the logs rather than by another run. The
+mismatch between what we force and what the engine's matrix assumes is `0.5 / headroom` — so it
+does not vary with PAGE DOWN and does vary with PAGE UP, which is precisely backwards from what was
+measured. And it comes out at 0.405 (full res) against 0.419 (1440p), 3% apart, so it predicts no
+resolution dependence at all. **Check a theory against the logs you already have before spending a
+run on it** — this one cost nothing because the numbers were sitting in `view_matrix.log`.
 
 ### The instrument that had been lying, and the ones added because of it
 

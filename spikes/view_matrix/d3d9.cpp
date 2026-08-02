@@ -865,6 +865,20 @@ volatile LONG g_yawHeldPct = -1;    // -1 = not measured yet, so the readout can
 // someone can hold their head. See the note where it is applied.
 volatile LONG g_freezeView = 0;
 int32_t g_frozenYaw = 0, g_frozenPitch = 0;
+
+// ---- ⭐ run 137: let the cutscene drive the mode ----
+//
+// SetCinematicMode is now confirmed as an engine-authoritative signal: run 136 logged it firing
+// with arg raw 0x00000001 on entry and 0x00000000 on exit, cleanly, which is exactly the check the
+// frame-layout note asked for. So it can steer the fix instead of merely reporting.
+//
+// Applied on TRANSITIONS ONLY, never per frame. g_matrixRot has another owner - the aim-mode path
+// writes it directly - and a per-frame override here would silently fight it for the whole run.
+// On entry: remember whatever mode the user had, switch to 3. On exit: put their mode back.
+volatile LONG g_cutsceneAuto = 1;   // ini: CutsceneAuto
+int  g_userCutMode = 1;             // the mode NUMPAD8 last selected, restored when a cutscene ends
+bool g_cineAutoActive = false;      // are we currently overriding?
+bool g_cinePrev = false;            // last seen CINE state, for edge detection
 bool    g_haveWant = false;
 int     g_hookHits = 0;
 
@@ -8918,7 +8932,10 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     // engine is ASKED for, which leaves what we FORCE as the remaining difference between a
     // rendered FOV that shows the fires and one that does not. Testing that without being able to
     // see its state is how the last three runs went wrong.
-    _snprintf_s(l5, sizeof(l5), _TRUNCATE, "MODE %d  ROT %s  PROJ %s", CutsceneMode(),
+    // The AUTO marker matters: mode 3 appearing on its own is correct during a cutscene and a bug
+    // during play, and without it the two are indistinguishable on screen.
+    _snprintf_s(l5, sizeof(l5), _TRUNCATE, "MODE %d%s ROT %s  PROJ %s", CutsceneMode(),
+                g_cineAutoActive ? " AUTO " : "  ",
                 InterlockedCompareExchange(&g_matrixRot, 0, 0) ? "MATRIX" : "ENGINE",
                 InterlockedCompareExchange(&g_vrProjection, 0, 0) ? "ON" : "OFF");
     // CINE is the candidate cutscene detector, shown but not acting. Watching it agree with what
@@ -9215,6 +9232,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     if (kNum8 && !pNum8) {
         const int next = (CutsceneMode() % 4) + 1;      // 1->2->3->4->1
         SetCutsceneMode(next);
+        // A manual press during a cutscene is the user overriding the automatic choice, so it also
+        // becomes what gets restored on the way out. Without this, cycling mid-cutscene would be
+        // silently undone at the boundary.
+        g_userCutMode = next;
         Log("NUMPAD8: cutscene mode %d - ROT %s, YAW FOLD %s. Deviation clamp is %d degrees"
             " - at 0 the matrix carries the WHOLE rotation. NUMPAD9 raises it.",
             next, (next == 2 || next == 3) ? "MATRIX (the view-projection carries the head)"
@@ -9669,12 +9690,58 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // the walk would be wasted. Retried on a slow tick rather than once, because the first
     // attempt can land while packages are still streaming in, and capped so a name that genuinely
     // does not exist in this build cannot cost a walk forever.
-    {
+    // ---- ⭐ run 137: resolving the NAMES was not enough - the HOOK was never installed ----
+    //
+    // Run 136 saw SetCinematicMode fire correctly, and it only worked because the tester happened
+    // to cycle aim mode with NUMPAD-dot first. That is what calls RepointScriptHook, and the log
+    // says so plainly at startup: "script hook: NOT installed at startup ... found through
+    // UFunction::Func when aim mode 6 or 7 is selected". The opening cutscene happens before any
+    // keypress, so on a normal launch the watch was still dead - I fixed the name table and left
+    // the actual gap in place.
+    //
+    // ⚠️ This installs a detour on ProcessInternal at startup rather than on a keypress, which is
+    // a real change in when the most delicate hook in this mod goes live. Run 102 crashed here
+    // (a cleared trampoline called while the detour was still installed) and the null-trampoline
+    // guard on the hot path is what makes it survivable. It is switchable for exactly that reason:
+    // `CutsceneAuto=0` restores the old behaviour with no rebuild, and this is the first thing to
+    // suspect if a launch starts misbehaving.
+    if (g_cutsceneAuto) {
         static int tick = 0, attempts = 0;
         if (FnIdx(kFnSetCinematic) < 0 && attempts < 12 && (++tick % 240) == 0 && g_camera) {
             ++attempts;
             Log("auto-resolving script names (attempt %d) - arming the cutscene watch", attempts);
             ResolveScriptNames();
+        }
+        // Separate from the names, and after them: the hook has to land on the real
+        // ProcessInternal, which is found through the object model and needs GObjects populated.
+        // Both calls are no-ops once they have succeeded, so this costs one branch a frame after
+        // the first success.
+        static bool hooked = false;
+        if (!hooked && FnIdx(kFnSetCinematic) >= 0) {
+            FindProcessInternal();
+            RepointScriptHook();
+            hooked = true;
+            Log("cutscene watch: script hook installed automatically - CINE is live from startup"
+                " rather than from the first NUMPAD-dot press");
+        }
+
+        // ---- the edge, and only the edge ----
+        const bool cineNow = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0;
+        if (cineNow != g_cinePrev) {
+            g_cinePrev = cineNow;
+            if (cineNow) {
+                // Capture what the user had rather than assuming mode 1 - they may be mid-test.
+                g_userCutMode = CutsceneMode();
+                g_cineAutoActive = true;
+                SetCutsceneMode(3);
+                Log("cutscene STARTED - switching to mode 3 (ROT MATRIX, YAW FOLD OFF) so head yaw"
+                    " survives the scripted camera. Was mode %d, restored on exit.", g_userCutMode);
+            } else if (g_cineAutoActive) {
+                g_cineAutoActive = false;
+                SetCutsceneMode(g_userCutMode);
+                Log("cutscene ENDED - restoring mode %d. The yaw fold-in is back on, which is what"
+                    " mouse and gamepad turning need.", g_userCutMode);
+            }
         }
     }
 
@@ -10744,6 +10811,16 @@ void LoadIniSettings() {
     Log("ini: UserPtrQuadByVertex=%d (%s)", g_upQuadByVertex,
         g_upQuadByVertex ? "a small draw is only a fullscreen quad if its first vertex is in NDC"
                          : "primitive count alone - the run-46 behaviour, decals stay unsplit");
+
+    // ON by default because without it head yaw is dead in every cutscene, which is the first
+    // thing a player sees. OFF restores run-136 behaviour: no startup script hook, and the
+    // cutscene mode only reachable by hand on NUMPAD8.
+    LONG cineIni = GetPrivateProfileIntA("Render", "CutsceneAuto", 1, path);
+    if (cineIni < 0 || cineIni > 1) cineIni = 1;
+    InterlockedExchange(&g_cutsceneAuto, cineIni);
+    Log("ini: CutsceneAuto=%ld (%s)", cineIni,
+        cineIni ? "install the script hook at startup and switch to mode 3 while a cutscene runs"
+                : "off - no startup script hook, cutscene mode is manual on NUMPAD8");
 
     g_userPtrHookLevel = GetPrivateProfileIntA("Render", "HookUserPointerDraws", 0, path);
     if (g_userPtrHookLevel < 0 || g_userPtrHookLevel > 3) g_userPtrHookLevel = 0;
