@@ -8675,12 +8675,28 @@ static bool ProjectToScreen(const float* mat, int conv, const float p[3],
     return true;
 }
 
-static int AnchorMarkerRects(D3DRECT* r, int n, int cap) {
+// ---- run 130: draw BOTH ends of the transform ----
+//
+// Asked why the cross follows the head rather than the controller. It should: the marker is G, the
+// gun's ORIGINAL anchor, and the engine draws the gun attached to the view - so G is head-relative
+// by definition. H, the hand, is where the gun is moved TO. They are different points:
+//
+//     v' = (v - G) * R + G + (H - G)
+//            pivot here          ends up here
+//
+// Showing only one of them made the transform look wrong when it was the instructions that were.
+// So both are drawn: MAGENTA is the pivot G, CYAN is the destination H.
+static int AnchorMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
     // The anchor in the same space the transform uses: head frame turned into world by body yaw.
     const float byr = g_baseYaw * (6.2831853f / 65536.0f);
     const float bc = cosf(byr), bs = sinf(byr);
     const float af = (float)g_gunAnchorFwd, ar = (float)g_gunAnchorRight;
-    const float G[3] = { bc * af - bs * ar, bs * af + bc * ar, (float)g_gunAnchorUp };
+    float G[3] = { bc * af - bs * ar, bs * af + bc * ar, (float)g_gunAnchorUp };
+    if (wantHand) {
+        G[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0);
+        G[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0);
+        G[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0));
+    }
 
     int slot = -1;
     for (int i = 0; i < kMaxCamMats; ++i) if (g_camMats[i].valid) { slot = i; break; }
@@ -8744,9 +8760,12 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     }
     if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
 
-    // The anchor cross, in magenta so it cannot be mistaken for the text.
-    int mn = AnchorMarkerRects(r, 0, kCap);
+    // MAGENTA: the pivot G, which is head-relative because the gun hangs off the view.
+    int mn = AnchorMarkerRects(r, 0, kCap, false);
     if (mn) dev->Clear((DWORD)mn, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 0, 200), 0.0f, 0);
+    // CYAN: the destination H, which is where your controller is.
+    mn = AnchorMarkerRects(r, 0, kCap, true);
+    if (mn) dev->Clear((DWORD)mn, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 220, 255), 0.0f, 0);
 
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
 }
