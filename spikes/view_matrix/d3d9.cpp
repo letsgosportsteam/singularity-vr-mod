@@ -5221,7 +5221,17 @@ volatile LONG g_fgDrawCount = 0;       // how many draws landed in the pass this
 // Vertex count is a good enough fingerprint: 5799, 3314 and 390 are specific numbers, and a draw
 // matching one of them anywhere in the frame is almost certainly the same mesh. Learned from the
 // foreground pass rather than hardcoded, so it survives a different weapon.
-const int kFgSigMax = 4;
+// ---- ⚠️ run 118: the signature table has to be PER FRAME ----
+//
+// It used to accumulate for the whole session and cap at four, so it filled with counts from menu
+// and loading frames - 11387, 3314, 390, 9 - before the gun mesh was ever seen, and the hide
+// indices then pointed at things that were not the gun. The report that came back ("presses 1, 3
+// and 4 look normal") was accurate; the labels on it were fiction.
+//
+// Rebuilt every frame from the current foreground pass, so the list is what is actually on screen
+// now. Eight slots rather than four, because truncation is what caused this and a table that
+// silently drops the entry you need is the same defect as a filter that encodes its answer.
+const int kFgSigMax = 8;
 volatile LONG g_fgSigVerts[kFgSigMax] = {};
 volatile LONG g_fgSigCount = 0;
 
@@ -5305,6 +5315,14 @@ void DumpDpgProbe() {
                 (e.a & D3DCLEAR_ZBUFFER) ? " ZBUFFER" : "",
                 (e.a & D3DCLEAR_STENCIL) ? " STENCIL" : "", e.z0);
     }
+    {
+        const LONG sn = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+        char line[256]; int m = 0;
+        for (LONG i = 0; i < sn && i < kFgSigMax; ++i)
+            m += _snprintf_s(line + m, sizeof(line) - m, _TRUNCATE, " [%ld]=%ld",
+                             i + 1, InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0));
+        Log("    meshes this frame (APPS index = vertex count):%s", sn ? line : " (none)");
+    }
     Log("    foreground draws this frame: %ld%s", InterlockedCompareExchange(&g_fgDrawCount, 0, 0),
         "");
     Log("    A depth-only Clear or a MinZ/MaxZ change LATE in the frame brackets the first-person"
@@ -5315,14 +5333,19 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                                                INT baseVertex, UINT minIndex, UINT numVertices,
                                                UINT startIndex, UINT primCount) {
     InterlockedIncrement(&g_frameDrawIdx);
-    if (FgHidden(numVertices)) return D3D_OK;   // hidden everywhere, prime pass included
+    // LEARN FIRST, THEN HIDE. If hiding skipped the learning, the hidden mesh would drop out of
+    // the list next frame and every index after it would shift - the toggle would walk through a
+    // moving target and nothing would be reproducible.
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         FgLearnSignature(numVertices);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, numVertices, primCount, (uint32_t)t);
+        if (FgHidden(numVertices)) return D3D_OK;
         // Returning S_OK without drawing is how the mod already drops draws elsewhere - the
         // device state is untouched, so the next draw behaves normally.
     } else if (FgMatchesSignature(numVertices)) {
+        // Outside the pass, but the same mesh - the near-plane depth prime at draws 2-3.
+        if (FgHidden(numVertices)) return D3D_OK;
         // The same mesh, drawn OUTSIDE the foreground pass. This is the whole question.
         DpgRecord(4, 0.0f, 0.0f, (uint32_t)InterlockedCompareExchange(&g_frameDrawIdx, 0, 0),
                   numVertices, primCount, 0);
@@ -9479,6 +9502,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_frameDrawIdx, 0);
             InterlockedExchange(&g_inForeground, 0);
             InterlockedExchange(&g_fgDrawCount, 0);
+            // The signature list is rebuilt from each frame, so it can never carry menu or
+            // loading-screen geometry into a gameplay frame.
+            InterlockedExchange(&g_fgSigCount, 0);
 
             // Run 98: find every field holding the view rotation, while we still know what the
             // view rotation IS. Runs only in mode 9 and stops after four samples, so it costs
