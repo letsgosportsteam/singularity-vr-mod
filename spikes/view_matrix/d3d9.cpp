@@ -4837,9 +4837,17 @@ const char* FmtName(D3DFORMAT f) {
     }
 }
 
+// Defined with the foreground-pass probe further down; this hook records into it.
+static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+
 HRESULT STDMETHODCALLTYPE Hook_SetRenderTarget(IDirect3DDevice9* dev, DWORD idx,
                                               IDirect3DSurface9* surf) {
     HRESULT hr = g_origSetRenderTarget(dev, idx, surf);
+    // Run 116: which target the first-person pass draws into. If it switches at the foreground
+    // boundary the pass is composited from its own surface, and skipping its draws leaves that
+    // surface at its cleared value - which would explain "black but still occluding" without any
+    // second copy of the geometry existing.
+    if (idx == 0) DpgRecord(3, 0.0f, 0.0f, (uint32_t)(uintptr_t)surf, 0, 0, 0);
     if (idx == 0) {
         // Before the backbuffer size is known, assume scene - the initial target IS the
         // backbuffer, and refusing to split would silently disable stereo instead of failing
@@ -5192,6 +5200,36 @@ volatile LONG g_inForeground = 0;      // set by the late depth clear, reset eac
 volatile LONG g_hideForeground = 0;    // VK_APPS toggles: skip the foreground draws entirely
 volatile LONG g_fgDrawCount = 0;       // how many draws landed in the pass this frame
 
+// ---- run 116: are these meshes drawn ANYWHERE ELSE in the frame? ----
+//
+// Hiding the six foreground draws left the gun black and still occluding. If the same meshes are
+// also drawn earlier - a depth or base pass in the main scene - that dark silhouette is what
+// remains, and moving only the foreground copy would leave a gun-shaped hole behind.
+//
+// Vertex count is a good enough fingerprint: 5799, 3314 and 390 are specific numbers, and a draw
+// matching one of them anywhere in the frame is almost certainly the same mesh. Learned from the
+// foreground pass rather than hardcoded, so it survives a different weapon.
+const int kFgSigMax = 4;
+volatile LONG g_fgSigVerts[kFgSigMax] = {};
+volatile LONG g_fgSigCount = 0;
+
+static void FgLearnSignature(UINT verts) {
+    const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i)
+        if ((UINT)InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0) == verts) return;
+    if (n >= kFgSigMax) return;
+    InterlockedExchange(&g_fgSigVerts[n], (LONG)verts);
+    InterlockedIncrement(&g_fgSigCount);
+}
+
+static bool FgMatchesSignature(UINT verts) {
+    if (!verts) return false;
+    const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i)
+        if ((UINT)InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0) == verts) return true;
+    return false;
+}
+
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     if (InterlockedCompareExchange(&g_dpgProbeFrames, 0, 0) <= 0) return;
     const LONG i = InterlockedIncrement(&g_dpgCount) - 1;
@@ -5233,6 +5271,11 @@ void DumpDpgProbe() {
         if (e.kind == 0)
             Log("    after draw %-5u  SetViewport  MinZ %.3f MaxZ %.3f  rect %u,%u %ux%u",
                 e.drawIdx, e.z0, e.z1, e.a, e.b, e.c, e.d);
+        else if (e.kind == 4)
+            Log("    *** draw %-5u OUTSIDE the foreground pass uses a first-person mesh:"
+                " verts %u prims %u", e.drawIdx, e.b, e.c);
+        else if (e.kind == 3)
+            Log("    after draw %-5u  SetRenderTarget  surface 0x%08X", e.drawIdx, e.a);
         else if (e.kind == 2)
             Log("    FOREGROUND draw #%u (frame draw %u)  verts %u  prims %u  primType %u",
                 e.a, e.drawIdx, e.b, e.c, e.d);
@@ -5255,10 +5298,15 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     InterlockedIncrement(&g_frameDrawIdx);
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
+        FgLearnSignature(numVertices);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, numVertices, primCount, (uint32_t)t);
         // Returning S_OK without drawing is how the mod already drops draws elsewhere - the
         // device state is untouched, so the next draw behaves normally.
         if (InterlockedCompareExchange(&g_hideForeground, 0, 0)) return D3D_OK;
+    } else if (FgMatchesSignature(numVertices)) {
+        // The same mesh, drawn OUTSIDE the foreground pass. This is the whole question.
+        DpgRecord(4, 0.0f, 0.0f, (uint32_t)InterlockedCompareExchange(&g_frameDrawIdx, 0, 0),
+                  numVertices, primCount, 0);
     }
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
