@@ -5138,10 +5138,17 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
 // Defined with the foreground-pass probe below; the draw hooks need it first.
 HWND g_gameWindow = nullptr;
 extern volatile LONG g_frameDrawIdx;
+extern volatile LONG g_inForeground, g_hideForeground, g_fgDrawCount;
+static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                         UINT start, UINT count) {
     InterlockedIncrement(&g_frameDrawIdx);
+    if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
+        const LONG k = InterlockedIncrement(&g_fgDrawCount);
+        DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, 0, count, (uint32_t)t);
+        if (InterlockedCompareExchange(&g_hideForeground, 0, 0)) return D3D_OK;
+    }
     return StereoPair(dev, [&] { return g_origDrawPrim(dev, t, start, count); });
 }
 // ================= ⭐ run 114: find the FOREGROUND pass =======================================
@@ -5171,6 +5178,20 @@ volatile LONG g_dpgProbeFrames = 0;
 volatile LONG g_frameDrawIdx = 0;
 void DumpDpgProbe();
 
+// ---- ⭐ run 115: the foreground pass, identified and skippable ----
+//
+// Stage 1 found the boundary: a depth+stencil Clear late in the frame, with six draws after it.
+// The first ZBUFFER clear of a frame happens at draw 0 and is the normal scene setup, so "a
+// ZBUFFER clear once some draws have already happened" separates the two without needing to know
+// the frame's total in advance.
+//
+// The threshold is deliberately loose. If a shadow or reflection pass also clears depth mid-frame
+// this will trip early and the log will show it as a foreground run of hundreds of draws rather
+// than six - which is a visible, diagnosable wrong answer instead of a silently wrong one.
+volatile LONG g_inForeground = 0;      // set by the late depth clear, reset each Present
+volatile LONG g_hideForeground = 0;    // VK_APPS toggles: skip the foreground draws entirely
+volatile LONG g_fgDrawCount = 0;       // how many draws landed in the pass this frame
+
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     if (InterlockedCompareExchange(&g_dpgProbeFrames, 0, 0) <= 0) return;
     const LONG i = InterlockedIncrement(&g_dpgCount) - 1;
@@ -5195,6 +5216,11 @@ HRESULT STDMETHODCALLTYPE Hook_SetViewport(IDirect3DDevice9* dev, const D3DVIEWP
 HRESULT STDMETHODCALLTYPE Hook_Clear(IDirect3DDevice9* dev, DWORD count, const D3DRECT* rects,
                                      DWORD flags, D3DCOLOR colour, float z, DWORD stencil) {
     DpgRecord(1, z, 0.0f, flags, count, 0, 0);
+    // The late depth clear opens the first-person pass. Draw 50 is well past the scene setup
+    // clear at draw 0 and far short of the ~1088 where the real boundary sits, so it separates
+    // them without assuming this frame's draw total.
+    if ((flags & D3DCLEAR_ZBUFFER) && InterlockedCompareExchange(&g_frameDrawIdx, 0, 0) > 50)
+        InterlockedExchange(&g_inForeground, 1);
     return g_origClear(dev, count, rects, flags, colour, z, stencil);
 }
 
@@ -5207,6 +5233,9 @@ void DumpDpgProbe() {
         if (e.kind == 0)
             Log("    after draw %-5u  SetViewport  MinZ %.3f MaxZ %.3f  rect %u,%u %ux%u",
                 e.drawIdx, e.z0, e.z1, e.a, e.b, e.c, e.d);
+        else if (e.kind == 2)
+            Log("    FOREGROUND draw #%u (frame draw %u)  verts %u  prims %u  primType %u",
+                e.a, e.drawIdx, e.b, e.c, e.d);
         else
             Log("    after draw %-5u  Clear        flags 0x%X%s%s%s  Z %.3f",
                 e.drawIdx, e.a,
@@ -5214,6 +5243,8 @@ void DumpDpgProbe() {
                 (e.a & D3DCLEAR_ZBUFFER) ? " ZBUFFER" : "",
                 (e.a & D3DCLEAR_STENCIL) ? " STENCIL" : "", e.z0);
     }
+    Log("    foreground draws this frame: %ld%s", InterlockedCompareExchange(&g_fgDrawCount, 0, 0),
+        InterlockedCompareExchange(&g_hideForeground, 0, 0) ? "  [HIDDEN - VK_APPS is ON]" : "");
     Log("    A depth-only Clear or a MinZ/MaxZ change LATE in the frame brackets the first-person"
         " pass. The draws after it are the arms and the weapon.");
 }
@@ -5222,6 +5253,13 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                                                INT baseVertex, UINT minIndex, UINT numVertices,
                                                UINT startIndex, UINT primCount) {
     InterlockedIncrement(&g_frameDrawIdx);
+    if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
+        const LONG k = InterlockedIncrement(&g_fgDrawCount);
+        DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, numVertices, primCount, (uint32_t)t);
+        // Returning S_OK without drawing is how the mod already drops draws elsewhere - the
+        // device state is untouched, so the next draw behaves normally.
+        if (InterlockedCompareExchange(&g_hideForeground, 0, 0)) return D3D_OK;
+    }
     return StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
     });
@@ -8499,6 +8537,26 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     }
     pDec = kDec;
 
+    // ---- VK_APPS: hide the first-person pass ----
+    //
+    // The confirmation test for stage 1. If the arms and gun vanish and NOTHING ELSE changes, the
+    // depth-clear boundary is right. If the world goes with them, the boundary is wrong and the
+    // log will show a foreground run of hundreds of draws rather than six.
+    //
+    // VK_APPS - the menu key by the right Ctrl - because every other key on this keyboard is
+    // already bound and it is isolated enough not to be hit by accident.
+    {
+        static bool pApps = false;
+        const bool kApps = (GetAsyncKeyState(VK_APPS) & 0x8000) != 0;
+        if (kApps && !pApps) {
+            const LONG on = InterlockedCompareExchange(&g_hideForeground, 0, 0) ? 0 : 1;
+            InterlockedExchange(&g_hideForeground, on);
+            InterlockedExchange(&g_dpgProbeFrames, 3);
+            Log("APPS: first-person pass %s", on ? "HIDDEN" : "shown");
+        }
+        pApps = kApps;
+    }
+
     // ---- PAUSE held for a second: quit the game ----
     //
     // A test loop that ends in taking the headset off, finding the mouse and clicking through a
@@ -9348,6 +9406,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             }
             InterlockedExchange(&g_dpgCount, 0);
             InterlockedExchange(&g_frameDrawIdx, 0);
+            InterlockedExchange(&g_inForeground, 0);
+            InterlockedExchange(&g_fgDrawCount, 0);
 
             // Run 98: find every field holding the view rotation, while we still know what the
             // view rotation IS. Runs only in mode 9 and stops after four samples, so it costs
