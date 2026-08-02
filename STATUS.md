@@ -31,6 +31,7 @@ dropped beside the game exe. No game files modified.
 | **Controller input** | ✅ **working** — full Touch mapping, menus, haptics, snap turn, off-hand movement |
 | **Aim decoupling** | ✅ **SOLVED via route 2** — the bullet follows the controller, the view never moves, and it costs NOTHING in culling or LOD. Aim mode 11 |
 | **Gun follows the controller** | ✅ **working** — 6-DOF, arms hidden, anchor tuned. APPS toggles it |
+| **Cutscene head tracking** | ✅ **working, automatic** — run 138. `SetCinematicMode` drives it; look around freely during a cutscene, normal turning restored on exit |
 
 ### If you are picking this up cold, read these three things
 
@@ -64,24 +65,19 @@ dropped beside the game exe. No game files modified.
      find which one never reaches the DEFAULT copy. `D3D9ExMode=0` is not a shippable workaround —
      it also disables zero-copy, which costs ~3.4 ms/frame at 2560×1440 and considerably more at
      full resolution.
-2. **Cutscene head yaw — should be DONE, needs one confirming run.** Cause found, fix known
-   (mode 3), and run 137 wired it to `SetCinematicMode`, which is confirmed engine-authoritative
-   (`arg raw 0x00000001` on entry, `0x00000000` on exit). ⚠️ The remaining risk is the **script
-   hook now installing at startup** instead of on the first NUMPAD-dot press — see the warning
-   below. `CutsceneAuto=0` reverts it without a rebuild.
-3. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
+2. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
    weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
    correctly aligned**, so they are not one system and whatever anchors the flash is not what
    anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
    not. Likely another mesh in the foreground pass, or a screen-space effect drawn after it.
-4. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
+3. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
    animation, so they are absent from the foreground list when the counts are latched. The fix is
    probably to latch a SET of counts rather than two, or to match on something steadier than
    vertex count.
-5. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+4. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-6. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+5. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
 
@@ -140,6 +136,32 @@ before they are written. **Touch stick turning is unaffected either way** — sn
   merely untried.
 - ❌ **Anything derived from camera yaw vs controller yaw vs written yaw.** The fold-in drags all
   three into agreement, so during a cutscene they are as self-consistent as during play.
+> ## ✅ DONE (run 138). Confirmed end to end on a clean launch at `D3D9ExMode=1`: `CINE` reads
+> `YES` through the intro, head yaw works, and it drops to `NO` when gameplay starts.
+>
+> ```
+> line  112: script hook: 0 calls named this window   <-- ZERO: the watch is DEAD, not quiet
+> line  461: script hook: 5992 calls named this window (0 unnamed), CINE OFF
+> line  807: cutscene STARTED - switching to mode 3. Was mode 1, restored on exit.
+> line 3537: cutscene ENDED - restoring mode 1.
+> ```
+>
+> **It took three failed runs, and all three failed the same way** — a diagnostic whose "off" state
+> is indistinguishable from its negative result:
+>
+> 1. Run 133: the name table was never resolved, so the watch had nothing to compare against.
+> 2. Run 137: the names resolved but the **script hook was never installed** — `RepointScriptHook`
+>    only ran on the aim-mode key.
+> 3. Run 138: hook installed, names resolved, address identical to the working run — and `fnIdx`
+>    was still `-1`, because it is only computed when the census is armed or aim mode ≥ 6. Run 136
+>    "worked" solely because the tester had cycled to aim mode 11. **Everything the log reported
+>    was true and the feature could not work.**
+>
+> The heartbeat (`script hook: N calls named this window`) exists so this class cannot recur. Note
+> in the trace above that the first named window reports `521 calls (301 unnamed)` — the FFrame
+> node-offset vote is still converging there, so **the watch is unreliable in its first window**
+> and a cutscene starting that early could still be missed.
+
 - ✅ **`SetCinematicMode` WORKS — the hook was simply never installed.** Run 136 saw it fire cleanly
   (`arg raw 0x00000001` entering a cutscene, `0x00000000` leaving), which is exactly the check the
   frame-layout note asked for. It had failed earlier because the ProcessEvent hook is **not

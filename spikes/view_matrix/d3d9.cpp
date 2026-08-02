@@ -8023,8 +8023,25 @@ void __fastcall Hook_ProcessEvent(void* self, void* edx, void* Stack, void* Resu
     // Mode 8 needs the name on every call too - it is the whole mechanism, not a diagnostic.
     const bool routeTwo = (aimMode >= 6);
     const bool censusOn = InterlockedCompareExchange(&g_peCensus, 0, 0) != 0;
+
+    // ---- ⭐ run 138: the cutscene watch needs the NAME, and was never asking for it ----
+    //
+    // This is why run 137 caught nothing. fnIdx was only computed when the census was armed or
+    // aim mode was >= 6, so with neither of those on it stayed -1 and every comparison in the
+    // cutscene watch below failed against it. Run 136 "worked" purely because the tester had
+    // cycled to aim mode 11, which set routeTwo; run 137 launched clean, so the watch was mute.
+    //
+    // The hook was installed, the names were resolved, the address was identical in both runs -
+    // everything the log reports was true and the feature still could not work. Third instance
+    // this session of a diagnostic that reads "off" exactly the way it reads "nothing happened".
+    //
+    // Cost: ScriptFuncNameIdx is two pointer dereferences with no VirtualQuery on this path (run
+    // 94 made sure of that), against a few thousand script calls a second. The heartbeat below
+    // measures it rather than leaving it asserted.
+    const bool cineWatch = InterlockedCompareExchange(&g_cutsceneAuto, 0, 0) != 0 &&
+                           FnIdx(kFnSetCinematic) >= 0;
     int32_t fnIdx = -1;
-    if ((censusOn || routeTwo) && Stack) {
+    if ((censusOn || routeTwo || cineWatch) && Stack) {
         fnIdx = ScriptFuncNameIdx(Stack);
         InterlockedIncrement(&g_peSeen);
         if (fnIdx < 0) InterlockedIncrement(&g_peUnnamed);
@@ -9705,7 +9722,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // guard on the hot path is what makes it survivable. It is switchable for exactly that reason:
     // `CutsceneAuto=0` restores the old behaviour with no rebuild, and this is the first thing to
     // suspect if a launch starts misbehaving.
-    if (g_cutsceneAuto) {
+    if (InterlockedCompareExchange(&g_cutsceneAuto, 0, 0)) {
         static int tick = 0, attempts = 0;
         if (FnIdx(kFnSetCinematic) < 0 && attempts < 12 && (++tick % 240) == 0 && g_camera) {
             ++attempts;
@@ -10277,6 +10294,23 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // any draw in it. If "frames with NO identification" is non-zero, that is a full-frame
             // flash, and g_bestRejectDot names the cause: near 0.99 is rotation lag against a
             // stale g_camFwd, far below it is a genuinely different matrix taking the register.
+            // ---- ⭐ run 138: is the script hook ALIVE? ----
+            //
+            // Runs 133, 136 and 137 all failed on the same ambiguity: a silent cutscene watch and
+            // a dead cutscene watch look identical. This removes it permanently. A non-zero rate
+            // means the hook is installed, running, and naming calls - so a silent CINE genuinely
+            // means no cutscene started. Zero means the watch is not working and nothing it
+            // reports means anything.
+            if (InterlockedCompareExchange(&g_cutsceneAuto, 0, 0)) {
+                const LONG seen = InterlockedExchange(&g_peSeen, 0);
+                const LONG unnamed = InterlockedExchange(&g_peUnnamed, 0);
+                Log("    script hook: %ld calls named this window (%ld unnamed), CINE %s%s",
+                    seen, unnamed,
+                    InterlockedCompareExchange(&g_inCinematic, 0, 0) ? "ON" : "OFF",
+                    seen == 0 ? "   <-- ZERO: the watch is DEAD, not quiet. CINE means nothing."
+                              : "");
+            }
+
             // The cutscene detector candidate. Snapshotted and reset here so the readout shows the
             // last second rather than a cumulative average, which would smear the boundary this
             // whole measurement exists to find.
