@@ -5436,7 +5436,8 @@ static void ApplyWorldMatrix(Reg4* m, int conv, const float C[4][4]) {
 LONG g_gunSignYaw = 1, g_gunSignPitch = -1, g_gunSignRoll = 1, g_gunFollowPos = 1;
 LONG g_gunSignPosZ = -1;                       // vertical translation came back flipped too
 LONG g_gunAnchorFwd = 25, g_gunAnchorRight = 8, g_gunAnchorUp = -8;   // engine units from the eye
-volatile LONG g_gunSignCombo = 0;              // CAPS LOCK cycles the eight rotation-sign combos
+volatile LONG g_gunSignCombo = 0;
+volatile LONG g_readoutOn = 1;   // on-screen state squares - see DrawStateReadout
 
 static void Mul3(float out[3][3], const float a[3][3], const float b[3][3]) {
     for (int i = 0; i < 3; ++i)
@@ -8527,10 +8528,63 @@ void SetVrMode(bool on) {
         on ? "ON" : "OFF - plain game");
 }
 
+// ================= ⭐ run 127: an on-screen readout, at last ===============================
+//
+// Every mode, count and setting in this mod goes to a log file, so the only way to check state
+// while wearing the headset has been to take it off. That gap was named several runs ago and then
+// left alone; it has since cost a run to "combo 2" meaning different things in two sessions.
+//
+// Clear() with a rectangle list is the cheapest possible readout: no font, no vertex buffer, no
+// shader, no state to restore beyond the scissor. Four bright-or-dark squares spell the CAPS combo
+// in binary, high bit on the left, and two below it give the APPS mode. Drawn into BOTH eye halves
+// so it is readable however the image is split.
+//
+// It is drawn at the top of Present, before the mod copies the frame to the headset, which is what
+// puts it in front of your eyes rather than only on the desktop mirror.
+static void DrawStateReadout(IDirect3DDevice9* dev) {
+    if (!dev || !g_srcW || !g_srcH) return;
+    const LONG combo = InterlockedCompareExchange(&g_gunSignCombo, 0, 0);
+    const LONG mode  = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+
+    DWORD oldScissor = FALSE;
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+
+    const LONG halfW = (LONG)g_srcW / 2;
+    const LONG sz = (LONG)(g_srcH / 40);          // square size, scaled to the target
+    const LONG gap = sz / 3;
+    const LONG y0 = (LONG)(g_srcH / 6);
+
+    // Two passes: dark squares for clear bits, bright for set ones. Two Clear calls total.
+    for (int pass = 0; pass < 2; ++pass) {
+        D3DRECT r[12]; int n = 0;
+        for (int eye = 0; eye < 2; ++eye) {
+            const LONG x0 = eye * halfW + halfW / 2 - (4 * (sz + gap)) / 2;
+            for (int bit = 0; bit < 4; ++bit) {           // CAPS combo, high bit left
+                const bool on = (combo & (8 >> bit)) != 0;
+                if (on != (pass == 1)) continue;
+                const LONG x = x0 + bit * (sz + gap);
+                r[n].x1 = x; r[n].y1 = y0; r[n].x2 = x + sz; r[n].y2 = y0 + sz; ++n;
+            }
+            for (int bit = 0; bit < 2; ++bit) {           // APPS mode below
+                const bool on = (mode & (2 >> bit)) != 0;
+                if (on != (pass == 1)) continue;
+                const LONG x = x0 + bit * (sz + gap);
+                r[n].x1 = x; r[n].y1 = y0 + sz + gap * 2;
+                r[n].x2 = x + sz; r[n].y2 = y0 + 2 * sz + gap * 2; ++n;
+            }
+        }
+        if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET,
+                          pass ? D3DCOLOR_XRGB(0, 255, 80) : D3DCOLOR_XRGB(40, 40, 40), 0.0f, 0);
+    }
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
+}
+
 HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
     // Whoever calls Present owns the device. Recorded so the user-pointer draw hooks can tell
     // render-thread calls from movie-playback-thread ones and stay completely inert on the latter.
     g_mainThreadId = GetCurrentThreadId();
+    if (InterlockedCompareExchange(&g_readoutOn, 0, 0)) DrawStateReadout(s);
     if (InterlockedExchange(&g_initTried, 1) == 0) {
         InstallViewHook(); InstallProcessEventHook(); InitXR();
     }
