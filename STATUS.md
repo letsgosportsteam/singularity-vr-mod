@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 151). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 152). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -208,6 +208,40 @@ logs that it did.
 > Locked at 120. **Level 3 costs nothing measurable post-router**, and there is no frame-time case
 > against `HudStereo`. Found by asking whether run 55 predated the router rather than by re-running
 > anything — the dates were already in this file.
+
+### ⭐ Run 152: engine occlusion culling is back on, and it halves the draw calls
+
+`OcclusionQueryMode` now defaults to **2**. Since run 30 the mod forced every occlusion query to
+report VISIBLE, because in stereo the boxes were drawn once at full-frame coordinates and the pixel
+count was meaningless. That cost half the frame's draw calls for over a hundred runs.
+
+**Nothing in the occlusion code changed.** What changed is that the boxes are now split per eye,
+as a side effect of the HUD work:
+
+- run 52 measured them as user-pointer draws — 14,478 of 14,478 query windows held exactly one;
+- `UserPtrQuad` classifies a 12-primitive world-space cube as real geometry, so it reaches
+  `StereoPair`;
+- `HookUserPointerDraws=3` is on by default from run 151, because `HudStereo` needs it.
+
+The override was propping up a problem that had already been fixed elsewhere. Measured, same scene:
+
+| | draws/frame |
+|---|---|
+| mode 0 (override, everything visible) | 1500–1693 |
+| **mode 2 (engine culling live)** | **737–943** |
+
+Lands squarely on run 30's own 50–70% figure. Frame rate is 120.0 locked either way at 1440p —
+this is headroom, and it will matter at 4992×2688.
+
+Also retracts run 55's *"auto occlusion mode made it actively worse"*, the third conclusion from
+that day to fall.
+
+> ⚠️ **Only half the discriminator is confirmed.** Run 53 wrote it two-sided and both halves must
+> hold: *draws/frame falls a lot* ✅ measured above; *nothing VANISHES* is a visual judgement over a
+> real play session, not a couple of minutes. Vanishing geometry is intermittent and
+> view-dependent, which is exactly why it cost run 30 a whole session. **If objects wink out at
+> distance or near the edges of view, `OcclusionQueryMode=0` restores the run-30 behaviour
+> exactly.** Shipped on the user's call with that risk stated.
 
 ### Audit of the contaminated window (07-31 09:00 → 19:19)
 

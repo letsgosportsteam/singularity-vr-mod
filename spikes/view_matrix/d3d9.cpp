@@ -11629,8 +11629,33 @@ void LoadIniSettings() {
     // round trip through me.
     // See the note above Hook_CreateQuery. Off by default: this removes a feature the engine
     // expects to have, so it is a measurement, not a setting.
-    g_occlusionMode = GetPrivateProfileIntA("Render", "OcclusionQueryMode", 0, path);
-    if (g_occlusionMode < 0 || g_occlusionMode > 3) g_occlusionMode = 0;
+    // ---- ⭐ run 152: the default is 2 - the engine's own culling is live again ----
+    //
+    // Mode 0 forced every occlusion query to report VISIBLE, because in stereo the boxes were
+    // drawn once at full-frame coordinates and the pixel count came back meaningless. That was
+    // brute force from run 30 and it has been costing half the frame's draw calls ever since.
+    //
+    // What changed is not this code. Run 52 measured the boxes as user-pointer draws (14478 of
+    // 14478 query windows contained exactly one), UserPtrQuad classifies a 12-primitive world-space
+    // cube as real geometry, and HookUserPointerDraws is now 3 by default because HudStereo needs
+    // it. So the boxes have been split per eye since run 151 - the override was propping up a
+    // problem that had already been fixed elsewhere.
+    //
+    // Measured, same scene, same session:
+    //     mode 0 (override)      1500-1693 draws/frame
+    //     mode 2 (culling live)   737- 943 draws/frame
+    //
+    // Roughly half, which lands on run 30's own 50-70% figure. This also retracts run 55's
+    // "auto occlusion mode made it actively worse" - that was measured in the window before the
+    // wireless link was diagnosed, along with two other conclusions from the same day.
+    //
+    // ⚠️ Only half the discriminator is confirmed. "draws/frame falls a lot" is measured above;
+    // "nothing VANISHES" is a visual judgement over a real play session, and vanishing geometry is
+    // intermittent and view-dependent - it cost run 30 an entire session for that reason. If
+    // objects start winking out at distance or near the edges of view, set this back to 0, which
+    // restores the run-30 behaviour exactly.
+    g_occlusionMode = GetPrivateProfileIntA("Render", "OcclusionQueryMode", 2, path);
+    if (g_occlusionMode < 0 || g_occlusionMode > 3) g_occlusionMode = 2;
     Log("ini: OcclusionQueryMode=%d (%s)", g_occlusionMode,
         g_occlusionMode == 0 ? "auto - report visible while true stereo is on, normal in mono" :
         g_occlusionMode == 1 ? "always report visible" :
