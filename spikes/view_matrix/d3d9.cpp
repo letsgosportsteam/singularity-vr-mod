@@ -3947,9 +3947,27 @@ inline SHORT DebugKey(int vk) {
 // Only settings that are consulted EVERY FRAME from a global belong here. Anything read once at
 // device creation - D3D9ExMode, ZeroCopy, the resolution - would appear to change and silently do
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
-const int kPanelRows = 10;
-enum { PR_AIMMETHOD = 0, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR,
-       PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG };
+const int kPanelRows = 11;
+enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
+       PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG };
+
+// ---- ⭐ run 159: VR mode on the panel, and starting in it ----
+//
+// ENABLE VR is the same switch BACKSPACE throws - SetVrMode - and BACKSPACE stays. What the row
+// adds is a way to reach it without a keyboard, which is what `Debug=0` needs.
+//
+// StartInVr is run 36 again, and run 37 reverted run 36. That reason is recorded and was a good
+// one: default-on meant **the main menu was rendered frame-split for the first time ever,
+// completely untested, on every launch.**
+//
+// ⚠️ What has changed since is specific and checkable rather than a change of mind: run 151 put the
+// game's HUD and menus into both eyes, and the pause menu and prompts are explicitly on that list.
+// So the thing run 37 objected to is the thing run 151 built. That makes the premise stale rather
+// than the decision wrong - which is the first lesson at the top of STATUS - but "should work now"
+// is not "was tested now", and one launch settles it. `StartInVr=0` restores run 37's cold start
+// exactly, with no rebuild.
+volatile LONG g_startInVr = 1;      // ini [Render] StartInVr
+void SetVrMode(bool on);            // defined with the other Present-time state
 
 // First row, because it is the one that changes the most: MOVE DIRECTION and CROSSHAIR both follow
 // from it, so it reads top-down as cause before effect.
@@ -3979,6 +3997,12 @@ void PanelSave() {
     if (!IniPath(path)) { Log("VR panel: no ini path - settings NOT saved"); return; }
     char v[32];
     // WritePrivateProfileString edits in place: comments, ordering and unrelated keys all survive.
+    // The row shows the LIVE state and saving it makes that state the next cold start, which is
+    // what "the panel remembers" has meant for every other row here. BACKSPACE deliberately does
+    // not save - it is a toggle, not a setting, and a key you press to peek at the flat game should
+    // not silently change how the game launches tomorrow.
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", VrModeOn() ? 1 : 0);
+    WritePrivateProfileStringA("Render", "StartInVr", v, path);
     _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_aimMethod, 0, 0));
     WritePrivateProfileStringA("Input", "AimMethod", v, path);
     _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_turnMode);
@@ -4007,6 +4031,9 @@ void PanelSave() {
 // the value column carries the explanation instead.
 void PanelRowText(int row, char* out, size_t cap) {
     switch (row) {
+        case PR_ENABLEVR:
+            _snprintf_s(out, cap, _TRUNCATE, "VR MODE        %s", VrModeOn() ? "ON" : "OFF");
+            break;
         case PR_AIMMETHOD:
             _snprintf_s(out, cap, _TRUNCATE, "AIM METHOD     %s",
                         InterlockedCompareExchange(&g_aimMethod, 0, 0) ? "MOTION CONTROLLER"
@@ -4072,6 +4099,12 @@ void PanelRowText(int row, char* out, size_t cap) {
 
 void PanelAdjust(int row, int dir) {
     switch (row) {
+        case PR_ENABLEVR:
+            // The same call BACKSPACE makes, so the two cannot drift. Turning VR off from here is
+            // safe: the panel is drawn into whichever frame layout is live, mono or split, and it
+            // is opened and driven by the controller - so it is still reachable to turn back on.
+            SetVrMode(!VrModeOn());
+            break;
         case PR_AIMMETHOD:
             InterlockedExchange(&g_aimMethod,
                                 InterlockedCompareExchange(&g_aimMethod, 0, 0) ? 0 : 1);
@@ -5060,7 +5093,50 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                                1.0f - 2.0f * (q.x * q.x + q.z * q.z));
         // Anchor to the GAME's current yaw, not our own previous output. Seeding from
         // g_wantYaw (initially 0) made enabling snap the view to world yaw 0.
+        // ---- ⚠️ run 159: the centre was captured before the pose had converged ----
+        //
+        // Reported after StartInVr landed: the main menu sat too low and the game loaded in at the
+        // ceiling, and toggling VR off and on fixed it. The log said why, in numbers:
+        //
+        //   startup : head yaw 0.0,  head pos (0.000, -1.223, 0.000)
+        //   later   : head yaw -3.5, head pos (0.033, -0.040, 0.227)
+        //
+        // A centre 1.18 m below the real one puts you 1.18 m up for the rest of the session. And
+        // x, z and yaw are EXACTLY zero with only y populated - a synthetic identity pose, not a
+        // measurement. It is what the runtime hands back in the moments after the session starts.
+        //
+        // ⚠️ POSITION_VALID was SET on that frame - the line carries no [POSITION NOT TRACKED]
+        // marker - so checking validity would have changed nothing. Valid means "this number is
+        // usable", not "this number is real yet". TRACKED is the bit that means the runtime is
+        // actively tracking rather than handing back a default, and a few frames of it settles the
+        // difference between converged and merely present.
+        //
+        // BACKSPACE always worked because by the time anyone pressed it the pose had converged.
+        // StartInVr fires as early as it possibly can, which is exactly when it has not.
+        //
+        // Bounded, because a 3DOF headset or a runtime that never sets TRACKED must still centre -
+        // it just centres without position, which is what g_haveCentrePos already means.
+        bool centreReady = true;
         if (!g_haveCentre) {
+            const bool tracked =
+                (vs.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0 &&
+                (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) != 0;
+            const int kCentreSettle = 10;    // consecutive tracked frames before it is believed
+            const int kCentreGiveUp = 300;   // ~2.5 s, then centre anyway and say so
+            static int settled = 0, waited = 0;
+            if (tracked) ++settled; else settled = 0;
+            ++waited;
+            if (settled < kCentreSettle && waited < kCentreGiveUp) {
+                centreReady = false;         // leave g_haveCentre false; retry next frame
+            } else {
+                if (settled < kCentreSettle)
+                    Log("recentre: pose never reported TRACKED in %d frames - centring anyway."
+                        " If the height is wrong, this is why.", kCentreGiveUp);
+                settled = 0;
+                waited = 0;
+            }
+        }
+        if (!g_haveCentre && centreReady) {
             g_centreYaw = yawRad;
             uintptr_t ctl = FindController();
             g_baseYaw = (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12))
@@ -5105,11 +5181,18 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 g_haveHandOffset = false;
             }
 
+            // The flags are printed because run 159's bad capture read POSITION_VALID and would
+            // have looked entirely normal on this line. "valid" and "tracked" being separately
+            // visible is what makes a wrong centre diagnosable from the log instead of from a
+            // second run.
             Log("recentred: head yaw %.1f, game yaw %d, head pos (%.3f, %.3f, %.3f)%s"
+                " [pos valid %d tracked %d]"
                 " | weapon neutral %s (yaw %+.1f, pitch %+.1f from the head)",
                 yawRad * 57.2958f, g_baseYaw,
                 g_centrePos[0], g_centrePos[1], g_centrePos[2],
                 g_haveCentrePos ? "" : " [POSITION NOT TRACKED]",
+                (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ? 1 : 0,
+                (vs.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) ? 1 : 0,
                 g_haveHandOffset ? "captured" : "NOT captured (right controller not tracked)",
                 g_handYawOffset * 57.2958f, g_handPitchOffset * 57.2958f);
         }
@@ -6312,9 +6395,122 @@ extern volatile LONG g_inForeground, g_hideMeshIdx, g_fgDrawCount;
 static bool FgHidden(UINT verts);
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 
+// ================================================================ the video-quad probe (run 160)
+//
+// Reported: the splash screens show DOUBLE VISION and the opening Bink cutscene is "way too zoomed
+// in". Those are one artifact described twice. A fullscreen quad is passed through untouched
+// (UserPtrQuad, and the primitive-count gate in the indexed paths) because UE3's post-process
+// quads operate on the scene target, which ALREADY holds the side-by-side frame - covering the
+// whole target is right for them. A Bink frame is a SINGLE image, so passed through it covers both
+// eye halves with one copy: the left eye gets the left half, the right eye the right half. Each eye
+// sees different content (double vision) stretched over its whole view (too zoomed).
+//
+// The fix is to draw a video quad once per eye with the full texture each time - mono in VR, which
+// is the correct presentation for 2D video. What is NOT known is how to tell a video quad from a
+// post-process quad, and the classifier must not be guessed: run 45 spent a session on a filter
+// that encoded its own answer, and run 118's signature table pointed at things that were not the
+// gun while reporting success.
+//
+// So this measures first and classifies nothing. For candidate draws it records what would
+// distinguish them, and the TEXTURE is the most promising column by far - a Bink frame is video
+// sized (say 1280x720) while a post-process source is scene sized (4992x2688 here). Frame draw
+// total is the second: video and splash frames have almost no 3D geometry.
+//
+// Self-arming, because splash screens happen before anyone can press a key and asking for a
+// keypress in a headset has already cost this project two runs.
+const int kVidSigMax = 10;
+struct VidSig {
+    uint8_t  src;          // 0 DrawPrim, 1 DrawIndexedPrim, 2 DrawPrimUP, 3 DrawIndexedPrimUP
+    uint32_t primType, primCount, stride;
+    float    v0x, v0y;
+    uint32_t texW, texH, texFmt;
+    uint32_t rtW, rtH;
+    uint32_t count;
+};
+VidSig g_vidSig[kVidSigMax]{};
+int       g_vidSigN = 0;
+int       g_vidFrameDraws = 0;      // draws seen this frame, counted by the probe itself
+ULONGLONG g_vidLastDump = 0;
+int       g_vidDumps = 0;
+const int kVidMaxDumps = 40;        // enough for the splashes and a cutscene; not a permanent cost
+
+const char* VidSrcName(uint8_t s) {
+    return s == 0 ? "DrawPrim   " : s == 1 ? "DrawIdxPrim" :
+           s == 2 ? "DrawPrimUP " : "DrawIdxPrUP";
+}
+
+// Only called for SMALL draws - the ones that could be a quad - so the device queries below never
+// run on the hundreds of real geometry draws in a gameplay frame.
+void VidProbeRecord(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UINT primCount,
+                    const void* vtx, UINT stride) {
+    if (g_vidDumps >= kVidMaxDumps) return;
+
+    VidSig s{};
+    s.src = src;
+    s.primType = (uint32_t)t;
+    s.primCount = primCount;
+    s.stride = stride;
+    if (vtx && stride >= 8 && Readable(vtx, 8)) {
+        const float* v = static_cast<const float*>(vtx);
+        s.v0x = v[0]; s.v0y = v[1];
+    }
+    // The two device queries this probe exists for. Both AddRef, so both are released.
+    if (IDirect3DBaseTexture9* bt = nullptr; SUCCEEDED(dev->GetTexture(0, &bt)) && bt) {
+        if (bt->GetType() == D3DRTYPE_TEXTURE) {
+            D3DSURFACE_DESC d{};
+            if (SUCCEEDED(static_cast<IDirect3DTexture9*>(bt)->GetLevelDesc(0, &d))) {
+                s.texW = d.Width; s.texH = d.Height; s.texFmt = (uint32_t)d.Format;
+            }
+        }
+        bt->Release();
+    }
+    if (IDirect3DSurface9* rt = nullptr; SUCCEEDED(dev->GetRenderTarget(0, &rt)) && rt) {
+        D3DSURFACE_DESC d{};
+        if (SUCCEEDED(rt->GetDesc(&d))) { s.rtW = d.Width; s.rtH = d.Height; }
+        rt->Release();
+    }
+
+    for (int i = 0; i < g_vidSigN; ++i) {
+        VidSig& e = g_vidSig[i];
+        if (e.src == s.src && e.primType == s.primType && e.primCount == s.primCount &&
+            e.texW == s.texW && e.texH == s.texH && e.texFmt == s.texFmt &&
+            e.rtW == s.rtW && e.rtH == s.rtH) { ++e.count; return; }
+    }
+    if (g_vidSigN < kVidSigMax) { s.count = 1; g_vidSig[g_vidSigN++] = s; }
+}
+
+// Called once per frame from Present. Dumps only for frames that look like video or a splash -
+// almost no 3D geometry - so gameplay is never printed and the log stays readable.
+void VidProbeFrameEnd() {
+    const int draws = g_vidFrameDraws;
+    g_vidFrameDraws = 0;
+    if (g_vidSigN == 0 || g_vidDumps >= kVidMaxDumps) { g_vidSigN = 0; return; }
+
+    // 60 is well below any gameplay frame here (700-1800 draws) and well above a video frame.
+    // Deliberately generous: a threshold tuned tight enough to be wrong is the failure this probe
+    // exists to avoid, and a few extra menu frames in the log cost nothing.
+    const bool looksLikeVideo = draws < 60;
+    const ULONGLONG now = GetTickCount64();
+    if (!looksLikeVideo || (g_vidLastDump && now - g_vidLastDump < 500)) { g_vidSigN = 0; return; }
+    g_vidLastDump = now;
+    ++g_vidDumps;
+
+    Log("video probe: %d draw(s) this frame, %d distinct small-draw signature(s)", draws, g_vidSigN);
+    for (int i = 0; i < g_vidSigN; ++i) {
+        const VidSig& e = g_vidSig[i];
+        Log("    %s type %u prims %-4u stride %-3u v0 (%+.3f, %+.3f)  tex %ux%u fmt %u"
+            "  rt %ux%u  x%u",
+            VidSrcName(e.src), e.primType, e.primCount, e.stride, e.v0x, e.v0y,
+            e.texW, e.texH, e.texFmt, e.rtW, e.rtH, e.count);
+    }
+    g_vidSigN = 0;
+}
+
 HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                         UINT start, UINT count) {
     InterlockedIncrement(&g_frameDrawIdx);
+    ++g_vidFrameDraws;
+    if (count <= 4) VidProbeRecord(dev, 0, t, count, nullptr, 0);
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, 0, count, (uint32_t)t);
@@ -6927,6 +7123,10 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                                                INT baseVertex, UINT minIndex, UINT numVertices,
                                                UINT startIndex, UINT primCount) {
     InterlockedIncrement(&g_frameDrawIdx);
+    ++g_vidFrameDraws;
+    // Indexed geometry cannot expose its vertices cheaply here, so v0 stays zero on these rows -
+    // the texture and render-target columns are what this path contributes.
+    if (primCount <= 4) VidProbeRecord(dev, 1, t, primCount, nullptr, 0);
     // LEARN FIRST, THEN HIDE. If hiding skipped the learning, the hidden mesh would drop out of
     // the list next frame and every index after it would shift - the toggle would walk through a
     // moving target and nothing would be reproducible.
@@ -7448,9 +7648,109 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
     return hr;
 }
 
+// ================================================================ Bink video, per eye (run 160)
+//
+// Measured, not inferred. Every video frame in the run-160 probe was identical:
+//
+//     DrawPrimUP type 5 prims 2 stride 24 v0 (-0.957, +1.000) tex 1280x720 fmt 50 rt 4992x2688
+//     ... and "1 draw(s) this frame"
+//
+// fmt 50 is D3DFMT_L8 - Bink decodes to Y/U/V planes as luminance textures and combines them in a
+// pixel shader. The quad is passed through as a fullscreen quad, which is correct for UE3's
+// post-process quads because their source ALREADY holds the side-by-side frame. A Bink frame is a
+// single image, so passed through it covers both halves with one copy: left eye gets the left half,
+// right eye the right half. Different content per eye (double vision), each stretched over a whole
+// eye (too zoomed). One artifact, reported twice.
+//
+// ---- the classifier, and why each half of it is here ----
+//
+// Three independent signals agreed in the probe and all three are required, because the obvious
+// one on its own is wrong: "texture smaller than the render target" also matches every bloom and
+// depth-of-field downsample pass, which are fullscreen quads over half- and quarter-res buffers.
+//
+//   FIRST DRAW OF THE FRAME   a post-process pass runs after hundreds of scene draws. A video frame
+//                             has exactly one draw in it, which is what the probe measured.
+//   2-primitive NDC quad      already established by UserPtrQuad, reused rather than re-derived.
+//   texture dims != RT dims   a post-process quad sampling the scene target reads equal.
+//
+// ---- the transform ----
+//
+// x' = x/2 + eyeOffset puts the whole quad in one half. y' = y/2 as well, and that is not optional:
+// the half is 2496x2688, nearly portrait, so halving x alone would squash a 16:9 video to 8:9. With
+// both axes halved the pixel size goes 4777x2688 -> 2389x1344, still exactly 16:9, centred in the
+// eye with black above and below. A flat screen in front of you, which is how 2D video should read
+// in a headset.
+volatile LONG g_videoStereo = 1;      // ini [Render] VideoStereo
+
+// Counted per second and printed only when nonzero. The detection log says it once, which proves it
+// fired at all and nothing about WHERE - and the failure mode that matters is it firing during
+// GAMEPLAY on a misclassified bloom or depth-of-field pass. During video this reads about one per
+// frame; in gameplay it must read nothing, and now that is checkable rather than argued.
+volatile LONG g_videoQuadDraws = 0;
+
+bool IsVideoQuad(IDirect3DDevice9* dev, UINT primCount) {
+    if (primCount != 2 || g_vidFrameDraws != 1) return false;   // see the classifier note above
+    UINT texW = 0, texH = 0, rtW = 0, rtH = 0;
+    if (IDirect3DBaseTexture9* bt = nullptr; SUCCEEDED(dev->GetTexture(0, &bt)) && bt) {
+        if (bt->GetType() == D3DRTYPE_TEXTURE) {
+            D3DSURFACE_DESC d{};
+            if (SUCCEEDED(static_cast<IDirect3DTexture9*>(bt)->GetLevelDesc(0, &d))) {
+                texW = d.Width; texH = d.Height;
+            }
+        }
+        bt->Release();
+    }
+    if (IDirect3DSurface9* rt = nullptr; SUCCEEDED(dev->GetRenderTarget(0, &rt)) && rt) {
+        D3DSURFACE_DESC d{};
+        if (SUCCEEDED(rt->GetDesc(&d))) { rtW = d.Width; rtH = d.Height; }
+        rt->Release();
+    }
+    return texW && texH && rtW && rtH && (texW != rtW || texH != rtH);
+}
+
+// Returns false when it cannot do the job safely, and the caller then draws the quad exactly as
+// before - a video that is merely uncorrected beats a video replaced by nothing.
+bool DrawVideoQuadPerEye(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT primCount,
+                         const void* vtxData, UINT vtxStride) {
+    UINT nv = 0;
+    switch (t) {
+        case D3DPT_TRIANGLESTRIP:
+        case D3DPT_TRIANGLEFAN:  nv = primCount + 2; break;
+        case D3DPT_TRIANGLELIST: nv = primCount * 3; break;
+        default: return false;
+    }
+    static uint8_t scratch[8 * 64];
+    if (!vtxData || vtxStride < 8 || vtxStride > 64 || nv > 8) return false;
+    if (!Readable(vtxData, (size_t)nv * vtxStride)) return false;
+
+    // The geometry lands entirely inside one half, so no scissor is needed - but a scissor left
+    // enabled by an earlier draw would clip it, so it is disabled and restored around the pair.
+    DWORD oldScissor = FALSE;
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+
+    HRESULT hr = D3D_OK;
+    for (int eye = 0; eye < 2; ++eye) {
+        memcpy(scratch, vtxData, (size_t)nv * vtxStride);
+        const float xOff = (eye == 0) ? -0.5f : +0.5f;
+        for (UINT i = 0; i < nv; ++i) {
+            float* p = reinterpret_cast<float*>(scratch + (size_t)i * vtxStride);
+            p[0] = p[0] * 0.5f + xOff;
+            p[1] = p[1] * 0.5f;
+        }
+        const HRESULT r = g_origDrawPrimUP(dev, t, primCount, scratch, vtxStride);
+        if (FAILED(r)) hr = r;
+    }
+
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
+    return SUCCEEDED(hr);
+}
+
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
     if (!g_origDrawPrimUP) return D3DERR_INVALIDCALL;
+    ++g_vidFrameDraws;
+    if (primCount <= 4) VidProbeRecord(dev, 2, t, primCount, vtxData, vtxStride);
     // Touch nothing off the render thread - see the note above OnRenderThread.
     if (UserPtrInert()) return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     ++g_drawsUP;
@@ -7471,7 +7771,26 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
     if (hudArmed && g_hudRemap && !quad)
         return HudStereoPair(dev, primCount, vtxStride, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
-    if (quad) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
+    if (quad) {
+        // The one fullscreen quad that must NOT simply pass through. Gated on VR mode: flat, the
+        // quad already covers the whole frame correctly and there is nothing to split.
+        if (InterlockedCompareExchange(&g_videoStereo, 0, 0) && VrModeOn() &&
+            IsVideoQuad(dev, primCount)) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                Log("video: Bink quad detected (2 prims, NDC, texture != render target, only draw"
+                    " in the frame) - drawing it once per eye from here");
+            }
+            if (DrawVideoQuadPerEye(dev, t, primCount, vtxData, vtxStride)) {
+                InterlockedIncrement(&g_videoQuadDraws);
+                return D3D_OK;
+            }
+            // Fell through: the vertex layout was not one this can rewrite. Draw it as before
+            // rather than not at all.
+        }
+        return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
+    }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
 }
@@ -7481,6 +7800,8 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
                                                 const void* idxData, D3DFORMAT idxFormat,
                                                 const void* vtxData, UINT vtxStride) {
     if (!g_origDrawIndexedPrimUP) return D3DERR_INVALIDCALL;
+    ++g_vidFrameDraws;
+    if (primCount <= 4) VidProbeRecord(dev, 3, t, primCount, vtxData, vtxStride);
     if (UserPtrInert())
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
@@ -10925,6 +11246,35 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         InstallViewHook(); InstallProcessEventHook(); InitXR();
     }
 
+    // ---- StartInVr, applied once and only with a session to render into (run 159) ----
+    //
+    // Gated on g_xrSession rather than fired at CreateDevice: with no headset connected there is no
+    // session, and turning VR mode on anyway would split the frame side-by-side on the desktop with
+    // nothing to send it to. That is the run-36 failure in a different costume - a cold start that
+    // looks broken, on a machine where nothing can fix it - so a missing headset simply leaves the
+    // game flat and says so once.
+    //
+    // InitXR is retried from here until it takes, so this is checked each frame until it fires
+    // rather than once beside it.
+    {
+        static bool done = false;
+        if (!done && InterlockedCompareExchange(&g_startInVr, 0, 0)) {
+            if (g_xrSession != XR_NULL_HANDLE) {
+                done = true;
+                SetVrMode(true);
+                Log("StartInVr: VR mode ON at startup. BACKSPACE toggles it, and VR MODE on the"
+                    " panel is the same switch.");
+            } else {
+                static int waited = 0;
+                if (++waited == 600) {          // ~5 s of frames with no session
+                    done = true;
+                    Log("StartInVr=1 but there is no OpenXR session after 600 frames - staying"
+                        " flat. Connect the headset and press BACKSPACE.");
+                }
+            }
+        }
+    }
+
     // Retry until it takes. DllMain gets first refusal, but XINPUT1_3.dll is a sibling static
     // import and the loader owes us no ordering, so the first attempt can legitimately find it
     // absent. Returns true once there is nothing left to do, including the failure cases - a
@@ -11824,6 +12174,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         //
         // Two interlocked reads a frame until it takes, then nothing.
         UpdateFgLatch();
+        // Once per frame, and it prints only for frames that look like video or a splash.
+        VidProbeFrameEnd();
 
         // ---- route 2's hooks, retried on a SLOW tick (run 158c) ----
         //
@@ -11975,6 +12327,13 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     }
                 }
             }
+
+            // Zero here is the expected reading and the reason this line exists - a nonzero count
+            // outside a cutscene means a post-process quad was taken for video, which is the one
+            // way this fix can break gameplay. VideoStereo=0 turns it off without a rebuild.
+            if (const LONG vq = InterlockedExchange(&g_videoQuadDraws, 0))
+                Log("    video quads drawn per eye: %ld this second%s", vq,
+                    g_drawsTotal > 200 ? "   <== DURING GAMEPLAY, this is a MISCLASSIFICATION" : "");
 
             // Directly under the correlation table, because it answers the next question that table
             // raises: the row above says the frame is 5 ms slower, this one says whether those 5 ms
@@ -12775,6 +13134,22 @@ void LoadIniSettings() {
         g_occlusionMode == 1 ? "always report visible" :
         g_occlusionMode == 2 ? "never override - the engine's own occlusion culling stays live"
                              : "refuse to create - WARNING, this crashed the game in run 30");
+
+    InterlockedExchange(&g_videoStereo,
+                        GetPrivateProfileIntA("Render", "VideoStereo", 1, path) ? 1 : 0);
+    Log("ini: VideoStereo=%ld (%s)", InterlockedCompareExchange(&g_videoStereo, 0, 0),
+        InterlockedCompareExchange(&g_videoStereo, 0, 0)
+            ? "Bink video drawn once per eye"
+            : "off - video spans the seam, i.e. double vision and over-zoom");
+
+    // Read here, applied at the first Present - see the note there. Applying it from CreateDevice
+    // would split the frame before OpenXR has been initialised, so a launch with no headset would
+    // show a side-by-side desktop image for no reason.
+    InterlockedExchange(&g_startInVr, GetPrivateProfileIntA("Render", "StartInVr", 1, path) ? 1 : 0);
+    Log("ini: StartInVr=%ld (%s)", InterlockedCompareExchange(&g_startInVr, 0, 0),
+        InterlockedCompareExchange(&g_startInVr, 0, 0)
+            ? "VR mode on as soon as the headset is up - BACKSPACE still toggles it"
+            : "cold start is flat, press BACKSPACE (run 37's behaviour)");
 
     // ---- ⭐ run 157: debug mode ----
     //

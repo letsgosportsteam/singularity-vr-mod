@@ -817,3 +817,106 @@ GpuFenceProbe=1
 ; shots that did not go through the crosshair - and nothing said so. The restore
 ; now falls out of the same function that applies it, called from SetVrMode in both
 ; directions, so there is no separate teardown that can drift out of step.
+
+; ---------------------------------------------------------------------------
+; StartInVr   -- VR mode on at launch, without pressing BACKSPACE (run 159)
+;
+;   1 = VR mode on as soon as the headset is up                   <- default
+;   0 = cold start is flat, press BACKSPACE (run 37's behaviour)
+;
+; Also on the VR panel as VR MODE, which is the same switch BACKSPACE throws.
+; BACKSPACE still works and is one of the two keys exempt from Debug.
+;
+; ---- ⚠️ this is run 36 again, and run 37 reverted run 36 ----
+;
+; Run 36 made VR mode default-on and run 37 reverted it, for a good reason worth
+; repeating: default-on meant THE MAIN MENU WAS RENDERED FRAME-SPLIT for the
+; first time ever, completely untested, on every launch.
+;
+; What changed is specific rather than a change of mind. Run 151 put the game's
+; HUD and menus into both eyes - the pause menu and prompts are explicitly on
+; that list - so the thing run 37 objected to is the thing run 151 built. The
+; premise went stale rather than the decision being wrong, which is the first
+; lesson at the top of STATUS.
+;
+; But "should work now" is not "was tested now". If the menus look wrong at
+; launch, StartInVr=0 restores run 37's cold start exactly, with no rebuild.
+;
+; ---- no headset, no split ----
+;
+; Applied at the first Present and gated on an OpenXR session EXISTING, not at
+; device creation. With no headset connected there is no session, and turning VR
+; mode on anyway would split the frame side-by-side on the desktop with nothing
+; to send it to - the run-36 failure in a different costume, on a machine where
+; nothing can fix it. A missing headset leaves the game flat and logs:
+;
+;   StartInVr=1 but there is no OpenXR session after 600 frames - staying flat.
+;
+; ---- what saves it, and what does not ----
+;
+; The panel's VR MODE row saves on close, so the state you leave it in is the
+; next cold start. BACKSPACE does NOT save: it is a toggle, not a setting, and a
+; key you press to peek at the flat game should not silently change how the game
+; launches tomorrow.
+; ---------------------------------------------------------------------------
+StartInVr=1
+
+; ---------------------------------------------------------------------------
+; VideoStereo   -- Bink video in both eyes, correctly (run 160)
+;
+;   1 = video drawn once per eye                                 <- default
+;   0 = off: video spans the seam, i.e. double vision + over-zoom
+;
+; ---- the symptom, which was two reports of one bug ----
+;
+; The splash screens showed DOUBLE VISION and the opening cutscene was "way too
+; zoomed in". Same artifact. A fullscreen quad is passed through untouched, which
+; is right for UE3's post-process quads because their source ALREADY holds the
+; side-by-side frame. A Bink frame is a SINGLE image, so passed through it covers
+; both halves with one copy: left eye gets the left half, right eye the right
+; half. Different content per eye, each stretched over a whole eye.
+;
+; ---- the classifier, measured rather than guessed ----
+;
+; Every video frame in the probe read identically:
+;
+;   DrawPrimUP type 5 prims 2 stride 24 v0 (-0.957,+1.000)
+;              tex 1280x720 fmt 50  rt 4992x2688     ... 1 draw(s) this frame
+;
+; fmt 50 is D3DFMT_L8 - Bink decodes to Y/U/V planes as luminance textures and
+; combines them in a pixel shader.
+;
+; THREE conditions, all required. "Texture smaller than the render target" alone
+; is WRONG: it also matches every bloom and depth-of-field downsample pass, which
+; are fullscreen quads over half-res buffers. What excludes those is FIRST DRAW
+; OF THE FRAME - a post-process pass runs after hundreds of scene draws, and a
+; video frame contains exactly one draw.
+;
+;   1. first draw of the frame
+;   2. 2-primitive quad in NDC (the existing UserPtrQuad classifier, reused)
+;   3. stage-0 texture dimensions != render target dimensions
+;
+; ---- why BOTH axes are halved ----
+;
+; x' = x/2 + eyeOffset puts the quad in one half. y' = y/2 is NOT optional: each
+; half is 2496x2688, nearly portrait, so halving x alone would squash 16:9 to
+; 8:9. With both halved the pixels go 4777x2688 -> 2389x1344, still exactly 16:9,
+; centred with black above and below. A flat screen in front of you, which is how
+; 2D video should read in a headset.
+;
+; If the vertex layout is not one this can rewrite, it falls through and draws the
+; quad exactly as before - an uncorrected video beats no video.
+;
+; ---- how to tell if it misfires ----
+;
+; The detection line is logged ONCE, which proves it fired and says nothing about
+; where. The per-second count is the real instrument:
+;
+;   video quads drawn per eye: 120 this second
+;
+; In a cutscene that is expected. IN GAMEPLAY IT IS A MISCLASSIFICATION - a post
+; process quad taken for video - and the line says so in as many words. That is
+; the one way this can break gameplay, and VideoStereo=0 disables it without a
+; rebuild.
+; ---------------------------------------------------------------------------
+VideoStereo=1

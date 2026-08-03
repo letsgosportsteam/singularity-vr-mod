@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-03** (end of run 158). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-03** (end of run 160). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -52,7 +52,7 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-0. **📋 `ENABLE VR` on the panel** — it would remove one of the two remaining keyboard exemptions.
+0. **📋 The BACKSPACE keyboard exemption can now go** — `VR MODE` is on the panel as of run 159, so the last reason to keep it live under `Debug=0` is gone.
    Run 157's `[Render] Debug` makes every keyboard key inert except **BACKSPACE** (VR mode on/off)
    and **PAUSE** (hold to quit, which is the `WM_CLOSE` path that lets the engine save — and every
    copy of this game shares one save profile). Both are marked at their call sites as the only
@@ -166,6 +166,72 @@ dropped beside the game exe. No game files modified.
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## ✅ Runs 159–160: start in VR, and Bink video in both eyes
+
+**`StartInVr=1` is the default** and `VR MODE` is the first panel row. This is run 36 again, which
+run 37 reverted because default-on meant *the main menu was rendered frame-split for the first time
+ever, untested, on every launch*. What changed is checkable rather than a change of mind: **run 151
+put the HUD and menus into both eyes**, so the thing run 37 objected to is the thing run 151 built.
+Confirmed working. `StartInVr=0` restores run 37's cold start with no rebuild.
+
+Applied at the first Present and gated on an **OpenXR session existing**, not at device creation —
+with no headset there is no session, and splitting the frame anyway would be the run-36 failure on a
+machine where nothing can fix it. The panel row saves; BACKSPACE deliberately does not, because a
+key you press to peek at the flat game should not change how it launches tomorrow.
+
+### ⚠️ The centre was captured before the pose converged — and `POSITION_VALID` was set
+
+Reported straight after `StartInVr` landed: the menu sat too low and the game loaded in at the
+ceiling, and toggling VR off and on fixed it. The log had it in numbers:
+
+```
+startup : head yaw 0.0,  head pos (0.000, -1.223, 0.000)
+later   : head yaw -3.5, head pos (0.033, -0.040, 0.227)
+```
+
+A centre 1.18 m low puts you 1.18 m high for the session. x, z and yaw were **exactly** zero with
+only y populated — a synthetic identity pose, not a measurement.
+
+**The obvious fix would not have worked.** `POSITION_VALID` *was* set on that frame. Valid means
+"this number is usable", not "this number is real yet". It now waits for `POSITION_TRACKED` **and**
+`ORIENTATION_TRACKED` to hold for 10 consecutive frames, bounded at 300 so a 3DOF headset still
+centres. The `recentred:` line prints both flags, because that bad capture looked entirely normal on
+the old one.
+
+BACKSPACE always worked because by the time anyone pressed it the pose had converged. `StartInVr`
+fires as early as it possibly can, which is exactly when it has not.
+
+### ✅ Bink video: two reports, one bug
+
+The splash screens showed double vision and the opening cutscene was "way too zoomed in". Same
+artifact. Fullscreen quads are passed through untouched — correct for UE3's post-process quads,
+whose source *already* holds the side-by-side frame. A Bink frame is a single image, so passed
+through it covers both halves with one copy: each eye gets a different half, stretched.
+
+Measured before classifying. Every video frame read identically:
+
+```
+DrawPrimUP type 5 prims 2 stride 24 v0 (-0.957,+1.000) tex 1280x720 fmt 50 rt 4992x2688
+... 1 draw(s) this frame
+```
+
+`fmt 50` is `D3DFMT_L8` — Bink's Y/U/V planes as luminance textures, combined in a pixel shader.
+
+**Three conditions, all required.** "Texture smaller than the render target" alone is wrong — it also
+matches every bloom and DOF downsample pass. **First draw of the frame** is what excludes those.
+
+**Both axes are halved, and `y` is not optional**: each half is 2496×2688, nearly portrait, so
+halving `x` alone would squash 16:9 to 8:9. Halving both gives 2389×1344 — exactly 16:9, centred,
+black above and below.
+
+The detection line logs once; the **per-second count** is the real instrument, and a nonzero count
+during gameplay is a misclassification and says so. `VideoStereo=0` disables it without a rebuild.
+
+### 📋 Known, not chased
+
+- **`thread-cpu: more than 96 threads`** — the CPU census under-counts on this build. Harmless while
+  nothing depends on it, but that instrument would lie if it were leaned on again.
 
 ## ✅ Runs 157–158: the settings panel grew up — AIM METHOD, and three silent no-ops
 
