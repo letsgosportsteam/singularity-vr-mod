@@ -592,3 +592,93 @@ GpuFenceProbe=1
 ;   0 = off, the UI spans the seam
 ; ---------------------------------------------------------------------------
 ; HudStereo=1
+
+; ---------------------------------------------------------------------------
+; [Input] TriggerTouchGate -- the phantom trigger fix (run 156). THIS is the
+;                             one that matters; AutoPad below is its fossil.
+;
+; ---- what was happening ----
+;
+; A Touch controller that has been set down and left to rest reports a
+; SUSTAINED PARTIAL TRIGGER PULL - measured at left 0.34-0.43 and right
+; 0.23-0.28, held for seconds, with isActive true on all 120 frames of every
+; sample. It sails past the 0.10 deadzone and reaches the game as LT ~97 /
+; RT ~64, and Raven's 360 layout maps those to AIM and FIRE. So the gun fires
+; and aims by itself, and the engine does exactly what it was told.
+;
+; The frame-rate cost, from a session where the two states separate cleanly:
+;
+;   neither trigger        120 fps
+;   right only (fire)       98 fps
+;   both (fire + aim)       77 fps
+;
+; Over a whole session the correlation is total: every second with a nonzero
+; trigger is 68-98 fps, every second without one is 109-120.
+;
+; ⚠️ A BIGGER DEADZONE IS NOT THE FIX, and it was considered and dropped. Real
+; pulls read a hard 1.00 - nobody lingers at partial deflection - so a
+; threshold near 0.6 would work today. But the phantom is not noise: it is a
+; plausible number with no finger behind it, and it has been seen as high as
+; 0.83. Any threshold that caught that would eat real input.
+;
+; ---- what the gate does ----
+;
+; Pulling a trigger requires touching it. `trigger/touch` is a capacitive
+; sensor on the trigger itself, so if no finger is on it, the analog value did
+; not come from the player whatever it claims. Bound to exactly two sources,
+; per hand, and nothing else may ever be added - the moment it accepts a second
+; surface it stops meaning "a finger is on the trigger" and becomes another
+; copy of the broad `grasp` signal, which answers a different question.
+;
+; Where the binding does not resolve, values pass through unchanged: a runtime
+; without the sensor keeps the old behaviour rather than losing its triggers.
+; The log prints the veto count every second, so a run where the judder is gone
+; and the count reads 0 means something ELSE fixed it.
+;
+;   TriggerTouchGate=1     on                                   <- default
+;   TriggerTouchGate=0     off, for re-measuring the phantom
+;
+; ---- AutoPad: obsolete since run 156, and OFF by default ----
+;
+; Runs 67-75 chased this same judder for nine runs and never named it. Five
+; mechanisms were proposed and all five died: OpenXR input cost, sleeping-
+; controller runtime stalls, dwPacketNumber churn, XInput poll rate, and
+; bSmoothFrameRate. The fallback was AutoPad - unplug the virtual pad once
+; neither controller had been touched for AutoPadStillFrames frames, and plug
+; it back the instant one was.
+;
+; It worked, for the reason now obvious: unplugging the pad is one way to stop
+; the phantom trigger reaching the game. But it cost 1-2 SECONDS OF DEAD
+; CONTROLS on every genuine pick-up, because UE3 enumerates XInput ports
+; round-robin at about one per second. That latency was the whole reason this
+; was reopened, and it is now simply gone.
+;
+; Kept in the build, not deleted: on a runtime where `trigger/touch` does not
+; resolve, the veto cannot help and auto-pad is still the best answer there is.
+;
+;   AutoPad=0              off - the cause is fixed upstream    <- default
+;   AutoPad=1              restore the old unplug/replug workaround
+;   AutoPadStillFrames=600 ~5 s at 120 fps, only read when AutoPad=1
+;
+; ---- ThreadCpu: per-thread CPU census, bucketed by frame time ----
+;
+; Prints per-thread CPU time once a second, split into FAST (>=105 fps) and
+; SLOW (<=90 fps) intervals, with the thread's start address as module+offset
+; so it can be looked up in Ghidra. It answers "when the frame is slow, is the
+; time BURNED or WAITED FOR" - a blocked thread accrues no CPU time.
+;
+; ⚠️ It was bucketed on the CONTROLLER STATE first, and that version reported
+; "no difference" on a run where the user was watching the drop happen. The
+; label was derived from the capacitive `grasp` sensor, which read `on desk`
+; through ninety seconds of deliberately holding both controllers - one sample
+; has a hand moving at 1331 um/frame and still reporting `on desk`. Both
+; buckets held both states and the difference averaged away. Keying on the
+; frame time itself removes every sensor from the loop.
+;
+;   ThreadCpu=1            on, costs a few microseconds a second <- default
+;   ThreadCpu=0            off
+; ---------------------------------------------------------------------------
+; [Input]
+; TriggerTouchGate=1
+; AutoPad=0
+; ThreadCpu=1

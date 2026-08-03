@@ -47,6 +47,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shlobj.h>
+#include <tlhelp32.h>    // Thread32First, for the per-thread CPU census
 #include <d3d9.h>
 #include <d3d11.h>
 
@@ -323,6 +324,33 @@ volatile LONG g_setStateCalls = 0;   // rumble path activity, counted per second
 // The right trigger straight from OpenXR, 0-255, independent of whether the pad is currently
 // plugged in. The script census splits on this so an unplugged pad cannot silently empty it.
 volatile LONG g_rawTrigger = 0;
+
+// ---- ⚠️ run 155: reported STUCK TRIGGERS on a set-down controller ----
+//
+// Both triggers read as pressed with the controllers face-down on the desk - the gun fires and aims
+// on its own. That is a live weapon firing continuously, which is real engine work, and it is the
+// first candidate for the run-75 interaction that is an OBSERVATION rather than a theory. Six
+// theories have died here; this one was seen.
+//
+// It is not confirmed yet, and the log could not settle it because nothing recorded the trigger.
+// Two causes fit equally well and need separating before anything is built on either:
+//
+//   PHYSICAL  - a controller resting face-down has the desk pressing its trigger. Mundane, entirely
+//               sufficient, and it would mean the mod is faithfully reporting a real press.
+//   RUNTIME   - the runtime keeps reporting a stale or garbage value once the controller sleeps.
+//
+// `getFloat` already returns 0 when `isActive` is false, so a merely inactive action cannot produce
+// this - which means either the runtime is claiming ACTIVE with a high value, or the trigger really
+// is down. Recording isActive alongside the value is what tells those apart.
+//
+// Min and max are held across the whole logging window, not sampled at the instant it prints: a
+// stuck trigger reads min == max == high, and one that flickers does not. A single instantaneous
+// sample cannot distinguish those and would have to be re-run to find out.
+float g_trigRaw[2] = { 0.0f, 0.0f };      // [0] = left / alt-fire, [1] = right / fire
+float g_trigMin[2] = { 9.0f, 9.0f };
+float g_trigMax[2] = { -9.0f, -9.0f };
+int   g_trigInactiveFrames[2] = { 0, 0 };
+int   g_trigFrames = 0;
 
 // Set once the OpenXR action set is attached. Lives here rather than with the input code because
 // both halves read it: the input code to know it may publish, the test overrides to know whether
@@ -3108,6 +3136,26 @@ XrPath   g_handSubPath[2] = { XR_NULL_PATH, XR_NULL_PATH };   // left, right
 XrAction g_actGrasp = XR_NULL_HANDLE;
 bool g_graspAvailable = false;
 
+// ---- ⭐ run 156: the phantom triggers, and the sensor that vetoes them ----
+//
+// A SEPARATE action from g_actGrasp, deliberately, and the distinction is the whole point. Grasp is
+// deliberately BROAD - run 82 widened it to every capacitive surface on the controller, because it
+// answers "is anyone holding this at all" and a false negative there unplugs the pad mid-fight.
+// This one has to be NARROW: it answers "is a finger on the TRIGGER", and the only correct source
+// for that is the trigger's own touch sensor.
+//
+// Sharing one action between the two questions would put a thumb on the stick to work as evidence
+// that the index finger is pulling the trigger, which is exactly the class of mistake this file has
+// paid for repeatedly - one signal quietly answering two different questions.
+//
+// Per-hand, because the two triggers drift independently: the run-155 log has left sitting at 0.38
+// while right sits at 0.25, sustained for seconds.
+XrAction g_actTrigTouch = XR_NULL_HANDLE;
+bool g_trigTouch[2] = { false, false };       // is a finger on this trigger
+bool g_trigTouchAvail[2] = { false, false };  // did the binding resolve at all
+int  g_trigVetoed[2] = { 0, 0 };              // frames this gate zeroed a nonzero value
+int  g_triggerGate = -1;                      // ini [Input] TriggerTouchGate, read on first use
+
 XrAction g_actHandPose = XR_NULL_HANDLE;
 XrSpace  g_handSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 bool     g_handPoseValid[2] = { false, false };
@@ -3212,7 +3260,20 @@ bool  g_handHavePos[2] = { false, false };
 // ⚠️ The threshold is a guess, and run 72's guess was wrong by enough to collapse a whole table.
 // So the measured speeds are logged now, and the number can be set from data rather than from
 // another guess.
-int  g_autoPad = 1;                 // ini AutoPad
+// ---- ✅ run 156: OBSOLETE, and now OFF by default. The cause was found ----
+//
+// Everything above this line is a workaround for a mechanism nobody could name. Run 156 named it:
+// a set-down controller reports a sustained phantom trigger pull, which reaches the game as FIRE
+// and AIM, and the game does exactly what it is told. The trigger-touch veto stops it at the
+// source, so there is nothing left for auto-pad to protect against.
+//
+// It is left in the build rather than deleted, because the veto depends on `trigger/touch`
+// resolving and a runtime without that sensor keeps the old behaviour - on which auto-pad is still
+// the best answer available. `AutoPad=1` restores it in full.
+//
+// Default 0 is the point of the whole exercise: the unplug/replug cycle cost 1-2 s of dead controls
+// on every genuine pick-up while UE3 re-enumerated its ports, and that latency is now simply gone.
+int  g_autoPad = 0;                 // ini AutoPad - off since run 156, see above
 bool g_autoPadDisabled = false;     // did WE turn it off, or did the user with NUMPAD3
 int  g_handStillFrames = 0;
 
@@ -3365,6 +3426,405 @@ const char* BucketName(int i) {
                 (i & 2) ? "off" : "ON ",
                 (i & 1) ? "ON DESK" : "in hand");
     return buf[i];
+}
+
+// The one place this index is computed. It used to live inline in Hook_Present, and the CPU census
+// below needs the identical value - two copies of a bucketing rule is how two mechanisms end up
+// answering one question slightly differently, which this project has already paid for twice.
+int StateBucketIndex() {
+    return (InterlockedCompareExchange(&g_padEmu, 0, 0) ? 4 : 0)
+         + (InterlockedCompareExchange(&g_xrInputOff, 0, 0) ? 2 : 0)
+         + ((g_handHeld[0] || g_handHeld[1]) ? 0 : 1);
+}
+
+// ================================================================ per-thread CPU census (run 154)
+//
+// Nine runs failed to name the mechanism behind the pad/controller interaction, and every one of
+// them started by proposing a mechanism. This does not. It asks the question that has to be
+// answered BEFORE any function is worth hunting:
+//
+//     the missing ~10 ms per frame - is it CPU being burned, or a thread being blocked?
+//
+// Run 72 measured 13.7 ms of "our work" in the bad state against 3.4 ms in the good one, at a
+// constant draw count, and concluded the app was "genuinely compute-bound". **That was an
+// inference, not a measurement.** "our work" is the residual between the Present hooks, and STATUS
+// says in as many words that it will absorb any amount of somebody else's latency while looking
+// exactly like your own bug - which is precisely what xrEndFrame did for a whole day in run 56,
+// hiding a 189 ms stall in that same number.
+//
+// GetThreadTimes settles it, because a blocked thread accrues no CPU time. Three outcomes, all of
+// them worth having:
+//
+//   CPU/frame rises with wall/frame   -> compute. And the table NAMES THE THREAD, so a sampling
+//                                        profiler has one target instead of thirty.
+//   CPU/frame flat, wall/frame rises  -> the thread is WAITING. No profile of game code will ever
+//                                        show this, and the whole "which function" framing retires.
+//   kernel time rises, user flat      -> syscalls: driver, runtime, or I/O, not game logic.
+//
+// ---- what would make this instrument lie ----
+//
+//   * **AutoPad=1 deletes the row the experiment needs.** Auto-pad unplugs the pad after 5 s of no
+//     touch, which IS the state under test, so the interesting bucket never fills. This is run 68's
+//     failure exactly - `NUMPAD/` forced the state flags false and made one row physically
+//     unrecordable. The report below prints the auto-pad setting next to the table for that reason.
+//   * **Samples taken across a state change land in the wrong bucket.** `g_handHeld` is the
+//     capacitive sensor, which STATUS already flags as too twitchy to trust per frame. Any interval
+//     whose bucket differs from the previous one is DROPPED rather than attributed - losing a
+//     second per transition costs nothing when the states last minutes.
+//   * **Unequal sample counts read as a difference.** Frame counts are printed beside every row and
+//     the verdict refuses to fire below 300 frames a side.
+//   * **Sampling only while we are inside our own code would find only our own code.** This samples
+//     every thread in the process from the frame loop, not from inside a hook, so a cost sitting in
+//     a game thread the mod never touches is fully visible.
+//
+// It is NOT a profiler and cannot name a function - it deliberately stops one step short, because
+// which thread to sample is itself an assumption this project has not earned yet.
+//
+// ---- ❌ run 155: bucketing on the CONTROLLER STATE was the mistake. Re-keyed on FRAME TIME ----
+//
+// Run 154 reported "the bad state was never captured" - 9.65 ms/frame held against 8.77 ms on the
+// desk, no difference worth explaining. **That was the instrument, not the game.** The user
+// reproduced the drop on the same run, watched it hit the 70s on Virtual Desktop's own overlay, and
+// the per-second log agrees flatly: clean stretches of 120.0 fps and clean stretches of 67-70.
+//
+// The label was the broken part. `g_handHeld[0]` read `on desk` for essentially the WHOLE session,
+// including ninety seconds of deliberately holding both controllers - one sample shows the left
+// hand moving at 1331 um/frame and still reporting `on desk`. So both buckets contained both
+// states, the difference averaged away, and the table said "nothing here" with total confidence.
+//
+// ⚠️ This is the third instrument in this investigation to hide the answer rather than miss it, and
+// the second to do it by MISLABELLING rather than by failing. Run 68: `ORIENTATION_TRACKED` read
+// backwards. Run 74: the motion threshold was 10x too low. Now this. The pattern is always the
+// same - a state label derived from a sensor that was never validated against the state it names.
+//
+// ---- the fix: stop asking what the controllers are doing ----
+//
+// The question was never "held or not". It is "when the frame is slow, is the time BURNED or
+// WAITED FOR" - and the frame time itself says which frames are slow, with no sensor in the way.
+// Intervals are keyed on their own measured frame rate: FAST, SLOW, or neither (dropped). A
+// mislabelled controller can no longer corrupt a row, because no controller is consulted.
+//
+// The two regimes are far enough apart to split cleanly - 119-120 against 67-76, with very little
+// in between - so the dropped middle costs almost nothing.
+const int kCpuThreads = 96;
+
+// Keyed on measured frame rate, not on anything the runtime reports. The gap between them is wide
+// on purpose: an interval that lands in it was mixed, and a mixed interval is exactly what produced
+// run 154's flat table.
+const int kCpuBuckets = 2;
+enum { CPU_FAST = 0, CPU_SLOW = 1 };
+const double kCpuFastFps = 105.0;   // at or above -> the good regime
+const double kCpuSlowFps =  90.0;   // at or below -> the bad regime
+
+const char* CpuBucketName(int i) { return i == CPU_FAST ? "FAST frames (>=105 fps)"
+                                                        : "SLOW frames (<=90 fps)"; }
+
+struct CpuThread {
+    DWORD     tid;
+    HANDLE    h;
+    char      name[48];        // the thread's start address as module+offset, for Ghidra
+    ULONGLONG lastK, lastU;    // previous sample, in 100 ns units
+    bool      haveLast;
+    bool      alive;           // seen in the most recent snapshot
+    bool      dead;            // confirmed gone - its slot is never matched or reused again
+    double    k[kCpuBuckets], u[kCpuBuckets];   // kernel and user ms per bucket, cumulative
+};
+CpuThread g_cpuThreads[kCpuThreads]{};
+int    g_cpuThreadN = 0;
+bool   g_cpuTableFull = false;
+
+double g_cpuWallMs[kCpuBuckets] = { 0 };        // wall ms attributed by THIS sampler, per bucket
+int    g_cpuBucketFrames[kCpuBuckets] = { 0 };  // and the frames that went with them
+int    g_cpuDroppedIntervals = 0;               // landed between the two regimes
+volatile LONG g_cpuIntervalFrames = 0;
+int    g_cpuOn = -1;                  // ini [Input] ThreadCpu, read on first use
+
+// A thread's Win32 start address turns an anonymous TID into something that can be looked up in
+// Ghidra. Undocumented but stable since NT 4, and a failure here costs the label and nothing else.
+typedef LONG (WINAPI *PFN_NtQueryInformationThread)(HANDLE, int, PVOID, ULONG, PULONG);
+
+void CpuThreadName(HANDLE h, char* out, size_t cap) {
+    static PFN_NtQueryInformationThread ntq = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        if (HMODULE nt = GetModuleHandleA("ntdll.dll"))
+            ntq = (PFN_NtQueryInformationThread)GetProcAddress(nt, "NtQueryInformationThread");
+    }
+    void* start = nullptr;
+    if (ntq && ntq(h, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr) >= 0
+            && start) {
+        HMODULE m = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                             | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)start, &m) && m) {
+            char path[MAX_PATH]{};
+            GetModuleFileNameA(m, path, MAX_PATH);
+            const char* base = strrchr(path, '\\');
+            base = base ? base + 1 : path;
+            _snprintf_s(out, cap, _TRUNCATE, "%s+0x%08X", base,
+                        (unsigned)((uintptr_t)start - (uintptr_t)m));
+            return;
+        }
+        _snprintf_s(out, cap, _TRUNCATE, "%p (no module)", start);
+        return;
+    }
+    _snprintf_s(out, cap, _TRUNCATE, "(start address unavailable)");
+}
+
+// Threads are discovered rather than assumed. UE3 spawns worker and streaming threads at load, so a
+// list taken once at startup would miss whichever one turns out to matter.
+void CpuRefreshThreads() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+
+    for (int i = 0; i < g_cpuThreadN; ++i) g_cpuThreads[i].alive = false;
+
+    const DWORD me = GetCurrentProcessId();
+    THREADENTRY32 te{};
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != me) continue;
+            // Matched only against LIVE slots. Windows recycles thread IDs, so a dead slot keyed on
+            // the same TID would hand a new thread a handle to the corpse of the old one - which
+            // reads as a thread that burns exactly zero CPU forever, the one failure this table
+            // could not detect from its own output.
+            int slot = -1;
+            for (int i = 0; i < g_cpuThreadN; ++i)
+                if (!g_cpuThreads[i].dead && g_cpuThreads[i].tid == te.th32ThreadID) { slot = i; break; }
+            if (slot < 0) {
+                if (g_cpuThreadN >= kCpuThreads) {
+                    if (!g_cpuTableFull) {
+                        g_cpuTableFull = true;
+                        Log("thread-cpu: more than %d threads - the rest are NOT counted, so the"
+                            " totals below are a floor", kCpuThreads);
+                    }
+                    continue;
+                }
+                // THREAD_QUERY_INFORMATION rather than _LIMITED_: the start address query needs it,
+                // and this is our own process, so it is grantable.
+                HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                if (!h) continue;
+                slot = g_cpuThreadN++;
+                g_cpuThreads[slot] = CpuThread{};
+                g_cpuThreads[slot].tid = te.th32ThreadID;
+                g_cpuThreads[slot].h   = h;
+                CpuThreadName(h, g_cpuThreads[slot].name, sizeof(g_cpuThreads[slot].name));
+            }
+            g_cpuThreads[slot].alive = true;
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+
+    // The snapshot is authoritative about what exists, so anything it did not list has exited. Its
+    // accumulated CPU is KEPT - that time really was spent, and dropping it would quietly shrink
+    // the totals mid-session - but the handle is released and the slot is retired.
+    for (int i = 0; i < g_cpuThreadN; ++i) {
+        if (g_cpuThreads[i].alive || g_cpuThreads[i].dead) continue;
+        g_cpuThreads[i].dead = true;
+        if (g_cpuThreads[i].h) { CloseHandle(g_cpuThreads[i].h); g_cpuThreads[i].h = nullptr; }
+    }
+}
+
+// Called once per reporting interval from the frame loop. The per-thread baselines advance on EVERY
+// call, including dropped ones - otherwise a dropped interval's CPU silently lands in the next
+// bucket, which is the same class of bug as a bucketing rule that exists in two places.
+void SampleThreadCpu() {
+    if (g_cpuOn < 0) {
+        char path[MAX_PATH]{};
+        g_cpuOn = IniPath(path) ? (GetPrivateProfileIntA("Input", "ThreadCpu", 1, path) ? 1 : 0) : 1;
+        if (!g_cpuOn) Log("thread-cpu: off ([Input] ThreadCpu=0)");
+    }
+    if (!g_cpuOn) return;
+
+    // The snapshot is the expensive part - a few hundred microseconds - so it runs every tenth
+    // interval. GetThreadTimes itself is a handful of microseconds across thirty threads.
+    static int untilRefresh = 0;
+    if (--untilRefresh <= 0) { CpuRefreshThreads(); untilRefresh = 10; }
+
+    static LARGE_INTEGER lastT{};
+    static bool haveLast = false;
+
+    const LARGE_INTEGER now = Now();
+    const LONG framesNow = InterlockedExchange(&g_cpuIntervalFrames, 0);
+    const double wallMs  = haveLast ? MsSince(lastT) : 0.0;
+
+    // The interval labels ITSELF, from the frame rate it actually achieved. No controller, no
+    // sensor, nothing that can read backwards - which is what run 154 got wrong.
+    const double fps = (wallMs > 0.0) ? (framesNow * 1000.0 / wallMs) : 0.0;
+    int idx = -1;
+    if (fps >= kCpuFastFps)      idx = CPU_FAST;
+    else if (fps <= kCpuSlowFps && fps > 1.0) idx = CPU_SLOW;
+
+    // Dropped: the first interval, anything landing between the two regimes (it was mixed), and
+    // anything with an implausible span - a loading screen or an alt-tab, where wall time and
+    // frames disagree wildly.
+    const bool attribute = haveLast && idx >= 0 && framesNow > 0
+                        && wallMs > 0.0 && wallMs < 5000.0;
+    if (haveLast && idx < 0) ++g_cpuDroppedIntervals;
+
+    for (int i = 0; i < g_cpuThreadN; ++i) {
+        CpuThread& t = g_cpuThreads[i];
+        if (!t.alive || !t.h) continue;
+        FILETIME ct, et, kt, ut;
+        if (!GetThreadTimes(t.h, &ct, &et, &kt, &ut)) { t.alive = false; continue; }
+        const ULONGLONG kk = ((ULONGLONG)kt.dwHighDateTime << 32) | kt.dwLowDateTime;
+        const ULONGLONG uu = ((ULONGLONG)ut.dwHighDateTime << 32) | ut.dwLowDateTime;
+        if (t.haveLast && attribute) {
+            t.k[idx] += double(kk - t.lastK) / 10000.0;   // 100 ns units -> ms
+            t.u[idx] += double(uu - t.lastU) / 10000.0;
+        }
+        t.lastK = kk;
+        t.lastU = uu;
+        t.haveLast = true;
+    }
+
+    if (attribute) {
+        g_cpuWallMs[idx]       += wallMs;
+        g_cpuBucketFrames[idx] += framesNow;
+    }
+    lastT = now;
+    haveLast = true;
+}
+
+void LogThreadCpu() {
+    if (g_cpuOn <= 0) return;
+
+    int populated[kCpuBuckets], np = 0;
+    for (int i = 0; i < kCpuBuckets; ++i) if (g_cpuBucketFrames[i] > 120) populated[np++] = i;
+    if (np == 0) return;
+
+    auto wallPerFrame = [](int i) { return g_cpuWallMs[i] / (double)g_cpuBucketFrames[i]; };
+    auto cpuPerFrame  = [](int i) {
+        double s = 0.0;
+        for (int t = 0; t < g_cpuThreadN; ++t) s += g_cpuThreads[t].u[i] + g_cpuThreads[t].k[i];
+        return s / (double)g_cpuBucketFrames[i];
+    };
+
+    Log("    ---- CPU by thread, bucketed by FRAME TIME (cumulative), ms per frame ----");
+    Log("      auto-pad %s | %d interval(s) dropped as mixed", g_autoPad ? "ON" : "off",
+        g_cpuDroppedIntervals);
+
+    for (int j = 0; j < np; ++j) {
+        const int i = populated[j];
+        double user = 0.0, kern = 0.0;
+        for (int t = 0; t < g_cpuThreadN; ++t) { user += g_cpuThreads[t].u[i];
+                                                 kern += g_cpuThreads[t].k[i]; }
+        const double n = (double)g_cpuBucketFrames[i];
+        Log("      [%d] %-24s : %6d fr | wall %6.2f | CPU %6.2f (user %.2f kernel %.2f)",
+            i, CpuBucketName(i), g_cpuBucketFrames[i], wallPerFrame(i),
+            (user + kern) / n, user / n, kern / n);
+    }
+
+    // The verdict, between the slowest and fastest populated buckets. Deliberately a ratio with its
+    // inputs printed rather than a bare label - five theories died here on labels that outlived the
+    // numbers that produced them.
+    int hi = -1, lo = -1;
+    if (np >= 2) {
+        hi = lo = populated[0];
+        for (int j = 1; j < np; ++j) {
+            if (wallPerFrame(populated[j]) > wallPerFrame(hi)) hi = populated[j];
+            if (wallPerFrame(populated[j]) < wallPerFrame(lo)) lo = populated[j];
+        }
+        if (g_cpuBucketFrames[hi] < 300 || g_cpuBucketFrames[lo] < 300) {
+            Log("      (no verdict: needs 300+ frames on both sides, have %d and %d)",
+                g_cpuBucketFrames[hi], g_cpuBucketFrames[lo]);
+        } else {
+            const double dWall = wallPerFrame(hi) - wallPerFrame(lo);
+            const double dCpu  = cpuPerFrame(hi)  - cpuPerFrame(lo);
+            if (dWall < 1.0) {
+                Log("      (no verdict: [%d] and [%d] differ by only %.2f ms/frame - nothing to"
+                    " explain, so the bad state was never captured)", hi, lo, dWall);
+            } else {
+                const double share = 100.0 * dCpu / dWall;
+                Log("      [%d] is %.2f ms/frame SLOWER than [%d], and burns %.2f ms/frame more CPU"
+                    " -> %.0f%% of the extra time is CPU", hi, dWall, lo, dCpu, share);
+                Log("      ==> %s", share > 70.0
+                        ? "COMPUTE. Sample the top thread below - it is the profiler's target."
+                    : share < 30.0
+                        ? "NOT COMPUTE. The thread is BLOCKED or waiting; no function-level profile"
+                          " of game code can show this."
+                        : "MIXED - inconclusive. Do not build on this row.");
+            }
+        }
+    }
+
+    // Per-thread rows, sorted by the difference the verdict is about, so the thread carrying the
+    // cost is the first line rather than something to be found by eye.
+    const bool haveDelta = (hi >= 0 && lo >= 0 && hi != lo);
+    int order[kCpuThreads], on = 0;
+    for (int t = 0; t < g_cpuThreadN; ++t) {
+        double peak = 0.0;
+        for (int j = 0; j < np; ++j) {
+            const double v = (g_cpuThreads[t].u[populated[j]] + g_cpuThreads[t].k[populated[j]])
+                           / (double)g_cpuBucketFrames[populated[j]];
+            if (v > peak) peak = v;
+        }
+        if (peak >= 0.02) order[on++] = t;      // below 0.02 ms/frame is noise, not a suspect
+    }
+    auto sortKey = [&](int t) {
+        if (haveDelta)
+            return (g_cpuThreads[t].u[hi] + g_cpuThreads[t].k[hi]) / (double)g_cpuBucketFrames[hi]
+                 - (g_cpuThreads[t].u[lo] + g_cpuThreads[t].k[lo]) / (double)g_cpuBucketFrames[lo];
+        double peak = 0.0;
+        for (int j = 0; j < np; ++j) {
+            const double v = (g_cpuThreads[t].u[populated[j]] + g_cpuThreads[t].k[populated[j]])
+                           / (double)g_cpuBucketFrames[populated[j]];
+            if (v > peak) peak = v;
+        }
+        return peak;
+    };
+    for (int a = 0; a < on; ++a)
+        for (int b = a + 1; b < on; ++b)
+            if (sortKey(order[b]) > sortKey(order[a])) { const int s = order[a]; order[a] = order[b];
+                                                         order[b] = s; }
+
+    {
+        char row[220];
+        int p = _snprintf_s(row, sizeof(row), _TRUNCATE, "      %-4s %-30s", "tid", "start address");
+        if (p < 0) p = (int)strlen(row);
+        for (int j = 0; j < np && p < (int)sizeof(row) - 12; ++j) {
+            const int w = _snprintf_s(row + p, sizeof(row) - p, _TRUNCATE, "      [%d]", populated[j]);
+            if (w < 0) break;
+            p += w;
+        }
+        if (haveDelta && p < (int)sizeof(row) - 12) {
+            const int w = _snprintf_s(row + p, sizeof(row) - p, _TRUNCATE, "    delta");
+            if (w > 0) p += w;
+        }
+        Log("%s", row);
+    }
+
+    const int kShow = 12;
+    for (int a = 0; a < on && a < kShow; ++a) {
+        const CpuThread& t = g_cpuThreads[order[a]];
+        char row[220];
+        int p = _snprintf_s(row, sizeof(row), _TRUNCATE, "      %04X %-30.30s",
+                            t.tid, t.name);
+        if (p < 0) p = (int)strlen(row);
+        for (int j = 0; j < np && p < (int)sizeof(row) - 12; ++j) {
+            const int i = populated[j];
+            const double v = (t.u[i] + t.k[i]) / (double)g_cpuBucketFrames[i];
+            const int w = _snprintf_s(row + p, sizeof(row) - p, _TRUNCATE, " %8.3f", v);
+            if (w < 0) break;
+            p += w;
+        }
+        if (haveDelta && p < (int)sizeof(row) - 12) {
+            const double d = (t.u[hi] + t.k[hi]) / (double)g_cpuBucketFrames[hi]
+                           - (t.u[lo] + t.k[lo]) / (double)g_cpuBucketFrames[lo];
+            const int w = _snprintf_s(row + p, sizeof(row) - p, _TRUNCATE, " %+8.3f", d);
+            if (w > 0) p += w;
+        }
+        // The Present thread is the one every existing timing number in this log is measured on, so
+        // it is marked - "the cost is somewhere else entirely" is a real and useful outcome.
+        if (p < (int)sizeof(row) - 24)
+            _snprintf_s(row + p, sizeof(row) - p, _TRUNCATE, "%s%s",
+                        t.tid == g_mainThreadId ? "  [PRESENT]" : "",
+                        t.dead ? "  (exited)" : "");
+        Log("%s", row);
+    }
+    if (on > kShow) Log("      (%d quieter threads not shown)", on - kShow);
 }
 
 // ---- Raven's 360 layout, read out of the game's own config (run 61b) ----
@@ -3633,7 +4093,7 @@ bool InitXRInput() {
             g_stickDownMask = (WORD)GetPrivateProfileIntA("Input", "StickDown", g_stickDownMask, path);
             g_walkDirection = GetPrivateProfileIntA("Input", "WalkDirection", 0, path);
             g_walkSign      = GetPrivateProfileIntA("Input", "WalkSign", 1, path) >= 0 ? 1 : -1;
-            g_autoPad       = GetPrivateProfileIntA("Input", "AutoPad", 1, path);
+            g_autoPad       = GetPrivateProfileIntA("Input", "AutoPad", 0, path);
             // ---- aim mode 7's gun pose, the two numbers that need calibrating ----
             // UUPer1: engine rotation units per 1.0 of anim aim offset. 16384 = 90 deg, which is
             // the common authored range - a guess, and the log prints what it should have been.
@@ -3719,6 +4179,17 @@ bool InitXRInput() {
 
     {
         XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
+        strcpy_s(aci.actionName, "trigtouch");
+        strcpy_s(aci.localizedActionName, "Finger on the trigger");
+        aci.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+        aci.countSubactionPaths = 2;
+        aci.subactionPaths = g_handSubPath;
+        if (XR_FAILED(xrCreateAction(g_actionSet, &aci, &g_actTrigTouch)))
+            g_actTrigTouch = XR_NULL_HANDLE;
+    }
+
+    {
+        XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
         strcpy_s(aci.actionName, "handpose");
         strcpy_s(aci.localizedActionName, "Hand pose");
         aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
@@ -3742,7 +4213,7 @@ bool InitXRInput() {
     // adding a row to g_padButtons cannot silently overrun this.
     // 4 fixed + one per button + 2 haptic outputs + 2 hand poses. Sized from the same constants
     // that fill it, so adding a row to g_padButtons cannot silently overrun this.
-    XrActionSuggestedBinding binds[4 + kPadButtonCount + 2 + 2 + 12]{};
+    XrActionSuggestedBinding binds[4 + kPadButtonCount + 2 + 2 + 12 + 2]{};
     uint32_t nb = 0;
     struct { XrAction a; const char* p; } fixed[] = {
         { g_actMove,    "/user/hand/left/input/thumbstick"    },
@@ -3792,6 +4263,16 @@ bool InitXRInput() {
         for (int i = 0; i < 12; ++i) {
             XrPath p;
             if (XrPathOf(gp[i], &p)) { binds[nb].action = g_actGrasp; binds[nb].binding = p; ++nb; }
+        }
+    }
+    if (g_actTrigTouch != XR_NULL_HANDLE) {
+        // Exactly two sources, and nothing else may be added here. The moment this accepts a second
+        // surface it stops meaning "a finger is on the trigger" and becomes another copy of grasp.
+        const char* tp[2] = { "/user/hand/left/input/trigger/touch",
+                              "/user/hand/right/input/trigger/touch" };
+        for (int i = 0; i < 2; ++i) {
+            XrPath p;
+            if (XrPathOf(tp[i], &p)) { binds[nb].action = g_actTrigTouch; binds[nb].binding = p; ++nb; }
         }
     }
     if (g_actHandPose != XR_NULL_HANDLE) {
@@ -4224,7 +4705,74 @@ void SyncXRInput(XrTime displayTime) {
     }
 
     tSt = Now();
-    float lt = getFloat(g_actAltFire), rt = getFloat(g_actFire);
+    // Recorded per hand rather than going through getFloat, so the value the RUNTIME reported and
+    // the value we chose to act on are both on the record. Those two differ exactly when isActive
+    // is false, which is the case the stuck-trigger report has to be separated from.
+    auto getTrigger = [&](XrAction a, int hand) -> float {
+        XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+        gi.action = a;
+        XrActionStateFloat st{ XR_TYPE_ACTION_STATE_FLOAT };
+        if (XR_FAILED(xrGetActionStateFloat(g_xrSession, &gi, &st))) {
+            ++g_trigInactiveFrames[hand];
+            return 0.0f;
+        }
+        // The runtime's number, kept whether or not it claims to be active - "value 1.0 while
+        // INACTIVE" is a different diagnosis from "value 1.0 while ACTIVE" and the log has to be
+        // able to say which one happened.
+        g_trigRaw[hand] = st.currentState;
+        if (st.currentState < g_trigMin[hand]) g_trigMin[hand] = st.currentState;
+        if (st.currentState > g_trigMax[hand]) g_trigMax[hand] = st.currentState;
+        if (!st.isActive) { ++g_trigInactiveFrames[hand]; return 0.0f; }
+        return st.currentState;
+    };
+    float lt = getTrigger(g_actAltFire, 0), rt = getTrigger(g_actFire, 1);
+    ++g_trigFrames;
+
+    // ---- ⭐ run 156: veto a trigger value that no finger is touching ----
+    //
+    // Run 155 measured the cause of the judder, and it is not subtle: with the controllers on the
+    // desk the runtime reports BOTH triggers at a sustained partial pull - left 0.34-0.43, right
+    // 0.23-0.28, held for seconds, with isActive true on every one of 120 frames. Past the 0.10
+    // deadzone, that reaches the game as LT 97 / RT 64, and Raven's 360 layout maps those to FIRE
+    // and AIM. The gun fires and aims by itself, which the user saw before any of this was logged.
+    //
+    // The correlation over the whole session is total: every second with a nonzero trigger is
+    // 68-98 fps, every second without one is 109-120. That is the interaction runs 67-75 could
+    // never explain - the pad matters because it is how the phantom reaches the game, and the
+    // controllers matter because putting them down is what invents the value.
+    //
+    // ⚠️ A deadzone cannot fix this and raising it would be the wrong instinct. The phantom peaks at
+    // 0.83, which is a HARDER pull than most real ones, so any threshold that suppressed it would
+    // eat real firing too. The value is not noise - it is a plausible number with no finger behind
+    // it, and the only thing that can tell those apart is whether a finger is there.
+    //
+    // Hence the veto: pulling a trigger requires touching it. If `trigger/touch` says no finger is
+    // on it, the analog value did not come from the player, whatever it says. Where the binding does
+    // not resolve, the value passes through unchanged - a runtime without the sensor keeps exactly
+    // today's behaviour rather than losing its triggers entirely.
+    if (g_triggerGate < 0) {
+        char path[MAX_PATH]{};
+        g_triggerGate = IniPath(path)
+                      ? (GetPrivateProfileIntA("Input", "TriggerTouchGate", 1, path) ? 1 : 0) : 1;
+    }
+    if (g_actTrigTouch != XR_NULL_HANDLE) {
+        for (int hand = 0; hand < 2; ++hand) {
+            XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+            gi.action = g_actTrigTouch;
+            gi.subactionPath = g_handSubPath[hand];
+            XrActionStateBoolean st{ XR_TYPE_ACTION_STATE_BOOLEAN };
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(g_xrSession, &gi, &st)) && st.isActive) {
+                g_trigTouchAvail[hand] = true;
+                g_trigTouch[hand] = st.currentState != 0;
+            } else {
+                g_trigTouchAvail[hand] = false;
+            }
+        }
+        if (g_triggerGate) {
+            if (g_trigTouchAvail[0] && !g_trigTouch[0] && lt > 0.0f) { ++g_trigVetoed[0]; lt = 0.0f; }
+            if (g_trigTouchAvail[1] && !g_trigTouch[1] && rt > 0.0f) { ++g_trigVetoed[1]; rt = 0.0f; }
+        }
+    }
     msStates += MsSince(tSt);
     // Triggers get the same treatment for the same reason: a resting trigger reporting 0.004 turns
     // into a byte that flickers between 0 and 1, and that is a state change every frame.
@@ -10867,6 +11415,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         last = now;
         if (g_drawsTotal > totPeak) totPeak = g_drawsTotal;
 
+        // Counted unconditionally and consumed by SampleThreadCpu, so the CPU census divides by the
+        // frames IT saw rather than by the 120 the report block happens to fire on.
+        InterlockedIncrement(&g_cpuIntervalFrames);
+
         // Bucket this frame by the state it was rendered in. Both controllers must be tracked to
         // count as awake - one hand down is the ambiguous case and would only blur the comparison.
         //
@@ -10881,9 +11433,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             const double dSubmit = g_msXrSubmit  - lastSubmit;
             lastWait = g_msWaitFrame; lastSubmit = g_msXrSubmit;
             if (thisFrameMs > 0.0 && thisFrameMs < 500.0 && dWait >= 0.0 && dSubmit >= 0.0) {
-                const int idx = (InterlockedCompareExchange(&g_padEmu, 0, 0) ? 4 : 0)
-                              + (InterlockedCompareExchange(&g_xrInputOff, 0, 0) ? 2 : 0)
-                              + ((g_handHeld[0] || g_handHeld[1]) ? 0 : 1);
+                const int idx = StateBucketIndex();
                 g_bucket[idx].frameMs    += thisFrameMs;
                 g_bucket[idx].waitMs     += dWait;
                 g_bucket[idx].xrSubmitMs += dSubmit;
@@ -10969,6 +11519,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // controllers AWAKE**. Without it there is no way to separate "the controllers are
             // awake" from "the input code is running", because in run 68 those were the same
             // condition. Pressing NUMPAD/ while holding the controllers is the whole experiment.
+            // Before the tables below read from it: this closes the interval and attributes its CPU.
+            SampleThreadCpu();
             {
                 bool any = false;
                 for (int i = 0; i < 8; ++i) if (g_bucket[i].frames > 30) any = true;
@@ -10992,6 +11544,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     }
                 }
             }
+
+            // Directly under the correlation table, because it answers the next question that table
+            // raises: the row above says the frame is 5 ms slower, this one says whether those 5 ms
+            // were spent or waited for.
+            LogThreadCpu();
 
             // The governor, in milliseconds per second of wall clock. If this is thousands of ms
             // while the frame rate sits at a suspiciously round number, the engine is holding the
@@ -11021,6 +11578,41 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 InterlockedCompareExchange(&g_xrInputOff, 0, 0) ? "OFF (numpad /)" : "on",
                 g_syncFailFrames);
             g_syncFailFrames = 0;
+
+            // The stuck-trigger report, made checkable. Read it as: if MAX is high while the
+            // controller is on the desk, something is pressing the trigger or claiming to - and the
+            // ACTIVE count says whether the runtime stood behind the value or not. The published
+            // bytes on the end are what the GAME actually received, which is the only number that
+            // can make it fire.
+            if (g_trigFrames > 0) {
+                const LONG pb = InterlockedCompareExchange(&g_padBtns, 0, 0);
+                Log("    triggers: LEFT raw %.2f (min %.2f max %.2f, inactive %d/%d) | "
+                    "RIGHT raw %.2f (min %.2f max %.2f, inactive %d/%d) "
+                    "-> game receives LT %u RT %u%s",
+                    g_trigRaw[0], g_trigMin[0] > 8.0f ? 0.0f : g_trigMin[0],
+                    g_trigMax[0] < -8.0f ? 0.0f : g_trigMax[0],
+                    g_trigInactiveFrames[0], g_trigFrames,
+                    g_trigRaw[1], g_trigMin[1] > 8.0f ? 0.0f : g_trigMin[1],
+                    g_trigMax[1] < -8.0f ? 0.0f : g_trigMax[1],
+                    g_trigInactiveFrames[1], g_trigFrames,
+                    (unsigned)((pb >> 16) & 0xFF), (unsigned)((pb >> 24) & 0xFF),
+                    (((pb >> 16) & 0xFF) || ((pb >> 24) & 0xFF))
+                        ? "   <== THE GAME IS BEING TOLD TO FIRE" : "");
+                // The veto's own accounting, so the fix is visible rather than assumed. A run where
+                // the judder is gone and this line reads 0 vetoes means something ELSE fixed it.
+                Log("    trigger touch gate %s: LEFT %s%s, RIGHT %s%s - vetoed %d/%d and %d/%d frames",
+                    g_triggerGate ? "ON" : "off (ini TriggerTouchGate=0)",
+                    g_trigTouchAvail[0] ? (g_trigTouch[0] ? "finger ON" : "no finger") : "NO SENSOR",
+                    g_trigTouchAvail[0] ? "" : " (values pass through unchanged)",
+                    g_trigTouchAvail[1] ? (g_trigTouch[1] ? "finger ON" : "no finger") : "NO SENSOR",
+                    g_trigTouchAvail[1] ? "" : " (values pass through unchanged)",
+                    g_trigVetoed[0], g_trigFrames, g_trigVetoed[1], g_trigFrames);
+                for (int i = 0; i < 2; ++i) {
+                    g_trigMin[i] = 9.0f; g_trigMax[i] = -9.0f; g_trigInactiveFrames[i] = 0;
+                    g_trigVetoed[i] = 0;
+                }
+                g_trigFrames = 0;
+            }
 
             // The four phases of SyncXRInput, so the stall has a NAME rather than a suspect list.
             // Worst-frame matters more than the mean here: a single 8 ms frame is a dropped frame

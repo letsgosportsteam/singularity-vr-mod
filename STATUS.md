@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 153). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 156). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -60,9 +60,17 @@ dropped beside the game exe. No game files modified.
    - Run 77 picked those sensors over motion for auto-pad and was right *for auto-pad* — that asks
      "is this held at all" over seconds. This asks it per frame, and the sensor is not steady
      enough.
+   - **⚠️ Run 155 found it is far worse than "not steady enough".** `g_handHeld[0]` read `on desk`
+     through an entire session including ninety seconds of deliberately holding both controllers,
+     with one sample moving at **1331 µm/frame** and still reporting `on desk`. Treat the broad
+     `grasp` signal as unreliable in both directions, not merely jittery — and do not build a
+     per-frame decision on it without fixing it first.
    - **Do not debounce it locally.** That would create a second, differently tuned notion of "in
-     hand" beside auto-pad's, and this project has already paid twice for two mechanisms answering
-     one question. One hysteresis, shared, when auto-pad is next opened up.
+     hand", and this project has already paid twice for two mechanisms answering one question. One
+     hysteresis, shared. **Auto-pad is no longer a consumer** (obsolete since run 156), so this is
+     now free to be designed around the crosshair's needs rather than compromised against auto-pad's.
+   - The narrow `trigger/touch` action added in run 156 is a worked example of the opposite choice:
+     one question, one sensor, bound to exactly one source per hand.
    - `HideCrosshair=2` behaves correctly meanwhile.
    - **The crosshair signature, measured** (bare view, nothing else on screen): four ticks around
      centre, each drawn twice, `stride=8` at `(±0.025, 0)` and `(0, ±0.045)`. **Stride 8 is unique
@@ -151,6 +159,100 @@ dropped beside the game exe. No game files modified.
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## ✅ Runs 154–156: the judder is SOLVED — a set-down controller reports a phantom trigger pull
+
+**This closes runs 67–75.** That investigation ran nine runs, proposed five mechanisms, buried all
+five, and shipped a workaround built on a correlation nobody could explain. The mechanism was
+never inside the engine's input plumbing, which is why nothing found there ever held up.
+
+### What is actually happening
+
+A Touch controller that has been set down and left to rest reports a **sustained partial trigger
+pull** — measured at left 0.34–0.43 and right 0.23–0.28, held for seconds, with `isActive` true on
+all 120 frames of every sample. It passes the 0.10 deadzone and reaches the game as LT ≈ 97 /
+RT ≈ 64, and [Raven's own 360 layout](#-run-61b-ravens-360-layout-read-out-of-the-games-own-config)
+maps those to **AIM** and **FIRE**.
+
+So the gun fires and aims by itself, and the engine spends the frame doing precisely what it was
+told. **Nothing was ever wrong with the engine, the pad, or the input code.**
+
+The cost, from a session where the states separate cleanly:
+
+| trigger state | fps |
+|---|---|
+| neither | **120** |
+| right only (fire) | **98** |
+| both (fire + aim) | **77** |
+
+Over the whole session the correlation is total: every second with a nonzero trigger is 68–98 fps,
+every second without one is 109–120. The per-thread CPU census agrees — on slow intervals
+`Singularity.exe+0x0116FA6F` goes **3.218 → 7.463 ms/frame**, a game thread more than doubling its
+work, which is what firing a weapon continuously looks like.
+
+**This is why the run-75 table was an interaction.** The pad mattered because it is how the phantom
+reaches the game. The controllers mattered because setting them down is what invents the value.
+Neither alone does anything, and no one-factor test could ever have separated them.
+
+### The fix: `TriggerTouchGate`
+
+Pulling a trigger requires touching it. A new action bound to `trigger/touch` **and nothing else**,
+per hand, vetoes any analog value with no finger behind it. Where the binding does not resolve the
+value passes through unchanged, so a runtime without the sensor keeps the old behaviour.
+
+- **A bigger deadzone was considered and rejected.** Real pulls read a hard 1.00 — nobody lingers at
+  partial deflection — so a threshold near 0.6 would work *today*. But the phantom has been seen at
+  0.83, and it is not noise: it is a plausible number with no finger behind it. Only the sensor
+  separates those. A deadzone would also put a floor under real input for no gain.
+- **It is a separate action from `grasp` on purpose.** Grasp is deliberately broad (run 82 widened
+  it to every capacitive surface) because it answers "is anyone holding this at all". A thumb on the
+  stick must never count as evidence that an index finger is pulling the trigger.
+- **The veto count is logged every second.** A run where the judder is gone and the count reads 0
+  means something else fixed it. In the confirming run the phantom still occurred on **120/120
+  frames** and was suppressed on every one — so the good result is not "it failed to reproduce".
+
+### 🗑️ `AutoPad` is obsolete and now defaults to 0
+
+It worked for the reason now obvious: unplugging the pad is one way to stop the phantom reaching the
+game. It cost **1–2 seconds of dead controls on every genuine pick-up** while UE3 re-enumerated its
+ports round-robin, and that latency is what reopened this. It is now gone. The code stays in the
+build for runtimes where `trigger/touch` does not resolve; `AutoPad=1` restores it.
+
+### ⚠️ Still unexplained, and deliberately not chased
+
+**Why a resting controller reports a pull at all.** It is not analog drift: while the controllers are
+held the log reads an exact `min 0.00 max 0.00`, and drift does not switch itself off when a hand
+arrives. The fabrication is **upstream of this mod** — the logged `raw` is `st.currentState` straight
+out of `xrGetActionStateFloat`, before the deadzone and before the veto — so nothing here synthesises
+it. Most likely the controller sleeping costs the runtime whatever zero-point calibration it applies
+while awake, which would make the phantom trigger and the frozen pose siblings of sleep rather than
+one causing the other. Vetoing input no finger is behind is correct regardless of the answer.
+
+### ⚠️ Method note: the instrument said "no effect" while the user watched the effect happen
+
+Run 154 built a per-thread CPU census bucketed by controller state and reported the two buckets
+within 0.88 ms/frame of each other — *on a run where the drop was reproduced, watched on Virtual
+Desktop's own overlay, and visible in the per-second log as clean 120.0 and clean 67–70 stretches.*
+
+The label was the broken part. `g_handHeld[0]` read `on desk` for essentially the whole session,
+including ninety seconds of deliberately holding both controllers; one sample has a hand moving at
+**1331 µm/frame and still reporting `on desk`**. Both buckets contained both states and the
+difference averaged to nothing.
+
+**That is the third instrument in this one investigation to hide the answer rather than miss it, and
+the second to do it by mislabelling rather than by failing** — run 68's `ORIENTATION_TRACKED` read
+backwards, run 74's motion threshold was 10× too low. The shape is identical every time: *a state
+label derived from a sensor nobody validated against the state it names.*
+
+The fix generalises. **Do not bucket by what you think is happening; bucket by what you are
+measuring.** The census now keys intervals on their own frame rate — FAST ≥ 105 fps, SLOW ≤ 90,
+anything between dropped as mixed and counted — and no sensor can corrupt a row because none is
+consulted.
+
+Second note, cheaper but real: **script calls per frame nearly doubled in the bad state (57 → 110)
+and it meant nothing.** Calls per *second* rose only 11%, and 14.46/8.31 = 1.74 is almost exactly
+the calls/frame ratio — script work proportional to elapsed time, i.e. a consequence of slow frames.
+Chasing it would have been a sixth dead mechanism.
 
 ## Runs 144–151: the HUD in both eyes
 
@@ -991,7 +1093,13 @@ the source as the record.
   are the same rotation, so that phrase covers both success and failure. What settled it was the
   user reporting the *view spinning* — a symptom nobody had asked for.
 
-## ✅ Runs 67–75: the judder was an INTERACTION, and one-factor tests could never have found it
+## ⛔ Runs 67–75: the judder was an INTERACTION — SUPERSEDED by runs 154–156, which named the cause
+
+> **Read runs 154–156 first.** The interaction is real and every number below still stands, but the
+> mechanism it could not name is now known: a set-down controller reports a phantom trigger pull,
+> the game is told to fire and aim, and it does. The pad mattered only because it is the path the
+> phantom takes to the engine. **The `AutoPad` fix described below is obsolete and now defaults to
+> 0.** Kept in full because the method notes at the end are the most valuable part of it.
 
 **Symptom:** judder and heavy frame loss whenever the controllers sat on the desk; fine once they
 were picked up. Nine runs, five dead theories.
