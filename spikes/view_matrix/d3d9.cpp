@@ -2958,6 +2958,41 @@ volatile LONG g_aimDecouple = 0;
 // Modes 2 and 3 deliberately need NO matrix split: the view and the engine both stay on the head,
 // which is the normal, truthful arrangement, and culling never diverges from what you can see.
 volatile LONG g_aimMode = 0;
+
+// ---- ⭐ run 158: AIM METHOD, the one control the other four follow ----
+//
+// Everything below this comment already worked; what was missing was a single place to say which
+// arrangement you want, and any way at all to say it without a keyboard. `g_aimMode` was never read
+// from the ini, so every session started at 0 and had to be walked back to 11 by hand.
+//
+//   HEAD               aim mode 0, arms visible, gun in front of your face, crosshair meaningful
+//   MOTION CONTROLLER  aim mode 11, arms hidden, gun on the controller, crosshair meaningless
+//
+// ---- what this deliberately does NOT touch ----
+//
+// It is not an input-device switch. Both methods take keyboard, mouse, a real 360 pad, or the Touch
+// controllers acting as one, and Raven's own input code handles all of them. Three behaviours that
+// look like they belong here already fall out for free and are left alone:
+//
+//   * **Mouse pitch does nothing in either method**, and no code makes that happen. `g_wantPitch` is
+//     recomputed from the headset every frame and written over whatever the mouse did. Yaw survives
+//     only because the yaw fold-in adds external deltas into `g_baseYaw`, and there is no pitch
+//     fold-in. The asymmetry is structural.
+//   * **Turn mode already only affects controller play.** `g_padTurnAccum` is fed from the XR turn
+//     action's X axis alone; the mouse reaches the view through the fold-in and never touches it.
+//   * **Snap turn works in HEAD too**, because turning runs into `g_baseYaw` without consulting the
+//     aim mode. Touch controllers as an untracked gamepad with snap turn is a supported combination
+//     rather than an accident.
+//
+// MOVE DIRECTION is preset to HEAD when HEAD is chosen, and left alone otherwise. Preset, not
+// forced - a setting that silently overrides another one is a bug this project has already paid for.
+volatile LONG g_aimMethod = 0;      // 0 = head, 1 = motion controller. ini [Input] AimMethod
+
+// "VR mode is on", as BACKSPACE means it. g_dupDraws is what the BACKSPACE toggle itself reads to
+// decide the next state, and what the panel already uses to decide how many eyes to draw into, so
+// this is the existing notion rather than a fourth one.
+inline bool VrModeOn() { return InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0; }
+
 int32_t g_aimYawUU = 0, g_aimPitchUU = 0;   // the hand's aim, in the engine's own units
 int32_t g_matCurYawUU = 0;      // what the engine is being told
 int32_t g_matCurPitchUU = 0;
@@ -3886,11 +3921,17 @@ bool g_panelDirty = false;      // has anything changed since it was opened?
 // interface. Holding the panel button still opens the VR settings, because that is a controller
 // binding and never went through here.
 //
-// ⚠️ EXACTLY ONE KEY IS EXEMPT: **BACKSPACE**, which switches VR mode on and off. The rest are
-// recoverable - turn DEBUGGING back on from the panel and they return - but VR mode is not
-// scaffolding, and the cold start is flat by design (run 37 reverted default-on) with no ENABLE VR
-// setting yet, so gating it would mean a Debug=0 launch could never enter VR at all. F8 is NOT
-// exempt: the controller's MENU tap already recentres, so losing it costs nothing.
+// ⚠️ TWO KEYS ARE EXEMPT, and both fail badly rather than inconveniently if taken away:
+//
+//   BACKSPACE  VR mode on and off. The cold start is flat by design (run 37 reverted default-on)
+//              and there is no ENABLE VR setting yet, so gating it would leave a Debug=0 launch
+//              unable to enter VR at all.
+//   PAUSE      hold to quit. This is the WM_CLOSE path that lets the engine SAVE on the way out,
+//              and every copy of this game shares one save profile - gating it would make killing
+//              the process the only exit from inside a headset.
+//
+// Everything else is recoverable: turn DEBUGGING back on from the panel and it returns. F8 is NOT
+// exempt - the controller's MENU tap already recentres, so losing it costs nothing.
 //
 // Consulted every frame from a global, so it qualifies for the panel by the rule below - and
 // belongs there, because turning it back on is otherwise impossible without editing a file.
@@ -3906,9 +3947,15 @@ inline SHORT DebugKey(int vk) {
 // Only settings that are consulted EVERY FRAME from a global belong here. Anything read once at
 // device creation - D3D9ExMode, ZeroCopy, the resolution - would appear to change and silently do
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
-const int kPanelRows = 9;
-enum { PR_MOVEDIR = 0, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_HEADROLL,
-       PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG };
+const int kPanelRows = 10;
+enum { PR_AIMMETHOD = 0, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR,
+       PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG };
+
+// First row, because it is the one that changes the most: MOVE DIRECTION and CROSSHAIR both follow
+// from it, so it reads top-down as cause before effect.
+extern volatile LONG g_aimMethod;
+void ApplyAimMethod(bool preset);   // defined with the foreground-mesh code, which it drives
+bool EnsureRouteTwoHooks();         // aim mode 11 is inert without these - see its definition
 
 // Defined with the occlusion-query hooks far below. On the panel because run 157 measured mode 2
 // dropping frames in the opening area where mode 0 held - a difference that can only be judged by
@@ -3932,6 +3979,8 @@ void PanelSave() {
     if (!IniPath(path)) { Log("VR panel: no ini path - settings NOT saved"); return; }
     char v[32];
     // WritePrivateProfileString edits in place: comments, ordering and unrelated keys all survive.
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_aimMethod, 0, 0));
+    WritePrivateProfileStringA("Input", "AimMethod", v, path);
     _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_turnMode);
     WritePrivateProfileStringA("Input", "TurnMode",  v, path);
     _snprintf_s(v, sizeof(v), _TRUNCATE, "%.0f", g_turnSpeedDeg);
@@ -3958,6 +4007,11 @@ void PanelSave() {
 // the value column carries the explanation instead.
 void PanelRowText(int row, char* out, size_t cap) {
     switch (row) {
+        case PR_AIMMETHOD:
+            _snprintf_s(out, cap, _TRUNCATE, "AIM METHOD     %s",
+                        InterlockedCompareExchange(&g_aimMethod, 0, 0) ? "MOTION CONTROLLER"
+                                                                       : "HEAD");
+            break;
         case PR_MOVEDIR:
             // HAND is meaningless without a tracked left controller, and silently doing nothing is
             // the failure mode this project keeps getting caught by - so it says so.
@@ -3993,9 +4047,12 @@ void PanelRowText(int row, char* out, size_t cap) {
         // silently swallow every row added after it and render them all as CROSSHAIR - a new
         // setting that appears to exist and adjusts something else is worse than a missing one.
         case PR_CROSSHAIR: {
+            // "AUTO", not "HIDE IN VR": since run 158 it follows AIM METHOD rather than anything
+            // about VR, and a label describing the old mechanism would send someone hunting for a
+            // sensor that is no longer consulted.
             const LONG h = InterlockedCompareExchange(&g_hideCrosshair, 0, 0);
             _snprintf_s(out, cap, _TRUNCATE, "CROSSHAIR      %s",
-                        h == 0 ? "ALWAYS SHOW" : h == 1 ? "HIDE IN VR" : "ALWAYS HIDE");
+                        h == 0 ? "ALWAYS SHOW" : h == 1 ? "AUTO" : "ALWAYS HIDE");
             break;
         }
         case PR_OCCLUSION:
@@ -4015,6 +4072,11 @@ void PanelRowText(int row, char* out, size_t cap) {
 
 void PanelAdjust(int row, int dir) {
     switch (row) {
+        case PR_AIMMETHOD:
+            InterlockedExchange(&g_aimMethod,
+                                InterlockedCompareExchange(&g_aimMethod, 0, 0) ? 0 : 1);
+            ApplyAimMethod(true);
+            break;
         case PR_MOVEDIR:
             g_walkDirection = g_walkDirection ? 0 : 1;
             break;
@@ -4172,6 +4234,11 @@ bool InitXRInput() {
             // Mode 11 trace rotation: flip if the shot deflects the wrong way.
             g_traceSignYaw   = GetPrivateProfileIntA("Input", "AimTraceSignYaw", 1, path) >= 0 ? 1 : -1;
             g_traceSignPitch = GetPrivateProfileIntA("Input", "AimTraceSignPitch", 1, path) >= 0 ? 1 : -1;
+            // AIM METHOD, applied rather than merely stored. Everything it drives - aim mode, the
+            // gun and arms, move direction, the rot mode - has to be in the right state before the
+            // first frame, not after the first panel visit. Applied last in this block, below.
+            InterlockedExchange(&g_aimMethod,
+                                GetPrivateProfileIntA("Input", "AimMethod", 0, path) ? 1 : 0);
             // Aim mode gun visual: signs and whether the gun follows the hand POSITION as well as
             // its direction. Up/down came back reversed, hence the -1 default on pitch.
             g_gunSignYaw   = GetPrivateProfileIntA("Input", "GunSignYaw",   1, path) >= 0 ? 1 : -1;
@@ -4197,6 +4264,10 @@ bool InitXRInput() {
                     "Input", g_padButtons[i].iniKey, g_padButtons[i].mask, path);
         }
     }
+
+    // After the whole block, because it presets WalkDirection and that is read above - applying it
+    // first would have the ini overwrite the preset, which is the wrong way round.
+    ApplyAimMethod(false);
 
     XrActionSetCreateInfo asci{ XR_TYPE_ACTION_SET_CREATE_INFO };
     strcpy_s(asci.actionSetName, "gameplay");
@@ -6366,6 +6437,92 @@ volatile LONG g_fgStableCount = 0;
 // selected and matched by value from then on.
 volatile LONG g_gunVerts = 0, g_armsVerts = 0;
 
+// ---- ⭐ run 158: the latch, extracted so it is not owned by one keypress ----
+//
+// This used to live inline in the APPS handler and ran only when the cycle passed through mode 1.
+// That was fine while APPS was the only way in, and it is a trap the moment a setting can select a
+// mode directly: g_hideMeshIdx = 3 with the counts still zero makes FgHidden and FgMoved both
+// return false, so the arms stay visible and the gun stays put while the panel cheerfully reports
+// MOTION CONTROLLER. Silent no-op, exactly the shape of run 157's occlusion vtable gate.
+//
+// Returns false while the foreground pass has not been seen yet, which is the normal state at
+// startup and through the menus - so callers retry rather than treating it as a failure.
+bool LatchFgMeshes() {
+    if (InterlockedCompareExchange(&g_fgStableCount, 0, 0) < 2) return false;
+    const LONG g = InterlockedCompareExchange(&g_fgStableVerts[0], 0, 0);
+    const LONG a = InterlockedCompareExchange(&g_fgStableVerts[1], 0, 0);
+    if (!g || !a) return false;
+    InterlockedExchange(&g_gunVerts,  g);
+    InterlockedExchange(&g_armsVerts, a);
+    return true;
+}
+
+// Applies AIM METHOD to the things that follow it. Defined here rather than beside the panel
+// because it is the first point in the file where everything it drives has been declared.
+//
+// `preset` separates CHANGING the method from LOADING it, and the distinction is load-bearing.
+// MOVE DIRECTION is a preset - a sane starting point you may then override - so it must be applied
+// when you pick a method and NOT when the ini is read, or a saved MOVE DIRECTION would be
+// overwritten on every launch and the "preset, not forced" promise would be a lie. Everything else
+// here is owned by the method outright and applies either way.
+// ---- ⭐ run 158b: the applied state follows VR MODE, not just the setting ----
+//
+// BACKSPACE turns the mod off and hands the game back. It writes head tracking, 6-DOF, stereo and
+// projection - and it used to leave aim mode 11 and the hidden arms exactly where they were, which
+// is not "the plain game" at all: the arms stayed missing, the gun kept being transformed onto a
+// controller that might be on a desk, and shots kept being trace-rotated so they missed the
+// crosshair. Flat mode was quietly broken in MOTION CONTROLLER and nothing said so.
+//
+// So g_aimMethod is the SETTING and this is what applies it, gated on VR being on. Calling it from
+// SetVrMode in both directions makes the restore fall out of the same path that applies it -
+// there is no separate teardown to keep in step, which is how the two would drift apart.
+void ApplyAimMethod(bool preset) {
+    const bool want = InterlockedCompareExchange(&g_aimMethod, 0, 0) != 0;
+    const bool mc   = want && VrModeOn();
+
+    // Aim mode 11 is route 2: the fire trace itself is rotated, so the engine's own rotation - and
+    // therefore culling, LOD and draw distance - stays on the head. 0 is the engine's own aim, which
+    // in ENGINE rot mode is the head, which is what makes the crosshair mean something.
+    InterlockedExchange(&g_aimMode, mc ? 11 : 0);
+    // Mode 11 needs its five hooks or it is selected and inert - see EnsureRouteTwoHooks. May
+    // legitimately fail this early; Present retries on a slow tick.
+    if (mc) EnsureRouteTwoHooks();
+
+    // 3 = gun moved onto the controller AND arms hidden; 0 = both left alone.
+    InterlockedExchange(&g_hideMeshIdx, mc ? 3 : 0);
+    // ⚠️ Deliberately does NOT latch here. This runs from the ini at startup, where the foreground
+    // list holds menu geometry - taking it produced a latch that was wrong AND that silenced its
+    // own retry (run 158d). UpdateFgLatch owns the latch now and vets it continuously; clearing on
+    // the way out means switching back to HEAD and in again re-takes it rather than trusting a
+    // value captured under conditions nobody checked.
+    if (!mc) { InterlockedExchange(&g_gunVerts, 0); InterlockedExchange(&g_armsVerts, 0); }
+
+    // Preset, not forced. Off-hand-relative movement is meaningless when you are not aiming with a
+    // hand, so HEAD is the sane starting point - but MOVE DIRECTION stays adjustable afterwards,
+    // and a saved value survives a relaunch because this is skipped on load.
+    // Keyed on `want`, not `mc`: the preset is about the method you CHOSE, and choosing HEAD while
+    // the mod happens to be switched off should still preset it.
+    if (preset && !want) g_walkDirection = 0;
+
+    // Both methods want ROT ENGINE with the yaw fold-in on - cutscene mode 1, the shipped
+    // arrangement. HEAD needs ENGINE so the character actually faces where you look; MOTION
+    // CONTROLLER needs it because route 2 leaves the engine on the head by design.
+    //
+    // ⚠️ During a cutscene the auto-switch has forced mode 3 and is holding the user's mode in
+    // g_userCutMode to restore on exit. Writing the live mode here would be overwritten seconds
+    // later by that restore, and the setting would look like it had not stuck - so write the
+    // SAVED mode instead and let the exit path apply it.
+    if (g_cineAutoActive) g_userCutMode = 1;
+    else                  SetCutsceneMode(1);
+
+    Log("aim method: %s%s (aim mode %d, meshes %d, move %s%s)",
+        want ? "MOTION CONTROLLER" : "HEAD",
+        (want && !mc) ? " [set, but VR mode is OFF - the plain game is running]" : "",
+        mc ? 11 : 0, mc ? 3 : 0,
+        g_walkDirection ? "HAND" : "HEAD",
+        g_cineAutoActive ? ", cutscene active - rot mode applied on exit" : "");
+}
+
 static void FgLearnSignature(UINT verts) {
     const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
@@ -6629,6 +6786,71 @@ static bool FgMatchesSignature(UINT verts) {
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
         if ((UINT)InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0) == verts) return true;
     return false;
+}
+
+// ---- ⚠️ run 158d: the latch took the WRONG values, and then stopped retrying ----
+//
+// Reported: on a cold start in MOTION CONTROLLER the aim tracked the controller but the GUN did
+// not. Toggling to HEAD and back attached it. So the latch had not failed - it had SUCCEEDED, with
+// garbage, which is the more dangerous of the two because it silences its own retry.
+//
+// `g_fgStableVerts` is not stable in the sense the name suggests. It is the PREVIOUS FRAME's
+// foreground list, replaced wholesale every frame so that menu geometry cannot accumulate. At the
+// main menu or mid-load it holds two entries that are not the gun and arms; LatchFgMeshes took
+// them and returned true, and the retry - keyed on the counts being ZERO - never fired again.
+// Toggling the method called the latch a second time, from gameplay, where the list is real.
+//
+// A one-shot latch cannot work here, because no moment can be named in advance as trustworthy. So
+// it is continuous and self-correcting, on the only evidence that means anything: **is the latched
+// mesh still being drawn?**
+//
+//   not latched        take the top two once they have held for kLatchSteady frames
+//   latched, seen      leave it. This is run 119's protection - while firing, muzzle-flash
+//                      geometry joins the list and shifts the order, and a latch that re-took on
+//                      every change would walk straight onto it
+//   latched, unseen    after kLatchMiss frames it is describing geometry nobody is drawing, which
+//                      is exactly what a menu-time latch looks like once gameplay starts. Drop it
+//                      and let the first branch re-take
+//
+// ⚠️ An EMPTY foreground list is neither a hit nor a miss. During a cutscene or in the menus there
+// is no first-person pass at all, and counting those frames as misses would throw away a perfectly
+// good latch and then re-take it from menu geometry - the original bug, arrived at from the other
+// side.
+const int kLatchSteady = 30;    // ~0.25 s at 120 fps
+const int kLatchMiss   = 240;   // ~2 s of the mesh genuinely not being drawn
+void UpdateFgLatch() {
+    if (!InterlockedCompareExchange(&g_hideMeshIdx, 0, 0)) return;   // no mode wants the meshes
+
+    const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
+    const LONG gun  = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+    const LONG arms = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+
+    if (gun && arms) {
+        if (n == 0) return;                       // nothing being drawn: no evidence either way
+        static int miss = 0;
+        if (FgMatchesSignature((UINT)gun)) { miss = 0; return; }
+        if (++miss < kLatchMiss) return;
+        miss = 0;
+        InterlockedExchange(&g_gunVerts, 0);
+        InterlockedExchange(&g_armsVerts, 0);
+        Log("mesh latch: gun=%ld has not been drawn for %d frames - dropping the latch and"
+            " re-taking it from what is on screen now", gun, kLatchMiss);
+        return;
+    }
+
+    // Not latched. Wait for the top two to settle before believing them.
+    static LONG candGun = 0, candArms = 0;
+    static int  steady = 0;
+    if (n < 2) { steady = 0; return; }
+    const LONG a = InterlockedCompareExchange(&g_fgStableVerts[0], 0, 0);
+    const LONG b = InterlockedCompareExchange(&g_fgStableVerts[1], 0, 0);
+    if (!a || !b) { steady = 0; return; }
+    if (a != candGun || b != candArms) { candGun = a; candArms = b; steady = 0; return; }
+    if (++steady < kLatchSteady) return;
+    steady = 0;
+    InterlockedExchange(&g_gunVerts,  a);
+    InterlockedExchange(&g_armsVerts, b);
+    Log("mesh latch: gun=%ld verts, arms=%ld verts (steady for %d frames)", a, b, kLatchSteady);
 }
 
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
@@ -7167,9 +7389,28 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
         // Drop the draw entirely rather than remapping it. Returning S_OK is honest here - the
         // call succeeded, we simply chose not to issue it - and matches what the game expects back
         // from a draw that had nothing to rasterise.
+        // ---- ⭐ run 158: mode 1 keys on AIM METHOD, not on the capacitive sensor ----
+        //
+        // It used to be `g_handHeld[1]`, and STATUS carried it as a known-flickering setting: lift
+        // a thumb off a controller you are still holding and the crosshair came back. Run 155 then
+        // showed that signal is unreliable in BOTH directions - it read `on desk` for a whole
+        // session including ninety seconds of holding both controllers, one sample at 1331 um/frame.
+        //
+        // The question was never "is a controller in a hand". It is "does the crosshair mean
+        // anything", and that is answered exactly by the aim method: with HEAD the bullet goes where
+        // the crosshair is, with MOTION CONTROLLER it goes where the controller points and a centred
+        // reticle is actively misleading. A deterministic setting replaces a sensor, and the flicker
+        // is gone by construction rather than by tuning a threshold.
+        //
+        // This retires the last per-frame consumer of g_handHeld.
+        //
+        // Gated on VrModeOn for the same reason ApplyAimMethod is: with the mod switched off the
+        // game is aiming normally, so the crosshair is meaningful again and AUTO must show it.
         const LONG hide = InterlockedCompareExchange(&g_hideCrosshair, 0, 0);
+        const bool aimIsController =
+            InterlockedCompareExchange(&g_aimMethod, 0, 0) != 0 && VrModeOn();
         if (hide && LooksLikeCrosshair(stride, r[3].x, r[3].y) &&
-            (hide == 2 || g_handHeld[1])) {
+            (hide == 2 || aimIsController)) {
             return S_OK;
         }
     }
@@ -9177,6 +9418,37 @@ void InstallLineCheckHook() {
 // that installs something must be safe to call twice, because a hotkey WILL be pressed twice.
 uintptr_t g_hookedAt = 0;
 
+// ---- ⚠️ run 158c: selecting aim mode 11 is not the same as MAKING it work ----
+//
+// NUMPAD-dot never just set g_aimMode. For any mode >= 6 it also resolved the script name table and
+// installed five hooks, and route 2's trace rotation lives in the LAST of them. So AIM METHOD
+// setting the mode on its own produced a mode 11 that was selected and INERT - the bullet kept
+// following the view, which is exactly what was reported.
+//
+// **Third time this shape has appeared in three runs**: run 157's occlusion vtable gate, run 158's
+// mesh vertex latch, and now this. A mode is not a value - it is a value plus whatever had to be
+// installed for it - and all three were invisible because the setting reported itself as applied
+// while doing nothing. Anything that moves a mode off a keypress needs its setup moved with it.
+//
+// Everything called here is idempotent and self-guarding, so repeats are free once it has taken.
+// It legitimately fails early - GNames is empty until packages load - so callers RETRY.
+void RepointScriptHook();    // both defined below; the other three are already above this point
+void ResolveScriptNames();
+bool EnsureRouteTwoHooks() {
+    if (g_origSLC) return true;                 // g_origSLC is the "route 2 can rotate the trace" bit
+    if (FnIdx(kFnGetAdjustedAim) < 0) ResolveScriptNames();
+    FindProcessInternal();
+    RepointScriptHook();
+    ProbeTraceNative();
+    InstallLineCheckHook();
+    InstallSingleLineCheckHook();
+    // Said once, on success. InstallSingleLineCheckHook logs only its FAILURES, so a run where
+    // everything worked said nothing at all about the one hook the whole aim method depends on -
+    // and "no error in the log" is not evidence that a hook is installed. Now it is.
+    if (g_origSLC) Log("aim: route-2 trace hook LIVE - the bullet follows the controller");
+    return g_origSLC != nullptr;
+}
+
 void RepointScriptHook() {
     if (!g_processInternal) return;
     if (g_hookedAt == g_processInternal && g_origProcessEvent) return;   // already done, no-op
@@ -10150,6 +10422,11 @@ void SetVrMode(bool on) {
     // recentre stops the 6-DOF offset resuming from wherever the head was when it was switched off.
     InvalidateCamMats();
     g_haveCentre = false;
+    // AFTER g_dupDraws is written, because ApplyAimMethod reads it through VrModeOn to decide
+    // whether the chosen method applies at all. Off, this restores aim mode 0 and the normal arms
+    // and gun; on, it puts the chosen method back. The setting itself is untouched either way, so
+    // BACKSPACE toggles cleanly in and out without anything to re-select.
+    ApplyAimMethod(false);
     Log("BACKSPACE: VR mode %s (head tracking, 6-DOF, true stereo, VR projection)",
         on ? "ON" : "OFF - plain game");
 }
@@ -10364,10 +10641,35 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
     // Everything below - line height, box width and height, the highlight bar - is derived from
     // px, so this single number is the panel's scale. Halved from g_srcH/170 in run 142: at full
     // headset resolution the first version filled the view.
-    int px = (int)(g_srcH / 340);
-    if (px < 1) px = 1;                              // a zero here would draw nothing at all
+    //
+    // ---- ⭐ run 158: px follows the ROW COUNT, so adding settings cannot grow the panel ----
+    //
+    // It was a bare g_srcH/340, which meant the box got taller every time a row was added. That was
+    // fine at 7 rows, needed shrinking at 9, and would have needed shrinking again at 12 - a manual
+    // adjustment due every few settings, and one that is only noticed from inside a headset.
+    //
+    // Deriving px from the target HEIGHT inverts that: more rows make the text smaller instead of
+    // the panel taller, so it occupies the same part of the view no matter how long the list gets
+    // and can never walk off the top and bottom of the lenses.
+    //
+    // kPanelHeightFrac is now the only number to touch to change the panel's overall size.
+    const double kPanelHeightFrac = 0.30;
+    int px = (int)((g_srcH * kPanelHeightFrac) / ((kGlyphH + 4) * (kPanelRows + 3)));
+    // Floor of 3, not 1. A 5x7 glyph at px=1 is five pixels across on a 2688-tall display: present
+    // in the frame, unreadable through a lens, and indistinguishable from the panel being broken.
+    // Past roughly 20 rows this floor wins and the panel starts growing again, which is the point at
+    // which it wants pages or columns rather than a smaller font.
+    if (px < 3) px = 3;
     const int  lh    = (kGlyphH + 4) * px;
-    const int  cols  = 30;                           // widest row plus margin
+    // Measured, not assumed. This was a hardcoded 30 "widest row plus margin", which silently
+    // becomes too narrow the first time a row is added with a longer label - and the failure is
+    // text spilling past the plate, not a compile error. +2 for the margin the constant included.
+    int widest = 0;
+    for (int i = 0; i < kPanelRows; ++i) {
+        const int len = (int)strlen(rows[i]);
+        if (len > widest) widest = len;
+    }
+    const int  cols  = widest + 2;
     const int  boxW  = cols * (kGlyphW + 1) * px;
     const int  boxH  = lh * (kPanelRows + 3);
     const int  y0    = (int)(g_srcH / 2) - boxH / 2;
@@ -11136,13 +11438,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_hideMeshIdx, next);
             // Latch the two meshes by vertex count at the moment of selection, so the transform
             // keeps hold of them when the foreground list changes under fire.
-            if (next == 1) {
-                InterlockedExchange(&g_gunVerts,  InterlockedCompareExchange(&g_fgStableVerts[0], 0, 0));
-                InterlockedExchange(&g_armsVerts, InterlockedCompareExchange(&g_fgStableVerts[1], 0, 0));
+            // Latched on ANY nonzero mode now, not only on 1 - see LatchFgMeshes. Cycling straight
+            // to 2 or 3 used to leave the counts at zero and do nothing at all.
+            if (next && LatchFgMeshes())
                 Log("APPS: latched gun=%ld verts, arms=%ld verts",
                     InterlockedCompareExchange(&g_gunVerts, 0, 0),
                     InterlockedCompareExchange(&g_armsVerts, 0, 0));
-            }
             InterlockedExchange(&g_dpgProbeFrames, 3);
             static const char* kWhat[4] = {
                 "0 - normal, nothing touched",
@@ -11168,7 +11469,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // shares ONE save profile - killing the process mid-write is a real way to lose it.
     {
         static ULONGLONG heldSince = 0;
-        const bool kPause = (DebugKey(VK_PAUSE) & 0x8000) != 0;
+        // ⚠️ NOT gated - raw GetAsyncKeyState, like BACKSPACE. Quitting cleanly is not developer
+        // scaffolding: this is the WM_CLOSE path that lets the engine save on the way out, and
+        // ENVIRONMENT.md records that every copy of this game shares ONE save profile. Taking it
+        // away with DEBUGGING off would leave killing the process as the only exit from inside a
+        // headset, which is a real way to lose a save.
+        const bool kPause = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
         if (!kPause) {
             heldSince = 0;
         } else {
@@ -11507,6 +11813,42 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Counted unconditionally and consumed by SampleThreadCpu, so the CPU census divides by the
         // frames IT saw rather than by the 120 the report block happens to fire on.
         InterlockedIncrement(&g_cpuIntervalFrames);
+
+        // ---- the mesh latch, retried until it takes (run 158) ----
+        //
+        // AimMethod=1 is applied from the ini long before any foreground pass has been drawn, so the
+        // latch inside ApplyAimMethod cannot succeed on a cold start - the stable list is empty
+        // through the splash screens and the main menu. Without this retry the arms would stay
+        // visible and the gun would stay put for the whole session while the panel reported MOTION
+        // CONTROLLER, which is the exact silent no-op the latch was extracted to prevent.
+        //
+        // Two interlocked reads a frame until it takes, then nothing.
+        UpdateFgLatch();
+
+        // ---- route 2's hooks, retried on a SLOW tick (run 158c) ----
+        //
+        // Same problem as the mesh latch and the same shape of fix, but this one cannot run every
+        // frame: ResolveScriptNames and FindProcessInternal walk GObjects and cost milliseconds,
+        // which is precisely why they lived on a keypress. Once a second is plenty - the aim is
+        // wrong for at most a second after a level loads, against a mode that was inert forever.
+        //
+        // Capped, because a build where these addresses do not match should stop paying for the
+        // walk rather than retry until the process exits.
+        {
+            static int cooldown = 0, attempts = 0;
+            if (InterlockedCompareExchange(&g_aimMode, 0, 0) >= 6 && !g_origSLC && attempts < 60) {
+                if (--cooldown <= 0) {
+                    cooldown = 120;
+                    ++attempts;
+                    if (EnsureRouteTwoHooks())
+                        Log("aim mode 11: route-2 hooks now live after %d attempt(s) - the trace"
+                            " follows the controller from here", attempts);
+                    else if (attempts == 60)
+                        Log("*** aim mode 11: route-2 hooks STILL not installed after 60 attempts."
+                            " The bullet will follow the view, not the controller. ***");
+                }
+            }
+        }
 
         // Bucket this frame by the state it was rendered in. Both controllers must be tracked to
         // count as awake - one hand down is the ambiguous case and would only blur the comparison.

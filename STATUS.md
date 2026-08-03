@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 156). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-03** (end of run 158). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -52,18 +52,12 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-0. **📋 Two more panel rows wanted: `ENABLE VR` and an aim-mode row.**
-   - **`ENABLE VR`** would replace the one keyboard exemption left. Run 157 added `[Render] Debug`,
-     which hides the state readout and makes every keyboard key inert — **except BACKSPACE**, which
-     stays live because the cold start is flat by design (run 37 reverted default-on) and gating it
-     would leave a `Debug=0` launch unable to enter VR at all. Once a panel row can do it, the
-     exemption in `Hook_Present` can go and the gate becomes total. It is marked in the code as the
-     one place a raw `GetAsyncKeyState` is legitimate.
-   - **Aim mode — head aim vs controller aim.** It changes more than aiming (arm visibility among
-     them), so it is a group of behaviours behind one control rather than a single flag, and worth
-     designing as such rather than adding another toggle.
-   - The panel is a safe home for both: opened by holding a controller button and driven by the
-     thumbstick, so it never went through the keyboard gate.
+0. **📋 `ENABLE VR` on the panel** — it would remove one of the two remaining keyboard exemptions.
+   Run 157's `[Render] Debug` makes every keyboard key inert except **BACKSPACE** (VR mode on/off)
+   and **PAUSE** (hold to quit, which is the `WM_CLOSE` path that lets the engine save — and every
+   copy of this game shares one save profile). Both are marked at their call sites as the only
+   places a raw `GetAsyncKeyState` is legitimate. A panel row retires the BACKSPACE one; PAUSE
+   probably has to stay, since quitting cannot depend on the thing you are quitting.
 
 1. **📋 `HideCrosshair=1` needs auto-pad's "in hand" signal, and should be done WITH it.** The
    crosshair itself is found and hidden — `HideCrosshair` in the ini and on the panel, 0 never /
@@ -172,6 +166,71 @@ dropped beside the game exe. No game files modified.
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## ✅ Runs 157–158: the settings panel grew up — AIM METHOD, and three silent no-ops
+
+`AIM METHOD` (HEAD / MOTION CONTROLLER) is now the one control the rest follow, and it **persists** —
+`g_aimMode` was never read from the ini, so every session started at 0 and had to be walked back to
+11 by hand. It drives aim mode, the gun and arms, the rot mode, and presets `MOVE DIRECTION`.
+
+| | HEAD | MOTION CONTROLLER |
+|---|---|---|
+| aim source | engine (`g_aimMode 0`) | trace rotation (`g_aimMode 11`) |
+| gun | in front of your face | follows the controller |
+| arms | visible | hidden |
+| crosshair `AUTO` | shown | hidden |
+
+Also on the panel: `OCCLUSION` (modes 0–2; 3 crashes and stays ini-only) and `DEBUGGING`
+(`[Render] Debug` — hides the readout and makes every keyboard key inert bar BACKSPACE and PAUSE).
+Panel scale now derives from a target *height*, so adding rows shrinks the text instead of growing
+the box, and the width is measured from the widest row rather than a hardcoded 30.
+
+**It is not an input-device switch.** Both methods take keyboard, mouse, a real 360 pad, or Touch
+acting as one. Three things that look like they belong here already fall out for free and were left
+alone: mouse pitch does nothing in either method (`g_wantPitch` is rewritten from the headset every
+frame, and there is no pitch fold-in the way there is for yaw); `TurnMode` only ever affected
+controller play; and snap turn works in HEAD too.
+
+### ⚠️ Method note: **a mode is not a value — it is a value plus whatever had to be installed for it**
+
+Three separate settings in two runs were set correctly and did nothing, and **all three reported
+themselves as applied**:
+
+| what was set | what was missing | how it presented |
+|---|---|---|
+| `OcclusionQueryMode` from the panel | the GetData vtable patch was gated on the mode at *first query creation* | changing it later did nothing, forever |
+| `g_hideMeshIdx = 3` | the gun/arms vertex latch only ran when the APPS cycle passed through mode 1 | arms visible, gun unmoved, panel said MOTION CONTROLLER |
+| `g_aimMode = 11` | five hooks the NUMPAD-dot path installed for any mode ≥ 6 | mode selected and inert; the bullet followed the view |
+
+**Anything moved off a keypress onto a setting has to bring its setup with it.** The keypress path
+was never just a value assignment, and reading only the assignment is what produced all three.
+
+### ⚠️ And the sharper one: a latch that succeeds with garbage silences its own retry
+
+The mesh latch was fixed with a retry keyed on the counts being *zero*. But `g_fgStableVerts` is the
+**previous frame's** foreground list, replaced wholesale each frame — at the main menu it holds two
+entries that are not the gun and arms. The latch took them, returned true, and the retry never fired
+again. Toggling the method re-latched from gameplay, which is why it "worked the second time".
+
+This is run 118's defect exactly: *"the hide indices then pointed at things that were not the gun.
+The report that came back was accurate; the labels on it were fiction."*
+
+The latch is now continuous and self-correcting on the only evidence that means anything — **is the
+latched mesh still being drawn?** Not latched: take the top two once they have held 30 frames.
+Latched and seen: leave it (run 119's protection — muzzle flash shifts the list while firing).
+Latched and unseen for 240 frames: drop it and re-take. An **empty** list is neither hit nor miss,
+because cutscenes and menus have no first-person pass and counting those as misses would throw away
+a good latch and re-take it from menu geometry — the same bug from the other side.
+
+Confirmed in the log: `mesh latch: gun=5799 verts, arms=3314 verts` — run 119's numbers, first try,
+no drop-and-retake.
+
+### BACKSPACE hands the game back completely
+
+`AimMethod` is the setting; whether it *applies* is gated on VR mode, and `ApplyAimMethod` is called
+from `SetVrMode` in **both** directions so the restore falls out of the same path that applies it.
+Before this, flat mode ran with missing arms, a gun transformed onto a controller possibly on a
+desk, and shots that missed the crosshair — silently.
 
 ## ✅ Runs 154–156: the judder is SOLVED — a set-down controller reports a phantom trigger pull
 

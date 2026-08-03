@@ -730,3 +730,90 @@ GpuFenceProbe=1
 ; TriggerTouchGate=1
 ; AutoPad=0
 ; ThreadCpu=1
+
+; ---------------------------------------------------------------------------
+; [Input] AimMethod   -- the one control the other four follow (run 158)
+;
+;   0 = HEAD               aim mode 0, arms visible, gun in front of your face,
+;                          crosshair meaningful                     <- default
+;   1 = MOTION CONTROLLER  aim mode 11, arms hidden, gun on the controller,
+;                          crosshair meaningless
+;
+; On the VR panel as AIM METHOD, first row, because MOVE DIRECTION and CROSSHAIR
+; both follow from it and it reads top-down as cause before effect.
+;
+; Every piece of this already worked. What was missing was one place to say which
+; arrangement you want, and any way at all to say it without a keyboard - the aim
+; mode was never read from the ini, so every session started at 0 and had to be
+; walked back to 11 by hand.
+;
+; ---- what it deliberately does NOT touch ----
+;
+; It is not an input-device switch. Both methods take keyboard, mouse, a real 360
+; pad, or the Touch controllers acting as one, and Raven's own input code handles
+; all of them. Three behaviours that look like they belong here fall out for free
+; and are left alone:
+;
+;   * Mouse pitch does nothing in either method, and no code makes that happen.
+;     g_wantPitch is recomputed from the headset every frame and written over
+;     whatever the mouse did. Yaw survives only because the yaw fold-in adds
+;     external deltas into g_baseYaw, and there is no pitch fold-in.
+;   * TurnMode already only affects controller play. g_padTurnAccum is fed from
+;     the XR turn action's X axis alone; the mouse reaches the view through the
+;     fold-in and never touches it.
+;   * Snap turn works in HEAD too, because turning runs into g_baseYaw without
+;     consulting the aim mode. Touch controllers as an untracked gamepad with
+;     snap turn is a supported combination, not an accident.
+;
+; The right stick's vertical axis is not a look axis in either method: up is
+; StickUp (CycleWeapon) and down is StickDown (Health), both configurable.
+;
+; ---- WalkDirection is PRESET, not forced ----
+;
+; Choosing HEAD sets MOVE DIRECTION to HEAD, because off-hand-relative movement
+; is meaningless when you are not aiming with a hand. It is applied when you
+; CHANGE the method and NOT when the ini is read - otherwise a saved
+; WalkDirection would be overwritten on every launch and "preset" would be a lie.
+;
+; ---- cutscenes ----
+;
+; Both methods want ROT ENGINE with the yaw fold-in on, which is cutscene mode 1,
+; the shipped arrangement. The cutscene auto-switch saves whatever mode it finds,
+; forces mode 3 so head yaw survives the scripted camera, and restores on exit -
+; so it is agnostic to the aim method and neither one changes it.
+;
+; ⚠️ Changing AIM METHOD *during* a cutscene writes the SAVED mode rather than the
+; live one. Writing the live mode would be overwritten seconds later by the
+; restore, and the setting would look like it had not stuck.
+;
+; ---- ⚠️ the mesh latch, which is what makes this work at all ----
+;
+; The gun and arms are identified by VERTEX COUNT, latched from the foreground
+; pass. That latch used to run only when the APPS cycle passed through mode 1, so
+; selecting a mode directly left the counts at zero, FgHidden and FgMoved both
+; returned false, and the arms stayed visible while the panel reported MOTION
+; CONTROLLER. Silent no-op.
+;
+; It is now its own function, called on any nonzero mode and RETRIED every frame
+; until it takes - necessary because AimMethod=1 is applied from the ini long
+; before any foreground pass has been drawn. The log prints "mesh latch: gun=N
+; verts, arms=N verts" on the frame it succeeds. If that line never appears while
+; MOTION CONTROLLER is selected, the gun and arms are not being touched at all.
+; ---------------------------------------------------------------------------
+; [Input]
+; AimMethod=0
+;
+; ---- BACKSPACE hands the game back completely ----
+;
+; AimMethod is the SETTING; whether it APPLIES is gated on VR mode. With VR mode
+; off, aim mode returns to 0 and the arms and gun to normal, so the plain game is
+; genuinely plain - mouse, keyboard and pad all behave as they always did, and the
+; crosshair comes back even on AUTO. BACKSPACE again restores whichever method you
+; chose. The setting is never cleared, so there is nothing to re-select.
+;
+; This was broken until run 158b: SetVrMode wrote head tracking, 6-DOF, stereo and
+; projection and left aim mode 11 and the hidden arms in place. Flat mode ran with
+; missing arms, a gun transformed onto a controller possibly sitting on a desk, and
+; shots that did not go through the crosshair - and nothing said so. The restore
+; now falls out of the same function that applies it, called from SetVrMode in both
+; directions, so there is no separate teardown that can drift out of step.
