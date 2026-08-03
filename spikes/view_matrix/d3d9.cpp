@@ -3421,8 +3421,9 @@ bool g_panelDirty = false;      // has anything changed since it was opened?
 // Only settings that are consulted EVERY FRAME from a global belong here. Anything read once at
 // device creation - D3D9ExMode, ZeroCopy, the resolution - would appear to change and silently do
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
-const int kPanelRows = 6;
-enum { PR_MOVEDIR = 0, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_HEADROLL };
+const int kPanelRows = 7;
+enum { PR_MOVEDIR = 0, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_HEADROLL,
+       PR_CROSSHAIR };
 
 // The turn settings are defined further down, beside the turn code they belong to. Declared here
 // rather than moved, so the settings stay next to the logic that reads them every frame.
@@ -3430,6 +3431,8 @@ extern int   g_turnMode;
 extern float g_turnAngleDeg;
 extern float g_turnSpeedDeg;
 extern int   g_turnSign;
+// Defined with the UI draw path, where the crosshair is identified and skipped.
+extern volatile LONG g_hideCrosshair;
 
 // Written on CLOSE, not on every change. Changes apply live so turn speed can be felt while the
 // stick is moving, but the file only ever receives a value that was settled on - a mis-set number
@@ -3451,6 +3454,8 @@ void PanelSave() {
     WritePrivateProfileStringA("Render", "HeadRoll", v, path);
     _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_walkDirection);
     WritePrivateProfileStringA("Input", "WalkDirection", v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_hideCrosshair, 0, 0));
+    WritePrivateProfileStringA("Render", "HideCrosshair", v, path);
     Log("VR panel: saved to %s", path);
 }
 
@@ -3486,10 +3491,16 @@ void PanelRowText(int row, char* out, size_t cap) {
             _snprintf_s(out, cap, _TRUNCATE, "TURN DIRECTION %s",
                         g_turnSign >= 0 ? "NORMAL" : "INVERTED");
             break;
-        default:
+        case PR_HEADROLL:
             _snprintf_s(out, cap, _TRUNCATE, "HEAD ROLL      %s",
                         InterlockedCompareExchange(&g_rollOn, 0, 0) ? "ON" : "OFF");
             break;
+        default: {
+            const LONG h = InterlockedCompareExchange(&g_hideCrosshair, 0, 0);
+            _snprintf_s(out, cap, _TRUNCATE, "CROSSHAIR      %s",
+                        h == 0 ? "ALWAYS SHOW" : h == 1 ? "HIDE IN VR" : "ALWAYS HIDE");
+            break;
+        }
     }
 }
 
@@ -3529,10 +3540,17 @@ void PanelAdjust(int row, int dir) {
         case PR_TURNDIR:
             g_turnSign = -g_turnSign;
             break;
-        default:
+        case PR_HEADROLL:
             InterlockedExchange(&g_rollOn,
                                 InterlockedCompareExchange(&g_rollOn, 0, 0) ? 0 : 1);
             break;
+        default: {
+            LONG h = InterlockedCompareExchange(&g_hideCrosshair, 0, 0) + dir;
+            if (h < 0) h = 0;
+            if (h > 2) h = 2;
+            InterlockedExchange(&g_hideCrosshair, h);
+            break;
+        }
     }
     g_panelDirty = true;
 }
@@ -6281,6 +6299,50 @@ bool g_inHudRemap = false;
 // thing worth knowing is whether it is being remapped twice as often as it should be, or the same
 // number of times with a transform that means something different there.
 volatile LONG g_hudDraws = 0, g_hudDrawsLast = 0;
+// Budget for the per-element position dump, refilled by the '[' re-arm.
+int g_uiDumpLeft = 0;
+
+// ---- ⭐ run 153: the crosshair, identified by measurement ----
+//
+// With aim mode 11 the bullet follows the controller and the view never moves, so a crosshair
+// welded to screen centre is not just useless - it points somewhere the shot is not going.
+//
+// Found by dumping every UI element's clip-space translation on a bare view, nothing else on
+// screen. The crosshair is FOUR ticks around the centre, each drawn twice:
+//
+//     prims=10  stride=8  at (+0.025, +0.000)   right tick
+//     prims=10  stride=8  at (-0.025, +0.000)   left
+//     prims=10  stride=8  at (-0.000, +0.045)   up
+//     prims=10  stride=8  at (-0.000, -0.044)   down
+//
+// **stride 8 is unique to it.** Every other UI element measured is stride 4, 12 or 20 - including
+// the centred prompts, which are stride 20 at y = -0.138 with 16-24 primitives. So stride alone
+// nearly does it, and the centre test makes it safe: a stride-8 element somewhere else on screen
+// is not this.
+//
+// ⚠️ Deliberately NOT keyed on primitive count. 10 is what these four ticks happen to be, and a
+// different weapon's reticle almost certainly differs - the TMD especially. Position and stride
+// describe what the thing IS; the primitive count describes one instance of it.
+inline bool LooksLikeCrosshair(UINT stride, float cx, float cy) {
+    return stride == 8 && fabsf(cx) < 0.15f && fabsf(cy) < 0.15f;
+}
+
+// ini HideCrosshair: 0 never, 1 while the right controller is in hand, 2 always.
+//
+// ⚠️ **MODE 1 IS TWITCHY AND THE FAULT IS THE SIGNAL, NOT THIS CODE.** `g_handHeld[1]` comes from
+// the Touch capacitive sensors - thumbrest and trigger touch - so simply LIFTING YOUR THUMB off a
+// controller you are still holding reads as "not in hand" and the crosshair flickers back.
+//
+// Run 77 chose those sensors over motion for auto-pad, and for that job they are right: a hand
+// resting still on a controller still registers, a controller on a desk does not. But auto-pad
+// asks "is this being held at all" on a several-second timescale, while this asks the same
+// question frame by frame, and the sensor is not steady enough for that.
+//
+// Deliberately not patched around here. Debouncing it locally would put a second, differently
+// tuned notion of "held" next to auto-pad's, and this project has already paid for two mechanisms
+// answering one question. Revisit when auto-pad is revisited - one hysteresis, shared.
+// Until then `HideCrosshair=2` is the setting that behaves.
+volatile LONG g_hideCrosshair = 1;
 
 const int kUpConstRegs = 32;
 float g_upConstSnap[kUpConstRegs * 4] = {};
@@ -6413,7 +6475,7 @@ inline bool UserPtrQuad(UINT primCount, const void* vtxData, UINT stride) {
 int g_hudRemap = 0;
 
 template <typename DrawFn>
-HRESULT HudStereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
+HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn&& draw) {
     if (!g_hudRemap || !InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
 
     float c[16];
@@ -6472,6 +6534,34 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
         }
     }
 
+    // ---- ⭐ run 153: WHERE is each UI element? ----
+    //
+    // The crosshair has to be identifiable before it can be hidden, and the same question will be
+    // asked again for the beta HUD inset. Under the ROW convention c8 is the translation row, so
+    // c8.x/c8.y is where this element sits in clip space - the crosshair is the one at the centre.
+    //
+    // Dumped on the '[' re-arm alongside everything else, and reported with the primitive count
+    // because position alone will not separate a crosshair from a centred prompt: "R Open" and
+    // "RELOAD" both sit near the middle. A rule needs both.
+    // Its own budget, not g_upXformDump's - that one is already spent by DumpUserPtrTransform
+    // before this runs, so sharing it would print nothing.
+    {
+        const Reg4* r = reinterpret_cast<const Reg4*>(c);
+        if (g_uiDumpLeft > 0) {
+            --g_uiDumpLeft;
+            Log("    UI element: prims=%-4u stride=%-3u  at clip (%+.3f, %+.3f)  scale (%.5f, %.5f)",
+                primCount, stride, r[3].x, r[3].y, r[0].x, r[1].y);
+        }
+        // Drop the draw entirely rather than remapping it. Returning S_OK is honest here - the
+        // call succeeded, we simply chose not to issue it - and matches what the game expects back
+        // from a draw that had nothing to rasterise.
+        const LONG hide = InterlockedCompareExchange(&g_hideCrosshair, 0, 0);
+        if (hide && LooksLikeCrosshair(stride, r[3].x, r[3].y) &&
+            (hide == 2 || g_handHeld[1])) {
+            return S_OK;
+        }
+    }
+
     g_inHudRemap = true;      // our own c5-c8 writes below must not re-arm the UI marker
     InterlockedIncrement(&g_hudDraws);
 
@@ -6527,7 +6617,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
     if (hudArmed && g_hudRemap && !quad)
-        return HudStereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
+        return HudStereoPair(dev, primCount, vtxStride, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
     if (quad) { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
     return StereoPair(dev, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
@@ -6551,7 +6641,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
     if (hudArmed && g_hudRemap && !quad)
-        return HudStereoPair(dev, [&] {
+        return HudStereoPair(dev, primCount, vtxStride, [&] {
             return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                            idxData, idxFormat, vtxData, vtxStride); });
     if (quad) {
@@ -10619,6 +10709,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // printed on the last one, so this count also decides when the answer appears.
         g_upXformDump = 12;
         g_upConstHaveSnap = false;
+        g_uiDumpLeft = 24;      // enough to catch every element on screen at once
         Log("[: user-pointer vertex sampler RE-ARMED - the next two draws in each primitive-count"
             " bucket will be dumped, and the quad/split counters are cleared. Whatever is on"
             " screen now is what gets described.");
@@ -11763,6 +11854,18 @@ void LoadIniSettings() {
             g_userPtrHookLevel);
         g_userPtrHookLevel = 3;
     }
+    // Default 1 rather than 2: with a keyboard and mouse the crosshair is still where the shot
+    // goes, so hiding it unconditionally would break the control scheme that needs it most.
+    LONG xhairIni = GetPrivateProfileIntA("Render", "HideCrosshair", 1, path);
+    if (xhairIni < 0 || xhairIni > 2) xhairIni = 1;
+    InterlockedExchange(&g_hideCrosshair, xhairIni);
+    Log("ini: HideCrosshair=%ld (%s)", xhairIni,
+        xhairIni == 0 ? "never - the game's crosshair is always drawn" :
+        xhairIni == 1 ? "hidden while the right controller is IN HAND - the bullet follows the"
+                        " controller then, so a centre-screen crosshair points somewhere the shot"
+                        " is not going"
+                      : "always hidden");
+
     Log("ini: HudStereo=%d (%s)", g_hudRemap,
         g_hudRemap ? "the game's HUD and menus are drawn into BOTH eyes"
                    : "off - the UI spans the seam, half in each eye");

@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-02** (end of run 152). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-02** (end of run 153). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -52,16 +52,38 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-1. **Hide the crosshair when aiming with the Touch controllers.** Now tractable: UI draws are
-   individually intercepted, so skipping one is easy — what is missing is a *signature* for which
-   draw is the crosshair, the way the foreground meshes needed vertex counts. Worth doing as a
-   panel setting rather than a hardcode.
-2. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
+1. **📋 `HideCrosshair=1` needs auto-pad's "in hand" signal, and should be done WITH it.** The
+   crosshair itself is found and hidden — `HideCrosshair` in the ini and on the panel, 0 never /
+   1 in VR / 2 always. Modes 0 and 2 are solid. **Mode 1 flickers**: `g_handHeld[1]` is the Touch
+   capacitive sensor, so lifting your thumb off a controller you are still holding reads as "not in
+   hand" and the crosshair comes back.
+   - Run 77 picked those sensors over motion for auto-pad and was right *for auto-pad* — that asks
+     "is this held at all" over seconds. This asks it per frame, and the sensor is not steady
+     enough.
+   - **Do not debounce it locally.** That would create a second, differently tuned notion of "in
+     hand" beside auto-pad's, and this project has already paid twice for two mechanisms answering
+     one question. One hysteresis, shared, when auto-pad is next opened up.
+   - `HideCrosshair=2` behaves correctly meanwhile.
+   - **The crosshair signature, measured** (bare view, nothing else on screen): four ticks around
+     centre, each drawn twice, `stride=8` at `(±0.025, 0)` and `(0, ±0.045)`. **Stride 8 is unique
+     to it** — everything else is stride 4, 12 or 20, and centred *prompts* are stride 20 at
+     `y = -0.138`. Deliberately NOT keyed on primitive count: 10 is what these ticks happen to be,
+     and another weapon's reticle will differ. Re-measure if a later weapon's crosshair persists.
+2. **📋 BETA: the HUD sits too close to the edge to see in the headset.** Health and ammo duplicate
+   correctly per eye since run 151, but they are anchored to the corners of a 16:9 frame and a
+   headset cannot see its own corners — the eye's usable area is a circle inside that rectangle.
+   They need pulling inward toward the centre.
+   - The mechanism is already in hand: the UI's stage-to-clip matrix is `c5`–`c8`, and
+     `HudStereoPair` already rewrites it per eye. Insetting is a scale-about-centre on the same
+     registers rather than a new system.
+   - Wants to be a panel setting (HUD inset / safe area), not a constant — how far in is
+     comfortable depends on the headset's optics and the player's IPD.
+3. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
    weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
    correctly aligned**, so they are not one system and whatever anchors the flash is not what
    anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
    not.
-3. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
+4. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
    option on, **the hidden arms turn BLACK instead of staying invisible.** So whatever hides the
    first-person meshes is not reaching the pass that HQ Decals enables — the arms are still being
    drawn there, at their original position. That is a much sharper lead than "decals are broken":
@@ -106,14 +128,14 @@ dropped beside the game exe. No game files modified.
 >   the wrapper had already been proven defective on the soldier by then. **An independently
 >   confirmed defect should not be dismissed on a one-line argument.**
 
-4. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
+5. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
    animation, so they are absent from the foreground list when the counts are latched. The fix is
    probably to latch a SET of counts rather than two, or to match on something steadier than
    vertex count.
-5. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+6. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-6. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+7. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
 
