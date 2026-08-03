@@ -3878,12 +3878,42 @@ volatile LONG g_panelOpen = 0;
 int  g_panelRow = 0;
 bool g_panelDirty = false;      // has anything changed since it was opened?
 
+// ---- ⭐ run 157: DEBUGGING ----
+//
+// Everything this mod grew while being built - the on-screen state readout and forty-odd hotkeys -
+// is developer scaffolding. Off, the readout is not drawn and every keyboard key stops responding.
+// Only an advanced user needs any of them, and for everyone else the controller is the whole
+// interface. Holding the panel button still opens the VR settings, because that is a controller
+// binding and never went through here.
+//
+// ⚠️ EXACTLY ONE KEY IS EXEMPT: **BACKSPACE**, which switches VR mode on and off. The rest are
+// recoverable - turn DEBUGGING back on from the panel and they return - but VR mode is not
+// scaffolding, and the cold start is flat by design (run 37 reverted default-on) with no ENABLE VR
+// setting yet, so gating it would mean a Debug=0 launch could never enter VR at all. F8 is NOT
+// exempt: the controller's MENU tap already recentres, so losing it costs nothing.
+//
+// Consulted every frame from a global, so it qualifies for the panel by the rule below - and
+// belongs there, because turning it back on is otherwise impossible without editing a file.
+volatile LONG g_debugOn = 1;   // ini [Render] Debug
+
+// Every keyboard key reads through this instead of GetAsyncKeyState, so the gate is one function
+// rather than a conditional wrapped around eight hundred lines of Present. There is one exception
+// in Present and it is BACKSPACE; any other raw GetAsyncKeyState there is a bug, and greps as one.
+inline SHORT DebugKey(int vk) {
+    return InterlockedCompareExchange(&g_debugOn, 0, 0) ? GetAsyncKeyState(vk) : (SHORT)0;
+}
+
 // Only settings that are consulted EVERY FRAME from a global belong here. Anything read once at
 // device creation - D3D9ExMode, ZeroCopy, the resolution - would appear to change and silently do
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
-const int kPanelRows = 7;
+const int kPanelRows = 9;
 enum { PR_MOVEDIR = 0, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_HEADROLL,
-       PR_CROSSHAIR };
+       PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG };
+
+// Defined with the occlusion-query hooks far below. On the panel because run 157 measured mode 2
+// dropping frames in the opening area where mode 0 held - a difference that can only be judged by
+// playing the same stretch both ways, which is exactly what an ini-only setting makes tedious.
+extern int g_occlusionMode;
 
 // The turn settings are defined further down, beside the turn code they belong to. Declared here
 // rather than moved, so the settings stay next to the logic that reads them every frame.
@@ -3916,6 +3946,10 @@ void PanelSave() {
     WritePrivateProfileStringA("Input", "WalkDirection", v, path);
     _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_hideCrosshair, 0, 0));
     WritePrivateProfileStringA("Render", "HideCrosshair", v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_occlusionMode);
+    WritePrivateProfileStringA("Render", "OcclusionQueryMode", v, path);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_debugOn, 0, 0));
+    WritePrivateProfileStringA("Render", "Debug", v, path);
     Log("VR panel: saved to %s", path);
 }
 
@@ -3955,12 +3989,27 @@ void PanelRowText(int row, char* out, size_t cap) {
             _snprintf_s(out, cap, _TRUNCATE, "HEAD ROLL      %s",
                         InterlockedCompareExchange(&g_rollOn, 0, 0) ? "ON" : "OFF");
             break;
-        default: {
+        // Named rather than left to `default`, which is what this used to be. A default case would
+        // silently swallow every row added after it and render them all as CROSSHAIR - a new
+        // setting that appears to exist and adjusts something else is worse than a missing one.
+        case PR_CROSSHAIR: {
             const LONG h = InterlockedCompareExchange(&g_hideCrosshair, 0, 0);
             _snprintf_s(out, cap, _TRUNCATE, "CROSSHAIR      %s",
                         h == 0 ? "ALWAYS SHOW" : h == 1 ? "HIDE IN VR" : "ALWAYS HIDE");
             break;
         }
+        case PR_OCCLUSION:
+            // Worded as what it DOES, not as the mode number. "ENGINE CULL" is the engine's own
+            // occlusion culling left alone (mode 2); "DRAW ALL" stops the engine hiding geometry
+            // the split frame made it wrongly believe was occluded.
+            _snprintf_s(out, cap, _TRUNCATE, "OCCLUSION      %s",
+                        g_occlusionMode == 0 ? "AUTO" :
+                        g_occlusionMode == 1 ? "DRAW ALL" : "ENGINE CULL");
+            break;
+        default:
+            _snprintf_s(out, cap, _TRUNCATE, "DEBUGGING      %s",
+                        InterlockedCompareExchange(&g_debugOn, 0, 0) ? "ON" : "OFF");
+            break;
     }
 }
 
@@ -4004,13 +4053,28 @@ void PanelAdjust(int row, int dir) {
             InterlockedExchange(&g_rollOn,
                                 InterlockedCompareExchange(&g_rollOn, 0, 0) ? 0 : 1);
             break;
-        default: {
+        case PR_CROSSHAIR: {
             LONG h = InterlockedCompareExchange(&g_hideCrosshair, 0, 0) + dir;
             if (h < 0) h = 0;
             if (h > 2) h = 2;
             InterlockedExchange(&g_hideCrosshair, h);
             break;
         }
+        case PR_OCCLUSION:
+            // Clamped to 0-2, and mode 3 is UNREACHABLE from here on purpose: it refuses to create
+            // occlusion queries at all and CRASHES this build. It survives in the ini only so that
+            // fact stays recorded rather than being rediscovered.
+            g_occlusionMode += dir;
+            if (g_occlusionMode < 0) g_occlusionMode = 0;
+            if (g_occlusionMode > 2) g_occlusionMode = 2;
+            break;
+        default:
+            // Always recoverable, by two independent routes: the panel is opened by holding a
+            // controller button and driven by the thumbstick, so it never went through the keyboard
+            // gate - and BACKSPACE is exempt, so VR mode can still be toggled either way.
+            InterlockedExchange(&g_debugOn,
+                                InterlockedCompareExchange(&g_debugOn, 0, 0) ? 0 : 1);
+            break;
     }
     g_panelDirty = true;
 }
@@ -7310,12 +7374,27 @@ HRESULT STDMETHODCALLTYPE Hook_CreateQuery(IDirect3DDevice9* dev, D3DQUERYTYPE t
     HRESULT hr = g_origCreateQuery(dev, type, out);
     // Patch GetData on the first real query we see. One patch covers every query from this
     // device, since they all share a vtable. Auto mode patches too - the hook decides per call.
-    if (g_occlusionMode <= 1 && SUCCEEDED(hr) && out && *out && !g_origQueryGetData) {
+    //
+    // ---- ⚠️ run 157: patched UNCONDITIONALLY, and the old `<= 1` was a trap ----
+    //
+    // The mode is now adjustable from the VR panel, and this gate meant the vtable was only ever
+    // patched if the mode happened to be 0 or 1 when the FIRST query was created. Launch on mode 2,
+    // switch to AUTO or DRAW ALL in the panel, and nothing would happen - the hook the new mode
+    // needs was never installed, and there is no second chance because `!g_origQueryGetData` only
+    // passes once. Exactly the silent-no-op the panel's own header warns about.
+    //
+    // Patching regardless costs nothing on mode 2: Hook_QueryGetData forwards to the original and
+    // OverrideOcclusion() returns false, so it is a plain pass-through.
+    if (SUCCEEDED(hr) && out && *out && !g_origQueryGetData) {
         g_origQueryGetData = (PFN_QueryGetData)PatchVTable(*out, 7, (void*)&Hook_QueryGetData);
         Log("occlusion queries will report FULLY VISIBLE (GetData patched, orig=%p)",
             (void*)g_origQueryGetData);
-        if (!g_origQueryGetData) { Log("*** GetData patch failed - occlusion test inactive ***");
-                                   g_occlusionMode = 0; }
+        // 2, not 0. With no patch nothing can be overridden, so the engine's own culling is what is
+        // running - and that is exactly what mode 2 means. It used to say 0 (AUTO), which was
+        // harmless while this was ini-only and is a lie now that the panel displays it.
+        if (!g_origQueryGetData) { Log("*** GetData patch failed - the engine's own occlusion"
+                                       " culling stays live (mode forced to 2) ***");
+                                   g_occlusionMode = 2; }
     }
     return hr;
 }
@@ -10535,7 +10614,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // Age the menu indicator once per frame. Without this a name that fired a minute ago looks
     // identical to one firing right now, which is the whole distinction the readout exists to show.
     InterlockedIncrement(&g_lastMenuAge);
-    if (InterlockedCompareExchange(&g_readoutOn, 0, 0)) DrawStateReadout(s);
+    // Debug gates the readout outright. g_readoutOn stays as the finer control underneath it, so
+    // NUMPAD6 still hides the readout on its own while debug mode is on.
+    if (InterlockedCompareExchange(&g_debugOn, 0, 0) &&
+        InterlockedCompareExchange(&g_readoutOn, 0, 0)) DrawStateReadout(s);
     if (InterlockedCompareExchange(&g_panelOpen, 0, 0)) DrawVrPanel(s);
     if (InterlockedExchange(&g_initTried, 1) == 0) {
         InstallViewHook(); InstallProcessEventHook(); InitXR();
@@ -10549,9 +10631,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     if (!xiDone) xiDone = InstallXInputHook();
 
     static bool p9=false,p8=false,p5=false,p4=false,p2=false;
-    bool k9=(GetAsyncKeyState(VK_F9)&0x8000)!=0, k8=(GetAsyncKeyState(VK_F8)&0x8000)!=0;
-    bool k5=(GetAsyncKeyState(VK_F5)&0x8000)!=0, k4=(GetAsyncKeyState(VK_F4)&0x8000)!=0;
-    bool k2=(GetAsyncKeyState(VK_F2)&0x8000)!=0;
+    bool k9=(DebugKey(VK_F9)&0x8000)!=0;
+    bool k8=(DebugKey(VK_F8)&0x8000)!=0;
+    bool k5=(DebugKey(VK_F5)&0x8000)!=0, k4=(DebugKey(VK_F4)&0x8000)!=0;
+    bool k2=(DebugKey(VK_F2)&0x8000)!=0;
     if (k9&&!p9) { LONG was=InterlockedCompareExchange(&g_enabled,0,0);
                    InterlockedExchange(&g_enabled, was?0:1); g_haveCentre=false;
                    Log("F9: head tracking %s", was?"OFF":"ON"); }
@@ -10562,20 +10645,20 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     if (k5&&!p5) { g_yawSign=-g_yawSign; g_haveCentre=false; Log("F5: yaw sign %+d", g_yawSign); }
     if (k4&&!p4) { g_pitchSign=-g_pitchSign; Log("F4: pitch sign %+d", g_pitchSign); }
     static bool p3 = false;
-    bool k3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+    bool k3 = (DebugKey(VK_F3) & 0x8000) != 0;
     if (k3 && !p3) { LONG was = InterlockedCompareExchange(&g_injectOn,0,0);
                      InterlockedExchange(&g_injectOn, was?0:1);
                      Log("F3: matrix camera offset %s (%.0f UU along the camera's right axis)",
                          was?"OFF":"ON", g_offsetUU); }
     p3 = k3;
     static bool p6 = false;
-    bool k6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+    bool k6 = (DebugKey(VK_F6) & 0x8000) != 0;
     if (k6 && !p6) { LONG was = InterlockedCompareExchange(&g_vrProjection,0,0);
                      InterlockedExchange(&g_vrProjection, was?0:1);
                      Log("F6: VR-correct projection %s", was?"OFF (headset FOV claimed, as before)":"ON"); }
     p6 = k6;
     static bool p1 = false;
-    bool k1 = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+    bool k1 = (DebugKey(VK_F1) & 0x8000) != 0;
     if (k1 && !p1) { LONG was = InterlockedCompareExchange(&g_dupDraws,0,0);
                      InterlockedExchange(&g_dupDraws, was?0:1);
                      // The two stereo methods are alternatives, never both at once. Duplication
@@ -10595,7 +10678,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // NUMPAD0: drop draws to the scene-sized non-colour target. See the note in StereoPair.
     static bool pNum0 = false;
-    bool kNum0 = (GetAsyncKeyState(VK_NUMPAD0) & 0x8000) != 0;
+    bool kNum0 = (DebugKey(VK_NUMPAD0) & 0x8000) != 0;
     if (kNum0 && !pNum0) {
         LONG was = InterlockedCompareExchange(&g_skipExtraTarget, 0, 0);
         InterlockedExchange(&g_skipExtraTarget, was ? 0 : 1);
@@ -10612,8 +10695,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // other two axes, and a wrong roll sign looks plausible until you tilt far enough to notice
     // the horizon going the wrong way. One keypress settles it in the headset.
     static bool pNum1 = false, pNum2 = false;
-    bool kNum1 = (GetAsyncKeyState(VK_NUMPAD1) & 0x8000) != 0;
-    bool kNum2 = (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) != 0;
+    bool kNum1 = (DebugKey(VK_NUMPAD1) & 0x8000) != 0;
+    bool kNum2 = (DebugKey(VK_NUMPAD2) & 0x8000) != 0;
     if (kNum1 && !pNum1) {
         LONG was = InterlockedCompareExchange(&g_rollOn, 0, 0);
         InterlockedExchange(&g_rollOn, was ? 0 : 1);
@@ -10632,9 +10715,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // only useful apart. If NUMPAD3 alone changes the HUD prompts, the game has noticed the pad
     // without any stick moving - which is already most of what we need to know about the menus.
     static bool pNum3 = false, pNum4 = false, pNum5 = false;
-    bool kNum3 = (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) != 0;
-    bool kNum4 = (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) != 0;
-    bool kNum5 = (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) != 0;
+    bool kNum3 = (DebugKey(VK_NUMPAD3) & 0x8000) != 0;
+    bool kNum4 = (DebugKey(VK_NUMPAD4) & 0x8000) != 0;
+    bool kNum5 = (DebugKey(VK_NUMPAD5) & 0x8000) != 0;
     if (kNum3 && !pNum3) {
         LONG was = InterlockedCompareExchange(&g_padEmu, 0, 0);
         InterlockedExchange(&g_padEmu, was ? 0 : 1);
@@ -10673,8 +10756,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // One key, fourteen presses, and Raven's whole console layout is on the record - which is
     // cheaper than the third guess at it and cannot be wrong about the installed build.
     static bool pNum6 = false, pNum7 = false;
-    bool kNum6 = (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) != 0;
-    bool kNum7 = (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0;
+    bool kNum6 = (DebugKey(VK_NUMPAD6) & 0x8000) != 0;
+    bool kNum7 = (DebugKey(VK_NUMPAD7) & 0x8000) != 0;
     if (kNum6 && !pNum6) {
         // Named `btn`, not `b`: `b` is Hook_Present's third RECT parameter and is live right here.
         // The file already carries one comment about exactly this shadowing mistake.
@@ -10694,7 +10777,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // NUMPAD8: move head yaw/pitch out of the engine's rotation and into the view matrix.
     static bool pNum8 = false;
-    bool kNum8 = (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) != 0;
+    bool kNum8 = (DebugKey(VK_NUMPAD8) & 0x8000) != 0;
     if (kNum8 && !pNum8) {
         const int next = (CutsceneMode() % 4) + 1;      // 1->2->3->4->1
         SetCutsceneMode(next);
@@ -10715,7 +10798,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // NUMPAD9: how far the engine's camera may point away from the view. The measurement that
     // decides whether aim decoupling is reachable this way at all - see the note on kDevSteps.
     static bool pNum9 = false;
-    bool kNum9 = (GetAsyncKeyState(VK_NUMPAD9) & 0x8000) != 0;
+    bool kNum9 = (DebugKey(VK_NUMPAD9) & 0x8000) != 0;
     if (kNum9 && !pNum9) {
         LONG next = (InterlockedCompareExchange(&g_devStep, 0, 0) + 1) % kDevStepCount;
         InterlockedExchange(&g_devStep, next);
@@ -10727,7 +10810,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // NUMPAD * : the flicker. The clamp cycles the angle; this is what makes the answer visible.
     static bool pMul = false;
-    bool kMul = (GetAsyncKeyState(VK_MULTIPLY) & 0x8000) != 0;
+    bool kMul = (DebugKey(VK_MULTIPLY) & 0x8000) != 0;
     if (kMul && !pMul) {
         LONG was = InterlockedCompareExchange(&g_devFlicker, 0, 0);
         InterlockedExchange(&g_devFlicker, was ? 0 : 1);
@@ -10741,7 +10824,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // NUMPAD / : turn ALL of this mod's XR input work off. The cheap control for run 67 - if the
     // judder survives this, it is not our input code and no amount of tuning it will help.
     static bool pDiv = false;
-    bool kDiv = (GetAsyncKeyState(VK_DIVIDE) & 0x8000) != 0;
+    bool kDiv = (DebugKey(VK_DIVIDE) & 0x8000) != 0;
     if (kDiv && !pDiv) {
         LONG was = InterlockedCompareExchange(&g_xrInputOff, 0, 0);
         InterlockedExchange(&g_xrInputOff, was ? 0 : 1);
@@ -10755,7 +10838,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // from "the engine costs this much simply because a pad exists". Controls stop responding
     // while it is on, by design.
     static bool pSub = false;
-    bool kSub = (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) != 0;
+    bool kSub = (DebugKey(VK_SUBTRACT) & 0x8000) != 0;
     if (kSub && !pSub) {
         LONG was = InterlockedCompareExchange(&g_freezePacket, 0, 0);
         InterlockedExchange(&g_freezePacket, was ? 0 : 1);
@@ -10769,7 +10852,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // NUMPAD + : neutralise UE3's frame-rate governor on the render thread.
     static bool pAdd = false;
-    bool kAdd = (GetAsyncKeyState(VK_ADD) & 0x8000) != 0;
+    bool kAdd = (DebugKey(VK_ADD) & 0x8000) != 0;
     if (kAdd && !pAdd) {
         LONG was = InterlockedCompareExchange(&g_killSleep, 0, 0);
         InterlockedExchange(&g_killSleep, was ? 0 : 1);
@@ -10783,7 +10866,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // your hand without moving the view into the matrix first would just swing the camera with
     // your hand - the exact thing this is meant to stop.
     static bool pDec = false;
-    bool kDec = (GetAsyncKeyState(VK_DECIMAL) & 0x8000) != 0;
+    bool kDec = (DebugKey(VK_DECIMAL) & 0x8000) != 0;
     if (kDec && !pDec) {
         // ---- ❌ run 89: modes 4 and 5 are OUT of the cycle. The time split is dead ----
         //
@@ -10985,7 +11068,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // about G. Then the anchor can be placed by eye without the gun sliding away from it.
     {
         static bool pTab = false;
-        const bool kTab = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
+        const bool kTab = (DebugKey(VK_TAB) & 0x8000) != 0;
         if (kTab && !pTab) {
             g_gunFollowPos = g_gunFollowPos ? 0 : 1;
             Log("TAB: gun position following %s%s", g_gunFollowPos ? "ON" : "OFF",
@@ -11001,10 +11084,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // edit-restart-look. Whatever it settles at goes into the ini to persist.
     {
         static bool pL = false, pR = false, pU = false, pD = false;
-        const bool kL = (GetAsyncKeyState(VK_LEFT)  & 0x8000) != 0;
-        const bool kR = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
-        const bool kU = (GetAsyncKeyState(VK_UP)    & 0x8000) != 0;
-        const bool kD = (GetAsyncKeyState(VK_DOWN)  & 0x8000) != 0;
+        const bool kL = (DebugKey(VK_LEFT)  & 0x8000) != 0;
+        const bool kR = (DebugKey(VK_RIGHT) & 0x8000) != 0;
+        const bool kU = (DebugKey(VK_UP)    & 0x8000) != 0;
+        const bool kD = (DebugKey(VK_DOWN)  & 0x8000) != 0;
         if (kL && !pL) InterlockedExchange(&g_anchorAxis,
                           (InterlockedCompareExchange(&g_anchorAxis, 0, 0) + 2) % 3);
         if (kR && !pR) InterlockedExchange(&g_anchorAxis,
@@ -11026,7 +11109,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // guess. Eight combinations on one key finds the right one inside a single session.
     {
         static bool pCaps = false;
-        const bool kCaps = (GetAsyncKeyState(VK_CAPITAL) & 0x8000) != 0;
+        const bool kCaps = (DebugKey(VK_CAPITAL) & 0x8000) != 0;
         if (kCaps && !pCaps) {
             const LONG combo = (InterlockedCompareExchange(&g_gunSignCombo, 0, 0) + 1) & 15;
             InterlockedExchange(&g_gunSignCombo, combo);
@@ -11047,7 +11130,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // already bound and it is isolated enough not to be hit by accident.
     {
         static bool pApps = false;
-        const bool kApps = (GetAsyncKeyState(VK_APPS) & 0x8000) != 0;
+        const bool kApps = (DebugKey(VK_APPS) & 0x8000) != 0;
         if (kApps && !pApps) {
             const LONG next = (InterlockedCompareExchange(&g_hideMeshIdx, 0, 0) + 1) % 4;
             InterlockedExchange(&g_hideMeshIdx, next);
@@ -11085,7 +11168,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // shares ONE save profile - killing the process mid-write is a real way to lose it.
     {
         static ULONGLONG heldSince = 0;
-        const bool kPause = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
+        const bool kPause = (DebugKey(VK_PAUSE) & 0x8000) != 0;
         if (!kPause) {
             heldSince = 0;
         } else {
@@ -11110,8 +11193,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // in run 61b; the probe wraps on its own without it. SCROLL LOCK stays wired up as well, since
     // accepting both costs one `||`.
     static bool pScr = false;
-    bool kScr = ((GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0)
-             || ((GetAsyncKeyState(VK_NUMPAD7) & 0x8000) != 0);
+    bool kScr = ((DebugKey(VK_SCROLL) & 0x8000) != 0)
+             || ((DebugKey(VK_NUMPAD7) & 0x8000) != 0);
     if (kScr && !pScr) {
         if (InterlockedCompareExchange(&g_peCensus, 0, 0)) {
             InterlockedExchange(&g_peCensus, 0);
@@ -11136,6 +11219,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     LogXInputStats();
 
     // BACKSPACE: the whole mod on or off in one key. See SetVrMode.
+    //
+    // ⚠️ THE ONE KEY THAT IS NOT GATED (run 157). Deliberately raw GetAsyncKeyState, not DebugKey.
+    // Everything else is developer scaffolding that can be recovered by turning DEBUGGING back on
+    // from the panel; switching in and out of VR is not scaffolding, and gating it would mean a
+    // Debug=0 launch could never enter VR at all, since the cold start is flat by design and there
+    // is no ENABLE VR setting yet. Remove this exemption only once that setting exists.
     static bool pBack = false;
     bool kBack = (GetAsyncKeyState(VK_BACK) & 0x8000) != 0;
     if (kBack && !pBack) SetVrMode(InterlockedCompareExchange(&g_dupDraws, 0, 0) == 0);
@@ -11217,7 +11306,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // produces and two launches can be made to agree. The angle is logged and put on the readout
     // in degrees precisely so they can be CHECKED to agree rather than assumed to.
     static bool pFreeze = false;
-    bool kFreeze = (GetAsyncKeyState(VK_OEM_6) & 0x8000) != 0;
+    bool kFreeze = (DebugKey(VK_OEM_6) & 0x8000) != 0;
     if (kFreeze && !pFreeze) {
         const LONG was = InterlockedCompareExchange(&g_freezeView, 0, 0);
         if (!was) {
@@ -11249,7 +11338,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // press it. The classification counters clear with it, for the same reason - a cumulative
     // quad/split ratio dominated by menu geometry says nothing about the HUD.
     static bool pReArm = false;
-    bool kReArm = (GetAsyncKeyState(VK_OEM_4) & 0x8000) != 0;      // '['
+    bool kReArm = (DebugKey(VK_OEM_4) & 0x8000) != 0;      // '['
     if (kReArm && !pReArm) {
         for (int i = 0; i < 6; ++i) { g_upVtxDumped[i] = 0; g_upHist[i] = 0; }
         g_drawsUPQuad = 0; g_drawsUPSplit = 0;
@@ -11267,7 +11356,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // ' : the HUD per-eye remap. On/off now that the convention is settled - run 147 measured ROW
     // correct and COL producing a white diagonal streak across the frame.
     static bool pHud = false;
-    bool kHud = (GetAsyncKeyState(VK_OEM_7) & 0x8000) != 0;
+    bool kHud = (DebugKey(VK_OEM_7) & 0x8000) != 0;
     if (kHud && !pHud) {
         g_hudRemap = g_hudRemap ? 0 : 1;
         Log("': HUD per-eye remap %s", g_hudRemap ? "ON" : "OFF - the UI spans the seam, as before");
@@ -11277,7 +11366,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // INSERT: blank one half. Whichever eye goes black tells us the half-to-eye mapping for
     // certain, which reading the code did not settle.
     static bool pIns = false;
-    bool kIns = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+    bool kIns = (DebugKey(VK_INSERT) & 0x8000) != 0;
     if (kIns && !pIns) {
         LONG next = (InterlockedCompareExchange(&g_eyeDebug,0,0) + 1) % 3;
         InterlockedExchange(&g_eyeDebug, next);
@@ -11290,7 +11379,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // PAGE UP: cycle the culling headroom, to test whether the very wide engine FOV it asks for
     // is what is making textures flicker (streaming and LOD both key off projected size).
     static bool pPgUp = false;
-    bool kPgUp = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+    bool kPgUp = (DebugKey(VK_PRIOR) & 0x8000) != 0;
     if (kPgUp && !pPgUp) {
         g_fovHeadroomStep = (g_fovHeadroomStep + 1) % kFovHeadroomCount;
         kFovHeadroom = kFovHeadroomSteps[g_fovHeadroomStep];
@@ -11307,7 +11396,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // PAGE DOWN: how much of the headset's field we render. Lowers what the engine has to cull,
     // which is the same trade as PAGE UP approached from the other side.
     static bool pPgDn = false;
-    bool kPgDn = (GetAsyncKeyState(VK_NEXT) & 0x8000) != 0;
+    bool kPgDn = (DebugKey(VK_NEXT) & 0x8000) != 0;
     if (kPgDn && !pPgDn) {
         g_renderFovStep = (g_renderFovStep + 1) % kRenderFovCount;
         g_renderFovScale = kRenderFovSteps[g_renderFovStep];
@@ -11322,7 +11411,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // HOME: suppress the scissor. The one test that separates "drawn, then clipped by us" from
     // "never drawn at all" - see the note by g_noScissor.
     static bool pHome = false;
-    bool kHome = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+    bool kHome = (DebugKey(VK_HOME) & 0x8000) != 0;
     if (kHome && !pHome) {
         LONG was = InterlockedCompareExchange(&g_noScissor, 0, 0);
         InterlockedExchange(&g_noScissor, was ? 0 : 1);
@@ -11336,7 +11425,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // END: collapse c0 - see the note by g_blankCamMat.
     static bool pEnd = false;
-    bool kEnd = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+    bool kEnd = (DebugKey(VK_END) & 0x8000) != 0;
     if (kEnd && !pEnd) {
         LONG was = InterlockedCompareExchange(&g_blankCamMat, 0, 0);
         InterlockedExchange(&g_blankCamMat, was ? 0 : 1);
@@ -11351,13 +11440,13 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
 
     // DELETE: reverse the mapping, so a confirmed swap can be fixed and verified immediately.
     static bool pDel = false;
-    bool kDel = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+    bool kDel = (DebugKey(VK_DELETE) & 0x8000) != 0;
     if (kDel && !pDel) { LONG was = InterlockedCompareExchange(&g_swapEyes,0,0);
                          InterlockedExchange(&g_swapEyes, was?0:1);
                          Log("DELETE: eye/half assignment %s", was?"NORMAL":"SWAPPED"); }
     pDel = kDel;
     static bool p12 = false;
-    bool k12 = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+    bool k12 = (DebugKey(VK_F12) & 0x8000) != 0;
     if (k12 && !p12) { LONG was = InterlockedCompareExchange(&g_stereo,0,0);
                        InterlockedExchange(&g_stereo, was?0:1);
                        g_eyeFilled[0] = g_eyeFilled[1] = false;
@@ -11369,14 +11458,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                      }
     p12 = k12;
     static bool p10 = false;
-    bool k10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    bool k10 = (DebugKey(VK_F10) & 0x8000) != 0;
     if (k10 && !p10) { LONG was = InterlockedCompareExchange(&g_sixDof,0,0);
                        InterlockedExchange(&g_sixDof, was?0:1);
                        g_haveCentre = false;      // recentre so the offset starts from zero
                        Log("F10: 6-DOF head position %s", was?"OFF":"ON"); }
     p10 = k10;
     static bool p11 = false;
-    bool k11 = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
+    bool k11 = (DebugKey(VK_F11) & 0x8000) != 0;
     if (k11 && !p11) {
         g_offsetStep = (g_offsetStep + 1) % kOffsetStepCount;
         g_offsetUU = kOffsetSteps[g_offsetStep];
@@ -11967,7 +12056,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // The scan runs for exactly one frame. Arming it in Present means it covers the whole of
     // the NEXT frame's constant uploads, so the report is collected on the frame after that.
     static bool p7 = false;
-    bool k7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+    bool k7 = (DebugKey(VK_F7) & 0x8000) != 0;
     if (InterlockedCompareExchange(&g_scanArmed, 0, 0)) {
         InterlockedExchange(&g_scanArmed, 0);
         ReportScan();
@@ -12345,6 +12434,17 @@ void LoadIniSettings() {
         g_occlusionMode == 2 ? "never override - the engine's own occlusion culling stays live"
                              : "refuse to create - WARNING, this crashed the game in run 30");
 
+    // ---- ⭐ run 157: debug mode ----
+    //
+    // Default 1 while this is still being built. The value that ships to anyone else is 0, and the
+    // panel row is what makes that survivable - it can be turned back on from inside the headset
+    // without editing a file or relaunching.
+    InterlockedExchange(&g_debugOn, GetPrivateProfileIntA("Render", "Debug", 1, path) ? 1 : 0);
+    Log("ini: Debug=%ld (%s)", InterlockedCompareExchange(&g_debugOn, 0, 0),
+        InterlockedCompareExchange(&g_debugOn, 0, 0)
+            ? "state readout drawn, every keyboard key live"
+            : "readout hidden, keyboard inert except BACKSPACE (VR mode on/off)");
+
     // The A/B for the readback ordering. Pipelined is the default because it is the better
     // ordering on paper, but "on paper" is exactly what has been wrong six times in this project,
     // so the old ordering stays one relaunch away and the log prints the phase breakdown for
@@ -12601,9 +12701,12 @@ HRESULT STDMETHODCALLTYPE Hook_CreateDevice(IDirect3D9* self, UINT ad, D3DDEVTYP
         // 118 = CreateQuery, the last method on IDirect3DDevice9. Counted forward from
         // SetVertexShaderConstantF at 94, which is independently confirmed working.
         g_origCreateQuery = (PFN_CreateQuery)PatchVTable(*out, 118, (void*)&Hook_CreateQuery);
-        if (!g_origCreateQuery && g_occlusionMode) {
-            Log("*** CreateQuery patch FAILED - leaving occlusion queries alone ***");
-            g_occlusionMode = 0;
+        if (!g_origCreateQuery && g_occlusionMode != 2) {
+            // Forced to 2 for the same reason as the GetData failure above: with no hook the engine
+            // is doing its own culling, and the panel must not offer a mode that cannot happen.
+            Log("*** CreateQuery patch FAILED - leaving occlusion queries alone (mode forced to 2,"
+                " and the panel's OCCLUSION row cannot do anything this run) ***");
+            g_occlusionMode = 2;
         }
         Log("Present + SetVertexShaderConstantF + Draw + SetRenderTarget hooks installed.");
         Log("F7 find the matrix | F1 TRUE stereo | F12 alternate-eye | F10 6-DOF | F9 head tracking");

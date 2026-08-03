@@ -52,6 +52,19 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
+0. **📋 Two more panel rows wanted: `ENABLE VR` and an aim-mode row.**
+   - **`ENABLE VR`** would replace the one keyboard exemption left. Run 157 added `[Render] Debug`,
+     which hides the state readout and makes every keyboard key inert — **except BACKSPACE**, which
+     stays live because the cold start is flat by design (run 37 reverted default-on) and gating it
+     would leave a `Debug=0` launch unable to enter VR at all. Once a panel row can do it, the
+     exemption in `Hook_Present` can go and the gate becomes total. It is marked in the code as the
+     one place a raw `GetAsyncKeyState` is legitimate.
+   - **Aim mode — head aim vs controller aim.** It changes more than aiming (arm visibility among
+     them), so it is a group of behaviours behind one control rather than a single flag, and worth
+     designing as such rather than adding another toggle.
+   - The panel is a safe home for both: opened by holding a controller button and driven by the
+     thumbstick, so it never went through the keyboard gate.
+
 1. **📋 `HideCrosshair=1` needs auto-pad's "in hand" signal, and should be done WITH it.** The
    crosshair itself is found and hidden — `HideCrosshair` in the ini and on the panel, 0 never /
    1 in VR / 2 always. Modes 0 and 2 are solid. **Mode 1 flickers**: `g_handHeld[1]` is the Touch

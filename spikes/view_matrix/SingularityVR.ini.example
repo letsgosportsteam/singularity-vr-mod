@@ -315,8 +315,56 @@ HeadRoll=1
 ; tried it and the game died between the splash screens and the main menu -
 ; consistent with the unchecked-NULL-from-a-factory habit already recorded for
 ; Raven's code. Kept only so nobody retries it.
+;
+; ---- run 157: ON THE VR PANEL, and modes 0-2 only ----
+;
+; Tested across the opening area, mode 2 dropped more frames than mode 0 - a
+; comparison that can only be made by playing the same stretch both ways, which
+; is why it moved to the panel. OCCLUSION reads AUTO / DRAW ALL / ENGINE CULL
+; for modes 0, 1 and 2. Mode 3 is unreachable from the panel because it crashes;
+; it is settable here only so the fact stays recorded.
+;
+; ⚠️ The GetData vtable patch is now installed UNCONDITIONALLY. It used to be
+; skipped when this started at 2, which meant switching to 0 or 1 later did
+; nothing at all - the hook the new mode needs was never installed, and there is
+; no second chance. On mode 2 the patch is a plain pass-through and costs
+; nothing. If either patch fails, the mode is forced to 2 and the log says so,
+; because with no hook the engine's own culling is what is actually running and
+; the panel must not display a mode that cannot happen.
 ; ---------------------------------------------------------------------------
 OcclusionQueryMode=0
+
+; ---------------------------------------------------------------------------
+; Debug   -- the developer scaffolding, on/off (run 157)
+;
+; Everything this mod grew while being built: the on-screen state readout, and
+; forty-odd hotkeys for toggling and tuning. None of it belongs in front of
+; someone playing the game.
+;
+;   1 = readout drawn, every keyboard key live                   <- default
+;   0 = readout hidden, keyboard inert except BACKSPACE
+;
+; Only an advanced user needs any of those keys, and for everyone else the
+; controller is the whole interface. The VR panel is unaffected: it is opened by
+; HOLDING a controller button and driven by the thumbstick, so it never went
+; through the keyboard gate, and DEBUGGING on the panel turns this back on from
+; inside the headset without editing a file or relaunching.
+;
+; ⚠️ EXACTLY ONE KEY IS EXEMPT: **BACKSPACE**, VR mode on/off. Every other key is
+; recoverable - turn DEBUGGING back on and they return - but switching in and out
+; of VR is not scaffolding, and the cold start is flat by design (run 37 reverted
+; default-on) with no ENABLE VR setting yet, so gating it would leave a Debug=0
+; launch unable to enter VR at all.
+;
+; F8 is NOT exempt. The controller's MENU tap already recentres, so losing it
+; costs nothing.
+;
+; Implemented as one gate, not a conditional wrapped round eight hundred lines:
+; every key reads through DebugKey() instead of GetAsyncKeyState(). There is one
+; exception inside Present and it is BACKSPACE, so any other raw GetAsyncKeyState
+; there is a bug and greps as one.
+; ---------------------------------------------------------------------------
+Debug=1
 
 ; ---------------------------------------------------------------------------
 ; FrameCopyMode   -- the performance measurement (run 31)
