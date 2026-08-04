@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-04** (end of run 177). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-04** (end of run 179). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -653,7 +653,43 @@ hand tracking. The gun visibly jumps to the user's actual hand. Everything measu
 > zero-point calibration — **was wrong** and is replaced. It would not have explained the gun
 > jumping to a bare hand.
 
-### ⚠️ What that means for the fix
+### 🛑 Runs 178–179: `xrGetCurrentInteractionProfile` CANNOT detect it. Built, tested, reverted.
+
+The obvious fix — ask the runtime whether each hand is still bound to the controller profile — **does
+not work on this runtime**, and the result is clean enough to be worth never repeating:
+
+```
+line  43: left hand is now NOT a controller  - (none - runtime bound nothing)
+line 491: left hand is now A CONTROLLER      - /interaction_profiles/oculus/touch_controller
+```
+
+**Four transitions, all at startup and pickup.** Setting the controllers down mid-session produced
+**none** — first with the `INTERACTION_PROFILE_CHANGED` event, then again with a 500 ms poll to rule
+out a missing event. The profile stays `touch_controller` throughout hand tracking; `XR_NULL_PATH`
+only appears before controllers have ever been seen.
+
+So the profile is not a usable signal here, and the code was reverted rather than left in place
+doing nothing.
+
+### ⚠️ And the scope was wrong, which is the more useful lesson
+
+The user asked, correctly, *"what are you trying to do here? we have a fix already that blocks the
+triggers and prevents the framerate tanks."*
+
+Two motivations, neither of which justified three test runs:
+
+1. **Replacing a working heuristic with a more principled one.** The trigger-touch veto is an
+   inference, and this file is full of notes preferring real signals — but that instinct was applied
+   without asking whether it bought anything. It does not. The veto has worked since run 156.
+2. **Stopping the gun snapping to a bare hand.** Cosmetic, visible only when the controllers are
+   already down and nobody is playing. The user had already said *"I guess that is ok?"* — which was
+   the answer, not a problem statement.
+
+**The framerate tank was already solved.** A solved problem was turned into three more headset runs.
+Worth remembering next to the fact that the same session's genuine wins — the video probe, the drift
+detector — came from measuring a symptom someone actually reported.
+
+### ⚠️ What a real fix would need (if the gun snap ever does matter)
 
 **The trigger-touch veto is treating a symptom.** It zeroes trigger *values* only, so the poses keep
 arriving and the gun keeps tracking a hand that is holding nothing. It cannot fix what was observed.
