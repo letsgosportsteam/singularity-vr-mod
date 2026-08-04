@@ -689,23 +689,26 @@ Two motivations, neither of which justified three test runs:
 Worth remembering next to the fact that the same session's genuine wins — the video probe, the drift
 detector — came from measuring a symptom someone actually reported.
 
-### ⚠️ What a real fix would need (if the gun snap ever does matter)
+### 📋 What is left, and why it is probably not worth doing
 
-**The trigger-touch veto is treating a symptom.** It zeroes trigger *values* only, so the poses keep
-arriving and the gun keeps tracking a hand that is holding nothing. It cannot fix what was observed.
+**The trigger-touch veto treats a symptom, and that is fine.** It zeroes trigger *values* only, so
+under hand tracking the poses keep arriving and the gun keeps tracking a bare hand. The veto does
+not fix that and cannot.
 
-The real condition is *"the runtime has handed input to hand tracking"*, and
-**`xrGetCurrentInteractionProfile` answers that per hand directly** — a first-class question to the
-runtime instead of an inference from a capacitive sensor that run 155 showed unreliable in both
-directions. While hand tracking is active the correct behaviour is one rule: treat the controllers
-as absent. No triggers, no poses, no gun.
+But the remaining symptom is **cosmetic** — the gun follows your hand while the controllers are down
+and nobody is playing — and the user's own verdict was *"I guess that is ok?"*. The framerate tank,
+which is what actually made the mod unpleasant, has been solved since run 156.
 
-That would supersede the trigger veto, `g_handHeld`, and the framing of the whole runs 67–75 judder
-investigation — which spent nine runs on "pad ON + controllers on desk" without ever knowing the
-runtime had swapped input sources underneath it.
+The obvious signal for a proper fix is **dead**: `xrGetCurrentInteractionProfile` cannot see the
+hand-over on this runtime (runs 178–179 above, with the evidence). What is left is speculative:
 
-📋 **Not built.** It is input gating, it wants its own test pass, and run 172 is a fresh reminder of
-what an untested binding change costs.
+- **`XR_EXT_hand_tracking`** — if the runtime exposes it, actively-tracked hand joints would be a
+  direct answer. Unverified, and it needs an extension this mod does not currently request.
+- Anything else would be another inference, which is what the veto already is.
+
+⚠️ **The bar for reopening this is high.** Three headset runs went into the profile approach for a
+cosmetic gain on an already-solved problem. If it is picked up again, it should be because the gun
+snap is genuinely bothering someone in play — not because the veto is a heuristic.
 
 ### ⚠️ Method note: the instrument said "no effect" while the user watched the effect happen
 
