@@ -1,4 +1,4 @@
-# HISTORY — the run log, runs 1–179
+# HISTORY — the run log, newest first
 
 Split out of `STATUS.md` on 2026-08-04. **Everything here was moved verbatim; nothing was
 deleted.** `STATUS.md` holds current state and is the file to read first.

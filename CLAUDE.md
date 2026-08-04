@@ -7,10 +7,10 @@ beside the game exe. No game files are modified.
 
 | File | What it is | When |
 |---|---|---|
-| `STATUS.md` | **Current state + what to do next.** ~340 lines | Always, first |
+| `STATUS.md` | **Current state + what to do next.** ~400 lines | Always, first |
 | `ENGINE_NOTES.md` | Engine internals, addresses, structures, Ghidra findings | When touching the engine |
 | `ENVIRONMENT.md` | Paths, toolchain, game copies | When a path is unclear |
-| `HISTORY.md` | The run log, runs 1–179. ~3,600 lines | **Search, don't read.** See below |
+| `HISTORY.md` | The run log, newest first. ~3,700 lines | **Search, don't read.** See below |
 
 **Do not read `HISTORY.md` cold** — it is roughly 55k tokens and almost none of it is current. Go
 there for one job: before building on a premise you inherited, check what actually measured it.
@@ -66,6 +66,9 @@ These are earned, not generic. The long-form versions are under *Method notes* i
 ## Doc hygiene
 
 `STATUS.md` is current state. When something ships, **update the existing claim rather than
-appending a new one** — the four ⛔ banners in `HISTORY.md` all exist because a status section was
-appended past instead of edited, and then read as fact months later. Run narrative belongs in
-`HISTORY.md`, newest at the top.
+appending a new one** — every ⛔ **SUPERSEDED** banner in `HISTORY.md` exists because a status
+section was appended past instead of edited, and then read as fact months later. Run narrative
+belongs in `HISTORY.md`, newest at the top.
+
+Numbers in prose go stale within hours. Prefer "newest first" to "runs 1–179", and a rough size to
+an exact line count — this file claimed both within a day of being written.
