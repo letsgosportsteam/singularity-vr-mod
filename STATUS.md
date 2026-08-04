@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-04** (end of run 176). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-04** (end of run 177). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -229,6 +229,42 @@ so in the log on the first save*.
 Reported as "there are no \*s around restart". `GlyphIndex` returns space for anything unknown, so
 `*RESTART*` drew as ` RESTART ` — **and the `>` / `<` on the page rows had been invisible since they
 were added.** Glyphs added rather than reworded around, and the fallback now carries a warning.
+
+### 🛑 Run 177: the menus report `CINE YES`, and that invalidates run 176's test
+
+**On-screen readout in both menus: `MODE 3 AUTO · ROT MATRIX · CINE YES · FOLD OFF · HELD 0`.**
+
+So `g_inCinematic` is TRUE in the menus. The run-176 switch reads
+`if (inCine || (gameOwnsCam && followMenuCam))` — **`inCine` short-circuits it**, so
+`MenuCameraFollow=0` was inert in a menu and the cutscene branch anchored the base anyway. The A/B
+returned "no change" because **nothing changed**, not because the hypothesis is wrong. The switch
+was left outside the cutscene path on the assumption that menus and cutscenes are different
+conditions; they are not.
+
+`HELD 0` is the other half — the engine keeps *none* of our written yaw in menus, against ~100% in
+gameplay. And `YAW 89`, which is the +89.5° that has been showing up since run 167.
+
+### 📋 The real shape, from the user's own testing
+
+Two menus share one 3D scene. **Menu 1** is the ocean/title scene, first after the splash screens.
+**Menu 2** is the options menu, set in a room with that same ocean visible *in the background*.
+Exiting gameplay lands you in menu 2; you go back to reach menu 1.
+
+| | menu 1 | menu 2 |
+|---|---|---|
+| first entry after splash screens | **no 6-DOF** | water correct |
+| entered after exiting gameplay | **6-DOF works** | **water moves with you** |
+
+So it is not "6-DOF is broken in menus" — it is a **trade-off between two states**, and the second
+symptom is the diagnostic one: **a distant backdrop moving with head translation is a skybox
+receiving a positional offset it should not get.** Background geometry belongs at infinity and must
+take rotation only.
+
+That reframes it. The question is not "why is 6-DOF off in menu 1" but "why does the same scene
+sometimes get the offset and sometimes not, and why does the backdrop take it when it does".
+
+📋 **Tabled at the user's request.** Nothing here is a guess — the states are reproducible and the
+readout names them.
 
 ### 🎯 6-DOF in the main menu — a named suspect, and a switch to test it (run 176)
 

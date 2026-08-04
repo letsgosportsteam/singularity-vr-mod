@@ -4550,6 +4550,18 @@ bool InitXRInput() {
                 GetPrivateProfileIntA("Input", "SwapSticks", 0, path) ? 1 : 0);
             InterlockedExchange(&g_menuCameraFollow,
                 GetPrivateProfileIntA("Input", "MenuCameraFollow", 1, path) ? 1 : 0);
+            // ⚠️ Logged because run 176's A/B could not be read without opening the ini by hand -
+            // after a whole session spent on settings that could not be verified from their own log.
+            //
+            // ⚠️ AND BECAUSE IT DOES NOT DO WHAT ITS NAME SAYS: the menus report CINE YES, so the
+            // cutscene branch anchors the base there regardless of this switch. Turning it off
+            // changes nothing in a menu. See the run-177 note in STATUS.
+            Log("ini: MenuCameraFollow=%ld (%s)",
+                InterlockedCompareExchange(&g_menuCameraFollow, 0, 0),
+                InterlockedCompareExchange(&g_menuCameraFollow, 0, 0)
+                    ? "base follows the game's camera when it owns it"
+                    : "base left alone - BUT menus report CINE YES, so the cutscene path still"
+                      " anchors it there and this switch is inert in menus");
             if (g_leftHanded)
                 Log("input: LEFT-HANDED - gun and buttons mirrored. Sticks are NOT swapped (that is"
                     " SwapSticks). MENU stays on the LEFT controller: the Touch profile has no"
