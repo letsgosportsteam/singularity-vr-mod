@@ -3949,7 +3949,7 @@ inline SHORT DebugKey(int vk) {
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
 enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
        PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
-       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND,
+       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND, PR_MENUCAM,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -3973,9 +3973,9 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
       PR_LEFTHAND, PR_BACK },
     { PR_CINESTICK, PR_CINECAM, PR_BACK },
     { PR_CROSSHAIR, PR_BACK },
-    { PR_OCCLUSION, PR_DEBUG, PR_BACK },
+    { PR_OCCLUSION, PR_DEBUG, PR_MENUCAM, PR_BACK },
 };
-const int kPageCount[kPanelPages] = { 6, 8, 3, 2, 3 };
+const int kPageCount[kPanelPages] = { 6, 8, 3, 2, 4 };
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -4035,6 +4035,7 @@ extern volatile LONG g_hideCrosshair;
 extern volatile LONG g_cineStickTurn;
 extern volatile LONG g_cutsceneLockCamera;
 extern volatile LONG g_swapSticks;
+extern volatile LONG g_menuCameraFollow;
 extern int g_leftHanded, g_leftHandedPending;
 // Defined with the handedness globals; the panel's MOVE DIRECTION row is the first thing to read it.
 inline int OffHand() { return g_leftHanded ? 1 : 0; }
@@ -4113,6 +4114,10 @@ void PanelSaveRow(int rowId, const char* path) {
             // The PENDING value, not the live one - see the LEFT HANDED row.
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_leftHandedPending);
             WritePrivateProfileStringA("Input", "LeftHanded", v, path); return;
+        case PR_MENUCAM:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_menuCameraFollow, 0, 0));
+            WritePrivateProfileStringA("Input", "MenuCameraFollow", v, path); return;
 
         case PR_GOTO_CTRL: case PR_GOTO_COMFORT: case PR_GOTO_DISPLAY: case PR_GOTO_ADV:
         case PR_BACK:
@@ -4213,6 +4218,10 @@ void PanelRowText(int row, char* out, size_t cap) {
             _snprintf_s(out, cap, _TRUNCATE, "CUTSCENE CAM   %s",
                         InterlockedCompareExchange(&g_cutsceneLockCamera, 0, 0) ? "LOCKED"
                                                                                 : "FOLLOWS SCENE");
+            break;
+        case PR_MENUCAM:
+            _snprintf_s(out, cap, _TRUNCATE, "MENU CAM       %s",
+                        InterlockedCompareExchange(&g_menuCameraFollow, 0, 0) ? "FOLLOW" : "IGNORE");
             break;
         case PR_GOTO_CTRL:    _snprintf_s(out, cap, _TRUNCATE, "CONTROLLER         >"); break;
         case PR_GOTO_COMFORT: _snprintf_s(out, cap, _TRUNCATE, "COMFORT            >"); break;
@@ -4316,6 +4325,10 @@ void PanelAdjust(int row, int dir) {
             break;
         // Navigation. Page changes reset the cursor, and `return` skips the dirty flag - moving
         // between pages is not a settings change and must not make PanelSave write on close.
+        case PR_MENUCAM:
+            InterlockedExchange(&g_menuCameraFollow,
+                                InterlockedCompareExchange(&g_menuCameraFollow, 0, 0) ? 0 : 1);
+            break;
         case PR_GOTO_CTRL:    g_panelPage = 1; g_panelRow = 0; return;
         case PR_GOTO_COMFORT: g_panelPage = 2; g_panelRow = 0; return;
         case PR_SWAPSTICKS:
@@ -4435,6 +4448,10 @@ int g_leftHanded = 0;                    // ini [Input] LeftHanded - read before
 int g_leftHandedPending = 0;
 volatile LONG g_swapSticks = 0;          // ini [Input] SwapSticks - live, on the CONTROLLER page
 
+// The run-168 menu camera follow, behind a switch so it can be A/B tested against menu 6-DOF.
+// 1 is current behaviour; 0 leaves the base alone in menus the way it was before run 167.
+volatile LONG g_menuCameraFollow = 1;    // ini [Input] MenuCameraFollow
+
 // Which hand the gun and aim follow. The only thing the four aim sites need to know.
 inline int AimHand() { return g_leftHanded ? 0 : 1; }
 extern volatile LONG g_inCinematic;
@@ -4531,6 +4548,8 @@ bool InitXRInput() {
                 GetPrivateProfileIntA("Input", "LeftHanded", 0, path) ? 1 : 0;
             InterlockedExchange(&g_swapSticks,
                 GetPrivateProfileIntA("Input", "SwapSticks", 0, path) ? 1 : 0);
+            InterlockedExchange(&g_menuCameraFollow,
+                GetPrivateProfileIntA("Input", "MenuCameraFollow", 1, path) ? 1 : 0);
             if (g_leftHanded)
                 Log("input: LEFT-HANDED - gun and buttons mirrored. Sticks are NOT swapped (that is"
                     " SwapSticks). MENU stays on the LEFT controller: the Touch profile has no"
@@ -5956,8 +5975,32 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                     Log("camera back under our control - base yaw resumes");
                 }
 
+                // ---- ⭐ run 176: the follow is switchable, to A/B it against menu 6-DOF ----
+                //
+                // The user spotted a timeline I had stopped tracking: the main menu looked right
+                // BEFORE run 167/168, which is when the base started coming from the camera. There
+                // is a mechanism connecting the two, and it is not subtle -
+                //
+                //     g_hmdOffset is rotated into world space by g_baseYaw
+                //
+                // - so with the base at the menu camera's +89.5 deg instead of the controller's ~0,
+                // leaning forward pushes you sideways. The offset keeps its full magnitude, which
+                // is exactly what the run-175 probe measured, while the motion goes somewhere
+                // unrelated to your head. That reads as "6-DOF does not work" long before it reads
+                // as "6-DOF is rotated 90 degrees".
+                //
+                // ⚠️ Switchable rather than reverted: rebuilding an old state risks differing from
+                // it in some other way, and this isolates ONE variable in one session. The cutscene
+                // anchor is deliberately NOT behind the switch - that fix is confirmed good and is
+                // a different condition (g_inCinematic).
+                //
+                // If this proves it, the fix is not the toggle: the base must feed the VIEW YAW
+                // without also rotating the POSITIONAL offset. The toggle only settles which change
+                // caused it.
                 const bool inCine = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0;
-                if (inCine || gameOwnsCam) {
+                const bool followMenuCam =
+                    InterlockedCompareExchange(&g_menuCameraFollow, 0, 0) != 0;
+                if (inCine || (gameOwnsCam && followMenuCam)) {
                     if (!g_haveCineAnchor) { g_cineAnchorYaw = camYaw; g_haveCineAnchor = true; }
                     // The frozen-anchor option is a CUTSCENE comfort setting and must not apply to
                     // menus: freezing there would reintroduce the rotation this fixes.

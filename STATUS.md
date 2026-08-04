@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-04** (end of run 175). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-04** (end of run 176). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -230,7 +230,34 @@ Reported as "there are no \*s around restart". `GlyphIndex` returns space for an
 `*RESTART*` drew as ` RESTART ` — **and the `>` / `<` on the page rows had been invisible since they
 were added.** Glyphs added rather than reworded around, and the fallback now carries a warning.
 
-### 📋 6-DOF in the main menu — measured, not resolved
+### 🎯 6-DOF in the main menu — a named suspect, and a switch to test it (run 176)
+
+**The user supplied the lead by noticing a timeline I had stopped tracking:** the main menu looked
+right *before* runs 167/168, which is when the base started coming from the camera.
+
+There is a mechanism, and it is not subtle:
+
+```c
+const float baseYawRad = g_baseYaw * (2π/65536);
+g_hmdOffset[0] = (bc * fwdAmt - bs * rightAmt) * kMetresToUU;
+```
+
+**The 6-DOF offset is rotated into world space by `g_baseYaw`.** In menus that is now the camera's
+yaw — measured at **+89.5°** — where before it was the controller's, near zero. So leaning forward
+pushes you sideways. The offset keeps full magnitude, which is exactly what the run-175 probe
+measured, while the motion goes somewhere unrelated to the head. **That reads as "6-DOF doesn't
+work" long before it reads as "6-DOF is rotated 90°"** — and it explains why every number in the log
+looked healthy.
+
+`[Input] MenuCameraFollow` (default 1, `MENU CAM` on the ADVANCED page) switches the run-168 follow
+off so the two states can be compared in one session. The cutscene anchor is deliberately **not**
+behind it — that fix is confirmed and keys on a different condition.
+
+> ⚠️ If confirmed, **the toggle is not the fix.** The follow is what fixed the menu *rotation*, so
+> rotation and 6-DOF would be broken by the same change. The real fix is for the base to feed the
+> **view yaw** without also rotating the **positional offset**.
+
+### 📋 The original measurement
 
 The menu is a real 3D scene, renders in stereo, and does not respond to head movement. Every usual
 suspect is clean: one recentre, `pos valid 1 tracked 1`, zero identification failures, **153 of 153
