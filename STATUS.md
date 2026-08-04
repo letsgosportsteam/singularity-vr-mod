@@ -2,8 +2,8 @@
 
 Last updated **2026-08-04** (end of run 180). Read this first, then `ENGINE_NOTES.md`.
 
-**This file is current state only.** The run-by-run log for runs 1–180 moved to `HISTORY.md` on
-2026-08-04 — you do not need it cold, but go there before building on any premise you inherited.
+**This file is current state only.** The run-by-run log moved to `HISTORY.md` on 2026-08-04 — you
+do not need it cold, but go there before building on any premise you inherited.
 It also flags, with ⛔ banners, four status claims that had gone stale in place.
 
 > ### ⭐ Run 180: UE3 yaw deltas were never wrapped, and it cost months of misattribution
