@@ -7769,8 +7769,58 @@ static bool FgMatchesSignature(UINT verts) {
 // side.
 const int kLatchSteady = 30;    // ~0.25 s at 120 fps
 const int kLatchMiss   = 240;   // ~2 s of the mesh genuinely not being drawn
+
+// ---- diagnostic: is the gun ONE mesh in two states, or TWO meshes? ----
+//
+// Measured across four runs with the player holding a SINGLE weapon, the latch took gun=5799 in
+// two of them and gun=11387 in the other two, and one run dropped 11387 and re-took 5799 mid-run.
+// A vertex count that is not stable for one weapon is not an identifier, and the two readings
+// need opposite fixes:
+//
+//   both counts present in the SAME frame's list  -> two coexisting meshes, and the latch is
+//                                                    picking whichever sorts first. Fix is
+//                                                    ordering / a set, per Next-session item 5.
+//   only ever one at a time                       -> one mesh changing state (LOD, attachment,
+//                                                    reload pose). A set of counts would NOT help;
+//                                                    the identifier has to stop being vertex count.
+//
+// So log the WHOLE list, not the top two, at both latch events - and separately flag the first
+// frame in which both known counts appear together, since that single line settles it outright.
+// Costs nothing when nothing is happening: the census line only prints when the list changes.
+void LogFgList(const char* why) {
+    const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
+    char buf[256]; int off = 0;
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i) {
+        const LONG v = InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0);
+        const int w = sprintf_s(buf + off, sizeof(buf) - off, "%s[%ld]=%ld", i ? " " : "", i, v);
+        if (w <= 0) break;
+        off += w;
+    }
+    if (!n) sprintf_s(buf, sizeof(buf), "(empty)");
+    Log("fg census (%s): %ld entr%s: %s", why, n, n == 1 ? "y" : "ies", buf);
+}
+
+// Prints once, the first time both counts are in one frame's list. One line answers the question.
+void CheckFgCoexist() {
+    static bool reported = false;
+    if (reported) return;
+    const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
+    bool a = false, b = false;
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i) {
+        const LONG v = InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0);
+        if (v == 5799)  a = true;
+        if (v == 11387) b = true;
+    }
+    if (a && b) {
+        reported = true;
+        LogFgList("BOTH counts present in ONE frame - they are TWO meshes, not one changing state");
+    }
+}
+
 void UpdateFgLatch() {
     if (!InterlockedCompareExchange(&g_hideMeshIdx, 0, 0)) return;   // no mode wants the meshes
+
+    CheckFgCoexist();
 
     const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
     const LONG gun  = InterlockedCompareExchange(&g_gunVerts, 0, 0);
@@ -7786,6 +7836,7 @@ void UpdateFgLatch() {
         InterlockedExchange(&g_armsVerts, 0);
         Log("mesh latch: gun=%ld has not been drawn for %d frames - dropping the latch and"
             " re-taking it from what is on screen now", gun, kLatchMiss);
+        LogFgList("at the DROP - this is what it will re-take from");
         return;
     }
 
@@ -7802,6 +7853,7 @@ void UpdateFgLatch() {
     InterlockedExchange(&g_gunVerts,  a);
     InterlockedExchange(&g_armsVerts, b);
     Log("mesh latch: gun=%ld verts, arms=%ld verts (steady for %d frames)", a, b, kLatchSteady);
+    LogFgList("at the TAKE - everything that was on screen when this was chosen");
 }
 
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
