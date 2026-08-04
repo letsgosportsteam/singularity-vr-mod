@@ -4518,6 +4518,23 @@ volatile LONG g_swapSticks = 0;          // ini [Input] SwapSticks - live, on th
 
 // Which hand the gun and aim follow. The only thing the four aim sites need to know.
 inline int AimHand() { return g_leftHanded ? 0 : 1; }
+
+// ---- ⚠️ run 180: the shortest angle between two UE3 yaws. Two sites had this WRONG ----
+//
+// UE3 rotation is 65536 units per turn, and a plain int32 subtraction does NOT wrap - two headings
+// 0.3 deg apart can differ by 65590 units, which reads as 360.3 deg. Both the drift log and the
+// camera-ownership test carried a `// wraps correctly` comment claiming otherwise, and both were
+// measured producing exactly that: 20 spurious "camera handed to the GAME (360.3 deg from the
+// pawn)" events in one run, each re-anchoring g_baseYaw to the camera and yanking the view
+// somewhere the player was not looking. Reported as "phantom snap turns"; there were no snap
+// turns at all, the run was in smooth mode and fired zero.
+//
+// Casting the difference to int16_t is the wrap: 65536 units IS 2^16, so the truncation lands the
+// result in [-32768, 32767] - the shortest signed path - for free. Use this for every yaw
+// comparison; a raw subtraction is only safe if you can prove both sides are already normalised,
+// and nothing here normalises them.
+inline int32_t YawDelta(int32_t a, int32_t b) { return (int16_t)(a - b); }
+inline float   YawDeltaDeg(int32_t a, int32_t b) { return YawDelta(a, b) * (360.0f / 65536.0f); }
 extern volatile LONG g_inCinematic;
 
 // The player's own turn during a cutscene, added on top of whichever base is in use. Separate from
@@ -6072,7 +6089,7 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
 
                 // ---- the drift log: diagnostic only, says nothing on a clean run ----
                 {
-                    const float driftDeg = (camYaw - g_wantYaw) * kUU2Deg;  // wraps correctly
+                    const float driftDeg = YawDeltaDeg(camYaw, g_wantYaw);
                     static ULONGLONG lastSaid = 0;
                     const ULONGLONG now = GetTickCount64();
                     if (fabsf(driftDeg) > 5.0f && (!lastSaid || now - lastSaid > 1000)) {
@@ -6114,8 +6131,7 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                     if (Readable((void*)(ctl + ACTOR_ROTATION), 12))
                         ctlYaw = reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1];
 
-                const int32_t apart = camYaw - ctlYaw;          // wraps correctly
-                const float apartDeg = fabsf(apart * (360.0f / 65536.0f));
+                const float apartDeg = fabsf(YawDeltaDeg(camYaw, ctlYaw));
                 const int32_t kOwnDeg = 15;
                 static int above = 0, below = 0;
                 static bool gameOwnsCam = false;
