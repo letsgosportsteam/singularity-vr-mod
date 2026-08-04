@@ -3949,7 +3949,7 @@ inline SHORT DebugKey(int vk) {
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
 enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
        PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
-       PR_CINESTICK, PR_CINECAM,
+       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -3969,12 +3969,13 @@ const int kPanelPages    = 5;
 const int kPanelRowsMax  = 8;
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV },
-    { PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_MOVEDIR, PR_BACK },
+    { PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_MOVEDIR, PR_SWAPSTICKS,
+      PR_LEFTHAND, PR_BACK },
     { PR_CINESTICK, PR_CINECAM, PR_BACK },
     { PR_CROSSHAIR, PR_BACK },
     { PR_OCCLUSION, PR_DEBUG, PR_BACK },
 };
-const int kPageCount[kPanelPages] = { 6, 6, 3, 2, 3 };
+const int kPageCount[kPanelPages] = { 6, 8, 3, 2, 3 };
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -4033,6 +4034,96 @@ extern volatile LONG g_hideCrosshair;
 // Defined beside the turn code, which is the first thing that reads them.
 extern volatile LONG g_cineStickTurn;
 extern volatile LONG g_cutsceneLockCamera;
+extern volatile LONG g_swapSticks;
+extern int g_leftHanded, g_leftHandedPending;
+// Defined with the handedness globals; the panel's MOVE DIRECTION row is the first thing to read it.
+inline int OffHand() { return g_leftHanded ? 1 : 0; }
+
+// Written on CLOSE, not on every change. Changes apply live so turn speed can be felt while the
+// stick is moving, but the file only ever receives a value that was settled on - a mis-set number
+// you immediately corrected never reaches the ini at all.
+// ---- ⭐ run 171: coverage is guaranteed by the PAGE TABLES, not by remembering ----
+//
+// "Shouldn't all settings be in PanelSave" - yes, and a comment saying so was not enough. Two rows
+// were adjustable on the panel and written nowhere: CUTSCENE CAM, which was reported reverting every
+// launch, and CUTSCENE TURN, which had the same bug and had not been noticed yet.
+//
+// So PanelSave no longer has its own list to fall out of step with. It walks kPageRows - the same
+// tables that build the UI - and asks this function to write each row. A row added to a page and not
+// added here now hits the default case and SAYS SO in the log, on the very first save, instead of
+// being discovered weeks later as "my setting does not stick".
+//
+// Nav rows return silently; they have nothing to persist.
+void PanelSaveRow(int rowId, const char* path) {
+    char v[32];
+    switch (rowId) {
+        // ⚠️ StartInVr is the panel's LIVE VR mode, saved so the state you leave it in is the next
+        // cold start. BACKSPACE deliberately does not save - it is a toggle, not a setting, and a
+        // key you press to peek at the flat game should not change how the game launches tomorrow.
+        case PR_ENABLEVR:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", VrModeOn() ? 1 : 0);
+            WritePrivateProfileStringA("Render", "StartInVr", v, path); return;
+        case PR_AIMMETHOD:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_aimMethod, 0, 0));
+            WritePrivateProfileStringA("Input", "AimMethod", v, path); return;
+        case PR_MOVEDIR:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_walkDirection);
+            WritePrivateProfileStringA("Input", "WalkDirection", v, path); return;
+        case PR_TURNMODE:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_turnMode);
+            WritePrivateProfileStringA("Input", "TurnMode", v, path); return;
+        case PR_TURNSPEED:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%.0f", g_turnSpeedDeg);
+            WritePrivateProfileStringA("Input", "TurnSpeed", v, path); return;
+        case PR_SNAPANGLE:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%.0f", g_turnAngleDeg);
+            WritePrivateProfileStringA("Input", "TurnAngle", v, path); return;
+        case PR_TURNDIR:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_turnSign);
+            WritePrivateProfileStringA("Input", "TurnSign", v, path); return;
+        case PR_HEADROLL:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_rollOn, 0, 0));
+            WritePrivateProfileStringA("Render", "HeadRoll", v, path); return;
+        case PR_CROSSHAIR:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_hideCrosshair, 0, 0));
+            WritePrivateProfileStringA("Render", "HideCrosshair", v, path); return;
+        case PR_OCCLUSION:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_occlusionMode);
+            WritePrivateProfileStringA("Render", "OcclusionQueryMode", v, path); return;
+        case PR_DEBUG:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_debugOn, 0, 0));
+            WritePrivateProfileStringA("Render", "Debug", v, path); return;
+        case PR_CINESTICK:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_cineStickTurn, 0, 0));
+            WritePrivateProfileStringA("Input", "CutsceneStickTurn", v, path); return;
+        case PR_CINECAM:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_cutsceneLockCamera, 0, 0));
+            WritePrivateProfileStringA("Input", "CutsceneLockCamera", v, path); return;
+        case PR_SWAPSTICKS:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_swapSticks, 0, 0));
+            WritePrivateProfileStringA("Input", "SwapSticks", v, path); return;
+        case PR_LEFTHAND:
+            // The PENDING value, not the live one - see the LEFT HANDED row.
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_leftHandedPending);
+            WritePrivateProfileStringA("Input", "LeftHanded", v, path); return;
+
+        case PR_GOTO_CTRL: case PR_GOTO_COMFORT: case PR_GOTO_DISPLAY: case PR_GOTO_ADV:
+        case PR_BACK:
+            return;                                   // navigation, nothing to persist
+
+        default:
+            Log("VR panel: row %d is on a page but has NO PanelSave entry - it will NOT persist."
+                " Add a case to PanelSaveRow.", rowId);
+            return;
+    }
+}
 
 // Written on CLOSE, not on every change. Changes apply live so turn speed can be felt while the
 // stick is moving, but the file only ever receives a value that was settled on - a mis-set number
@@ -4040,34 +4131,11 @@ extern volatile LONG g_cutsceneLockCamera;
 void PanelSave() {
     char path[MAX_PATH]{};
     if (!IniPath(path)) { Log("VR panel: no ini path - settings NOT saved"); return; }
-    char v[32];
     // WritePrivateProfileString edits in place: comments, ordering and unrelated keys all survive.
-    // The row shows the LIVE state and saving it makes that state the next cold start, which is
-    // what "the panel remembers" has meant for every other row here. BACKSPACE deliberately does
-    // not save - it is a toggle, not a setting, and a key you press to peek at the flat game should
-    // not silently change how the game launches tomorrow.
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", VrModeOn() ? 1 : 0);
-    WritePrivateProfileStringA("Render", "StartInVr", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_aimMethod, 0, 0));
-    WritePrivateProfileStringA("Input", "AimMethod", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_turnMode);
-    WritePrivateProfileStringA("Input", "TurnMode",  v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%.0f", g_turnSpeedDeg);
-    WritePrivateProfileStringA("Input", "TurnSpeed", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%.0f", g_turnAngleDeg);
-    WritePrivateProfileStringA("Input", "TurnAngle", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_turnSign);
-    WritePrivateProfileStringA("Input", "TurnSign",  v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_rollOn, 0, 0));
-    WritePrivateProfileStringA("Render", "HeadRoll", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_walkDirection);
-    WritePrivateProfileStringA("Input", "WalkDirection", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_hideCrosshair, 0, 0));
-    WritePrivateProfileStringA("Render", "HideCrosshair", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d",  g_occlusionMode);
-    WritePrivateProfileStringA("Render", "OcclusionQueryMode", v, path);
-    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", InterlockedCompareExchange(&g_debugOn, 0, 0));
-    WritePrivateProfileStringA("Render", "Debug", v, path);
+    // Every page, every row - so the set that is SAVED is by construction the set that is SHOWN.
+    for (int page = 0; page < kPanelPages; ++page)
+        for (int i = 0; i < kPageCount[page]; ++i)
+            PanelSaveRow(kPageRows[page][i], path);
     Log("VR panel: saved to %s", path);
 }
 
@@ -4089,7 +4157,7 @@ void PanelRowText(int row, char* out, size_t cap) {
             // the failure mode this project keeps getting caught by - so it says so.
             _snprintf_s(out, cap, _TRUNCATE, "MOVE DIRECTION %s",
                         g_walkDirection == 0    ? "HEAD" :
-                        g_handPoseValid[0]      ? "HAND" : "HAND (NO TRACKING)");
+                        g_handPoseValid[OffHand()]      ? "HAND" : "HAND (NO TRACKING)");
             break;
         case PR_TURNMODE:
             // "GAME TURN" rather than "GAME DEFAULT": it is not this mod's default and calling it
@@ -4148,6 +4216,17 @@ void PanelRowText(int row, char* out, size_t cap) {
             break;
         case PR_GOTO_CTRL:    _snprintf_s(out, cap, _TRUNCATE, "CONTROLLER         >"); break;
         case PR_GOTO_COMFORT: _snprintf_s(out, cap, _TRUNCATE, "COMFORT            >"); break;
+        case PR_SWAPSTICKS:
+            _snprintf_s(out, cap, _TRUNCATE, "SWAP STICKS    %s",
+                        InterlockedCompareExchange(&g_swapSticks, 0, 0) ? "ON" : "OFF");
+            break;
+        case PR_LEFTHAND:
+            // The marker is the whole point of this row existing rather than the setting being
+            // ini-only: it says the value moved AND that nothing has happened yet.
+            _snprintf_s(out, cap, _TRUNCATE, "LEFT HANDED    %s%s",
+                        g_leftHandedPending ? "ON" : "OFF",
+                        (g_leftHandedPending != g_leftHanded) ? "  *RESTART*" : "");
+            break;
         case PR_GOTO_DISPLAY: _snprintf_s(out, cap, _TRUNCATE, "DISPLAY            >"); break;
         case PR_GOTO_ADV:     _snprintf_s(out, cap, _TRUNCATE, "ADVANCED           >"); break;
         case PR_BACK:         _snprintf_s(out, cap, _TRUNCATE, "<  BACK");              break;
@@ -4239,6 +4318,15 @@ void PanelAdjust(int row, int dir) {
         // between pages is not a settings change and must not make PanelSave write on close.
         case PR_GOTO_CTRL:    g_panelPage = 1; g_panelRow = 0; return;
         case PR_GOTO_COMFORT: g_panelPage = 2; g_panelRow = 0; return;
+        case PR_SWAPSTICKS:
+            InterlockedExchange(&g_swapSticks,
+                                InterlockedCompareExchange(&g_swapSticks, 0, 0) ? 0 : 1);
+            break;
+        case PR_LEFTHAND:
+            // Moves the PENDING value only. g_leftHanded is untouched until the next launch reads
+            // it back, because the button bindings it controls are frozen at attach.
+            g_leftHandedPending = g_leftHandedPending ? 0 : 1;
+            break;
         case PR_GOTO_DISPLAY: g_panelPage = 3; g_panelRow = 0; return;
         case PR_GOTO_ADV:     g_panelPage = 4; g_panelRow = 0; return;
         case PR_BACK:         g_panelPage = 0; g_panelRow = 0; return;
@@ -4323,6 +4411,32 @@ int32_t g_padTurnAccum = 0;    // snap steps waiting to be folded in, in FRotato
 // controllers in head aim mode, which is a perfectly reachable combination.
 volatile LONG g_cineStickTurn = 2;       // ini [Input] CutsceneStickTurn - default FREE
 volatile LONG g_cutsceneLockCamera = 0;  // ini [Input] CutsceneLockCamera - off by default
+
+// ---- ⭐ run 170: handedness, as TWO independent settings ----
+//
+// Split deliberately, and not by preference - Half-Life: Alyx shipped them welded together, players
+// reported it forced them to aim or move with the wrong hand, and Valve separated them in Update
+// 1.2. Copying the fixed version rather than the shipped one.
+//
+//   LeftHanded  the GUN and the BUTTONS move to the other hand. Sticks do not.
+//   SwapSticks  movement and turning trade sticks. Nothing else changes.
+//
+// ⚠️ LeftHanded is INI-ONLY and needs a relaunch, and that is not laziness: OpenXR binding
+// suggestions are fixed when the action set is attached, so a live toggle would change the value
+// and not the bindings. The panel's own header states the rule - a setting that appears to change
+// and silently does nothing is worse than one that is not offered - and this session has produced
+// three of those already. SwapSticks IS live, because it is read per frame.
+int g_leftHanded = 0;                    // ini [Input] LeftHanded - read before bindings are built
+
+// What the panel edits. Separate from g_leftHanded ON PURPOSE: changing the live value would swap
+// the gun to the other hand immediately while the BUTTON BINDINGS stayed where they were, because
+// those are frozen at attach. A half-applied handedness is worse than one that waits - so the panel
+// moves this, PanelSave writes it, and the next launch reads it into both.
+int g_leftHandedPending = 0;
+volatile LONG g_swapSticks = 0;          // ini [Input] SwapSticks - live, on the CONTROLLER page
+
+// Which hand the gun and aim follow. The only thing the four aim sites need to know.
+inline int AimHand() { return g_leftHanded ? 0 : 1; }
 extern volatile LONG g_inCinematic;
 
 // The player's own turn during a cutscene, added on top of whichever base is in use. Separate from
@@ -4398,7 +4512,7 @@ bool InitXRInput() {
             // is the point it ROTATES ABOUT, so getting it near the grip is what stops the gun
             // swinging through an arc when you turn your wrist.
             g_gunAnchorFwd   = GetPrivateProfileIntA("Input", "GunAnchorFwd",   25, path);
-            g_gunAnchorRight = GetPrivateProfileIntA("Input", "GunAnchorRight",  8, path);
+            g_gunAnchorRight   = GetPrivateProfileIntA("Input", "GunAnchorRight",    8, path);
             g_gunAnchorUp    = GetPrivateProfileIntA("Input", "GunAnchorUp",    -8, path);
             // Which sign combination to START in. Set from the ini rather than by changing the
             // sign defaults, because changing those RENUMBERS the combos - which is what made
@@ -4411,6 +4525,16 @@ bool InitXRInput() {
                 GetPrivateProfileIntA("Input", "CutsceneStickTurn", 2, path) & 3);
             InterlockedExchange(&g_cutsceneLockCamera,
                 GetPrivateProfileIntA("Input", "CutsceneLockCamera", 0, path) ? 1 : 0);
+            // Read BEFORE the binding table is built below - that is the whole reason this one is
+            // not on the panel.
+            g_leftHanded = g_leftHandedPending =
+                GetPrivateProfileIntA("Input", "LeftHanded", 0, path) ? 1 : 0;
+            InterlockedExchange(&g_swapSticks,
+                GetPrivateProfileIntA("Input", "SwapSticks", 0, path) ? 1 : 0);
+            if (g_leftHanded)
+                Log("input: LEFT-HANDED - gun and buttons mirrored. Sticks are NOT swapped (that is"
+                    " SwapSticks). MENU stays on the LEFT controller: the Touch profile has no"
+                    " right-hand menu/click and system/click is reserved by the runtime.");
             for (int i = 0; i < kPadButtonCount; ++i)
                 g_padButtons[i].mask = (WORD)GetPrivateProfileIntA(
                     "Input", g_padButtons[i].iniKey, g_padButtons[i].mask, path);
@@ -4502,19 +4626,85 @@ bool InitXRInput() {
     // that fill it, so adding a row to g_padButtons cannot silently overrun this.
     XrActionSuggestedBinding binds[4 + kPadButtonCount + 2 + 2 + 12 + 2]{};
     uint32_t nb = 0;
-    struct { XrAction a; const char* p; } fixed[] = {
-        { g_actMove,    "/user/hand/left/input/thumbstick"    },
-        { g_actTurn,    "/user/hand/right/input/thumbstick"   },
-        { g_actFire,    "/user/hand/right/input/trigger/value" },
-        { g_actAltFire, "/user/hand/left/input/trigger/value"  },
+    // ---- ⭐ run 170: left-handed mode ----
+    //
+    // Mirrors the hand in a binding path. Two things it deliberately does NOT touch:
+    //
+    //   THE THUMBSTICKS. Movement stays on the left stick and turning on the right whichever hand
+    //   holds the gun. This is the convention every modern VR title follows, and Half-Life: Alyx
+    //   shipped the other way, tied handedness to stick assignment, and SPLIT THEM BACK APART in
+    //   Update 1.2 after players said it forced them to aim or move with the wrong hand. Swapping
+    //   sticks is a separate setting - SwapSticks - exactly as Valve ended up doing.
+    //
+    //   MENU. `menu/click` exists on the LEFT hand only in the Touch profile and `system/click` on
+    //   the right is reserved by the runtime, so there is no right-hand menu button to move it to.
+    //   Confirmed against the interaction profile rather than taken from this file's own note. The
+    //   pause tap and the recentre long-press therefore stay on the left thumb in both modes, and a
+    //   left-handed player has to be told rather than left to hunt for it.
+    //
+    // The face buttons mirror cleanly as PAIRS - x<->a and y<->b - so jump/crouch and
+    // age/flashlight simply trade places with no collision. That is why a whole-table mirror works
+    // here at all.
+    // ---- ⚠️ run 172: the face buttons need the COMPONENT swapped too, not just the hand ----
+    //
+    // First version swapped only the hand and produced `/user/hand/left/input/a/click`, which does
+    // not exist: `a` and `b` are RIGHT-hand only and `x` and `y` are LEFT-hand only in this profile.
+    // xrSuggestInteractionProfileBindings is all-or-nothing, so that one bad path took every binding
+    // with it and no button worked at all. The log said so on the first line:
+    //
+    //     xrSuggestInteractionProfileBindings failed (-22) for 31 bindings
+    //     - one bad path rejects them all
+    //
+    // The mapping was already written down correctly - "x<->a and y<->b" - and then not implemented.
+    // Mirroring a Touch binding is a swap of the hand AND of the face-button name together.
+    auto mirrorHand = [&](const char* p, char* buf, size_t cap) -> const char* {
+        if (!g_leftHanded || !p) return p;
+        if (strstr(p, "/input/menu/click")) return p;            // left-hand only, see above
+        // The four hand-exclusive components, remapped to their opposite-hand counterpart.
+        struct { const char* from; const char* to; } kFace[] = {
+            { "/user/hand/right/input/a/", "/user/hand/left/input/x/"  },
+            { "/user/hand/right/input/b/", "/user/hand/left/input/y/"  },
+            { "/user/hand/left/input/x/",  "/user/hand/right/input/a/" },
+            { "/user/hand/left/input/y/",  "/user/hand/right/input/b/" },
+        };
+        for (auto& f : kFace) {
+            const size_t n = strlen(f.from);
+            if (strncmp(p, f.from, n) == 0) {
+                _snprintf_s(buf, cap, _TRUNCATE, "%s%s", f.to, p + n);
+                return buf;
+            }
+        }
+        // Everything else - trigger, squeeze, thumbstick, thumbrest - exists on both hands, so a
+        // plain hand swap is valid.
+        if (strncmp(p, "/user/hand/left/", 16) == 0)
+            _snprintf_s(buf, cap, _TRUNCATE, "/user/hand/right/%s", p + 16);
+        else if (strncmp(p, "/user/hand/right/", 17) == 0)
+            _snprintf_s(buf, cap, _TRUNCATE, "/user/hand/left/%s", p + 17);
+        else return p;
+        return buf;
+    };
+
+    struct { XrAction a; const char* p; bool handed; } fixed[] = {
+        { g_actMove,    "/user/hand/left/input/thumbstick",     false },  // sticks never mirror
+        { g_actTurn,    "/user/hand/right/input/thumbstick",    false },
+        { g_actFire,    "/user/hand/right/input/trigger/value", true  },
+        { g_actAltFire, "/user/hand/left/input/trigger/value",  true  },
     };
     for (auto& f : fixed) {
+        char mb[64];
         XrPath p;
-        if (XrPathOf(f.p, &p)) { binds[nb].action = f.a; binds[nb].binding = p; ++nb; }
+        const char* path = f.handed ? mirrorHand(f.p, mb, sizeof(mb)) : f.p;
+        if (XrPathOf(path, &p)) { binds[nb].action = f.a; binds[nb].binding = p; ++nb; }
     }
     for (int i = 0; i < kPadButtonCount; ++i) {
+        char mb[64];
         XrPath p;
-        if (XrPathOf(g_padButtons[i].path, &p)) {
+        const char* path = mirrorHand(g_padButtons[i].path, mb, sizeof(mb));
+        // Printed only in left-handed mode, and only because the suggest call is ALL-OR-NOTHING:
+        // when it fails there is no way to tell which of 31 paths was the bad one, which is exactly
+        // the position run 172 was in. Thirteen lines once at startup is worth not being there again.
+        if (g_leftHanded) Log("  mirrored binding: %-40s -> %s", g_padButtons[i].path, path);
+        if (XrPathOf(path, &p)) {
             binds[nb].action = g_padButtons[i].action; binds[nb].binding = p; ++nb;
         }
     }
@@ -4707,6 +4897,20 @@ void SyncXRInput(XrTime displayTime) {
     LARGE_INTEGER tSt = Now();
     getVec2(g_actMove, &mx, &my);
     getVec2(g_actTurn, &tx, &ty);
+    // ---- ⭐ run 170: SwapSticks, the southpaw option ----
+    //
+    // Swapped at READ time rather than in the bindings, which is what makes it live: OpenXR binding
+    // suggestions are fixed once the action set is attached, so a binding-level swap would need a
+    // relaunch. Four floats and it is done.
+    //
+    // Independent of LeftHanded on purpose - see the note there. Some people want the gun in the
+    // left hand with movement still on the left stick; some want the sticks swapped with the gun
+    // where it is. Welding them together is the thing Alyx had to undo.
+    if (InterlockedCompareExchange(&g_swapSticks, 0, 0)) {
+        float sx = mx, sy = my;
+        mx = tx; my = ty;
+        tx = sx; ty = sy;
+    }
     msStates += MsSince(tSt);
 
     // ⚠️ The panel navigates on the LEFT stick, and it has to use these raw values rather than
@@ -4817,8 +5021,8 @@ void SyncXRInput(XrTime displayTime) {
     //
     // This also happens to be the check that the pose plumbing is correct: if walking follows your
     // left hand rather than sliding off at an angle, the conventions are right.
-    if (g_walkDirection && g_handPoseValid[0] && (mx != 0.0f || my != 0.0f)) {
-        float d = g_walkSign * (g_handYawRad[0] - g_headYawRad);
+    if (g_walkDirection && g_handPoseValid[OffHand()] && (mx != 0.0f || my != 0.0f)) {
+        float d = g_walkSign * (g_handYawRad[OffHand()] - g_headYawRad);
         while (d >  3.14159265f) d -= 6.2831853f;
         while (d < -3.14159265f) d += 6.2831853f;
         const float c = cosf(d), s = sinf(d);
@@ -5040,7 +5244,17 @@ void SyncXRInput(XrTime displayTime) {
         if (!st.isActive) { ++g_trigInactiveFrames[hand]; return 0.0f; }
         return st.currentState;
     };
-    float lt = getTrigger(g_actAltFire, 0), rt = getTrigger(g_actFire, 1);
+    // ---- ⚠️ run 173: these indices are PHYSICAL HANDS and must follow the mirror ----
+    //
+    // Reported: in left-handed mode the left trigger only fired while the RIGHT trigger was being
+    // touched. The trigger-touch veto reads g_trigTouch[], which is indexed by physical hand, but
+    // fire was hardcoded to index 1 - and in left-handed mode g_actFire is bound to the LEFT
+    // trigger. So the gate for the left trigger was consulting the right hand's sensor.
+    //
+    // AimHand() is the hand the fire binding actually landed on, so deriving both indices from it
+    // keeps the raw values, the veto and the log columns all describing the same physical hand.
+    const int fireHand = AimHand(), altHand = 1 - fireHand;
+    float rt = getTrigger(g_actFire, fireHand), lt = getTrigger(g_actAltFire, altHand);
     ++g_trigFrames;
 
     // ---- ⭐ run 156: veto a trigger value that no finger is touching ----
@@ -5084,8 +5298,12 @@ void SyncXRInput(XrTime displayTime) {
             }
         }
         if (g_triggerGate) {
-            if (g_trigTouchAvail[0] && !g_trigTouch[0] && lt > 0.0f) { ++g_trigVetoed[0]; lt = 0.0f; }
-            if (g_trigTouchAvail[1] && !g_trigTouch[1] && rt > 0.0f) { ++g_trigVetoed[1]; rt = 0.0f; }
+            if (g_trigTouchAvail[altHand] && !g_trigTouch[altHand] && lt > 0.0f) {
+                ++g_trigVetoed[altHand]; lt = 0.0f;
+            }
+            if (g_trigTouchAvail[fireHand] && !g_trigTouch[fireHand] && rt > 0.0f) {
+                ++g_trigVetoed[fireHand]; rt = 0.0f;
+            }
         }
     }
     msStates += MsSince(tSt);
@@ -5349,12 +5567,12 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             //
             // Recentre is the right moment because it is deliberate: hold the gun where it feels
             // neutral, hold MENU for a second, and that pose becomes straight ahead.
-            if (g_handPoseValid[1]) {
-                float dy = g_handYawRad[1] - yawRad;
+            if (g_handPoseValid[AimHand()]) {
+                float dy = g_handYawRad[AimHand()] - yawRad;
                 while (dy >  3.14159265f) dy -= 6.2831853f;
                 while (dy < -3.14159265f) dy += 6.2831853f;
                 g_handYawOffset   = dy;
-                g_handPitchOffset = g_handPitchRad[1] - pitchRad;
+                g_handPitchOffset = g_handPitchRad[AimHand()] - pitchRad;
                 g_haveHandOffset  = true;
             } else {
                 g_haveHandOffset = false;
@@ -5445,6 +5663,40 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             g_hmdOffset[1] = (bs * fwdAmt + bc * rightAmt) * kMetresToUU;
             g_hmdOffset[2] = upAmt * kMetresToUU;
 
+            // ---- ⭐ run 175: is the 6-DOF offset being COMPUTED, or just not applied? ----
+            //
+            // Reported: the main menu is a real 3D scene, renders in stereo, and does not respond to
+            // head movement. The obvious suspects are all clean in the log - one recentre, pos valid
+            // and tracked, identification 0 failures, 153 of 153 draws split WITH PARALLAX - so the
+            // injection path is demonstrably live and the eye separation is reaching it.
+            //
+            // That leaves two possibilities with opposite fixes, and no way to tell them apart from
+            // what is already logged:
+            //
+            //   the offset is ~0        the head-to-centre delta is not being produced, so the bug
+            //                           is here, above the injection
+            //   the offset is non-zero  it is computed and injected and the menu still does not
+            //                           move - which would mean the menu's content is not drawn
+            //                           through the view-projection we inject into. The file already
+            //                           records that this menu is DIEGETIC, "rendered into a texture
+            //                           and mapped onto a monitor in the scene", and an offscreen
+            //                           pass has its own matrix that our hook never sees.
+            //
+            // One line a second, only while VR mode is on, so a normal run costs nothing.
+            if (VrModeOn()) {
+                static ULONGLONG lastSaid = 0;
+                const ULONGLONG now = GetTickCount64();
+                if (!lastSaid || now - lastSaid > 1000) {
+                    lastSaid = now;
+                    Log("6dof: offset (%.1f, %.1f, %.1f) UU | head-centre (%.3f, %.3f, %.3f) m"
+                        " | posValid %d haveCentrePos %d sixDof %ld",
+                        g_hmdOffset[0], g_hmdOffset[1], g_hmdOffset[2], ox, oy, oz,
+                        (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ? 1 : 0,
+                        g_haveCentrePos ? 1 : 0,
+                        InterlockedCompareExchange(&g_sixDof, 0, 0));
+                }
+            }
+
             // Left eye -> right eye, through the identical transform. The mapping is linear,
             // so it can be applied to the separation vector directly; interpupillary distance
             // still never needs naming.
@@ -5479,11 +5731,11 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         // the head points, and both are already known in the same XR frame. No base, no centre, no
         // offsets, nothing that can drift - if the hand and head point the same way this is zero
         // by construction, which none of the derived versions could promise.
-        if (g_handPoseValid[1]) {
-            float dvy = g_handYawRad[1] - yawRad;
+        if (g_handPoseValid[AimHand()]) {
+            float dvy = g_handYawRad[AimHand()] - yawRad;
             while (dvy >  3.14159265f) dvy -= 6.2831853f;
             while (dvy < -3.14159265f) dvy += 6.2831853f;
-            const float dvp = g_handPitchRad[1] - pitchRad;
+            const float dvp = g_handPitchRad[AimHand()] - pitchRad;
             // ---- ⭐ run 113: apply the SAME sign convention as everything else ----
             //
             // Reported: left/right mirrored, up/down correct. That is not a coincidence and it is
@@ -5511,14 +5763,17 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             // through the SAME two-stage basis as the head offset above - centre-yaw to get the
             // head's own frame, then body yaw to get world - so hand and head are expressed the
             // same way rather than by two conventions that agree by luck.
-            float dvr = g_handRollRad[1] - g_headRollRad;
+            float dvr = g_handRollRad[AimHand()] - g_headRollRad;
             while (dvr >  3.14159265f) dvr -= 6.2831853f;
             while (dvr < -3.14159265f) dvr += 6.2831853f;
             InterlockedExchange(&g_handDevRollUU, (LONG)(dvr * kRadToUU));
             {
-                const float hx = g_handLastPos[1].x - g_headPosXR[0];
-                const float hy = g_handLastPos[1].y - g_headPosXR[1];
-                const float hz = g_handLastPos[1].z - g_headPosXR[2];
+                // ⚠️ AimHand(), not 1. The gun's ROTATION already followed the aim hand while its
+                // POSITION was still read from the right controller, so in left-handed mode it
+                // turned with the left hand and sat at the right one - reported exactly that way.
+                const float hx = g_handLastPos[AimHand()].x - g_headPosXR[0];
+                const float hy = g_handLastPos[AimHand()].y - g_headPosXR[1];
+                const float hz = g_handLastPos[AimHand()].z - g_headPosXR[2];
                 const float sc2 = sinf(g_centreYaw), cc2 = cosf(g_centreYaw);
                 const float fwd   = -(hx * sc2) - (hz * cc2);
                 const float right =  (hx * cc2) - (hz * sc2);
@@ -5750,13 +6005,13 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         // without any of the matrix-split machinery being involved.
         g_aimYawUU = g_wantYaw;
         g_aimPitchUU = g_wantPitch;
-        if (g_handPoseValid[1]) {
-            float dh = g_handYawRad[1] - (g_haveHandOffset ? g_handYawOffset : 0.0f) - g_centreYaw;
+        if (g_handPoseValid[AimHand()]) {
+            float dh = g_handYawRad[AimHand()] - (g_haveHandOffset ? g_handYawOffset : 0.0f) - g_centreYaw;
             while (dh >  3.14159265f) dh -= 6.2831853f;
             while (dh < -3.14159265f) dh += 6.2831853f;
             g_aimYawUU = g_baseYaw + (int32_t)(g_yawSign * dh * kRadToUU);
             int32_t ap = (int32_t)(g_pitchSign
-                         * (g_handPitchRad[1] - (g_haveHandOffset ? g_handPitchOffset : 0.0f))
+                         * (g_handPitchRad[AimHand()] - (g_haveHandOffset ? g_handPitchOffset : 0.0f))
                          * kRadToUU);
             if (ap >  16000) ap =  16000;
             if (ap < -16000) ap = -16000;
@@ -5766,18 +6021,18 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         const bool aimOn = InterlockedCompareExchange(&g_aimDecouple, 0, 0) != 0;
         int32_t engineYawTarget  = g_wantYaw;      // where the ENGINE should point
         int32_t enginePitchTarget = g_wantPitch;
-        if (aimOn && g_handPoseValid[1]) {
+        if (aimOn && g_handPoseValid[AimHand()]) {
             // The right hand, mapped through exactly the transform the head uses - same centre,
             // same signs - and then corrected by the neutral captured at recentre, so "pointing
             // where I am looking" comes out as zero deviation rather than whatever your grip
             // happens to be.
-            float dYawHand = g_handYawRad[1] - (g_haveHandOffset ? g_handYawOffset : 0.0f)
+            float dYawHand = g_handYawRad[AimHand()] - (g_haveHandOffset ? g_handYawOffset : 0.0f)
                            - g_centreYaw;
             while (dYawHand >  3.14159265f) dYawHand -= 6.2831853f;
             while (dYawHand < -3.14159265f) dYawHand += 6.2831853f;
             engineYawTarget = g_baseYaw + (int32_t)(g_yawSign * dYawHand * kRadToUU);
             int32_t hp = (int32_t)(g_pitchSign
-                         * (g_handPitchRad[1] - (g_haveHandOffset ? g_handPitchOffset : 0.0f))
+                         * (g_handPitchRad[AimHand()] - (g_haveHandOffset ? g_handPitchOffset : 0.0f))
                          * kRadToUU);
             if (hp >  16000) hp =  16000;
             if (hp < -16000) hp = -16000;
@@ -7157,6 +7412,24 @@ static void ApplyWorldMatrix(Reg4* m, int conv, const float C[4][4]) {
 LONG g_gunSignYaw = 1, g_gunSignPitch = -1, g_gunSignRoll = 1, g_gunFollowPos = 1;
 LONG g_gunSignPosZ = -1;                       // vertical translation came back flipped too
 LONG g_gunAnchorFwd = 25, g_gunAnchorRight = 8, g_gunAnchorUp = -8;   // engine units from the eye
+
+// ---- 🛑 run 174: the sideways anchor does NOT mirror. Two attempts, both wrong, both removed ----
+//
+// First I multiplied it by -1 in the transform. Then I split it into a second tunable value. Both
+// were built on the same unexamined premise: that the anchor is a property of the HAND.
+//
+// It is not. It was tuned with the gun attached to the ARMS, so it describes where the game's own
+// gun mesh sits relative to the eye - and the game has no left-handed arms. The mesh is on the same
+// side whichever controller is aiming it, so there is nothing to mirror.
+//
+// The evidence agreed once the right question was asked. With position frozen (TAB) the gun swung
+// through an ARC in left-handed mode, which is the documented symptom of a pivot in the wrong
+// place, and -8 against +8 is a pivot 16 units off the grip - exactly that.
+//
+// ⚠️ Worth keeping as a caution rather than just deleting: the sign flip also sat DOWNSTREAM of the
+// on-screen readout and the arrow-key tuning, so the panel showed one number while another was
+// applied and pressing "right" moved the gun LEFT. Any future per-handedness value must go through
+// the same accessor as its readout and its tuning, or calibrating it by feel is impossible.
 volatile LONG g_gunSignCombo = 0;
 volatile LONG g_readoutOn = 1;   // on-screen state squares - see DrawStateReadout
 
@@ -7267,7 +7540,10 @@ static void GunAnchorWorld(float G[3]) {
     const float F[3] = {  cp * cy,  cp * sy, sp };
     const float R[3] = { -sy,       cy,      0.0f };
     const float U[3] = { -sp * cy, -sp * sy, cp };
-    const float af = (float)g_gunAnchorFwd, ar = (float)g_gunAnchorRight, au = (float)g_gunAnchorUp;
+    // The sideways offset mirrors with the hand: the gun hangs off the right of your eye when it is
+    // in your right hand and the left when it is not. Forward and up are unaffected.
+    const float af = (float)g_gunAnchorFwd, au = (float)g_gunAnchorUp;
+    const float ar = (float)g_gunAnchorRight;
     for (int i = 0; i < 3; ++i) G[i] = af * F[i] + ar * R[i] + au * U[i];
 }
 
@@ -11209,6 +11485,18 @@ static const unsigned char kFont[][kGlyphH] = {
     {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},               // -
     {0x02,0x04,0x04,0x04,0x04,0x04,0x02},               // ( 
     {0x08,0x04,0x04,0x04,0x04,0x04,0x08},               // )
+    // ---- ⚠️ run 172: an unsupported character renders as a SPACE, silently ----
+    //
+    // Reported as "there are no *s around restart". GlyphIndex returns 0 - space - for anything it
+    // does not know, so `*RESTART*` drew as ` RESTART `. The same was true of `>` and `<`: the
+    // page rows have read "CONTROLLER" and "BACK" with an invisible arrow since they were added,
+    // and nobody could have known from looking.
+    //
+    // Adding the glyphs rather than rewording around them, because the next string with a stray
+    // character will fail exactly this way and the fallback gives no clue it happened.
+    {0x10,0x08,0x04,0x02,0x04,0x08,0x10},               // >
+    {0x02,0x04,0x08,0x10,0x08,0x04,0x02},               // <
+    {0x00,0x15,0x0E,0x1F,0x0E,0x15,0x00},               // *
 };
 
 static int GlyphIndex(char ch) {
@@ -11220,6 +11508,12 @@ static int GlyphIndex(char ch) {
     if (ch == '-') return 38;
     if (ch == '(') return 39;
     if (ch == ')') return 40;
+    if (ch == '>') return 41;
+    if (ch == '<') return 42;
+    if (ch == '*') return 43;
+    // ⚠️ Falling through here draws a SPACE, which is indistinguishable from the character having
+    // been left out of the string. That cost two invisible arrows and a missing pair of asterisks
+    // before anyone noticed. Add the glyph rather than assuming the text was wrong.
     return 0;
 }
 
@@ -12168,7 +12462,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if      (ax == 0) g_gunAnchorFwd   += step;
             else if (ax == 1) g_gunAnchorRight += step;
             else              g_gunAnchorUp    += step;
-            Log("ANCHOR: fwd %ld right %ld up %ld", g_gunAnchorFwd, g_gunAnchorRight, g_gunAnchorUp);
+            Log("ANCHOR: fwd %ld right %ld up %ld", g_gunAnchorFwd, g_gunAnchorRight,
+                g_gunAnchorUp);
         }
         pL = kL; pR = kR; pU = kU; pD = kD;
     }

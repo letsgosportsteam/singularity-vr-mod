@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-03** (end of run 169). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-04** (end of run 175). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -166,6 +166,88 @@ dropped beside the game exe. No game files modified.
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## ✅ Runs 170–175: left-handed mode, and a settings bug that hid behind a comment
+
+### Handedness, as TWO independent settings
+
+Split deliberately, copying the *fixed* version of Half-Life: Alyx rather than the shipped one —
+Valve welded handedness to stick assignment, players said it forced them to aim or move with the
+wrong hand, and Update 1.2 separated them.
+
+- **`LeftHanded`** — gun, aim, triggers, grips and face buttons mirror. **Sticks do not.**
+  Ini-backed with a panel row that edits a *pending* value and shows `*RESTART*`: OpenXR binding
+  suggestions are frozen at attach, so a live toggle would move the gun and leave the buttons.
+- **`SwapSticks`** — movement and turning trade sticks, nothing else. Live, four floats at read time.
+
+**The clamp depends on TURN MODE, not aim method.** Mouse and `TurnMode 0` both go through the
+engine's look axis and inherit the matinee's limits; `TurnMode 1/2` are mod-side and do not.
+
+⚠️ **`menu/click` is LEFT-hand only and `system/click` is runtime-reserved** — confirmed against the
+Oculus Touch interaction profile, not taken from this file's own note. So MENU stays on the left
+thumb in both modes, and the startup log says so rather than leaving a left-handed player to hunt.
+
+### ⚠️ Three bugs, all the same shape: a literal where an index belonged
+
+`AimHand()` / `OffHand()` now exist because fixing "the four aim sites" missed everything else:
+
+| symptom | cause |
+|---|---|
+| no buttons worked at all | the mirror swapped the **hand** but not the **component** — `a`/`b` are right-only and `x`/`y` left-only, so `/user/hand/left/input/a/click` does not exist. `xrSuggestInteractionProfileBindings` is **all-or-nothing**: one bad path killed all 31 |
+| left trigger fired only while the *right* trigger was touched | `g_trigTouch[]` is indexed by physical hand; fire was hardcoded to index 1 |
+| gun rotated by the left hand, positioned at the right | `g_handLastPos[1]` hardcoded |
+
+The mapping `x`↔`a`, `y`↔`b` had been **written down correctly and then not implemented**. Because
+the suggest call names no culprit, left-handed mode now logs every mirrored binding at startup.
+
+### 🛑 The gun anchor does NOT mirror — two attempts, both removed
+
+A sign flip, then a second tunable value. Both assumed the anchor is a property of the *hand*. It
+is not: it was tuned with the gun **attached to the arms**, so it describes where the game's own gun
+mesh sits relative to the eye — and the game has no left-handed arms.
+
+The evidence agreed once the right question was asked: with position frozen (**TAB**) the gun swung
+through an **arc**, the documented symptom of a pivot in the wrong place, and ±8 is a pivot 16 units
+off the grip.
+
+⚠️ Kept as a caution: the sign flip sat **downstream of the readout and the arrow keys**, so the
+panel showed one number while another was applied and pressing "right" moved the gun left. Any
+per-handedness value must go through the same accessor as its readout and its tuning.
+
+### ⚠️ `PanelSave` had its own list, and it fell out of step
+
+`CUTSCENE CAM` was reported reverting every launch. `CUTSCENE TURN` had the identical bug and had
+not been noticed. A comment saying "remember to add it here" was already present and had already
+failed.
+
+**Now `PanelSave` walks `kPageRows` — the same tables that build the UI** — so the set that is saved
+is by construction the set that is shown. A row with no save entry hits the default case and *says
+so in the log on the first save*.
+
+### ⚠️ An unsupported character renders as a SPACE, silently
+
+Reported as "there are no \*s around restart". `GlyphIndex` returns space for anything unknown, so
+`*RESTART*` drew as ` RESTART ` — **and the `>` / `<` on the page rows had been invisible since they
+were added.** Glyphs added rather than reworded around, and the fallback now carries a warning.
+
+### 📋 6-DOF in the main menu — measured, not resolved
+
+The menu is a real 3D scene, renders in stereo, and does not respond to head movement. Every usual
+suspect is clean: one recentre, `pos valid 1 tracked 1`, zero identification failures, **153 of 153
+draws split with parallax**. And the offset *is* produced, at the same scale as gameplay:
+
+```
+menu     head-centre (-0.049, -0.004, -0.096) m -> offset ( 2.7,  4.9, -0.2) UU
+gameplay head-centre (-0.371, -0.021, -0.334) m -> offset (24.0, 10.6, -1.1) UU
+```
+
+So the mod behaves identically in both places. Two possibilities remain: the effect is real but too
+small to perceive at that scene's distances, or the menu's content is not drawn through the
+view-projection we inject into.
+
+⚠️ **F3 cannot be used to tell them apart while 6-DOF is on.** `posOffset` wins over `g_injectOn` —
+*"6-DOF wins when both are on; the F3 constant is only a probe"* — so F3 does nothing in either
+place. A valid test must turn 6-DOF off (F10) first. One run was wasted on this.
 
 ## 🚧 Runs 164–169: panel pages, cutscene comfort, and TWO OPEN BUGS
 
@@ -493,15 +575,38 @@ game. It cost **1–2 seconds of dead controls on every genuine pick-up** while 
 ports round-robin, and that latency is what reopened this. It is now gone. The code stays in the
 build for runtimes where `trigger/touch` does not resolve; `AutoPad=1` restores it.
 
-### ⚠️ Still unexplained, and deliberately not chased
+### ✅ SOLVED (run 175): the runtime switches to HAND TRACKING
 
-**Why a resting controller reports a pull at all.** It is not analog drift: while the controllers are
-held the log reads an exact `min 0.00 max 0.00`, and drift does not switch itself off when a hand
-arrives. The fabrication is **upstream of this mod** — the logged `raw` is `st.currentState` straight
-out of `xrGetActionStateFloat`, before the deadzone and before the veto — so nothing here synthesises
-it. Most likely the controller sleeping costs the runtime whatever zero-point calibration it applies
-while awake, which would make the phantom trigger and the frozen pose siblings of sleep rather than
-one causing the other. Vetoing input no finger is behind is correct regardless of the answer.
+**Confirmed by observation:** set the controllers down and the Quest runtime hands input over to
+hand tracking. The gun visibly jumps to the user's actual hand. Everything measured then follows:
+
+- The runtime synthesises controller input from hand poses, so **a curled finger reads as a partial
+  trigger pull** — which is why the values were *sustained* (0.34–0.43 and 0.23–0.28) rather than
+  noisy, and why they differed per hand.
+- `isActive` was true on every frame because the runtime genuinely was delivering input.
+- The value was an exact `0.00` while held, because that is a real controller reporting a real zero.
+
+> ⚠️ The earlier guess in this section — that the controller sleeping costs the runtime its
+> zero-point calibration — **was wrong** and is replaced. It would not have explained the gun
+> jumping to a bare hand.
+
+### ⚠️ What that means for the fix
+
+**The trigger-touch veto is treating a symptom.** It zeroes trigger *values* only, so the poses keep
+arriving and the gun keeps tracking a hand that is holding nothing. It cannot fix what was observed.
+
+The real condition is *"the runtime has handed input to hand tracking"*, and
+**`xrGetCurrentInteractionProfile` answers that per hand directly** — a first-class question to the
+runtime instead of an inference from a capacitive sensor that run 155 showed unreliable in both
+directions. While hand tracking is active the correct behaviour is one rule: treat the controllers
+as absent. No triggers, no poses, no gun.
+
+That would supersede the trigger veto, `g_handHeld`, and the framing of the whole runs 67–75 judder
+investigation — which spent nine runs on "pad ON + controllers on desk" without ever knowing the
+runtime had swapped input sources underneath it.
+
+📋 **Not built.** It is input gating, it wants its own test pass, and run 172 is a fresh reminder of
+what an untested binding change costs.
 
 ### ⚠️ Method note: the instrument said "no effect" while the user watched the effect happen
 

@@ -984,3 +984,39 @@ VideoStereo=1
 ; ---------------------------------------------------------------------------
 CutsceneStickTurn=2
 CutsceneLockCamera=0
+
+; ---------------------------------------------------------------------------
+; [Input] LeftHanded / SwapSticks -- handedness, as TWO settings (run 170)
+;
+; Split deliberately. Half-Life: Alyx shipped them welded together, players said
+; it forced them to aim or move with the wrong hand, and Valve separated them in
+; Update 1.2. This copies the fixed version, not the shipped one.
+;
+;   LeftHanded=0    gun, aim, triggers, grips and face buttons mirror to the
+;                   other hand. STICKS DO NOT.                    <- default
+;   SwapSticks=0    movement and turning trade sticks. Nothing else changes.
+;
+; LeftHanded needs a RELAUNCH and the panel row says so. OpenXR binding
+; suggestions are frozen when the action set is attached, so a live toggle would
+; move the gun and leave the buttons where they were. SwapSticks is live - it is
+; four floats swapped at read time.
+;
+; ⚠️ MENU CANNOT MIRROR. `menu/click` exists on the LEFT hand only in the Touch
+; profile and `system/click` on the right is reserved by the runtime - confirmed
+; against the interaction profile. So the pause tap and the recentre long-press
+; stay on the left thumb in both modes, and the startup log says so.
+;
+; The face buttons mirror as PAIRS - x<->a and y<->b - so jump/crouch and
+; age/flashlight trade places with no collision. A mirror that swaps only the
+; HAND produces /user/hand/left/input/a/click, which does not exist, and
+; xrSuggestInteractionProfileBindings is all-or-nothing: one bad path silently
+; kills every binding. That is why left-handed mode logs each mirrored path.
+;
+; ⚠️ GunAnchorRight is NOT mirrored. It was tuned with the gun attached to the
+; ARMS, so it describes where the game's own gun mesh sits relative to your eye -
+; and the game has no left-handed arms. Two attempts to mirror it were removed.
+; If the gun swings through an arc with position frozen (TAB), the anchor is a
+; PIVOT in the wrong place, not an offset with the wrong sign.
+; ---------------------------------------------------------------------------
+LeftHanded=0
+SwapSticks=0
