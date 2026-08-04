@@ -767,8 +767,36 @@ The installer also adds `PhysX\Common` to the machine `PATH`, so a process start
 install may still fail on a stale environment. Reboot if the first launch after repairing fails
 the same way.
 
-**For the install guide:** the GOG package ships no `redist` folder, so a GOG-only user has no
-way to repair this and will blame the mod. Ship the instruction, or the redist.
+**For the install guide:** verified by inspection — the GOG package ships **no redist folder and no
+installer of any kind** (`__support` is empty; the only exes are the game, `language_setup.exe` and
+the uninstaller). A GOG-only user has no local source at all and must get NVIDIA's legacy PhysX
+9.09 from nvidia.com. Note this is per-game packaging, not a GOG rule — GOG's *Mirror's Edge* does
+ship `__redist/PHYSX` and `__redist/PHYSXLEGACY`.
+
+### ✅ The fix: make the game self-contained, like Mirror's Edge already is
+
+Raven shipped `NxCooking.dll` and `PhysXExtensions.dll` in `Binaries\` but **not**
+`PhysXLoader.dll`, so Singularity depends on system state. Mirror's Edge ships its own
+`Binaries\PhysXLoader.dll` *plus* a `PhysXLocal\` copy, which is why it sailed through the outage
+that killed Singularity.
+
+**Windows searches the application directory first, and this is measured, not assumed.** With a
+local copy in `Binaries\` *and* the system copy present, the preflight logs:
+
+```
+physx preflight: PhysXLoader.dll resolves to ...\Singularity\Binaries\PhysXLoader.dll
+physx preflight:   -> LOCAL to the game folder - independent of system PhysX
+```
+
+So one file in `Binaries\` is enough. `spikes/view_matrix/setup_physx.ps1` does it, sourcing the
+DLL from the user's own machine so the mod redistributes nothing. `PhysXPreflight()` in
+`d3d9.cpp` catches the failure at `DllMain` and shows a message box naming the fix, because
+otherwise the crash is silent and the mod gets blamed.
+
+⚠️ **Not total immunity.** The loader still resolves `PhysXCore.dll` through
+`PhysX\Engine\v2.7.x\`, and those folders survived the incident untouched — so a local loader
+would have prevented *this* failure, but an installer that also strips the engine folders would
+still bite. Mirror's Edge hedges that with a local core as well. Untested here.
 
 ### Consequence for distribution
 

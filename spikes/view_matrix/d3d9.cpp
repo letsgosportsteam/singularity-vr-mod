@@ -14693,6 +14693,58 @@ void InstallAutoResolution() {
         g_autoResW, g_autoResH);
 }
 
+// ---- ⭐ run 180: PhysX preflight. The mod gets blamed for a crash that is not the mod ----
+//
+// Measured 2026-08-04: with the 32-bit PhysXLoader.dll missing system-wide, the game dies with
+// 0xc06d007e (delay-load: "module could not be found") followed by a NULL deref at +0x007cdde6 -
+// on the STEAM copy at the identical offset, which is what proves it is not an install problem.
+// No message, no window, just gone. ENGINE_NOTES predicted exactly this and predicted the user
+// would blame the mod, because ours is the only unusual file in the folder.
+//
+// We load before the game touches PhysX, so we are the only thing positioned to say so.
+//
+// Also logs WHICH copy would resolve. Windows searches the application directory first, so a copy
+// in Binaries\ takes precedence over the system one in PhysX\Common - that is how Mirror's Edge is
+// immune, and it is what the setup script will do. This line is the proof of which one wins.
+void PhysXPreflight() {
+    char found[MAX_PATH] = {};
+    char* filePart = nullptr;
+    const DWORD n = SearchPathA(nullptr, "PhysXLoader.dll", nullptr,
+                                MAX_PATH, found, &filePart);
+    if (n && n < MAX_PATH) {
+        Log("physx preflight: PhysXLoader.dll resolves to %s", found);
+        // Name the source explicitly - "it works" and "it works INDEPENDENTLY" are different
+        // claims, and only the second one survives another game's installer running.
+        char exeDir[MAX_PATH] = {};
+        if (GetModuleFileNameA(nullptr, exeDir, MAX_PATH)) {
+            if (char* s = strrchr(exeDir, '\\')) *s = 0;
+            Log("physx preflight:   -> %s",
+                _strnicmp(found, exeDir, strlen(exeDir)) == 0
+                    ? "LOCAL to the game folder - independent of system PhysX"
+                    : "the SYSTEM copy - another game's legacy PhysX installer can remove it");
+        }
+        return;
+    }
+    Log("physx preflight: *** PhysXLoader.dll NOT FOUND - the game is about to crash ***");
+    Log("    This is NOT the VR mod. Singularity delay-loads PhysXLoader.dll and derefs the NULL");
+    Log("    it gets back (0xc06d007e then 0xc0000005 at +0x007cdde6). The unmodded game does the");
+    Log("    same thing - verified on the Steam copy at the identical offset.");
+    MessageBoxA(nullptr,
+        "Singularity cannot start: NVIDIA PhysX is missing.\r\n\r\n"
+        "This is NOT caused by the VR mod - the unmodded game crashes the same way.\r\n"
+        "The 32-bit PhysXLoader.dll is not installed on this PC.\r\n\r\n"
+        "TO FIX (Steam):\r\n"
+        "  Run redist\\PhysX_9.09.1112_SystemSoftware.exe as administrator.\r\n"
+        "  IMPORTANT: uninstall any newer 'NVIDIA PhysX System Software' FIRST, or that\r\n"
+        "  installer runs in REMOVE mode and makes things worse.\r\n\r\n"
+        "TO FIX (GOG):\r\n"
+        "  The GOG package ships no redist folder. Install NVIDIA's legacy PhysX System\r\n"
+        "  Software (9.09) from nvidia.com, then relaunch.\r\n\r\n"
+        "Installing another older game can break this again - its legacy PhysX installer\r\n"
+        "can remove the loader this game needs.",
+        "Singularity VR - PhysX missing", MB_OK | MB_ICONERROR);
+}
+
 BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(m);
@@ -14707,6 +14759,7 @@ BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
         }
         if (!LoadReal()) { Log("FATAL: real d3d9.dll not loadable"); return FALSE; }
+        PhysXPreflight();
         InstallAutoResolution();
         // Earliest possible attempt, for the same reason the command line needs one: if UE3
         // enumerates input devices during startup and caches "no pad", a hook installed at the
