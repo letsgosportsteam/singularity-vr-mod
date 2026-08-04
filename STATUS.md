@@ -9,7 +9,8 @@ It also flags, with ⛔ banners, four status claims that had gone stale in place
 > # ✅ The ladder is complete. Every rung, including controller input.
 >
 > **Full resolution parity at a locked 120 fps, inherited automatically from the headset.**
-> Launch `Singularity.exe` with no arguments and press **BACKSPACE**. That is the whole procedure.
+> Launch `Singularity.exe` with no arguments. That is the whole procedure — it **starts in VR**
+> (`StartInVr=1`, the default since run 159). No keypress, no command line.
 >
 > ```
 > auto-resolution: injecting -ResX=4992 -ResY=2688 -windowed (cached from the headset last run)
@@ -218,11 +219,19 @@ only to override it deliberately.
 > The `XR submit` figure in the frame budget is the check. If it is anything but small, the link is
 > the problem and **nothing in the render code will help** — see run 56.
 
-**Cold start is flat**, as always. **BACKSPACE reaches head tracking + 6-DOF + true stereo in one
-press** instead of three (run 37 reverted run 36's default-on, which rendered the untested main
-menu split from launch — BACKSPACE gets the same one-key convenience without changing what the
-game looks like before you press anything). BACKSPACE again drops back to flat, dropping the
-forced projection with it — a mono image stretched to 98° looks broken rather than standard.
+**The cold start is VR** since run 159 — `StartInVr=1` is the default, applied at the first Present
+and gated on an OpenXR session existing, so a machine with no headset still comes up flat rather
+than frame-split. `VR MODE` is the first panel row and it saves.
+
+**BACKSPACE is now only a toggle**, for peeking at the flat game — it deliberately does *not*
+save, because a key you press to look at something should not change how the game launches
+tomorrow. Toggling off drops the forced projection with it; a mono image stretched to 98° looks
+broken rather than standard, which is expected.
+
+> Run 37 reverted run 36's default-on because it rendered the untested main menu frame-split on
+> every launch. Run 159 reinstated it on a checkable change, not a change of mind: **run 151 put
+> the HUD and menus into both eyes**, so the thing run 37 objected to is the thing run 151 built.
+> `StartInVr=0` restores the flat cold start with no rebuild.
 
 Individual toggles, unchanged: **F9** head tracking · **F10** 6-DOF head position · **F1** true
 stereo (draw duplication) · **F12** alternate-eye stereo ·
