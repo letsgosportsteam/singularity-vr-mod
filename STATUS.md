@@ -251,10 +251,15 @@ Log: `C:\Users\<you>\AppData\Local\SingularityVR\view_matrix.log` — **read it 
 it does not need pasting into chat, and it must never be pasted into this file. Truncated at each
 attach and stamped with the run's date and time on line 1, so a stale file is obvious at a glance.
 
-**Rotated 12 deep** (`kLogKeep` in `d3d9.cpp`): `view_matrix.log`, then `view_matrix.prev1.log`
-… `prev12.log`, oldest last. Every measurement here is an A/B across launches, so the previous
-run is usually the one you actually want — `prev1` is the launch before this one. Uninstall =
-delete `d3d9.dll`.
+**Every run is kept, named for when it started.** The live run is always `view_matrix.log`; at
+the next attach it is renamed to `view_matrix_YYYY-MM-DD_HH-MM-SS.log`, the stamp read back out
+of its own line-1 header. Newest archive = most recent finished run. Nothing is ever evicted, so
+**a reference to a specific log stays valid permanently** — cite them by name in notes.
+
+The old `view_matrix.prevN.log` files are the previous scheme and are left alone; `prevN` named a
+*position*, so those names meant something different after every launch. Pruning is manual and
+deliberate — nothing deletes logs automatically, including the 24-line ones, which are the
+evidence when the question is "why did it die at startup". Uninstall = delete `d3d9.dll`.
 
 Paths, toolchain and game copies: `ENVIRONMENT.md`. Nothing is tied to the repo location.
 

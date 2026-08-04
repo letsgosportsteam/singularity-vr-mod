@@ -28,14 +28,16 @@ did not work.
 
 ## The log
 
-`%LOCALAPPDATA%\SingularityVR\view_matrix.log`, rotated 12 deep (`prev1` … `prev12`, oldest
-last). **Read it from disk with the Read tool.** It is truncated at each attach and stamped with
-the run's date/time on line 1.
+`%LOCALAPPDATA%\SingularityVR\`. **Read logs from disk with the Read tool.**
 
+- `view_matrix.log` is **always the current run**. At the next attach it is archived as
+  `view_matrix_YYYY-MM-DD_HH-MM-SS.log`, stamped with when it *started*.
+- **Default to reading `view_matrix.log` alone.** For an A/B, name the two timestamped files
+  explicitly. Never bulk-read the directory — one run can be 1.2 MB.
+- Nothing is ever deleted, so a log named in a note stays valid forever. Cite them by name.
+- `view_matrix.prevN.log` are from the old positional scheme. Historical; don't add to them.
 - Never paste log contents into `STATUS.md` or `HISTORY.md`. The docs stay prose; the logs stay
   on disk. (`STATUS.md` reached 240 KB without this happening — don't start.)
-- Measurements here are A/B across launches, so `prev1.log` — the launch *before* this one — is
-  usually the file you actually want.
 
 ## Testing happens in a VR headset
 

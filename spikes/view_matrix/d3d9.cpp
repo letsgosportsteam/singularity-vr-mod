@@ -84,14 +84,66 @@ bool g_stageLockReady = false;
 // second number you no longer have the first. Run 31 lost two of its three tests to exactly
 // that, and the loss is silent: the file looks complete, it is simply the wrong run.
 //
-// So the previous logs are rotated rather than overwritten. Three back is enough for the
-// three-launch comparisons this project actually runs.
-// ⚠️ Raised from 3 in run 136. Three spares is under an hour of testing, and it cost a result:
-// the full-resolution half of a resolution A/B had rotated out by the time the pair was compared,
-// leaving four logs that were all 1440p. An A/B whose two halves are separate launches needs
-// enough history to survive the relaunches BETWEEN them plus whatever is run afterwards, and these
-// are a few hundred KB each.
-const int kLogKeep = 12;
+// So the previous log is kept rather than overwritten.
+//
+// ---- rotation by COUNT was the wrong lever, and the count was never the fix ----
+//
+// This was prevN slots, 3 deep, raised to 12 in run 136 after the full-resolution half of a
+// resolution A/B rotated out before the pair was compared. Twelve did not fix the class either.
+// Measured on a live log directory: ten of the thirteen slots came from a single 43-MINUTE
+// window, everything older than that was already evicted, and TWO slots were 24-line corpses -
+// launches that died on startup and were relaunched three seconds later. A dead launch costs a
+// full slot, so the headroom the bigger number bought is spent on runs containing nothing.
+//
+// The deeper problem is that `prevN` names a POSITION, not a run: "prev3" means "three launches
+// ago" and therefore means something different every time the game starts. A note in STATUS or
+// HISTORY saying "the judder trace is in prev3" is wrong the moment you relaunch - silently,
+// because a file is still there and still looks complete. That is run 31's failure mode moved
+// from truncation to renaming.
+//
+// So: no count, no slots, no eviction. The live run is always `view_matrix.log`; at attach the
+// outgoing one is renamed to ITS OWN start time, read back out of the header it wrote. A
+// reference to a timestamped log stays valid forever, a dead launch costs 2 KB instead of a
+// slot, and nothing has to be tuned. Pruning is deliberate and manual - anything automatic
+// reintroduces exactly the eviction this removes, and a 24-line log is the evidence when the
+// question is "why did it die at startup". At a few hundred KB a launch this is cheap.
+//
+// The old view_matrix.prevN.log files are left alone. Nothing here touches them again.
+
+// Line 1 is the header DllMain writes:
+//   === view_matrix attached 2026-08-04 10:43:58 - run starts here ===
+// Parse the stamp back out of it, so the archived filename matches the content it labels. A
+// name that disagrees with its own header is worse than no name at all.
+bool ReadLogStamp(const char* path, char* out, size_t outsz) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "r") == 0 && f) {
+        char line[256] = {};
+        const bool got = fgets(line, sizeof(line), f) != nullptr;
+        fclose(f);
+        unsigned y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+        if (got && sscanf_s(line, "=== view_matrix attached %u-%u-%u %u:%u:%u",
+                            &y, &mo, &d, &h, &mi, &s) == 6) {
+            sprintf_s(out, outsz, "%04u-%02u-%02u_%02u-%02u-%02u", y, mo, d, h, mi, s);
+            return true;
+        }
+    }
+    // No readable header - a log from before this scheme, or a launch that died before DllMain
+    // got to the stamp. Keep it anyway, ordered by when it ENDED rather than when it began, and
+    // say so in the name so the two are never confused.
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
+        FILETIME lt{}; SYSTEMTIME st{};
+        if (FileTimeToLocalFileTime(&fad.ftLastWriteTime, &lt) && FileTimeToSystemTime(&lt, &st)) {
+            sprintf_s(out, outsz, "%04u-%02u-%02u_%02u-%02u-%02u-ended",
+                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Defined below, but LogInit has one thing worth saying out loud - see the archive warning.
+void Log(_Printf_format_string_ const char* fmt, ...);
 
 void LogInit() {
     InitializeCriticalSection(&g_lock);
@@ -102,18 +154,33 @@ void LogInit() {
         strcat_s(base, "\\SingularityVR");
         CreateDirectoryA(base, nullptr);
         sprintf_s(g_logPath, "%s\\view_matrix.log", base);
-        // Oldest first, so nothing is overwritten before it has been moved along.
-        char from[MAX_PATH], to[MAX_PATH];
-        for (int i = kLogKeep; i >= 1; --i) {
-            sprintf_s(to, "%s\\view_matrix.prev%d.log", base, i);
-            if (i == 1) sprintf_s(from, "%s", g_logPath);
-            else        sprintf_s(from, "%s\\view_matrix.prev%d.log", base, i - 1);
-            DeleteFileA(to);
-            MoveFileA(from, to);        // fails harmlessly when the run does not exist yet
+
+        // True when there is no previous run to lose - the first launch ever, or one whose log
+        // has already been archived. Stays true only if the archive actually succeeds.
+        bool safeToTruncate = (GetFileAttributesA(g_logPath) == INVALID_FILE_ATTRIBUTES);
+        if (!safeToTruncate) {
+            char stamp[64] = {};
+            if (ReadLogStamp(g_logPath, stamp, sizeof(stamp))) {
+                char to[MAX_PATH];
+                sprintf_s(to, "%s\\view_matrix_%s.log", base, stamp);
+                // Two launches inside the same second would collide. Keep both rather than
+                // silently drop one - this whole scheme exists to stop losing runs.
+                for (int n = 1; n < 100 && GetFileAttributesA(to) != INVALID_FILE_ATTRIBUTES; ++n)
+                    sprintf_s(to, "%s\\view_matrix_%s_%d.log", base, stamp, n);
+                safeToTruncate = (MoveFileA(g_logPath, to) != 0);
+            }
         }
+
         FILE* f = nullptr;
-        if (fopen_s(&f, g_logPath, "w") == 0 && f) fclose(f);
+        // "w" truncates, and truncating is the one thing that cannot be undone. Only do it once
+        // the previous run is safely renamed; if the rename failed, APPEND. A concatenated log is
+        // confusing - two "attached" headers in one file - but it is recoverable, and run 31
+        // already paid for the alternative.
+        if (fopen_s(&f, g_logPath, safeToTruncate ? "w" : "a") == 0 && f) fclose(f);
         g_logReady = true;
+        if (!safeToTruncate)
+            Log("WARNING: could not archive the previous run - appending to it instead. This file"
+                " now holds MORE THAN ONE run; split it at the next 'attached' header.");
     }
 }
 // _Printf_format_string_ is what makes MSVC apply printf checking to a custom variadic function.
