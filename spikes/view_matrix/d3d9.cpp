@@ -3254,7 +3254,13 @@ bool g_graspAvailable = false;
 // while right sits at 0.25, sustained for seconds.
 XrAction g_actTrigTouch = XR_NULL_HANDLE;
 bool g_trigTouch[2] = { false, false };       // is a finger on this trigger
-bool g_trigTouchAvail[2] = { false, false };  // did the binding resolve at all
+bool g_trigTouchAvail[2] = { false, false };  // did the binding resolve THIS frame
+bool g_trigTouchEver[2] = { false, false };   // has it EVER resolved - one-way, see the run-180 note
+int  g_trigGateFrames = 0;                    // frames the gate has run, for the startup grace
+// How long the gate fails CLOSED while `trigger/touch` is still unknown. ~30 s at 120 fps, far past
+// the 9 s worst case measured in run 180. Past it, an unresolved sensor is taken to mean the runtime
+// has none, and triggers pass through rather than being lost forever. See the run-180 note below.
+const int kTrigGateGrace = 3600;
 int  g_trigVetoed[2] = { 0, 0 };              // frames this gate zeroed a nonzero value
 int  g_triggerGate = -1;                      // ini [Input] TriggerTouchGate, read on first use
 
@@ -4016,7 +4022,7 @@ inline SHORT DebugKey(int vk) {
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
 enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
        PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
-       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND, PR_MENUCAM,
+       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -4040,9 +4046,9 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
       PR_LEFTHAND, PR_BACK },
     { PR_CINESTICK, PR_CINECAM, PR_BACK },
     { PR_CROSSHAIR, PR_BACK },
-    { PR_OCCLUSION, PR_DEBUG, PR_MENUCAM, PR_BACK },
+    { PR_OCCLUSION, PR_DEBUG, PR_BACK },
 };
-const int kPageCount[kPanelPages] = { 6, 8, 3, 2, 4 };
+const int kPageCount[kPanelPages] = { 6, 8, 3, 2, 3 };   // ADVANCED lost MENU CAM in run 180
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -4102,7 +4108,6 @@ extern volatile LONG g_hideCrosshair;
 extern volatile LONG g_cineStickTurn;
 extern volatile LONG g_cutsceneLockCamera;
 extern volatile LONG g_swapSticks;
-extern volatile LONG g_menuCameraFollow;
 extern int g_leftHanded, g_leftHandedPending;
 // Defined with the handedness globals; the panel's MOVE DIRECTION row is the first thing to read it.
 inline int OffHand() { return g_leftHanded ? 1 : 0; }
@@ -4181,10 +4186,6 @@ void PanelSaveRow(int rowId, const char* path) {
             // The PENDING value, not the live one - see the LEFT HANDED row.
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_leftHandedPending);
             WritePrivateProfileStringA("Input", "LeftHanded", v, path); return;
-        case PR_MENUCAM:
-            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
-                        InterlockedCompareExchange(&g_menuCameraFollow, 0, 0));
-            WritePrivateProfileStringA("Input", "MenuCameraFollow", v, path); return;
 
         case PR_GOTO_CTRL: case PR_GOTO_COMFORT: case PR_GOTO_DISPLAY: case PR_GOTO_ADV:
         case PR_BACK:
@@ -4285,10 +4286,6 @@ void PanelRowText(int row, char* out, size_t cap) {
             _snprintf_s(out, cap, _TRUNCATE, "CUTSCENE CAM   %s",
                         InterlockedCompareExchange(&g_cutsceneLockCamera, 0, 0) ? "LOCKED"
                                                                                 : "FOLLOWS SCENE");
-            break;
-        case PR_MENUCAM:
-            _snprintf_s(out, cap, _TRUNCATE, "MENU CAM       %s",
-                        InterlockedCompareExchange(&g_menuCameraFollow, 0, 0) ? "FOLLOW" : "IGNORE");
             break;
         case PR_GOTO_CTRL:    _snprintf_s(out, cap, _TRUNCATE, "CONTROLLER         >"); break;
         case PR_GOTO_COMFORT: _snprintf_s(out, cap, _TRUNCATE, "COMFORT            >"); break;
@@ -4392,10 +4389,6 @@ void PanelAdjust(int row, int dir) {
             break;
         // Navigation. Page changes reset the cursor, and `return` skips the dirty flag - moving
         // between pages is not a settings change and must not make PanelSave write on close.
-        case PR_MENUCAM:
-            InterlockedExchange(&g_menuCameraFollow,
-                                InterlockedCompareExchange(&g_menuCameraFollow, 0, 0) ? 0 : 1);
-            break;
         case PR_GOTO_CTRL:    g_panelPage = 1; g_panelRow = 0; return;
         case PR_GOTO_COMFORT: g_panelPage = 2; g_panelRow = 0; return;
         case PR_SWAPSTICKS:
@@ -4515,10 +4508,6 @@ int g_leftHanded = 0;                    // ini [Input] LeftHanded - read before
 int g_leftHandedPending = 0;
 volatile LONG g_swapSticks = 0;          // ini [Input] SwapSticks - live, on the CONTROLLER page
 
-// The run-168 menu camera follow, behind a switch so it can be A/B tested against menu 6-DOF.
-// 1 is current behaviour; 0 leaves the base alone in menus the way it was before run 167.
-volatile LONG g_menuCameraFollow = 1;    // ini [Input] MenuCameraFollow
-
 // Which hand the gun and aim follow. The only thing the four aim sites need to know.
 inline int AimHand() { return g_leftHanded ? 0 : 1; }
 extern volatile LONG g_inCinematic;
@@ -4615,20 +4604,6 @@ bool InitXRInput() {
                 GetPrivateProfileIntA("Input", "LeftHanded", 0, path) ? 1 : 0;
             InterlockedExchange(&g_swapSticks,
                 GetPrivateProfileIntA("Input", "SwapSticks", 0, path) ? 1 : 0);
-            InterlockedExchange(&g_menuCameraFollow,
-                GetPrivateProfileIntA("Input", "MenuCameraFollow", 1, path) ? 1 : 0);
-            // ⚠️ Logged because run 176's A/B could not be read without opening the ini by hand -
-            // after a whole session spent on settings that could not be verified from their own log.
-            //
-            // ⚠️ AND BECAUSE IT DOES NOT DO WHAT ITS NAME SAYS: the menus report CINE YES, so the
-            // cutscene branch anchors the base there regardless of this switch. Turning it off
-            // changes nothing in a menu. See the run-177 note in STATUS.
-            Log("ini: MenuCameraFollow=%ld (%s)",
-                InterlockedCompareExchange(&g_menuCameraFollow, 0, 0),
-                InterlockedCompareExchange(&g_menuCameraFollow, 0, 0)
-                    ? "base follows the game's camera when it owns it"
-                    : "base left alone - BUT menus report CINE YES, so the cutscene path still"
-                      " anchors it there and this switch is inert in menus");
             if (g_leftHanded)
                 Log("input: LEFT-HANDED - gun and buttons mirrored. Sticks are NOT swapped (that is"
                     " SwapSticks). MENU stays on the LEFT controller: the Touch profile has no"
@@ -5374,9 +5349,30 @@ void SyncXRInput(XrTime displayTime) {
     // it, and the only thing that can tell those apart is whether a finger is there.
     //
     // Hence the veto: pulling a trigger requires touching it. If `trigger/touch` says no finger is
-    // on it, the analog value did not come from the player, whatever it says. Where the binding does
-    // not resolve, the value passes through unchanged - a runtime without the sensor keeps exactly
-    // today's behaviour rather than losing its triggers entirely.
+    // on it, the analog value did not come from the player, whatever it says.
+    //
+    // ---- ⚠️ run 180: "no sensor yet" was failing OPEN, and that is the load-in phantom ----
+    //
+    // Reported: on loading in, the melee button fires by itself and the gun is attached to nothing
+    // for about a second before snapping to the controller. Measured, the cause is not subtle: the
+    // `trigger/touch` binding does not resolve immediately, and until it does this gate passed every
+    // value through unchecked. Three runs, same build:
+    //
+    //     10:43  2 of 43 gate-windows NO SENSOR
+    //     12:46  0 of 171
+    //     13:03  9 of 136        <- the run that was reported
+    //
+    // It is a RACE, not a constant, which is exactly why it reads as "this was fine yesterday". Nine
+    // windows is about nine seconds with no veto at all, and the phantom peaks at 0.83 - a harder
+    // pull than most real ones - so the game gets sustained FIRE and AIM it never asked for.
+    //
+    // So fail CLOSED while the sensor is still unknown: a second of dead triggers at load-in is
+    // strictly better than nine seconds of the gun firing itself. But it has to be bounded, because
+    // the original open-fallback protected a real case - a runtime that genuinely has no such sensor
+    // must keep its triggers rather than lose them forever. Hence: veto until the sensor resolves,
+    // and if it has not resolved within the grace window, conclude this runtime does not have one
+    // and revert to passing through. The distinction is per hand and one-way - once a hand's sensor
+    // has EVER been seen, a later dropout is a dropout, not a missing feature.
     if (g_triggerGate < 0) {
         char path[MAX_PATH]{};
         g_triggerGate = IniPath(path)
@@ -5396,12 +5392,16 @@ void SyncXRInput(XrTime displayTime) {
             }
         }
         if (g_triggerGate) {
-            if (g_trigTouchAvail[altHand] && !g_trigTouch[altHand] && lt > 0.0f) {
-                ++g_trigVetoed[altHand]; lt = 0.0f;
-            }
-            if (g_trigTouchAvail[fireHand] && !g_trigTouch[fireHand] && rt > 0.0f) {
-                ++g_trigVetoed[fireHand]; rt = 0.0f;
-            }
+            ++g_trigGateFrames;
+            // Veto when the sensor says no finger, OR when it has never resolved for this hand and
+            // we are still inside the grace window. Outside the window an unresolved sensor means
+            // the runtime does not have one, and the value passes through as it always did.
+            auto blocked = [](int hand) {
+                if (g_trigTouchAvail[hand]) { g_trigTouchEver[hand] = true; return !g_trigTouch[hand]; }
+                return !g_trigTouchEver[hand] && g_trigGateFrames < kTrigGateGrace;
+            };
+            if (blocked(altHand)  && lt > 0.0f) { ++g_trigVetoed[altHand];  lt = 0.0f; }
+            if (blocked(fireHand) && rt > 0.0f) { ++g_trigVetoed[fireHand]; rt = 0.0f; }
         }
     }
     msStates += MsSince(tSt);
@@ -6054,11 +6054,16 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                     Log("camera back under our control - base yaw resumes");
                 }
 
-                // ---- ⭐ run 176: the follow is switchable, to A/B it against menu 6-DOF ----
+                // ---- 🛑 run 176's MenuCameraFollow switch: REMOVED in run 180, it was inert ----
                 //
-                // The user spotted a timeline I had stopped tracking: the main menu looked right
-                // BEFORE run 167/168, which is when the base started coming from the camera. There
-                // is a mechanism connecting the two, and it is not subtle -
+                // The switch was added to A/B the menu camera follow against menu 6-DOF. It could
+                // never answer that, and its own log line said so: menus report CINE YES, so
+                // `inCine` short-circuits the condition below and the switch never reaches it in
+                // the case it was built to test. A control that cannot affect its own experiment
+                // is not a control - and this one was also a live variable, found sitting at 0 in
+                // the run while the ini on disk said 1.
+                //
+                // The mechanism it was built to investigate is still real and still unfixed:
                 //
                 //     g_hmdOffset is rotated into world space by g_baseYaw
                 //
@@ -6068,18 +6073,16 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 // unrelated to your head. That reads as "6-DOF does not work" long before it reads
                 // as "6-DOF is rotated 90 degrees".
                 //
-                // ⚠️ Switchable rather than reverted: rebuilding an old state risks differing from
-                // it in some other way, and this isolates ONE variable in one session. The cutscene
-                // anchor is deliberately NOT behind the switch - that fix is confirmed good and is
-                // a different condition (g_inCinematic).
+                // The real fix, when someone takes it: the base must feed the VIEW YAW without also
+                // rotating the POSITIONAL offset. That is the actual defect, and no toggle here can
+                // substitute for it.
                 //
-                // If this proves it, the fix is not the toggle: the base must feed the VIEW YAW
-                // without also rotating the POSITIONAL offset. The toggle only settles which change
-                // caused it.
+                // ⚠️ The gate below is `g_inCinematic`, and that flag is KNOWN BAD - menus report
+                // CINE YES. Everything hanging off it leaks out of cutscenes, including the two
+                // cutscene comfort settings, which the user observed affecting normal gameplay.
+                // Fix `g_inCinematic` and several reported symptoms go with it.
                 const bool inCine = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0;
-                const bool followMenuCam =
-                    InterlockedCompareExchange(&g_menuCameraFollow, 0, 0) != 0;
-                if (inCine || (gameOwnsCam && followMenuCam)) {
+                if (inCine || gameOwnsCam) {
                     if (!g_haveCineAnchor) { g_cineAnchorYaw = camYaw; g_haveCineAnchor = true; }
                     // The frozen-anchor option is a CUTSCENE comfort setting and must not apply to
                     // menus: freezing there would reintroduce the rotation this fixes.
@@ -13297,12 +13300,19 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                         ? "   <== THE GAME IS BEING TOLD TO FIRE" : "");
                 // The veto's own accounting, so the fix is visible rather than assumed. A run where
                 // the judder is gone and this line reads 0 vetoes means something ELSE fixed it.
-                Log("    trigger touch gate %s: LEFT %s%s, RIGHT %s%s - vetoed %d/%d and %d/%d frames",
+                // NO SENSOR now has two meanings and they are opposite, so name which one it is:
+                // inside the grace window the gate FAILS CLOSED, past it the runtime is taken to
+                // have no sensor and values pass. Reading "pass through" during the first seconds
+                // of a run is the signature of the run-180 bug being back.
+                const bool grace = g_trigGateFrames < kTrigGateGrace;
+                auto sensorState = [&](int h) {
+                    return g_trigTouchAvail[h] ? (g_trigTouch[h] ? "finger ON" : "no finger")
+                         : (!g_trigTouchEver[h] && grace) ? "NO SENSOR YET (vetoing - startup grace)"
+                         : "NO SENSOR (values pass through unchanged)";
+                };
+                Log("    trigger touch gate %s: LEFT %s, RIGHT %s - vetoed %d/%d and %d/%d frames",
                     g_triggerGate ? "ON" : "off (ini TriggerTouchGate=0)",
-                    g_trigTouchAvail[0] ? (g_trigTouch[0] ? "finger ON" : "no finger") : "NO SENSOR",
-                    g_trigTouchAvail[0] ? "" : " (values pass through unchanged)",
-                    g_trigTouchAvail[1] ? (g_trigTouch[1] ? "finger ON" : "no finger") : "NO SENSOR",
-                    g_trigTouchAvail[1] ? "" : " (values pass through unchanged)",
+                    sensorState(0), sensorState(1),
                     g_trigVetoed[0], g_trigFrames, g_trigVetoed[1], g_trigFrames);
                 for (int i = 0; i < 2; ++i) {
                     g_trigMin[i] = 9.0f; g_trigMax[i] = -9.0f; g_trigInactiveFrames[i] = 0;
