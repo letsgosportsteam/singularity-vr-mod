@@ -3947,9 +3947,51 @@ inline SHORT DebugKey(int vk) {
 // Only settings that are consulted EVERY FRAME from a global belong here. Anything read once at
 // device creation - D3D9ExMode, ZeroCopy, the resolution - would appear to change and silently do
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
-const int kPanelRows = 11;
 enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
-       PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG };
+       PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
+       PR_CINESTICK, PR_CINECAM,
+       PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
+
+// ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
+//
+// PR_HEADROLL is deliberately NOT on any page any more. Head roll is not a preference: if you tilt
+// your head and the view does not tilt with it, the horizon swings against your inner ear. It was
+// only ever on the panel because it happened to be a global read every frame, and it started life
+// as a run-59 DIAGNOSTIC on NUMPAD1/NUMPAD2. The ini key stays as an escape hatch for a runtime
+// that reports bad roll; the enum entry stays so PanelRowText still has a case for it.
+//
+// VR MODE and AIM METHOD stay on the root: they are the two anyone actually toggles mid-session,
+// and burying them behind a page would cost a press every time for no gain.
+// DISPLAY is its own page with a single row today. That is deliberate: HUD inset/safe-area tuning
+// is already queued (it is the beta item in STATUS), and the crosshair belongs with it rather than
+// with comfort. A page of one that is about to be a page of three beats moving it twice.
+const int kPanelPages    = 5;
+const int kPanelRowsMax  = 8;
+const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
+    { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV },
+    { PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_MOVEDIR, PR_BACK },
+    { PR_CINESTICK, PR_CINECAM, PR_BACK },
+    { PR_CROSSHAIR, PR_BACK },
+    { PR_OCCLUSION, PR_DEBUG, PR_BACK },
+};
+const int kPageCount[kPanelPages] = { 6, 6, 3, 2, 3 };
+
+// Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
+// page's rows can display, not to what they happen to show now - that is what keeps the box from
+// resizing as you toggle a setting. The measurement in DrawVrPanel stays underneath as a floor
+// raiser, so forgetting to update one of these costs a resize rather than text spilling off the
+// plate. The widest strings are "AIM METHOD MOTION CONTROLLER" and "MOVE DIRECTION HAND (NO
+// TRACKING)", which is why those two pages are the broad ones.
+const int kPageCols[kPanelPages] = { 34, 35, 30, 28, 28 };
+const char* kPageName[kPanelPages] = { "VR SETTINGS", "CONTROLLER", "COMFORT", "DISPLAY",
+                                       "ADVANCED" };
+
+int g_panelPage = 0;
+inline int PanelRowCount() { return kPageCount[g_panelPage]; }
+inline int PanelRowId(int i) {
+    if (i < 0 || i >= PanelRowCount()) return PR_BACK;
+    return kPageRows[g_panelPage][i];
+}
 
 // ---- ⭐ run 159: VR mode on the panel, and starting in it ----
 //
@@ -3988,6 +4030,9 @@ extern float g_turnSpeedDeg;
 extern int   g_turnSign;
 // Defined with the UI draw path, where the crosshair is identified and skipped.
 extern volatile LONG g_hideCrosshair;
+// Defined beside the turn code, which is the first thing that reads them.
+extern volatile LONG g_cineStickTurn;
+extern volatile LONG g_cutsceneLockCamera;
 
 // Written on CLOSE, not on every change. Changes apply live so turn speed can be felt while the
 // stick is moving, but the file only ever receives a value that was settled on - a mis-set number
@@ -4090,6 +4135,22 @@ void PanelRowText(int row, char* out, size_t cap) {
                         g_occlusionMode == 0 ? "AUTO" :
                         g_occlusionMode == 1 ? "DRAW ALL" : "ENGINE CULL");
             break;
+        case PR_CINESTICK: {
+            const LONG s = InterlockedCompareExchange(&g_cineStickTurn, 0, 0);
+            _snprintf_s(out, cap, _TRUNCATE, "CUTSCENE TURN  %s",
+                        s == 0 ? "OFF" : s == 1 ? "GAME" : "FREE");
+            break;
+        }
+        case PR_CINECAM:
+            _snprintf_s(out, cap, _TRUNCATE, "CUTSCENE CAM   %s",
+                        InterlockedCompareExchange(&g_cutsceneLockCamera, 0, 0) ? "LOCKED"
+                                                                                : "FOLLOWS SCENE");
+            break;
+        case PR_GOTO_CTRL:    _snprintf_s(out, cap, _TRUNCATE, "CONTROLLER         >"); break;
+        case PR_GOTO_COMFORT: _snprintf_s(out, cap, _TRUNCATE, "COMFORT            >"); break;
+        case PR_GOTO_DISPLAY: _snprintf_s(out, cap, _TRUNCATE, "DISPLAY            >"); break;
+        case PR_GOTO_ADV:     _snprintf_s(out, cap, _TRUNCATE, "ADVANCED           >"); break;
+        case PR_BACK:         _snprintf_s(out, cap, _TRUNCATE, "<  BACK");              break;
         default:
             _snprintf_s(out, cap, _TRUNCATE, "DEBUGGING      %s",
                         InterlockedCompareExchange(&g_debugOn, 0, 0) ? "ON" : "OFF");
@@ -4163,6 +4224,24 @@ void PanelAdjust(int row, int dir) {
             if (g_occlusionMode < 0) g_occlusionMode = 0;
             if (g_occlusionMode > 2) g_occlusionMode = 2;
             break;
+        case PR_CINESTICK: {
+            LONG s = InterlockedCompareExchange(&g_cineStickTurn, 0, 0) + dir;
+            if (s < 0) s = 0;
+            if (s > 2) s = 2;
+            InterlockedExchange(&g_cineStickTurn, s);
+            break;
+        }
+        case PR_CINECAM:
+            InterlockedExchange(&g_cutsceneLockCamera,
+                                InterlockedCompareExchange(&g_cutsceneLockCamera, 0, 0) ? 0 : 1);
+            break;
+        // Navigation. Page changes reset the cursor, and `return` skips the dirty flag - moving
+        // between pages is not a settings change and must not make PanelSave write on close.
+        case PR_GOTO_CTRL:    g_panelPage = 1; g_panelRow = 0; return;
+        case PR_GOTO_COMFORT: g_panelPage = 2; g_panelRow = 0; return;
+        case PR_GOTO_DISPLAY: g_panelPage = 3; g_panelRow = 0; return;
+        case PR_GOTO_ADV:     g_panelPage = 4; g_panelRow = 0; return;
+        case PR_BACK:         g_panelPage = 0; g_panelRow = 0; return;
         default:
             // Always recoverable, by two independent routes: the panel is opened by holding a
             // controller button and driven by the thumbstick, so it never went through the keyboard
@@ -4218,6 +4297,42 @@ bool  g_snapArmed    = true;
 float g_smoothTurnRem = 0.0f;
 
 int32_t g_padTurnAccum = 0;    // snap steps waiting to be folded in, in FRotator units
+
+// Declared here rather than beside the cutscene watch that sets it: the turn code below is the
+// first thing in the file that reads either of these.
+// ---- ⭐ run 165: three values, because a toggle could not express what was wanted ----
+//
+// Renamed from CutsceneLockTurn, which was a double negative - "LockTurn=0" reads as both "no lock"
+// and "turning locked off", and it was misread in conversation more than once. This says what it
+// does: does the STICK turn you during a cutscene, and how.
+//
+//   0 OFF    no stick turning. Reorient by turning your body - physical rotation does not cause
+//            the vection that artificial rotation does, which matters most in exactly these scenes
+//            where the camera is already moving you.                            <- default
+//   1 GAME   the stick is handed to the ENGINE's look axis for the duration, so it goes down the
+//            same path as the mouse and inherits the scene's own clamp. Overrides TurnMode for the
+//            cutscene only, so you keep snap turn in gameplay and still get vanilla-consistent
+//            turning in scenes - a combination that was not reachable before.
+//   2 FREE   your normal TurnMode applies. Snap and smooth are mod-side and therefore UNCLAMPED,
+//            which lets a standing player turn past what the scene intended. GAME TURN users get
+//            clamping here too, since mode 0 is the engine path either way.
+//
+// ⚠️ Applies to the STICK only, in both aim methods. The mouse is the game's own input and never
+// passes through here, which is why head aim with a mouse behaves identically at every setting.
+// Naming it a "controller aim" setting would have made it silently inert while holding Touch
+// controllers in head aim mode, which is a perfectly reachable combination.
+volatile LONG g_cineStickTurn = 2;       // ini [Input] CutsceneStickTurn - default FREE
+volatile LONG g_cutsceneLockCamera = 0;  // ini [Input] CutsceneLockCamera - off by default
+extern volatile LONG g_inCinematic;
+
+// The player's own turn during a cutscene, added on top of whichever base is in use. Separate from
+// g_baseYaw because run 163 overwrites that from the camera every frame - see the note at the turn.
+int32_t g_cineTurnOffset = 0;
+// The heading the current cutscene started on, for CutsceneLockCamera. Latched on the first frame
+// of the scene rather than at the edge, because the camera is still settling at the edge itself -
+// the run-162 log caught it swinging -77 then +98 degrees within two frames of the transition.
+int32_t g_cineAnchorYaw = 0;
+bool    g_haveCineAnchor = false;
 
 bool XrPathOf(const char* s, XrPath* out) {
     return XR_SUCCEEDED(xrStringToPath(g_xrInstance, s, out));
@@ -4292,6 +4407,10 @@ bool InitXRInput() {
                 GetPrivateProfileIntA("Input", "GunSignCombo", 0, path) & 15);
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
+            InterlockedExchange(&g_cineStickTurn,
+                GetPrivateProfileIntA("Input", "CutsceneStickTurn", 2, path) & 3);
+            InterlockedExchange(&g_cutsceneLockCamera,
+                GetPrivateProfileIntA("Input", "CutsceneLockCamera", 0, path) ? 1 : 0);
             for (int i = 0; i < kPadButtonCount; ++i)
                 g_padButtons[i].mask = (WORD)GetPrivateProfileIntA(
                     "Input", g_padButtons[i].iniKey, g_padButtons[i].mask, path);
@@ -4819,13 +4938,13 @@ void SyncXRInput(XrTime displayTime) {
         static bool armedY = true, armedX = true;
         if (fabsf(panelY) > 0.6f && armedY) {
             g_panelRow += (panelY > 0) ? -1 : 1;    // stick up moves UP the list
-            if (g_panelRow < 0) g_panelRow = kPanelRows - 1;
-            if (g_panelRow >= kPanelRows) g_panelRow = 0;
+            if (g_panelRow < 0) g_panelRow = PanelRowCount() - 1;
+            if (g_panelRow >= PanelRowCount()) g_panelRow = 0;
             armedY = false;
         } else if (fabsf(panelY) < 0.3f) armedY = true;
 
         if (fabsf(panelX) > 0.6f && armedX) {
-            PanelAdjust(g_panelRow, (panelX > 0) ? +1 : -1);
+            PanelAdjust(PanelRowId(g_panelRow), (panelX > 0) ? +1 : -1);
             armedX = false;
         } else if (fabsf(panelX) < 0.3f) armedX = true;
 
@@ -4833,9 +4952,37 @@ void SyncXRInput(XrTime displayTime) {
         return;                                     // no turning, no walking, no buttons
     }
 
+    // ---- ⭐ run 161: stick turning locked during cutscenes ----
+    //
+    // Vanilla does not let you turn the camera during a scripted sequence, and the game frames its
+    // cutscenes on the assumption that you are looking where it put you. HEAD LOOK IS UNAFFECTED -
+    // that runs through the matrix in cutscene mode 3 and never touches this - so you can still
+    // look around freely; what stops is driving the character's facing with the stick.
+    //
+    // ⚠️ Suppressed at the ACCUMULATOR, not at the point it is applied, and the accumulator is
+    // cleared. Blocking only the application would let deflection pile up for the length of the
+    // cutscene and then dump it as one jump on exit.
+    //
+    // Not the fix for starting at the wrong angle - that was a stale base yaw and is fixed
+    // separately by recentring on level load. This is the comfort/parity setting on its own terms,
+    // and it is a setting rather than a rule precisely because it removes the manual correction
+    // that was the only workaround before that fix existed.
     const bool headOwnsYaw = InterlockedCompareExchange(&g_enabled, 0, 0) != 0;
+    // Only the TURN is affected. Not an early return - buttons still have to reach the game during
+    // a cutscene, and one of them is the one that skips it.
+    const bool inCine   = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0;
+    const LONG cineTurn = InterlockedCompareExchange(&g_cineStickTurn, 0, 0);
+    const bool cineOff  = inCine && cineTurn == 0;
+    const bool cineGame = inCine && cineTurn == 1;
+    if (cineOff || cineGame) { g_padTurnAccum = 0; g_smoothTurnRem = 0.0f; }
     float lookX = 0.0f;
-    if (g_turnMode == 1 && headOwnsYaw) {
+    if (cineOff) {
+        // lookX stays 0, so mode 0's pass-through to the engine's look axis is silenced too.
+    } else if (cineGame) {
+        // GAME: straight to the engine's look axis whatever TurnMode says, so the scene's own
+        // clamp applies. This is the one path that gets the mouse's behaviour from a stick.
+        lookX = tx;
+    } else if (g_turnMode == 1 && headOwnsYaw) {
         if (fabsf(tx) > 0.7f && g_snapArmed) {
             const int32_t step = (int32_t)(g_turnAngleDeg * (65536.0f / 360.0f));
             g_padTurnAccum += (tx > 0 ? 1 : -1) * g_turnSign * step;
@@ -5036,7 +5183,19 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         // Discarded rather than applied before the first centre: g_baseYaw is seeded from the
         // game's own yaw at that moment, so anything accumulated beforehand would be overwritten
         // and a snap pressed during a load would appear to do nothing.
-        if (g_haveCentre) g_baseYaw += g_padTurnAccum;
+        // ---- ⭐ run 164: during a cutscene the turn goes to its OWN offset ----
+        //
+        // Run 163 anchors g_baseYaw to the scripted camera EVERY FRAME, so adding a turn to it here
+        // would be erased on the very next frame - you would turn and snap straight back. Unlocking
+        // the stick with CutsceneLockTurn=0 would have been a setting that appeared to exist and did
+        // nothing, which this file has now produced three times and does not need a fourth.
+        //
+        // So a cutscene turn accumulates separately and is added ON TOP of the anchor. Cleared when
+        // the cutscene starts, so a scene never inherits the previous one's correction.
+        if (g_haveCentre) {
+            if (InterlockedCompareExchange(&g_inCinematic, 0, 0)) g_cineTurnOffset += g_padTurnAccum;
+            else                                                  g_baseYaw        += g_padTurnAccum;
+        }
         g_padTurnAccum = 0;
     }
     // The pacing target, measured rather than assumed. A frame time that sits at an exact
@@ -5138,9 +5297,29 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         }
         if (!g_haveCentre && centreReady) {
             g_centreYaw = yawRad;
+            // ---- ⭐ run 167: the base comes from the CAMERA, falling back to the controller ----
+            //
+            // The menu rotation bug, and it is the cutscene bug again in a different room. The
+            // recentre read the CONTROLLER's rotation, and at the second main menu the log caught
+            // it capturing `game yaw 16384` - exactly 90 degrees, which is exactly the reported
+            // rotation. In gameplay the two agree (measured: controller 18038 against camera POV
+            // 18039), which is why reading the wrong one never showed up until a menu, where they
+            // evidently do not.
+            //
+            // The view is built from the camera, so the base has to be the camera's. The controller
+            // stays as the fallback for the case where no camera has been found yet - at that point
+            // it is the only heading available and is what this always used.
+            int32_t camYawNow = 0;
+            bool    haveCamYaw = false;
+            if (uintptr_t cam = FindCamera())
+                if (Readable((void*)(cam + CAM_POV_ROT), 12)) {
+                    camYawNow = reinterpret_cast<int32_t*>(cam + CAM_POV_ROT)[1];
+                    haveCamYaw = true;
+                }
             uintptr_t ctl = FindController();
-            g_baseYaw = (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12))
-                        ? reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1] : 0;
+            const int32_t ctlYaw = (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12))
+                                 ? reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1] : 0;
+            g_baseYaw = haveCamYaw ? camYawNow : ctlYaw;
             // Midpoint of the eyes, so neither stereo eye starts biased against the centre.
             const bool haveBoth = (n >= 2);
             g_centrePos[0] = haveBoth ? (views[0].pose.position.x + views[1].pose.position.x) * 0.5f
@@ -5185,14 +5364,19 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
             // have looked entirely normal on this line. "valid" and "tracked" being separately
             // visible is what makes a wrong centre diagnosable from the log instead of from a
             // second run.
-            Log("recentred: head yaw %.1f, game yaw %d, head pos (%.3f, %.3f, %.3f)%s"
-                " [pos valid %d tracked %d]"
-                " | weapon neutral %s (yaw %+.1f, pitch %+.1f from the head)",
-                yawRad * 57.2958f, g_baseYaw,
+            // Both headings are printed because run 167's whole point is that they can DISAGREE,
+            // and a single "game yaw" column could not have shown that.
+            Log("recentred: head yaw %.1f, base from %s | camera %d (%+.1f) controller %d (%+.1f)"
+                ", head pos (%.3f, %.3f, %.3f)%s"
+                " [pos valid %d tracked %d]",
+                yawRad * 57.2958f, haveCamYaw ? "CAMERA" : "controller (no camera yet)",
+                camYawNow, camYawNow * (360.0f / 65536.0f),
+                ctlYaw, ctlYaw * (360.0f / 65536.0f),
                 g_centrePos[0], g_centrePos[1], g_centrePos[2],
                 g_haveCentrePos ? "" : " [POSITION NOT TRACKED]",
                 (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) ? 1 : 0,
-                (vs.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) ? 1 : 0,
+                (vs.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) ? 1 : 0);
+            Log("           weapon neutral %s (yaw %+.1f, pitch %+.1f from the head)",
                 g_haveHandOffset ? "captured" : "NOT captured (right controller not tracked)",
                 g_handYawOffset * 57.2958f, g_handPitchOffset * 57.2958f);
         }
@@ -5362,6 +5546,174 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
         if (p >  16000) p =  16000;
         if (p < -16000) p = -16000;
         g_wantPitch = p;
+        // ---- ⭐ run 163: during a cutscene, the BASE is the scripted camera ----
+        //
+        // Four attempts, and the confirmation that settled it was one bit: head look still works
+        // during a cutscene while we are NOT writing the engine yaw. So the view is built from our
+        // forced matrix, and g_wantYaw is an ABSOLUTE heading, not a delta added to the engine's.
+        //
+        // That explains both halves of the report at once. The head delta is live, so looking
+        // around works. The base is g_baseYaw - captured at the main menu and, with the fold-in off
+        // during cutscenes, never corrected - so the whole view sits at the menu's heading while
+        // the scene is somewhere else. Measured: base -1.8 deg against a scripted camera at +99.1.
+        //
+        // Anchoring the base to mCurrentPOV each frame gives view = scripted heading + head look.
+        // The camera keeps panning (measured: 99.1 -> 98.6 -> 98.0 -> 97.4, the helicopter track)
+        // and the base follows it, so that motion is preserved rather than fought.
+        //
+        // ⚠️ This is only safe BECAUSE run 162 stopped writing the controller during cutscenes. The
+        // camera normally follows the controller, so anchoring to it while also writing it would be
+        // a feedback loop - our own output read back as input, compounding every frame. The two
+        // changes are load-bearing together and neither should be reverted alone.
+        //
+        // On exit the base is left at the camera's final heading, which is where the scene put you.
+        // ---- run 164: two comfort settings, both expressible because of the decomposition above ----
+        //
+        // The anchor is where "what feeds the base" is decided, so both settings live here:
+        //
+        //   CutsceneLockCamera=0  base tracks the scripted camera - the scene's pan carries you,
+        //                         which is how it keeps its subject framed          <- default
+        //   CutsceneLockCamera=1  base frozen at the heading the cutscene STARTED on, so the scene
+        //                         no longer rotates you. You turn your head to follow the action
+        //                         instead, and the scene stops composing itself for you - relief
+        //                         for scenes that swing hard, not a general improvement.
+        //
+        // g_cineTurnOffset is added in both cases: it is the player's own correction and must
+        // survive whichever base is in use.
+        // ---- ⭐ run 166: a level or menu transition recentres ----
+        //
+        // Two things at once, and they are the same event.
+        //
+        // Wanted: entering the main menu should put the menu where you are LOOKING, rather than
+        // wherever the last level left the base yaw. And the rotation bug survived a trip through
+        // the menu - play, get rotated, quit to menu, start a new game, still rotated - because
+        // nothing between those points ever re-established the base.
+        //
+        // The signal is the camera POSITION jumping. Gameplay moves it smoothly; a level load or a
+        // menu transition teleports it by tens of thousands of units. It costs one read of a field
+        // already being located, needs no new lookup, and unlike the run-161 attempt it does not
+        // depend on a cached POINTER changing - which is exactly what made that one never fire.
+        //
+        // ⚠️ It will also fire on an in-game teleport, and this game has those. Recentring there is
+        // defensible - you have been moved somewhere else and the base should follow - but it is a
+        // behaviour change beyond the reported bug, so it is logged every time rather than silent.
+        if (uintptr_t cam = FindCamera()) {
+            if (Readable((void*)(cam + CAM_POV_LOC), 12)) {
+                // `camPos`, not `p` - there is a live `p` in this scope already, and this file has
+                // caught me shadowing a Present parameter twice now.
+                const float* camPos = reinterpret_cast<const float*>(cam + CAM_POV_LOC);
+                static float prev[3] = { 0, 0, 0 };
+                static bool  havePrev = false;
+                const float dx = camPos[0] - prev[0], dy = camPos[1] - prev[1],
+                            dz = camPos[2] - prev[2];
+                const float d2 = dx*dx + dy*dy + dz*dz;
+                const float kJump = 20000.0f;          // UU; gameplay never steps this far
+                if (havePrev && d2 > kJump * kJump) {
+                    g_haveCentre = false;
+                    Log("camera jumped %.0f UU - level or menu transition, recentring so the base"
+                        " yaw comes from where you are now rather than the last level", sqrtf(d2));
+                }
+                prev[0] = camPos[0]; prev[1] = camPos[1]; prev[2] = camPos[2];
+                havePrev = true;
+            }
+
+            // ---- ⭐ run 168: the drift detector ----
+            //
+            // Four attempts at the menu rotation, and the last "smoking gun" - a base of exactly
+            // 16384 - turned out to be a coincidence. 90 degrees is an ordinary world heading for an
+            // axis-aligned level, and the main menu is diegetic, so there is nothing wrong with a
+            // non-zero base per se. What has to be true is narrower:
+            //
+            //     the view yaw we PRODUCE must match the yaw of the camera the game is USING
+            //
+            // So that is what this measures, rather than anything about the base on its own.
+            // g_wantYaw is our output; the camera's POV yaw is the game's. In gameplay we drive the
+            // camera, so they track. Anywhere the game owns the camera and we have not noticed -
+            // the suspected case being the primary menu handing off to the full main menu without a
+            // position jump big enough to trip the recentre above - they separate, and by exactly
+            // the angle that gets reported as being rotated.
+            //
+            // Rate-limited to once a second and gated on a real difference, so a clean run says
+            // nothing at all and any line at all is the bug.
+            // Everything below reads the camera's rotation, so it is fetched ONCE here rather than
+            // per consumer. Readable() is a VirtualQuery - a kernel call - and this block had grown
+            // to three FindCamera calls and three reads a frame for one number.
+            if (Readable((void*)(cam + CAM_POV_ROT), 12)) {
+                const int32_t camYaw = reinterpret_cast<int32_t*>(cam + CAM_POV_ROT)[1];
+                const float kUU2Deg = 360.0f / 65536.0f;
+
+                // ---- the drift log: diagnostic only, says nothing on a clean run ----
+                {
+                    const float driftDeg = (camYaw - g_wantYaw) * kUU2Deg;  // wraps correctly
+                    static ULONGLONG lastSaid = 0;
+                    const ULONGLONG now = GetTickCount64();
+                    if (fabsf(driftDeg) > 5.0f && (!lastSaid || now - lastSaid > 1000)) {
+                        lastSaid = now;
+                        Log("view drift %+.1f deg: camera %d (%+.1f) vs our wantYaw %d (%+.1f)"
+                            " | base %d (%+.1f) | cine %s | cam@%p",
+                            driftDeg, camYaw, camYaw * kUU2Deg,
+                            g_wantYaw, g_wantYaw * kUU2Deg, g_baseYaw, g_baseYaw * kUU2Deg,
+                            InterlockedCompareExchange(&g_inCinematic, 0, 0) ? "ON" : "off",
+                            (void*)cam);
+                    }
+                }
+
+        // ---- ⭐ run 168: follow the camera whenever the GAME owns it, not just in cutscenes ----
+        //
+        // The menu rotation, measured at last. Setting the base from the camera at the recentre
+        // WORKED and then decayed: the log shows it captured 16289 (+89.5) correctly and read 17 by
+        // the next sample. The yaw fold-in is anchored to the CONTROLLER, so it reads our
+        // camera-derived write as an 87 degree external delta and subtracts it back out. A base set
+        // once cannot survive that - it has to be re-established every frame, exactly as the
+        // cutscene path already does.
+        //
+        // The signal for "the game owns the camera" needs no menu detection, because the same log
+        // separates the two states by three orders of magnitude:
+        //
+        //     menu      camera 16289  controller   461   -> 87 degrees apart
+        //     gameplay  camera 18046  controller 18053   -> 0.04 degrees apart
+        //
+        // In gameplay we drive the controller and the camera follows it, so they agree to within
+        // rounding. Anywhere the game is running its own camera - menus, scripted sequences - they
+        // separate hugely. 15 degrees sits in an enormous gap and is not a tuned number.
+        //
+        // Hysteresis both ways, because a camera interpolating toward a new heading
+        // (mDesiredRotationInterpRate is real) can cross a threshold briefly in normal play, and a
+        // base that flips between two sources every few frames would be worse than either.
+            {
+                int32_t ctlYaw = camYaw;
+                if (uintptr_t ctl = FindController())
+                    if (Readable((void*)(ctl + ACTOR_ROTATION), 12))
+                        ctlYaw = reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION)[1];
+
+                const int32_t apart = camYaw - ctlYaw;          // wraps correctly
+                const float apartDeg = fabsf(apart * (360.0f / 65536.0f));
+                const int32_t kOwnDeg = 15;
+                static int above = 0, below = 0;
+                static bool gameOwnsCam = false;
+                if (apartDeg > kOwnDeg) { ++above; below = 0; } else { ++below; above = 0; }
+                if (!gameOwnsCam && above >= 10) {
+                    gameOwnsCam = true;
+                    Log("camera handed to the GAME (%.1f deg from the pawn) - following it rather"
+                        " than the base, so menus and scripted cameras are not rotated", apartDeg);
+                } else if (gameOwnsCam && below >= 10) {
+                    gameOwnsCam = false;
+                    Log("camera back under our control - base yaw resumes");
+                }
+
+                const bool inCine = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0;
+                if (inCine || gameOwnsCam) {
+                    if (!g_haveCineAnchor) { g_cineAnchorYaw = camYaw; g_haveCineAnchor = true; }
+                    // The frozen-anchor option is a CUTSCENE comfort setting and must not apply to
+                    // menus: freezing there would reintroduce the rotation this fixes.
+                    g_baseYaw = (inCine && InterlockedCompareExchange(&g_cutsceneLockCamera, 0, 0)
+                                 ? g_cineAnchorYaw : camYaw) + g_cineTurnOffset;
+                } else {
+                    g_haveCineAnchor = false;
+                }
+            }
+            }
+        }
         g_wantYaw   = g_baseYaw + (int32_t)(g_yawSign * dYaw * kRadToUU);
         g_haveWant  = true;
 
@@ -6430,6 +6782,7 @@ struct VidSig {
 VidSig g_vidSig[kVidSigMax]{};
 int       g_vidSigN = 0;
 int       g_vidFrameDraws = 0;      // draws seen this frame, counted by the probe itself
+int       g_vidPrevFrameDraws = 0;  // and the previous frame's total - see IsVideoQuad
 ULONGLONG g_vidLastDump = 0;
 int       g_vidDumps = 0;
 const int kVidMaxDumps = 40;        // enough for the splashes and a cutscene; not a permanent cost
@@ -6483,6 +6836,10 @@ void VidProbeRecord(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UINT
 // almost no 3D geometry - so gameplay is never printed and the log stays readable.
 void VidProbeFrameEnd() {
     const int draws = g_vidFrameDraws;
+    // Published for IsVideoQuad, which needs "was the last frame video-only" and cannot ask about
+    // the current one from inside a draw. See the note there.
+    // (run 169: the previous-frame gate that consumed this was reverted - kept as probe context)
+    g_vidPrevFrameDraws = draws;
     g_vidFrameDraws = 0;
     if (g_vidSigN == 0 || g_vidDumps >= kVidMaxDumps) { g_vidSigN = 0; return; }
 
@@ -7688,18 +8045,57 @@ volatile LONG g_videoStereo = 1;      // ini [Render] VideoStereo
 // frame; in gameplay it must read nothing, and now that is checkable rather than argued.
 volatile LONG g_videoQuadDraws = 0;
 
+// ---- ⚠️ run 167: the classifier was too loose, and the counter caught it ----
+//
+// "video quads drawn per eye: 51 this second <== DURING GAMEPLAY, this is a MISCLASSIFICATION" -
+// the exact line added in case this happened. The visible symptom was the main menu coming apart
+// into a split image: the menu is diegetic, so its quad looks structurally like Bink's and got
+// drawn once per eye.
+//
+// The fix is the one column measured in run 160 and then not used: **D3DFMT_L8**. Bink decodes to
+// Y/U/V planes as LUMINANCE textures and combines them in a pixel shader; UI and menu quads are
+// A8R8G8B8. Every video frame in the probe read `fmt 50`, and nothing else did.
+//
+// Failing this test is the safe direction: an unrecognised video renders exactly as it did before
+// - uncorrected, but whole - while a misrecognised menu breaks the menu.
+const UINT kFmtL8 = 50;   // D3DFMT_L8
+
+// ---- 🛑 run 169: a fourth condition was TRIED and REVERTED. Do not add a fifth ----
+//
+// The attempt: gate on the previous frame's draw total, so the quad only counts as video when the
+// video IS the whole frame. The theory was sound and probably still is - the main menu has a
+// looping Bink background, a genuine L8 quad under hundreds of draws of interface, which every
+// earlier test correctly called video while answering the wrong question.
+//
+// It fixed the menu and broke real video: a short sequence before the main cutscene began doubling,
+// and so did something else. The draw-count proxy separated the cases I had already seen and not
+// the ones I had not.
+//
+// ⚠️ **Three conditions were bolted on here, each after a misfire, and it is still wrong in both
+// directions.** That is tuning a heuristic until it fits the last observation - run 45's recorded
+// mistake, "a filter that encoded its own answer" - and a fourth would be more of the same.
+//
+// KNOWN AND ACCEPTED: the main menu's background is drawn per eye and doubles. `VideoStereo=0`
+// turns the whole feature off and restores the original behaviour, all video spanning the seam,
+// for anyone who prefers that trade.
+//
+// If this is picked up again, do NOT add a condition to this function. It needs a real signal:
+// hook Bink's own presentation, or identify the video by its render target. Every geometric
+// property of a video quad is shared with something else on screen, which is why four attempts at
+// describing its shape have each found a new false positive or negative.
 bool IsVideoQuad(IDirect3DDevice9* dev, UINT primCount) {
     if (primCount != 2 || g_vidFrameDraws != 1) return false;   // see the classifier note above
-    UINT texW = 0, texH = 0, rtW = 0, rtH = 0;
+    UINT texW = 0, texH = 0, rtW = 0, rtH = 0, texFmt = 0;
     if (IDirect3DBaseTexture9* bt = nullptr; SUCCEEDED(dev->GetTexture(0, &bt)) && bt) {
         if (bt->GetType() == D3DRTYPE_TEXTURE) {
             D3DSURFACE_DESC d{};
             if (SUCCEEDED(static_cast<IDirect3DTexture9*>(bt)->GetLevelDesc(0, &d))) {
-                texW = d.Width; texH = d.Height;
+                texW = d.Width; texH = d.Height; texFmt = (UINT)d.Format;
             }
         }
         bt->Release();
     }
+    if (texFmt != kFmtL8) return false;
     if (IDirect3DSurface9* rt = nullptr; SUCCEEDED(dev->GetRenderTarget(0, &rt)) && rt) {
         D3DSURFACE_DESC d{};
         if (SUCCEEDED(rt->GetDesc(&d))) { rtW = d.Width; rtH = d.Height; }
@@ -10940,8 +11336,9 @@ static int AnchorMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
 static void DrawVrPanel(IDirect3DDevice9* dev) {
     if (!dev || !g_srcW || !g_srcH) return;
 
-    char rows[kPanelRows][40];
-    for (int i = 0; i < kPanelRows; ++i) PanelRowText(i, rows[i], sizeof(rows[i]));
+    const int nRows = PanelRowCount();
+    char rows[kPanelRowsMax][40];
+    for (int i = 0; i < nRows; ++i) PanelRowText(PanelRowId(i), rows[i], sizeof(rows[i]));
 
     DWORD oldScissor = FALSE;
     dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
@@ -10974,8 +11371,17 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
     // and can never walk off the top and bottom of the lenses.
     //
     // kPanelHeightFrac is now the only number to touch to change the panel's overall size.
+    // ---- ⚠️ run 167: the divisor is a CONSTANT, not this page's row count ----
+    //
+    // Sizing px from nRows held the panel's HEIGHT constant and let the text grow to fill it, so a
+    // two-row sub-page got px ~14 against the root's ~8 - nearly double the glyph size. That is why
+    // the sub-pages still read as "way too wide" after the column fix: the columns were fewer and
+    // each one was twice as big.
+    //
+    // Sizing from kPanelRowsMax keeps the TEXT the same on every page and lets short pages simply
+    // be short boxes, which is what a settings menu does.
     const double kPanelHeightFrac = 0.30;
-    int px = (int)((g_srcH * kPanelHeightFrac) / ((kGlyphH + 4) * (kPanelRows + 3)));
+    int px = (int)((g_srcH * kPanelHeightFrac) / ((kGlyphH + 4) * (kPanelRowsMax + 3)));
     // Floor of 3, not 1. A 5x7 glyph at px=1 is five pixels across on a 2688-tall display: present
     // in the frame, unreadable through a lens, and indistinguishable from the panel being broken.
     // Past roughly 20 rows this floor wins and the panel starts growing again, which is the point at
@@ -10986,13 +11392,25 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
     // becomes too narrow the first time a row is added with a longer label - and the failure is
     // text spilling past the plate, not a compile error. +2 for the margin the constant included.
     int widest = 0;
-    for (int i = 0; i < kPanelRows; ++i) {
+    for (int i = 0; i < nRows; ++i) {
         const int len = (int)strlen(rows[i]);
         if (len > widest) widest = len;
     }
-    const int  cols  = widest + 2;
+    // ---- ⚠️ run 166: a FLOOR, not the width ----
+    //
+    // Measuring the current rows made the box resize as you used it: "AIM METHOD MOTION CONTROLLER"
+    // is the longest string in the panel, so selecting it visibly widened the whole plate, and
+    // moving between pages changed the width again. A settings menu that changes shape when you
+    // change a value reads as a glitch.
+    //
+    // So the measurement becomes a floor-raiser rather than the width itself, and the floor is
+    // PER PAGE - one global constant made every two-row sub-page as wide as the root, which was
+    // the next thing reported. kPageCols carries each page's worst case; the measurement below it
+    // only ever raises, so a row longer than its page's constant still cannot spill past the plate.
+    const int  colsMin = kPageCols[g_panelPage];
+    const int  cols    = (widest + 2 > colsMin) ? widest + 2 : colsMin;
     const int  boxW  = cols * (kGlyphW + 1) * px;
-    const int  boxH  = lh * (kPanelRows + 3);
+    const int  boxH  = lh * (nRows + 3);
     const int  y0    = (int)(g_srcH / 2) - boxH / 2;
 
     const int kCap = 8192;
@@ -11024,10 +11442,10 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
     n = 0;
     for (int eye = 0; eye < eyes; ++eye) {
         const int x0 = (int)(eye * halfW + halfW / 2) - boxW / 2;
-        n = TextRects(r, n, kCap, x0, y0, px, "VR SETTINGS");
-        for (int i = 0; i < kPanelRows; ++i)
+        n = TextRects(r, n, kCap, x0, y0, px, kPageName[g_panelPage]);
+        for (int i = 0; i < nRows; ++i)
             n = TextRects(r, n, kCap, x0, y0 + lh * (2 + i), px, rows[i]);
-        n = TextRects(r, n, kCap, x0, y0 + lh * (kPanelRows + 2), px,
+        n = TextRects(r, n, kCap, x0, y0 + lh * (nRows + 2), px,
                       "LEFT STICK   HOLD Y TO CLOSE");
     }
     if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
@@ -11945,6 +12363,26 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 g_userCutMode = CutsceneMode();
                 g_cineAutoActive = true;
                 SetCutsceneMode(3);
+                // Each scene starts clean: no inherited correction, and the frozen anchor re-latched
+                // from this scene's own opening heading rather than the last one's.
+                g_cineTurnOffset = 0;
+                g_haveCineAnchor = false;
+                // ---- ⚠️ run 166: drop the cached camera and controller ----
+                //
+                // Reported: going to the main menu and starting a new game brings the rotation bug
+                // back, while launching straight into a new game is fine. The log shows the
+                // signature - `camera POV 0` for the whole scene, where a working run read 18050.
+                //
+                // FindCamera caches exactly the way FindController does: it returns g_camera while
+                // that address stays readable with a matching class pointer. Across a level change
+                // the old camera object can satisfy both tests and still be dead, so the anchor
+                // reads a corpse and the base goes to zero. **This is the same trap that killed the
+                // run-161 fix**, in the other one of the two cached lookups.
+                //
+                // Cleared here rather than detected: a cutscene start is a level-scoped event, the
+                // rescan is one GObjects walk, and it happens at most once per scene.
+                g_camera = 0;
+                g_controller = 0;
                 Log("cutscene STARTED - switching to mode 3 (ROT MATRIX, YAW FOLD OFF) so head yaw"
                     " survives the scripted camera. Was mode %d, restored on exit.", g_userCutMode);
             } else if (g_cineAutoActive) {
@@ -12811,6 +13249,23 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     // crossing the wrap point needs no special case.
     if (InterlockedCompareExchange(&g_enabled, 0, 0) && g_haveWant) {
         uintptr_t ctl = FindController();
+
+        // ---- ❌ run 161: "recentre when the PlayerController pointer changes" - REMOVED ----
+        //
+        // Written to fix "I start 90 degrees off when a new game reaches the cutscene". It never
+        // fired, and it would not have worked if it had. Both reasons are worth keeping so it is
+        // not written a third time:
+        //
+        //   1. **FindController CACHES.** It returns g_controller unchanged while that address is
+        //      still readable with a matching class pointer, so a level load does not move it and
+        //      the comparison had nothing to see.
+        //   2. **Reading the controller gives back OUR OWN value.** `yaw held` reads 100% - the
+        //      engine never changes what we write - so g_baseYaw = rot[1] would have recaptured
+        //      the stale menu yaw it was supposed to replace.
+        //
+        // The second is the real lesson: there is currently NO path by which the game's intended
+        // spawn heading reaches this mod, because we overwrite it every frame before anyone reads
+        // it. That is what run 162's yaw-assertion log is measuring.
         if (ctl && Readable((void*)(ctl + ACTOR_ROTATION), 12)) {
             int32_t* rot = reinterpret_cast<int32_t*>(ctl + ACTOR_ROTATION);
             // ---- ⭐ run 99: do NOT fold in our own fire-window write ----
@@ -12882,6 +13337,79 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 if (observedYaw == g_lastWrittenYaw) InterlockedIncrement(&g_yawHeld);
             }
 
+            // ---- ⭐ run 163: the WHOLE yaw composition during a cutscene ----
+            //
+            // Three fixes have now missed, and every one of them was a plausible mechanism that the
+            // next log contradicted. The pattern in all three was the same: I measured ONE quantity
+            // and assumed the rest of the chain. So this logs the entire chain at once.
+            //
+            // What the view actually is during a cutscene:
+            //
+            //   controller Rotation   what we were overwriting, and now do not
+            //   camera mCurrentPOV    what the matinee drives - and the run-162 log showed the
+            //                         controller sitting at 0 during the scene, so this is the
+            //                         leading candidate for where the scripted +98 deg lives
+            //   g_baseYaw             the facing all head tracking is measured against
+            //   des - cur             the delta the MATRIX carries in ROT MATRIX mode
+            //
+            // Rate-limited by frames rather than capped globally. Run 162's probe stopped after 60
+            // events and every one of them landed BEFORE the cutscene, so the window that mattered
+            // was never recorded - the instrument answered a question about the wrong sixty frames.
+            if (InterlockedCompareExchange(&g_inCinematic, 0, 0)) {
+                static int every = 0;
+                if ((every++ % 60) == 0) {
+                    const float k = 360.0f / 65536.0f;
+                    int32_t camYaw = 0;
+                    if (uintptr_t cam = FindCamera())
+                        if (Readable((void*)(cam + CAM_POV_ROT), 12))
+                            camYaw = reinterpret_cast<int32_t*>(cam + CAM_POV_ROT)[1];
+                    // The camera POINTER is printed because run 166's suspect is a stale cached
+                    // object - a pointer that does not change across a level load is the tell, and
+                    // the yaw value alone cannot distinguish "camera says 0" from "dead camera".
+                    Log("cine yaw: cam@%p controller %d (%+.1f) | camera POV %d (%+.1f)"
+                        " | baseYaw %d (%+.1f)"
+                        " | head des %d cur %d, matrix carries %+.1f deg | wrote %d (%+.1f)",
+                        (void*)FindCamera(),
+                        observedYaw, observedYaw * k, camYaw, camYaw * k,
+                        g_baseYaw, g_baseYaw * k,
+                        g_matDesYawUU, g_matCurYawUU, (g_matDesYawUU - g_matCurYawUU) * k,
+                        g_wantYaw, g_wantYaw * k);
+                }
+            }
+
+            // ---- ⭐ run 162: every yaw the ENGINE asserts, logged ----
+            //
+            // Two fixes for "I start 90 degrees off" have now missed, and both missed because of
+            // something this log line would have shown.
+            //
+            //   1. Recentre on level change - FindController CACHES, so the pointer never moved.
+            //   2. And it would not have helped anyway: `yaw held` reads 100%, meaning the engine
+            //      never changes what we write. g_baseYaw = rot[1] reads back OUR OWN stale value,
+            //      so recentring from the controller cannot recover the game's intended heading.
+            //
+            // So the question is no longer "where do we recentre" but "does the engine EVER assert
+            // a heading we could adopt, and when". At 100% held these events are rare, which is
+            // exactly what makes logging all of them cheap and the signal unambiguous.
+            //
+            // Deliberately OUTSIDE the fold-in branch below: during a cutscene the fold-in is off
+            // and would swallow the very event most likely to matter - the one at the transition
+            // into the scripted camera.
+            if (g_haveLastWrittenYaw && !windowRaced && observedYaw != g_lastWrittenYaw) {
+                static int said = 0;
+                if (said < 60) {
+                    ++said;
+                    // `dYaw`, not `d` - Hook_Present's fifth parameter is `d` and is live here.
+                    // The file already carries a note about being caught by this twice.
+                    const int32_t dYaw = observedYaw - g_lastWrittenYaw;
+                    Log("yaw asserted by the ENGINE: observed %d, we wrote %d, delta %d (%+.1f deg)"
+                        " | baseYaw %d (%+.1f deg) | fold-in %s, cine %s",
+                        observedYaw, g_lastWrittenYaw, dYaw, dYaw * (360.0f / 65536.0f),
+                        g_baseYaw, g_baseYaw * (360.0f / 65536.0f),
+                        InterlockedCompareExchange(&g_yawFoldIn, 0, 0) ? "ON" : "off",
+                        InterlockedCompareExchange(&g_inCinematic, 0, 0) ? "ON" : "off");
+                }
+            }
+
             if (!InterlockedCompareExchange(&g_yawFoldIn, 0, 0)) {
                 // Suppressed. The reference still advances below, so re-enabling mid-run does
                 // not fold in the whole accumulated difference as one jump.
@@ -12892,7 +13420,35 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     g_wantYaw += externalDelta;
                 }
             }
-            rot[1] = g_wantYaw;
+            // ---- ⭐ run 162: during a cutscene in ROT MATRIX, the ENGINE owns the yaw ----
+            //
+            // Measured, after two wrong guesses. Throughout the opening cutscene the log reads:
+            //
+            //   observed 18050, we wrote 185, delta 17865 (+98.1 deg) | fold-in off, cine ON
+            //
+            // The scripted camera asserts +98 degrees every frame and we overwrite it with +1,
+            // every frame, for the whole scene. That IS the "I start 90 degrees rotated" report.
+            //
+            // The contrast in the same log proves the mechanism rather than merely fitting it: at
+            // line 358, in gameplay with fold-in ON, the engine asserted +90.4 deg and it was
+            // absorbed correctly. The menu-to-game transition self-corrects. Only cutscenes do not,
+            // because fold-off is precisely what mode 3 means.
+            //
+            // ---- why suppressing the write is the fix, not a patch ----
+            //
+            // Writing g_wantYaw exists so the ENGINE's camera follows your head. In ROT MATRIX the
+            // matrix carries head rotation instead - that is the definition of the mode - so this
+            // write is already redundant there, and during a scripted scene it is actively fighting
+            // the camera the scene is trying to point. Skipping it leaves the engine on the
+            // scripted heading and the head free in the matrix, which is what mode 3 was built for.
+            //
+            // Narrow on purpose: gated on a cutscene ACTUALLY running, not on ROT MATRIX generally.
+            // Modes 2 and 3 are reachable by hand from the NUMPAD8 cycle for aim-decoupling work,
+            // and silently stopping the engine from following the head there would break a
+            // different thing than the one being fixed.
+            const bool cineOwnsYaw = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0 &&
+                                     InterlockedCompareExchange(&g_matrixRot, 0, 0) != 0;
+            if (!cineOwnsYaw) rot[1] = g_wantYaw;
 
             // ---- ⭐ run 79: stop lying to the engine, and look for a SECOND rotation ----
             //

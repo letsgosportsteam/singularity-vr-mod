@@ -920,3 +920,67 @@ StartInVr=1
 ; rebuild.
 ; ---------------------------------------------------------------------------
 VideoStereo=1
+
+; ---------------------------------------------------------------------------
+; [Input] CutsceneStickTurn -- stick turning during cutscenes (runs 161, 165)
+;
+; Renamed from CutsceneLockTurn, which was a double negative - "LockTurn=0" reads
+; as both "no lock" and "turning locked off", and both readings came up in one
+; conversation. This says what it does. On the VR panel under COMFORT.
+;
+;   0 OFF    no stick turning. Reorient by turning your body; physical rotation
+;            does not cause the vection artificial rotation does, which matters
+;            most in exactly these scenes where the camera is already moving you.
+;   1 GAME   the stick is handed to the ENGINE's look axis for the duration, so
+;            it goes down the same path as the mouse and inherits the scene's own
+;            clamp. Overrides TurnMode for the cutscene only, so you keep snap
+;            turn in gameplay and still get vanilla-consistent turning in scenes -
+;            a combination that was not reachable before.
+;   2 FREE   your normal TurnMode applies. Snap and smooth are mod-side and
+;            therefore UNCLAMPED, which lets a standing player turn past what the
+;            scene intended.                                       <- default
+;
+; HEAD LOOK IS UNAFFECTED at every setting - it comes from the mod's forced
+; matrix and never touches the turn code.
+;
+; ⚠️ Applies to the STICK only, in both aim methods. The mouse is the game's own
+; input and never passes through here. Naming it a "controller aim" setting would
+; have made it silently inert while holding Touch controllers in head aim mode,
+; which is a perfectly reachable combination.
+;
+; ⚠️ THE CLAMP DEPENDS ON TURN MODE, not on aim method. Mouse and TurnMode 0 both
+; go through the engine's look axis and inherit the matinee's limits; TurnMode
+; 1/2 are mod-side and do not. A 360 pad in head aim behaves like the mouse on
+; GAME TURN and does not on snap or smooth.
+;
+; OFF is suppressed at the ACCUMULATOR and cleared, not at the point it is
+; applied: blocking only the application would let deflection pile up for the
+; length of the cutscene and dump it as one jump on exit. And not as an early
+; return - buttons must still reach the game, one of them being the skip.
+;
+; ⚠️ None of this is what fixed starting a cutscene rotated 90 degrees. That was
+; a base heading captured at the main menu, fixed in run 163 by anchoring it to
+; the scripted camera.
+;
+; ---------------------------------------------------------------------------
+; [Input] CutsceneLockCamera -- stop the scene rotating you (run 164)
+;
+;   0 = the base tracks the scripted camera, so the scene's pan carries you and
+;       keeps its subject framed                                  <- default
+;   1 = the base is frozen at the heading the cutscene STARTED on, so the scene
+;       rotates around you instead
+;
+; The tradeoff, plainly: if you are sitting in a helicopter and you lock the
+; camera, the helicopter moves around you. That is a fair trade for anyone who
+; does not want to be swung about by an intense scene, and a bad default for
+; everyone else - which is why it is off.
+;
+; The anchor latches on the first frame of the scene, NOT on the transition edge:
+; the run-162 log caught the camera swinging -77 then +98 degrees within two
+; frames of the edge, so latching there would freeze you to a transient.
+;
+; Applies to cutscenes only. Menus follow the camera unconditionally - freezing
+; there would reintroduce the rotation run 168 fixed.
+; ---------------------------------------------------------------------------
+CutsceneStickTurn=2
+CutsceneLockCamera=0

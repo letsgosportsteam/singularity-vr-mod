@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-03** (end of run 160). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-03** (end of run 169). Read this first, then `ENGINE_NOTES.md`.
 
 > # ✅ The ladder is complete except controller input.
 >
@@ -166,6 +166,143 @@ dropped beside the game exe. No game files modified.
 rather than at first `Present`. `InstallViewHook` tolerates `MH_ERROR_ALREADY_INITIALIZED`
 accordingly — treating it as a failure would silently kill head tracking. It is the newest
 structural change in the build and the first thing to suspect if tracking ever misbehaves.
+
+## 🚧 Runs 164–169: panel pages, cutscene comfort, and TWO OPEN BUGS
+
+### ✅ Landed
+
+- **Panel pages.** Root (VR MODE, AIM METHOD) → `CONTROLLER`, `COMFORT`, `DISPLAY`, `ADVANCED`.
+  DISPLAY holds the crosshair and is deliberately a page of one — HUD inset belongs there next.
+- **`CutsceneStickTurn`** (renamed from `CutsceneLockTurn`, which was a double negative and got
+  misread twice in conversation). `OFF` / `GAME` / `FREE`, default **FREE**. `GAME` hands the stick
+  to the engine's look axis for the scene, so it inherits the matinee's clamp exactly like the
+  mouse — and overrides `TurnMode` for the duration, a combination not reachable before.
+- **`CutsceneLockCamera`**, default off. Freezes the base at the scene's opening heading so the
+  scene rotates around you instead of carrying you. The tradeoff in the user's words: *"if you lock
+  the camera the helicopter will move around you"* — relief for an intense scene, not a default.
+- **Head roll off the panel.** It is correctness, not preference: tilt your head and the view must
+  tilt with it. Was only ever a row because it happened to be a per-frame global; it began as a
+  run-59 diagnostic. Ini key stays as an escape hatch.
+- **Panel sizing.** Width is a per-page floor (`kPageCols`) rather than measured, so toggling a
+  value no longer resizes the box; `px` derives from a fixed row count rather than the current
+  page's, so sub-pages have the same text size instead of doubling it.
+- **Camera-ownership follow.** The base now tracks the camera whenever the *game* owns it, not just
+  in cutscenes — see below.
+
+### ⚠️ The clamp depends on TURN MODE, not on aim method
+
+A correction worth keeping, because the first framing was wrong and plausible:
+
+| | path | clamped? |
+|---|---|---|
+| mouse | engine look axis | **yes** — inherits the matinee's limits |
+| stick, `TurnMode 0` | engine look axis | **yes** |
+| stick, `TurnMode 1/2` | our own base | **no** — mod-side, outside the engine |
+
+So a 360 pad in head aim behaves like the mouse *on GAME TURN*, and doesn't on snap or smooth. The
+earlier "head aim clamped, controller aim free" was an accident of testing head aim with a mouse.
+
+### 🐛 OPEN: the menu rotation bug
+
+Entering the main menu leaves the view rotated, and it survives into a new game. **Five attempts,
+all failed.** What is known:
+
+- `g_baseYaw` set from the camera at the recentre **works and then decays** — measured capturing
+  `16289 (+89.5)` correctly and reading `17` a moment later. The yaw fold-in is anchored to the
+  **controller** and subtracts the difference back out, so a base set once cannot survive.
+- Camera and controller **diverge hugely in menus and agree in gameplay** — `16289` vs `461` (87°)
+  against `18046` vs `18053` (0.04°). That is now the signal for "the game owns the camera", with
+  10-frame hysteresis, and the handover fires and releases correctly in the log.
+- **It still rotates.** So something beyond yaw is involved, and the remaining lead is that the view
+  comes from the mod's forced matrix rather than from the camera we are now tracking.
+- ⚠️ **`FindCamera` and `FindController` both CACHE** and both defeated an attempt. Any future fix
+  that keys on a pointer changing is already known not to work.
+- ⚠️ A base of exactly `16384` was read as a smoking gun and was **a coincidence** — 90° is an
+  ordinary world heading for an axis-aligned level. The menu is diegetic; a non-zero base is normal.
+  What must be true is `our view yaw == the camera's yaw`, nothing about the base alone.
+
+The `view drift` log line measures exactly that and is left in: it says nothing on a clean run, so
+any line at all is the bug.
+
+### 🐛 OPEN: the video classifier misfires in both directions
+
+`VideoStereo` corrects splash screens and the opening cutscene. It also **doubles the main menu's
+background**, which is a genuine Bink video under hundreds of draws of interface.
+
+**Four conditions were tried; the fourth was reverted** because it fixed the menu and broke real
+video (a sequence before the main cutscene started doubling). Current state is three conditions:
+first draw of the frame, 2-primitive NDC quad, `D3DFMT_L8`.
+
+> **Do not add a fifth condition.** Every geometric property of a video quad is shared with
+> something else on screen, which is why each attempt at describing its shape found a new false
+> positive or negative. This is run 45's recorded mistake — *"a filter that encoded its own
+> answer"*. It needs a real signal: hook Bink's presentation, or identify the video by its render
+> target. `VideoStereo=0` restores the original all-video-spans-the-seam behaviour.
+
+The per-second misfire counter is what caught every one of these and should stay.
+
+### ⚠️ Method notes
+
+- **A setting that cannot express what is wanted gets misread.** `CutsceneLockTurn=0` parses as both
+  "no lock" and "turning locked off", and both readings appeared in one conversation. The rename to
+  `CutsceneStickTurn` made the ambiguity vanish without changing any behaviour.
+- **Name the thing measured, not the category.** "Are we in a menu" is not readable — run 141 records
+  that the main menu reports `PAUSED NO`. "Does our view yaw match the camera's" is directly
+  measurable and covers menus, cutscenes and anything scripted with one rule.
+- **An estimate is not a measurement, including mine.** The per-frame cost of the new camera reads
+  was quoted from general knowledge (~6 µs/frame, ~0.07% of frame time), never timed on this
+  machine. The `xrinput cost` line exists because the same question was answered properly once.
+
+## ✅ Runs 161–163: starting a cutscene rotated ~90° — four attempts, and what each one taught
+
+**Symptom:** starting a new game sometimes put you ~90° off once the in-engine cutscene began. Head
+look worked; the scripted camera panned correctly; only the heading was wrong.
+
+**Cause:** the view is built from the mod's **forced matrix**, and `g_wantYaw` is an **absolute**
+heading — `g_baseYaw + headDelta` — not a delta on top of the engine's rotation. `g_baseYaw` was
+captured at the main menu (which is diegetic, so it captures the *menu camera's* yaw) and the
+fold-in that would correct it is deliberately off during cutscenes. Measured: **base −1.8° against a
+scripted camera at +99.1°.** Head look worked because the delta was live; the base was simply wrong.
+
+**Fix:** during a cutscene, anchor `g_baseYaw` to the camera's `mCurrentPOV` yaw every frame. View
+becomes scripted heading + head look, and the camera's pan (99.1 → 98.6 → 98.0 → 97.4, tracking the
+helicopter) is followed rather than fought.
+
+> ⚠️ **This is only safe because run 162 stopped writing the controller yaw during cutscenes.** The
+> camera normally follows the controller, so anchoring to it while also writing it is a feedback
+> loop — our own output read back as input. **The two changes are load-bearing together and neither
+> should be reverted alone.**
+
+### ⚠️ Method: three misses, and every one was a mode's NAME mistaken for its behaviour
+
+| attempt | why it failed |
+|---|---|
+| recentre when the `PlayerController` pointer changes | `FindController` **caches** — the pointer never moved. And it would not have worked anyway: `yaw held` is 100%, so reading the controller returns *our own* value |
+| suppress the engine yaw write during cutscenes | the yaw was not in that field; the deltas collapsed and nothing visible changed |
+| assume `ROT MATRIX` carries head rotation | **`matrix carries +0.0 deg` on every logged line.** With the deviation clamp at `maxDev = 0` the split is inert — the code's own note says so: *"at maxDev = 0 the matrix rotation is identically zero"* |
+
+**The generalisable one:** `ROT MATRIX` describes a mode's *intent*, not what it does at the current
+settings. Two of the three attempts were built on the name. **Read what the split actually carries,
+not what the mode is called.**
+
+**And the instrument failed twice in the same way it did in run 154.** The first yaw probe capped at
+60 events and all 60 landed *before* the cutscene — it answered a question about the wrong sixty
+frames. The fix both times was the same: key the instrument on the state you care about, not on a
+global budget.
+
+**What finally settled it was one bit**, asked directly rather than inferred: *does head look still
+work during the cutscene while we are not writing the engine yaw?* Yes → the view comes from the
+matrix, and the base is the only thing left that could be wrong.
+
+### `CutsceneLockTurn` — stick turning locked during cutscenes
+
+`[Input] CutsceneLockTurn=1`. Vanilla does not let you turn during a scripted scene, and the game
+frames its cutscenes assuming you are looking where it put you. **Head look is unaffected.**
+Suppressed at the *accumulator* and cleared, not at the point it is applied — blocking only the
+application would let deflection pile up and dump as one jump on exit. Not an early return either:
+buttons must still reach the game during a cutscene, one of them being the one that skips it.
+
+📋 Wanted: a toggle for the scene rotating you to track its subject (the helicopter). Kept for now.
 
 ## ✅ Runs 159–160: start in VR, and Bink video in both eyes
 
