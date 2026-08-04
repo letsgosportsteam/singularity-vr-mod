@@ -3253,6 +3253,14 @@ bool g_graspAvailable = false;
 // Per-hand, because the two triggers drift independently: the run-155 log has left sitting at 0.38
 // while right sits at 0.25, sustained for seconds.
 XrAction g_actTrigTouch = XR_NULL_HANDLE;
+// run 180: the narrow "thumb on the stick" sensor. Measured, not acted on - see the note at
+// the snap-turn site. Phantom snap turns were reported with no instrument on the stick at all.
+XrAction g_actStickTouch = XR_NULL_HANDLE;
+bool g_stickTouch[2] = { false, false };
+bool g_stickTouchAvail[2] = { false, false };
+float g_stickAbsMax[2] = { 0.0f, 0.0f };     // largest |x| seen this window, per hand
+int   g_stickOver[2] = { 0, 0 };             // frames past the 0.7 snap threshold this window
+int   g_snapFired = 0;                       // snap turns this window, for the readout
 bool g_trigTouch[2] = { false, false };       // is a finger on this trigger
 bool g_trigTouchAvail[2] = { false, false };  // did the binding resolve THIS frame
 bool g_trigTouchEver[2] = { false, false };   // has it EVER resolved - one-way, see the run-180 note
@@ -4672,6 +4680,23 @@ bool InitXRInput() {
             g_actTrigTouch = XR_NULL_HANDLE;
     }
 
+    // ---- run 180: the same narrow sensor for the STICK, for measuring only ----
+    // thumbstick/touch is currently only wired into the GRASP boolean, the "any finger anywhere"
+    // signal run 155 proved unreliable in both directions. A dedicated action per hand is what
+    // run 156 built for the trigger, and it is what a stick veto would need - but nothing is
+    // vetoed yet. This run answers one question: do phantom snap turns arrive with a thumb on
+    // the stick or without one?
+    {
+        XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
+        strcpy_s(aci.actionName, "sticktouch");
+        strcpy_s(aci.localizedActionName, "Thumb on the stick");
+        aci.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+        aci.countSubactionPaths = 2;
+        aci.subactionPaths = g_handSubPath;
+        if (XR_FAILED(xrCreateAction(g_actionSet, &aci, &g_actStickTouch)))
+            g_actStickTouch = XR_NULL_HANDLE;
+    }
+
     {
         XrActionCreateInfo aci{ XR_TYPE_ACTION_CREATE_INFO };
         strcpy_s(aci.actionName, "handpose");
@@ -4823,6 +4848,15 @@ bool InitXRInput() {
         for (int i = 0; i < 2; ++i) {
             XrPath p;
             if (XrPathOf(tp[i], &p)) { binds[nb].action = g_actTrigTouch; binds[nb].binding = p; ++nb; }
+        }
+    }
+    if (g_actStickTouch != XR_NULL_HANDLE) {
+        // Same rule as trigtouch above: exactly two sources. One question, one sensor, one hand.
+        const char* sp[2] = { "/user/hand/left/input/thumbstick/touch",
+                              "/user/hand/right/input/thumbstick/touch" };
+        for (int i = 0; i < 2; ++i) {
+            XrPath p;
+            if (XrPathOf(sp[i], &p)) { binds[nb].action = g_actStickTouch; binds[nb].binding = p; ++nb; }
         }
     }
     if (g_actHandPose != XR_NULL_HANDLE) {
@@ -4983,6 +5017,14 @@ void SyncXRInput(XrTime displayTime) {
         float sx = mx, sy = my;
         mx = tx; my = ty;
         tx = sx; ty = sy;
+    }
+    // run 180: census on the turn stick, so a reported phantom snap has numbers behind it. Recorded
+    // AFTER the swap, so it always describes the stick that actually drives turning.
+    {
+        const int th = AimHand() ^ 1;
+        const float ax = fabsf(tx);
+        if (ax > g_stickAbsMax[th]) g_stickAbsMax[th] = ax;
+        if (ax > 0.7f) ++g_stickOver[th];
     }
     msStates += MsSince(tSt);
 
@@ -5264,6 +5306,25 @@ void SyncXRInput(XrTime displayTime) {
             const int32_t step = (int32_t)(g_turnAngleDeg * (65536.0f / 360.0f));
             g_padTurnAccum += (tx > 0 ? 1 : -1) * g_turnSign * step;
             g_snapArmed = false;
+            // ---- run 180: log what CAUSED every snap, because phantom snaps were reported ----
+            //
+            // The trigger has full instrumentation and the stick had none, so a reported phantom
+            // snap could not be told from a real one. Run 155 measured the runtime inventing
+            // sustained trigger values with the controllers down; if it does the same to the
+            // stick, a phantom past 0.7 fires a turn nobody asked for.
+            //
+            // NOTHING IS VETOED HERE. This run answers one question: does a phantom snap arrive
+            // with a thumb on the stick or without one? If they land consistently on "no thumb",
+            // the fix is run 156's veto applied to the stick, and it will be justified rather
+            // than guessed. If they arrive WITH a thumb, the stick is not the source at all and
+            // a veto would have been wasted work - which is the outcome worth knowing about.
+            const int th = AimHand() ^ 1;   // turn is the off hand; see the stick read above
+            Log("SNAP TURN: tx %+.3f -> %+ld deg | thumb on stick %s | %s",
+                tx, (long)(g_turnAngleDeg * (tx > 0 ? 1 : -1) * g_turnSign),
+                g_stickTouchAvail[th] ? (g_stickTouch[th] ? "YES" : "NO  <== no thumb, candidate phantom")
+                                      : "NO SENSOR",
+                g_handHeld[th] ? "controller reads in-hand" : "controller reads ON DESK");
+            ++g_snapFired;
         } else if (fabsf(tx) < 0.4f) {
             g_snapArmed = true;
         }
@@ -5377,6 +5438,20 @@ void SyncXRInput(XrTime displayTime) {
         char path[MAX_PATH]{};
         g_triggerGate = IniPath(path)
                       ? (GetPrivateProfileIntA("Input", "TriggerTouchGate", 1, path) ? 1 : 0) : 1;
+    }
+    if (g_actStickTouch != XR_NULL_HANDLE) {
+        for (int hand = 0; hand < 2; ++hand) {
+            XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+            gi.action = g_actStickTouch;
+            gi.subactionPath = g_handSubPath[hand];
+            XrActionStateBoolean st{ XR_TYPE_ACTION_STATE_BOOLEAN };
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(g_xrSession, &gi, &st)) && st.isActive) {
+                g_stickTouchAvail[hand] = true;
+                g_stickTouch[hand] = st.currentState != 0;
+            } else {
+                g_stickTouchAvail[hand] = false;
+            }
+        }
     }
     if (g_actTrigTouch != XR_NULL_HANDLE) {
         for (int hand = 0; hand < 2; ++hand) {
@@ -13314,6 +13389,19 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     g_triggerGate ? "ON" : "off (ini TriggerTouchGate=0)",
                     sensorState(0), sensorState(1),
                     g_trigVetoed[0], g_trigFrames, g_trigVetoed[1], g_trigFrames);
+                // run 180: the turn stick had NO instrument at all while phantom snaps were being
+                // reported. Nothing is vetoed here - this is the measurement that decides whether a
+                // stick veto is justified. `over 0.7` with no thumb is the phantom signature.
+                {
+                    const int th = AimHand() ^ 1;
+                    Log("    turn stick [%s hand]: peak |x| %.3f, %d frame(s) past the 0.7 snap"
+                        " threshold, %d snap(s) fired | thumb on stick %s",
+                        th ? "right" : "left", g_stickAbsMax[th], g_stickOver[th], g_snapFired,
+                        g_stickTouchAvail[th] ? (g_stickTouch[th] ? "YES" : "NO") : "NO SENSOR");
+                    g_stickAbsMax[0] = g_stickAbsMax[1] = 0.0f;
+                    g_stickOver[0] = g_stickOver[1] = 0;
+                    g_snapFired = 0;
+                }
                 for (int i = 0; i < 2; ++i) {
                     g_trigMin[i] = 9.0f; g_trigMax[i] = -9.0f; g_trigInactiveFrames[i] = 0;
                     g_trigVetoed[i] = 0;
