@@ -1,10 +1,29 @@
 # STATUS — session handoff
 
-Last updated **2026-08-04** (end of run 179). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-04** (end of run 180). Read this first, then `ENGINE_NOTES.md`.
 
-**This file is current state only.** The run-by-run log for runs 1–179 moved to `HISTORY.md` on
+**This file is current state only.** The run-by-run log for runs 1–180 moved to `HISTORY.md` on
 2026-08-04 — you do not need it cold, but go there before building on any premise you inherited.
 It also flags, with ⛔ banners, four status claims that had gone stale in place.
+
+> ### ⭐ Run 180: UE3 yaw deltas were never wrapped, and it cost months of misattribution
+>
+> `camYaw - ctlYaw` on `int32_t` does **not** wrap. UE3 is 65536 units per turn, so two headings
+> **0.3° apart** differ by 65590 units and read as **360.3°**. Two sites did this and both carried
+> a comment saying `// wraps correctly`.
+>
+> Measured in one 8,476-line run: **20** false `camera handed to the GAME (360.3 deg from the
+> pawn)` events, each re-anchoring `g_baseYaw` to the camera and yanking the view. Reported for
+> months as phantom snap turns — there were no snap turns; the run was `TurnMode=2` and fired
+> **zero**. After the fix, same conditions under heavy turning: **0 handoffs**, and the drift log
+> reports `-5.0 / +89.5` instead of `±360`.
+>
+> **Cast the difference to `int16_t`** — 65536 units *is* 2¹⁶, so truncation gives the shortest
+> signed path for free. Use `YawDelta()` / `YawDeltaDeg()`; a raw subtraction is only safe if both
+> sides are provably normalised, and nothing here normalises them.
+>
+> ⚠️ **Several other sites still subtract yaws raw**, including one at the FRotator write path
+> carrying the same `int32 wrap is correct` claim. No measured evidence yet. Audit them next.
 
 > # ✅ The ladder is complete. Every rung, including controller input.
 >
@@ -56,6 +75,33 @@ dropped beside the game exe. No game files modified.
    same resolution. One minute, and it settles "is this us at all" before any bisection starts.
 
 ### Next session, in order
+
+**A. 🔬 Three run-180 changes are in the build and NOT yet verified.** Each has a named false pass;
+none should be called done until its own condition has actually occurred in a run.
+
+- **The trigger veto now fails CLOSED at startup.** It used to pass everything through until
+  `trigger/touch` resolved, which is the load-in phantom melee and the gun attached to nothing.
+  It is a **race**: measured at 2, 0 and 9 unprotected gate-windows across three runs of one
+  build, so a clean load-in proves nothing. **Verify by finding a run whose log says
+  `NO SENSOR YET (vetoing - startup grace)`.** Both runs since the fix resolved instantly and
+  never exercised it.
+- **The turn stick now has a narrow `thumbstick/touch` sensor and a per-window census.**
+  Measuring only — nothing is vetoed. It was added to catch phantom snaps and instead proved
+  they were not snaps at all. Left in because the stick had *no* instrument before.
+- **The mesh-latch census** logs the whole foreground list at take and drop. It has not yet
+  caught a drop. Needs a long session — every run that dropped the latch was 11,000+ lines,
+  every run that did not was under 3,100.
+
+**B. 📋 Audit the remaining raw yaw subtractions.** Same class as the run-180 fix, no evidence yet.
+`YawDelta()` exists now. The one at the FRotator write path carries the same false
+`int32 wrap is correct` comment and is the first to check.
+
+**C. 🐛 `g_inCinematic` is wrong — menus report `CINE YES`.** Everything gated on it leaks out of
+cutscenes, which is why the two cutscene comfort settings were seen affecting normal gameplay.
+Both settings gate on it *correctly*; the flag is the bug. Fixing it should take several reported
+symptoms with it, and it is the likeliest lead on the tabled **menu rotation bug** — whose exact
+repro is recorded: free/follows → enter game → pause → free/locked → exit to main menu → start
+game → menu is rotated.
 
 0. **📋 The BACKSPACE keyboard exemption can now go** — `VR MODE` is on the panel as of run 159, so the last reason to keep it live under `Debug=0` is gone.
    Run 157's `[Render] Debug` makes every keyboard key inert except **BACKSPACE** (VR mode on/off)

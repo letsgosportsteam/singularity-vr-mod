@@ -24,6 +24,71 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 180: the yaw delta that never wrapped, and three misattributions it caused
+
+**The bug.** `camYaw - ctlYaw` on `int32_t` does not wrap. UE3 rotation is 65536 units per turn,
+so two headings **0.3° apart** can differ by 65590 units, which reads as **360.3°**. Two sites did
+this — the camera-ownership test and the drift log — and **both carried a comment claiming
+`// wraps correctly`**. Both were introduced in `559653f`, during the menu-rotation investigation.
+
+**Measured, one 8,476-line run:**
+
+```
+camera handed to the GAME (360.3 deg from the pawn)     x20
+view drift  +358.4 / +359.9 / +360.0 / -359.8 / -360.3 deg
+```
+
+Every one of those is ~0° misread as a full turn. The ownership threshold is 15°, so each false
+reading handed the camera to the game and re-anchored `g_baseYaw` to it — yanking the view
+somewhere the player was not looking.
+
+**After the fix, comparable conditions, heavy turning** (peak stick `1.000`, windows at 120/120
+frames of full deflection): **0 handoffs**, drift reporting `-5.0 / -5.4 / +89.5 / -89.9`.
+
+The fix is to cast the difference to `int16_t` — 65536 units *is* 2¹⁶, so truncation lands the
+result in `[-32768, 32767]`, the shortest signed path, for free. Behind `YawDelta()` /
+`YawDeltaDeg()` so a third site cannot repeat it.
+
+### What it had been blamed on
+
+- **"Phantom snap turns."** There were none. The run was `TurnMode=2` — smooth — so the snap
+  branch never executes, and the instrument added this run recorded **zero snaps fired** while the
+  symptom was being reported.
+- **A set-down controller inventing input.** Ruled out by the user's own observation that it only
+  happened with fingers on the sticks and while moving one. It fires when a turn carries the yaw
+  across the wrap boundary, which is the opposite condition.
+- **Last night's left-handed / settings work.** The user suspected the changes made while chasing
+  the menu-rotation bug and was right about the commit, wrong about which part: the drift log is
+  `Log()`-only and cannot change behaviour; the ownership test in the same commit can.
+
+### The lesson is the comments
+
+Two load-bearing comments asserted the exact property that was false, and they were believed for
+every run since. `// wraps correctly` is not a note, it is a claim — and an unverified claim in a
+comment is indistinguishable from a verified one when you read it six runs later.
+
+### Also this run
+
+- **The trigger veto failed OPEN at startup.** `trigger/touch` does not resolve immediately, and
+  until it did, the run-156 veto passed every value through — the load-in phantom melee, and the
+  gun attached to nothing. A **race**: 2, 0 and 9 unprotected windows across three runs of one
+  build, which is why it read as "this was fine yesterday". Now fails closed, bounded by a ~30 s
+  grace so a runtime genuinely lacking the sensor still keeps its triggers. **Not yet verified** —
+  both runs since resolved instantly.
+- **`MenuCameraFollow` (run 176) removed entirely.** It could never A/B what it was built for:
+  menus report `CINE YES`, so `g_inCinematic` short-circuits the condition before the switch is
+  reached, and its own log line said so. It was also a live uncontrolled variable, found at 0 in
+  a run while the ini on disk read 1.
+- **The turn stick had no instrument at all** while phantom snaps were being reported. It has one
+  now — narrow `thumbstick/touch` per hand, plus a per-window census. Measuring only.
+- **Diagnostic honesty, twice.** The stick census was briefly called broken on the strength of its
+  first 8 windows, which were startup; across all 122 it read correctly. And installing the
+  pre-change backup DLL for an A/B reinstated the old positional `prevN` rotation, which destroyed
+  the 08-03 night logs over six relaunches.
+- **Not the mod at all:** a day of "the game will not start" was `PhysXLoader.dll` missing
+  system-wide — `0xc06d007e` delay-load failure, then a NULL deref at `+0x007cdde6`, identically
+  on the Steam copy. This is the crash `ENGINE_NOTES.md` predicted and said was never identified.
+
 ## ✅ Runs 170–175: left-handed mode, and a settings bug that hid behind a comment
 
 ### Handedness, as TWO independent settings

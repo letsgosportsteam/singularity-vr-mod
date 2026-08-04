@@ -742,6 +742,34 @@ Steam's does (DirectX, PhysX, VC++) and runs it on first launch.
 Causation is inferred from timeline plus a coherent mechanism, not proven — the exact missing
 component was not identified.
 
+### ✅ IDENTIFIED (2026-08-04): it is the 32-bit `PhysXLoader.dll`
+
+Reproduced in full, on **both** game copies, with the crash signature captured:
+
+```
+0xc06d007e  in KERNELBASE.dll                   delay-load failure: "module could not be found"
+0xc0000005  in Singularity.exe +0x007cdde6      the NULL deref immediately after
+```
+
+The Steam copy faulted at the **identical offset**, which is what proves it system-wide rather
+than an install problem. `C:\Program Files (x86)\NVIDIA Corporation\PhysX\Common\` held
+`PhysXLoader64.dll` but **not** the 32-bit `PhysXLoader.dll`, and Singularity is 32-bit. The
+versioned engines (`Engine\v2.7.1\`, `v2.7.3\`, …) were all intact — only the loader that bridges
+to them was gone.
+
+**Repair:** run the game's own bundled redist, `redist\PhysX_9.09.1112_SystemSoftware.exe`, as
+administrator. ⚠️ **Uninstall `NVIDIA PhysX System Software` first.** With a newer version
+registered, the 9.09 installer runs in *remove* mode — it took `PhysXLoader64.dll` and the
+`physxcudart` files with it and left the registration behind, making things worse. With nothing
+registered it installs cleanly and restores both loaders.
+
+The installer also adds `PhysX\Common` to the machine `PATH`, so a process started before the
+install may still fail on a stale environment. Reboot if the first launch after repairing fails
+the same way.
+
+**For the install guide:** the GOG package ships no `redist` folder, so a GOG-only user has no
+way to repair this and will blame the mod. Ship the instruction, or the redist.
+
 ### Consequence for distribution
 
 This is a latent Raven bug, but it matters to us: a user installing the mod onto a **fresh GOG
