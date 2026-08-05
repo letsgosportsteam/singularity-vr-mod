@@ -13,7 +13,7 @@ Two kinds of content live here, and they carry different risk:
 
 - **Run narrative** — every section is stamped with its run number, so its age is visible and you
   can weigh it yourself. Safe to read as "what was true at run N".
-- **Superseded status snapshots** — three sections that were written as *current state* and never
+- **Superseded status snapshots** — sections that were written as *current state* and never
   updated, so they read as present-tense fact while being wrong. Each now carries a
   ⛔ **SUPERSEDED** banner naming what overturned it. **Do not quote these as current.** They are
   kept because the runs that produced them are kept, and a claim is easier to weigh next to the
@@ -21,6 +21,278 @@ Two kinds of content live here, and they carry different risk:
 
 A grep that lands in this file may well have landed on a retracted conclusion. Check for a
 SUPERSEDED banner above your hit, and check the run number, before you act on it.
+
+---
+
+## ⭐ Runs 182–190: the gun's feel fixed twice, and a nine-run hunt aimed at the wrong thing
+
+Two wins on how the mod *feels*, one workaround, and an expensive lesson about what a measurement
+does and does not license.
+
+### ✅ The gun moved in STEPS, and it was integer truncation
+
+Reported first as "jitter, like it's not tracking at the full framerate", then **redescribed as
+"moving in steps, almost like there's a deadzone — if I move the controller very slowly I can see it
+jumping."** The redescription is what solved it, and it did so by ruling out an entire class:
+**latency shifts smooth motion in time; it cannot turn smooth motion into stairs.**
+
+`g_handOffX/Y/Z` held the hand-minus-head offset in **whole unreal units**. Eye separation is a
+measured 3.32 UU = 6.3 cm, so 1 UU ≈ **1.9 cm** — the gun could only ever sit on a 1.9 cm lattice.
+`(LONG)` also truncates *toward zero*, so the step was asymmetric about the origin. Now milli-UU with
+`lroundf`: 19 µm, below the controller's noise floor.
+
+The **rotation** was never involved — `g_handDev*UU` are engine rotation units at 65536/turn, 0.0055°
+per step. Fixing both would have worked and taught nothing about which mattered.
+
+> ### ⚠️ The method lesson, and it is the uncomfortable kind
+>
+> A **confirmed measurement pointed the wrong way.** The `pose lead` instrument was built for this
+> report, worked correctly, and read **8.33 ms** of pose staleness — exactly one display period, five
+> windows running. Acting on that alone would have produced a small real improvement and a confident
+> "fixed", with the stepping still there.
+>
+> **The instrument was right, the number was right, and it was not the answer to the question asked.**
+> What settled it was a user redescription, not a measurement. When a symptom is described as
+> *stepping*, suspect quantisation before timing, whatever the instruments say.
+
+### ✅ The gun's pose was also a full frame stale — a separate, additive fix
+
+Same runs, different defect, deliberately tested in its own run. D3D9 renders and *then* Presents, so
+the pose sampled at Present N is consumed by frame N+1's draws — one display period late.
+
+**Why the head hides it:** the head goes to the compositor as the projection layer's pose and gets
+**reprojected** at scan-out, so late error is corrected in hardware. The gun is baked into *geometry*
+by `BuildGunC`, and reprojection cannot move a vertex. Hence gun-only lag next to a smooth head.
+
+Fix: locate the hand spaces at `predictedDisplayTime + predictedDisplayPeriod` (`PoseLeadFrames=1`).
+Measured 8.33 ms → **0.00 ms**. The period comes from `xrWaitFrame`, not a hardcoded 8.33 ms.
+
+> ⚠️ **`0.00 ms` is bookkeeping, not tracking quality.** With pacing locked the metric becomes
+> arithmetically exact and is measuring its own arithmetic. It proves the timestamp we ask for matches
+> the frame the geometry lands in; it says nothing about the runtime's *prediction* at that timestamp.
+> The open risk is overshoot on sharp reversals, since prediction error grows with lead time.
+
+### ⛔ Nine runs chased the muzzle FX through the engine. The seam was the answer.
+
+The flash and barrel smoke were assumed to be correctly drawn at a *wrong engine position*, so runs
+182–188 went after moving the first-person weapon in the engine's object model. What ended it was one
+observation from the **flat monitor**, not the headset:
+
+> the effect sits at the dead centre of the **monitor** — on the seam, between the two eye images.
+
+World geometry goes through `StereoPair` and is drawn **twice**, once per scissored half. A merely
+mis-placed effect would appear **twice**, once near each gun. Seeing **one**, straddling the middle,
+means its clip position is `(0,0)` in the *full side-by-side frame*. **It is our own per-eye remap
+missing this draw — not Raven's placement.** And it predicts, correctly, that the aim method cannot
+matter, because the effect never receives a per-eye position at all.
+
+Also established: the flash and the smoke are **one particle system**. `RvGame.u` lists no smoke
+property; the smoke is an emitter inside the muzzle-flash asset. Two bugs reported for sixty runs,
+one asset.
+
+Workaround shipped — `HideMuzzleFx=1` nulls the first-person templates on the live `RvWeaponFX`, which
+kills both. The real fix is a per-eye remap and should retire the setting.
+
+**What the nine runs did produce, and it is in `ENGINE_NOTES.md`:** the UObject property-offset layout
+(`Children +0x4C`, `Next +0x40`, `Offset +0x64`), solved by requiring it to reproduce
+`Actor.Location=+0x054` *and* `Actor.Rotation=+0x060`; and the measured negative that writing a
+component's `Translation` moves the derived transform by **+0.0 UU** — UE3 will not recompose without
+a reattach.
+
+### 📋 Runs 191–194: the flash draw IDENTIFIED, the register not, and tabled
+
+Four solid facts, none of which should be re-derived: the draw is **`DrawIndexedPrimitiveUP` at stride
+72** (unique to firing, ~7 per shot, found by a baseline-vs-fire census); it **is** already split per
+eye; its vertices are **world-space** (so not a screen-space quad — the Bink fix does not apply); and it
+has a vertex shader whose **`c5..c8` is its local→world matrix**, confirmed by a `w` column of
+`(0,0,0,1)` and a translation that drifts frame to frame as the particle moves.
+
+Pass-through counts were **104/frame in baseline and fire alike**, which killed the quad-classifier
+theory outright — and only a baseline could have shown that. A fire-window number on its own had
+nothing to compare against.
+
+**Not found:** the register carrying the *clip* transform. Still open, with the shortlist recorded in
+STATUS, plus a cheaper hypothesis to test first — that the flash rides `c0` and merely arrives when no
+`g_camMats` slot is valid, which would make a duplicated draw land identically in both halves.
+
+> ### 💥 Run 196: three instruments were built on an identification nothing had tested
+>
+> Run 192's census diffed a fire window against a baseline and found **stride 72** unique to firing. That
+> part was sound. **The error was reading "unique to firing" as "is the muzzle flash"** — a tracer, an
+> ejected casing and an impact effect all appear only when you shoot, and all render correctly.
+>
+> Runs 193, 194, 195 and 196 then hunted that draw's transform: a per-draw write mask, a block dump, an
+> alignment fix, and finally the shader bytecode. The bytecode was **the first measurement capable of
+> contradicting the premise**, and it did — the shader reads `c0`, which is locked, valid and remapped at
+> that draw, so its transform cannot be what lands on the seam.
+>
+> The test that would have caught it was one line, available from the start, and is the same
+> discriminator that settled the foreground-pass question in a single run: **drop the draw and see
+> whether the artefact goes.** It now exists as `MuzzleFxDropStride`.
+>
+> **Run 197 ran it: the artefact REMAINED.** So stride 72 was never the flash, and runs 193–196 measured
+> the wrong draw from beginning to end — four runs of increasingly careful instrumentation, every one of
+> them pointed at geometry that was already being remapped correctly. The one-line test cost nothing and
+> would have redirected all four.
+>
+> **Confirm what a thing IS before measuring its properties.** Every later instrument inherited the
+> unvalidated label, and being more rigorous about *alignment*, *caps* and *bytecode* could not rescue a
+> chain whose first link was a guess.
+
+> ### 💥 Run 191's scan was the wrong instrument, and it looked like evidence
+>
+> The matrix scan tests whether the **camera** transforms to `w≈0`, which is only true of a full
+> world→clip matrix in translated-world space. A local→clip matrix for an effect fails that test while
+> still being the transform. So its silence was **structural blindness, not a negative** — and it was
+> read as a negative for a run. Before trusting an instrument's "not found", check that the thing being
+> looked for is inside the class it can detect.
+
+### 💥 Four more runs lost to bounds I chose for tidiness
+
+The recurring shape, worth stating as a rule: **a cap chosen to keep output readable silently excluded
+the answer.** Run 183's owner cap filled with archetypes before reaching the live weapon. Run 192's
+signature table saturated on indexed draws that carry no vertex data. Run 193 `break`'d after the first
+constant block — and the first block was the *world* matrix, not the screen transform. Run 194 then
+added a 4-alignment filter that **excluded `c5`, the very block the previous run had confirmed.**
+
+**Shader constants have no alignment requirement** — a compiler packs them wherever they fit. The view
+matrix visible in the same dump was not 4-aligned either.
+
+When the question is *"which of these is it"*, do not cap the list at one.
+
+### 💥 Five instruments in a row could not answer, and all five failures were mine
+
+Worth recording as a set, because they were not five different mistakes:
+
+| run | the instrument's defect | shape |
+|---|---|---|
+| 183 | ownership cap filled with `RvCE_WeaponFire` and archetypes before reaching the live weapon | a cap that silently truncates the answer |
+| 183 | `NameOf` per object across ~36,000 objects, re-walking on every miss | **string compare where an index compare would do** |
+| 184 | `Readable(obj, 0x1000)` all-or-nothing silently disabled the control | a control that quietly declines to participate |
+| 185 | NaN passed every test — `err > maxErr` is false for NaN, so NaN scored a perfect zero | a filter applied only at seed time |
+| 186 | 2,223-combination search with a syscall in the innermost loop → seconds-long load-in freeze | **string compare where an index compare would do** |
+
+Three of those are one recurring shape — comparing interned UE3 names as **strings** instead of
+comparing the `FName` index at `+0x2C`. It is the default failure mode of this API and it is now
+written down in `ENGINE_NOTES.md`.
+
+The habit that saved the run: **the scan carried a positive control** — the camera actor, where
+`+0x0054` is known to hold the world position. When it read `ABSENT`, the run was thrown out instead of
+its negative being believed. Two of the five defects were caught by that control and by nothing else.
+
+And one instrument earned its keep by being *wrong usefully*: run 185's delta scan found the wrong
+field to **write** (`LocalToWorld`, a derived output) and exactly the right field to **watch** — which
+is what made run 188's component-write test self-verifying without needing anyone's eyes.
+
+---
+
+## ⭐ Run 181: two visual artefacts, and both were the same reading error
+
+Reported together: the pistol's **barrel smoke sits at the centre of the screen** instead of at the
+muzzle, and **two crosshair lines appear while jumping** with the crosshair hidden. They turned out
+to share a shape — in each case the measurement that would have prevented the bug was already in the
+file and had been read past.
+
+**Flown.** ✅ The crosshair fix is verified. 🔬 The smoke fix engaged and did not reach the smoke.
+
+### The results
+
+| | outcome |
+|---|---|
+| crosshair on jump | ✅ **fixed.** `8 seen, 8 dropped`, with two frames at `r=0.167` and `r=0.151` — both past the old `0.15` box, so the spread really did exceed it and the case really was exercised |
+| barrel smoke | ❌ still at screen centre |
+| impact smoke | ✅ correctly did **not** move — the negative control passed |
+| `weapon fx` peak | `0 → 2 → 3 → 4` — **the mechanism engaged**; there are draws beyond the gun mesh in the pass and they did ride |
+
+The smoke result is the informative one: the transform reached extra geometry and the smoke was not
+among it. That rules out "in the pass, transform wrong" — that would have moved it *somewhere*. So
+the smoke is not in the foreground pass, and `WEAPON FX = HIDE PASS (TEST)` is the next step because
+it answers *where* by construction rather than by inference: what vanishes is in the pass.
+
+**⚠️ A print-once diagnostic hid the one thing worth knowing about it.** `weapon fx: STOPPED RIDING`
+fired once at load-in — the run-115 depth-clear boundary tripping early, before the gun was latched,
+which is the benign case. But the guard was `static bool said`, so the log **could not say whether it
+recurs during gameplay** — and the gun transform rests on that same boundary. A diagnostic that
+reports an event exists and then goes quiet is the shape of half the instruments this project has had
+to rebuild. Now: first occurrence in full, then a running count on a slow tick.
+
+### The smoke: a transform whose reach was narrower than its description
+
+`FgMoved` matched exactly **one** vertex count, the latched gun mesh. Route 2 deliberately never
+moves the engine's own weapon — that is the whole reason culling and LOD cost nothing — so a muzzle
+effect spawns at the *engine's* muzzle, which is the centre of the view, while the mesh it is
+supposed to be leaving is over on the controller. Nothing was wrong with the transform; it simply
+never reached the effects.
+
+The rule that generalises was established back in run 114 and not used: **the foreground pass IS the
+first-person weapon pass.** The engine already separated that geometry for us. So `FgRidesGun` moves
+every draw in the pass except the arms, which stay hidden — and the **non-indexed** draw hook, which
+could not move anything at all before, now can.
+
+Shipped as `WEAPON FX` on the panel's ADVANCED page because it is a **discriminator, not timidity**:
+if the smoke follows the gun at `RIDE GUN` and returns to centre at `STAY`, the effects are in the
+pass and this is the fix; if there is no difference either way, they are drawn elsewhere, no
+transform on this path can reach them, and the next seam is `SetFlashLocation` — which run 95's
+census already measured at 88.9% enrichment under fire. `weapon fx: N … (new peak)` in the log
+separates "engaged and found nothing" from "never engaged", which look identical in a headset.
+
+> ### ⛔ The premise this replaces named the wrong effect, and the observation itself was correct
+>
+> The run-112 known-issues list below says the flash and smoke are *"still tied to screen centre"*
+> in one bullet and that *"barrel smoke **IS** correctly aligned"* in the **very next one**, and
+> STATUS carried the second forward for sixty-odd runs as the lead to chase: *find what the smoke
+> rides on that the flash does not.*
+>
+> **The aligned smoke was the IMPACT smoke — the puff off the wall where the bullet lands. The
+> barrel smoke was never aligned.** Established by the user in run 181, and it makes the whole thing
+> coherent:
+>
+> | effect | space | why it lands where it does |
+> |---|---|---|
+> | impact smoke | **world** — spawned at the trace hit point | route 2 rotates the trace, so the hit point is correct, so the puff is correct |
+> | muzzle flash, barrel smoke | **view** — attached to the first-person weapon | the engine still has that weapon at the camera, and route 2 never moves it |
+>
+> So there **is** a real asymmetry, and it is between world-space and view-space effects. It is just
+> not the asymmetry the note described: the flash and the barrel smoke are one system and always
+> were, so *"what does the smoke ride on that the flash does not"* had no answer to find.
+>
+> **The failure mode is a mislabelled SUBJECT, not a stale measurement.** The observation was
+> accurate — something was correctly aligned — and the name attached to it was wrong. Two grey puffs
+> appear near where you are aiming within a second of each other; one is on the wall and one is on
+> the gun. That is an easy conflation to make in a headset and an expensive one to write down,
+> because the note reads as a measurement and cannot be checked without re-running the shot.
+>
+> Worth carrying forward: **the mod's own effects split cleanly on world-space vs view-space**, and
+> that is the first question to ask about any future misplaced effect. World-space ones come out
+> right for free.
+
+### The crosshair: an aspect ratio hiding in plain sight
+
+`LooksLikeCrosshair` tested a **square** box — `|cx| < 0.15` and `|cy| < 0.15` — in clip space, where
+x spans the frame's full **width** and y its full **height**. One tick at a given *pixel* radius
+therefore reads 16/9 = **1.8× larger in y**.
+
+That ratio was sitting in run 153's own measurement, four lines above the test: `0.045 / 0.025 = 1.8`.
+The four ticks are equidistant in pixels and the numbers differ only because the units do. Jump
+spread pushes them outward, the vertical pair crosses 0.15 **first and alone**, and two lines come
+back — the report, down to the count.
+
+The fix uses the part of the measurement the box discarded: **each tick sits ON a centre axis**
+(`cy = +0.000` for left/right, `cx = -0.000` for up/down). The rule is now "on an axis, within reach
+of centre", which is *tighter* across the axis than the old box and looser along it — the only
+direction spread can move a tick.
+
+`crosshair census` prints seen/dropped/furthest-radius from Present on change, because **"it looks
+fixed" is not a measurement** and a rule that counts only its own hits cannot report a miss. Resting
+truth is **8 seen, 8 dropped**: four ticks, each drawn twice.
+
+### Two stale notes corrected on the way past
+
+Both said mode 1 of `HideCrosshair` *flickers* because `g_handHeld[1]` is a capacitive sensor, and
+that `HideCrosshair=2` was "the setting that behaves". **Run 158 replaced that signal with AIM
+METHOD** — deterministic, no flicker — and updated the panel row while leaving the declaration
+comment and the STATUS item describing a sensor nothing reads. The ini log line carried the same
+stale text. All three are fixed; the code comment keeps the warning rather than deleting it.
 
 ---
 
@@ -1237,6 +1509,13 @@ rather than by changing sign defaults, because changing those renumbers the comb
 
 ### 📋 Known issues, deliberately not chased yet — these are now the top of the list
 
+- ⛔ **SUPERSEDED (run 181) — the second bullet below names the wrong effect. Do not quote it.**
+  The smoke that was correctly aligned is the **impact** smoke off the wall, which is spawned in
+  world space at the trace hit point and comes out right for free because route 2 rotates the trace.
+  The **barrel** smoke was never aligned: it is attached to the first-person weapon, which the engine
+  still has at the camera. So the flash and the barrel smoke are one system, they were both
+  centre-anchored, and *"what does the smoke ride on that the flash does not"* — which STATUS chased
+  for sixty-odd runs — had no answer to find. See the run-181 section.
 - **Muzzle flash / smoke still tied to screen centre.** Barely visible in the headset, obvious on
   the monitor. A separate effect that does not follow the gun.
 - **Barrel smoke IS correctly aligned** — so the effects are not one system, and whatever anchors

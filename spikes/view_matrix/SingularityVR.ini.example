@@ -1020,3 +1020,73 @@ CutsceneLockCamera=0
 ; ---------------------------------------------------------------------------
 LeftHanded=0
 SwapSticks=0
+
+; ---------------------------------------------------------------------------
+; [Render] WeaponFxRideGun -- the muzzle flash and barrel smoke (run 181)
+;
+;   1 = every draw in the first-person pass rides the same transform as the gun
+;       - flash, barrel smoke, ejected shells                     <- default
+;   0 = only the gun mesh moves; the effects stay where the engine put them
+;   2 = TEST. Drops the whole first-person pass. The gun goes BLACK, which is
+;       correct (run 117: the pass is composited through a mask, so removing the
+;       geometry leaves the mask nothing to show). Read the SMOKE, not the gun -
+;       it vanishing means it is in this pass, it surviving means it is not.
+;
+; ---- 🔬 run 181 result: engaged, and the barrel smoke was not in it ----
+;
+; `weapon fx: N ... (new peak)` climbed 0 -> 2 -> 3 -> 4, so draws beyond the gun
+; mesh are in the pass and did ride the transform. The barrel smoke stayed at
+; screen centre anyway; the impact smoke correctly did not move. So the widening
+; is right as far as it goes and the smoke is somewhere else. Mode 2 exists to
+; settle that by construction rather than by inference.
+;
+; Reported as "the smoke that should come out of the barrel is stuck in the
+; middle of the screen", and it is not a bug in the gun transform - it is the
+; transform's reach. Route 2 deliberately never moves the engine's own weapon
+; (that is why culling and LOD cost nothing), so a muzzle effect spawns at the
+; engine's muzzle, which is the centre of your view, while the mesh it is
+; supposed to be leaving sits over on your controller.
+;
+; The rule: the foreground pass IS the first-person weapon pass. The engine
+; separated that geometry for us in run 114, so everything in it belongs on the
+; controller. Matching a single vertex count was always narrower than the thing
+; being described. The arms remain the one exception - they are hidden, not
+; moved.
+;
+; ⚠️ Nothing rides until the gun is LATCHED. Moving the effects onto the
+; controller while the gun is still at the engine's position would separate them
+; from the very mesh they are attached to, which looks worse than the bug.
+;
+; This is also the A/B, and BOTH answers mean something:
+;
+;   smoke follows the gun at 1 and returns to centre at 0
+;       -> the effects are in the foreground pass and this is the fix.
+;   no difference either way
+;       -> they are drawn somewhere else, no transform on this path can reach
+;          them, and the next seam is SetFlashLocation - which the run-95 census
+;          already measured at 88.9% enrichment under fire.
+;
+; The log line `weapon fx: N foreground draw(s) rode the gun transform in one
+; frame (new peak)` separates those two: N staying at its baseline through a
+; magazine means the mechanism found nothing, not that the transform is wrong.
+;
+; ⚠️ The premise this replaces named the wrong effect, and chasing it cost
+; sixty-odd runs. STATUS said "barrel smoke IS correctly aligned, so find what it
+; rides on that the flash does not". The aligned smoke was the IMPACT smoke off
+; the wall:
+;
+;   impact smoke   spawned in WORLD space at the trace hit point. Route 2 rotates
+;                  the trace, so the hit point is right and so is the puff - free.
+;   flash + barrel
+;   smoke          attached to the FIRST-PERSON WEAPON, which the engine still
+;                  has at the camera and route 2 never moves.
+;
+; So the flash and the barrel smoke are one system and always were. The asymmetry
+; is real but it is world-space vs view-space, which is the first question to ask
+; about any effect that lands in the wrong place.
+;
+; ⚠️ Impact smoke must therefore NOT move when this is on. It is world geometry in
+; the main scene, not in the foreground pass, so it should be untouched - and it
+; moving onto the gun would mean this setting is reaching further than the pass.
+; ---------------------------------------------------------------------------
+WeaponFxRideGun=1

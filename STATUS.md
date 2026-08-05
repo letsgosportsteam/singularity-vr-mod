@@ -1,10 +1,10 @@
 # STATUS — session handoff
 
-Last updated **2026-08-04** (end of run 180). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-05** (end of run 190). Read this first, then `ENGINE_NOTES.md`.
 
 **This file is current state only.** The run-by-run log moved to `HISTORY.md` on 2026-08-04 — you
 do not need it cold, but go there before building on any premise you inherited.
-It also flags, with ⛔ banners, four status claims that had gone stale in place.
+It also flags, with ⛔ banners, the status claims that had gone stale in place.
 
 > ### ⭐ Run 180: UE3 yaw deltas were never wrapped, and it cost months of misattribution
 >
@@ -76,8 +76,16 @@ dropped beside the game exe. No game files modified.
 
 ### Next session, in order
 
-**A. 🔬 Three run-180 changes are in the build and NOT yet verified.** Each has a named false pass;
-none should be called done until its own condition has actually occurred in a run.
+**A. ✅ Runs 181–190 are FLOWN and four fixes are verified.** Details at items 1, 3, 4 and 5.
+
+| fix | state |
+|---|---|
+| Crosshair jump-spread no longer escapes the hide rule | ✅ **verified** — two frames at `r=0.167` / `r=0.151`, past the old `0.15` box, `8 seen 8 dropped`. The case was genuinely exercised |
+| Gun stepping on slow movement (1.9 cm lattice) | ✅ **verified** — integer truncation of the hand offset; now milli-UU |
+| Gun pose one full frame stale | ✅ **measured** 8.33 ms → **0.00 ms** with `PoseLeadFrames=1` |
+| Muzzle flash + barrel smoke at screen centre | ✅ **suppressed** (`HideMuzzleFx=1`); ⚠️ the real cause is the stereo seam — see item 3 |
+
+**Still owed from run 180, and none of these has had its condition occur yet:**
 
 - **The trigger veto now fails CLOSED at startup.** It used to pass everything through until
   `trigger/touch` resolved, which is the load-in phantom melee and the gun attached to nothing.
@@ -110,26 +118,35 @@ game → menu is rotated.
    places a raw `GetAsyncKeyState` is legitimate. A panel row retires the BACKSPACE one; PAUSE
    probably has to stay, since quitting cannot depend on the thing you are quitting.
 
-1. **📋 `HideCrosshair=1` needs auto-pad's "in hand" signal, and should be done WITH it.** The
-   crosshair itself is found and hidden — `HideCrosshair` in the ini and on the panel, 0 never /
-   1 in VR / 2 always. Modes 0 and 2 are solid. **Mode 1 flickers**: `g_handHeld[1]` is the Touch
-   capacitive sensor, so lifting your thumb off a controller you are still holding reads as "not in
-   hand" and the crosshair comes back.
-   - Run 77 picked those sensors over motion for auto-pad and was right *for auto-pad* — that asks
-     "is this held at all" over seconds. This asks it per frame, and the sensor is not steady
-     enough.
-   - **⚠️ Run 155 found it is far worse than "not steady enough".** `g_handHeld[0]` read `on desk`
-     through an entire session including ninety seconds of deliberately holding both controllers,
-     with one sample moving at **1331 µm/frame** and still reporting `on desk`. Treat the broad
-     `grasp` signal as unreliable in both directions, not merely jittery — and do not build a
-     per-frame decision on it without fixing it first.
-   - **Do not debounce it locally.** That would create a second, differently tuned notion of "in
-     hand", and this project has already paid twice for two mechanisms answering one question. One
-     hysteresis, shared. **Auto-pad is no longer a consumer** (obsolete since run 156), so this is
-     now free to be designed around the crosshair's needs rather than compromised against auto-pad's.
-   - The narrow `trigger/touch` action added in run 156 is a worked example of the opposite choice:
-     one question, one sensor, bound to exactly one source per hand.
-   - `HideCrosshair=2` behaves correctly meanwhile.
+1. **✅ FIXED and VERIFIED (run 181) — the crosshair's JUMP SPREAD escaped the hide rule.**
+   Confirmed by measurement, not by looking: `8 stride-8 elements, 8 dropped` throughout, with two
+   frames reaching `r=0.167` and `r=0.151` — both **past** the old `0.15` box, so the spread really did
+   exceed it and the case really was exercised. Not a false pass.
+   Reported: with the crosshair hidden, **two** crosshair lines come back while the player is
+   jumping. Spread pushes the four ticks outward and the test was a **square** box — `|cx| < 0.15`
+   and `|cy| < 0.15` — in a space where x and y are not the same scale.
+   - Clip x spans the frame's full **width** and clip y its full **height**, so one tick at a given
+     *pixel* radius reads 16/9 = **1.8× larger in y**. That ratio was already sitting in the
+     measurement and was read straight past: `0.045 / 0.025 = 1.8`. The vertical pair therefore
+     leaves a square box **first and alone** — two lines, which is the report down to the count.
+   - The fix uses the part of the measurement the box discarded: **each tick sits ON a centre
+     axis.** `LooksLikeCrosshair` now tests "on an axis, within reach of centre" (`kXhairAxis`
+     0.006, `kXhairReach` 0.60) — *tighter* across the axis than the old box, looser along it,
+     which is the only direction spread can move a tick.
+   - **Verify with the census, not by looking.** `crosshair census: N stride-8 element(s) this
+     frame, M dropped, furthest at r=…` prints from Present on change. **Resting truth is 8 seen,
+     8 dropped** (four ticks, each drawn twice). *Seen above dropped is the bug*, in whatever form
+     it returns. **The false pass: not jumping hard enough to spread the reticle at all** — a run
+     with no line above `r=0.045` never exercised this.
+   - **⚠️ STATUS carried a stale version of this item for twenty-odd runs**, and so did the comment
+     at `g_hideCrosshair`: both said mode 1 *flickered* because `g_handHeld[1]` is a capacitive
+     sensor, and that `HideCrosshair=2` was "the setting that behaves". **Run 158 replaced that
+     signal with AIM METHOD** — deterministic, no flicker — and neither note was updated. Modes
+     0, 1 and 2 are all sound. Both texts are corrected; the code comment keeps the warning.
+   - `g_handHeld` is still not to be trusted if anything else ever wants it. Run 155: `g_handHeld[0]`
+     read `on desk` through a whole session including ninety seconds of deliberately holding both
+     controllers, one sample moving at **1331 µm/frame**. Unreliable in *both* directions, and it
+     has no per-frame consumers left.
    - **The crosshair signature, measured** (bare view, nothing else on screen): four ticks around
      centre, each drawn twice, `stride=8` at `(±0.025, 0)` and `(0, ±0.045)`. **Stride 8 is unique
      to it** — everything else is stride 4, 12 or 20, and centred *prompts* are stride 20 at
@@ -144,12 +161,120 @@ game → menu is rotated.
      registers rather than a new system.
    - Wants to be a panel setting (HUD inset / safe area), not a constant — how far in is
      comfortable depends on the headset's optics and the player's IPD.
-3. **The muzzle flash is still anchored to screen centre.** The one visible artefact left on the
-   weapon. Barely noticeable in the headset, obvious on the monitor — and the **barrel smoke IS
-   correctly aligned**, so they are not one system and whatever anchors the flash is not what
-   anchors the smoke. That asymmetry is the lead: find what the smoke rides on and the flash does
-   not.
-4. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
+3. **⭐ The muzzle flash and barrel smoke draw on the STEREO SEAM — and it is OUR bug, not the
+   engine's.** Suppressed for now: `MUZZLE FX` on the panel's DISPLAY page, `HideMuzzleFx=1`, default
+   hidden. The real fix is queued and should retire that setting entirely.
+   - **They are ONE particle system.** `RvGame.u` lists no smoke property at all — the barrel smoke is
+     an emitter inside the muzzle-flash asset. Reported as two separate bugs for sixty runs; nulling
+     `mMuzzleFlash1stPerson` plus the looping and ironsights variants kills both.
+   - **The diagnosis came from the flat monitor and it is decisive.** The effect sits at the dead centre
+     of the *monitor*, on the seam between the two eye images. World geometry goes through `StereoPair`
+     and is drawn **twice**, once per scissored half — so a merely mis-placed effect would appear
+     **twice**, once near each gun. Seeing **one**, straddling the middle, means its clip position is
+     `(0,0)` in the *full side-by-side frame*: each eye's scissor keeps the half that falls in its
+     region, and the halves meet at the seam.
+   - **Therefore the aim method cannot matter**, because the effect never receives a per-eye position at
+     all. Confirmed identical in HEAD and MOTION CONTROLLER. That is why the setting is binary — an AUTO
+     that cannot differ from ALWAYS is a setting lying about having a reason to exist.
+   - **📋 TABLED at run 194, with the draw identified.** Four facts are nailed down and should not be
+     re-derived; the remaining step is small but my instruments kept eating the runs.
+     | fact | how |
+     |---|---|
+     | The draw is **`DrawIndexedPrimitiveUP`, stride 72**, ~16–18 prims, ~7 per shot | run 192's baseline-vs-fire census; stride 72 appears in every fire window and never in baseline |
+     | It **is** already split per eye | same census — so the split works and only the transform is unremapped |
+     | Its vertices are **world-space**, not pre-transformed screen space (box `x[260..860]`) | so it is not a screen-space quad, and the Bink-quad fix does not apply |
+     | It has a **vertex shader**, and **`c5..c8` is its local→world matrix** (w column `(0,0,0,1)`; translation drifts frame to frame as the particle moves) | run 193's per-draw write-mask dump |
+     | Pass-throughs are **104/frame in baseline and in fire alike** | firing adds no fullscreen-quad pass-through, so the quad classifier is not involved |
+   - **What is still unknown:** which register carries the draw's *clip* transform. `c5..c8` is affine,
+     so something else projects it. Registers written just before the draw are
+     **`c5`–`c12`, `c15`–`c18`, `c20`–`c25`**. A view matrix (unit axes + translation) is visible around
+     **`c26`** in the `c24..c27` dump.
+   - **🛑 The stride-72 identification is UNVALIDATED and probably wrong (run 196).** Its shader's own
+     bytecode says it **reads `c0`** — and `c0` was confirmed locked, valid and remapped at that very
+     draw. So that draw's transform *is* eye-remapped and it cannot be what lands on the seam. Run 192
+     was right that stride 72 is *shot geometry*; the error was reading "unique to firing" as "is the
+     muzzle flash". A tracer, a casing or an impact effect all appear only when firing and all render
+     correctly.
+   - **🛑 CONFIRMED WRONG (run 197). `MuzzleFxDropStride=72` with the flash visible: the artefact
+     REMAINED.** Stride 72 was never the muzzle flash — it is some other shot geometry (tracer, casing
+     or impact). **Runs 193–196 measured the wrong draw from beginning to end.** The `c0` reading, the
+     write masks, the block dumps and the bytecode all describe a draw that was never the artefact.
+   - **▶ NEXT STEP if resumed: identify by SHADER, not by primitive count.** The flash is on an
+     **indexed** path (`DrawIdxPrim` rose ~1600 during fire — the observation dismissed in run 192 as
+     confounded, and the only surviving lead). Indexed draws cannot be told apart by primitive count —
+     that is exactly what saturated run 192's table with twenty rows of zeros — so the handle has to be
+     something else, and the shader pointer is the natural one:
+     1. Record the **set of vertex shaders** used in a baseline window and in a fire window. The ones
+        unique to firing are the shot's own. `GetVertexShader` returns a comparable pointer, and run 196
+        already built a bytecode reader for whatever it finds.
+     2. Add an ini key to **drop draws using shader N**, then walk N until the artefact disappears.
+        That is identification *by construction* rather than by inference — one build, then cheap
+        relaunches, instead of a run per instrument.
+   - **Do not skip step 2 for step 1's convenience.** That is precisely the mistake of runs 193–196:
+     a plausible label taken as identified, then three instruments built on it.
+   - **⛔ Confirm what a thing IS before measuring its properties.** Three instruments (runs 193–196)
+     were built on an identification nothing had tested. The bytecode dump was the first measurement
+     capable of contradicting it, and did — after three runs. The one-line drop test was available the
+     whole time.
+   - **⚠️ A cheaper hypothesis to check FIRST, and it costs one log line:** the flash may ride the
+     scene's own `c0` and simply arrive when **no `g_camMats` slot is valid** — `g_camMatrixBound` is
+     cleared whenever a shadow or post pass takes the tracked register, and `InvalidateCamMats()` fires
+     on partial overlaps. A duplicated draw with nothing to remap lands identically in both halves,
+     which is exactly this artefact. **Log how many slots are valid at a stride-72 draw before hunting
+     any further for a register.**
+   - **⛔ Four runs were lost to my own instruments, not to the problem.** Recorded because the shape
+     repeats: run 183's owner cap filled with archetypes before reaching the live weapon; run 192's
+     table saturated on indexed draws; run 193 `break`'d after the first constant block; run 194 added a
+     4-alignment filter that **excluded `c5`, the block already confirmed**. Every one was a bound
+     chosen for tidiness that silently excluded the answer. **Shader constants have no alignment
+     requirement — a compiler packs them wherever they fit.** When the question is "which of these is
+     it", do not cap the list at one.
+   - ⛔ **Runs 182–188 chased a phantom.** They assumed the effect was correctly drawn at a wrong
+     *engine* position and went after moving the weapon mesh in the engine. The engine position may have
+     been right all along. What survives is in `ENGINE_NOTES.md` and is genuinely useful: the UObject
+     property-offset layout, and the measured negative that writing a component `Translation` does
+     nothing without a reattach.
+   - ⛔ **An earlier premise named the wrong effect**, and this item chased *"find what the smoke rides
+     on that the flash does not"* for sixty-odd runs. The aligned smoke was the **impact** smoke off the
+     wall: spawned in world space at the trace hit point, which route 2 already rotates, so it is right
+     for free. Two grey puffs appear near your aim within a second of each other — one on the wall, one
+     on the gun. Easy to conflate in a headset, expensive to write down, because it then reads as a
+     measurement.
+
+4. **✅ FIXED (run 190) — the gun no longer moves in STEPS. The cause was integer truncation.**
+   Reported first as jitter, then **redescribed as "moving in steps, like a deadzone — if I move the
+   controller very slowly I can see it jumping."** That redescription is what solved it: latency shifts
+   smooth motion in time and **cannot** turn it into stairs.
+   - `g_handOffX/Y/Z` held the hand-minus-head offset in **whole unreal units**. Eye separation is a
+     measured 3.32 UU = 6.3 cm, so **1 UU ≈ 1.9 cm** — the gun could only ever sit on a 1.9 cm lattice.
+     `(LONG)` also **truncates toward zero**, so the step was asymmetric about the origin.
+   - Now milli-UU with `lroundf`: **19 µm**, far below the controller's own noise floor. Both read sites
+     divide by the same constant, including the on-screen anchor marker — run 174's trap was a readout
+     in different units from the thing it described.
+   - **The rotation was never involved and was deliberately left alone.** `g_handDev*UU` are engine
+     rotation units at 65536/turn = 0.0055° per step. Fixing both would have hidden which one mattered.
+   - **Method note, and it is the useful part.** A *confirmed measurement pointed the wrong way*.
+     `pose lead` correctly read 8.33 ms of staleness; acting on that alone would have produced a small
+     improvement and a false "fixed". **The redescription ruled out the entire latency class by
+     itself.** When a symptom is described as *stepping*, suspect quantisation before timing, whatever
+     the instruments say.
+
+5. **✅ The gun's pose was ALSO a full frame stale — fixed separately (`PoseLeadFrames=1`).**
+   Measured **8.33 ms**, exactly one display period at 120 Hz, then **0.00 ms** with the fix.
+   - **Why the head hides it:** the head is submitted as the projection layer's pose and the compositor
+     **reprojects** the image at scan-out, correcting late error in hardware. The gun is baked into
+     **geometry** by `BuildGunC`, and reprojection cannot move a vertex. D3D9 renders *then* Presents,
+     so the pose sampled at Present N is consumed by frame N+1's draws — one period late.
+   - The fix is one term: locate the hand spaces at `predictedDisplayTime + predictedDisplayPeriod`. The
+     period comes from `xrWaitFrame` rather than a hardcoded 8.33 ms, so it is correct at 72 and 90 Hz.
+   - ⚠️ **The head's layer pose is deliberately NOT shifted.** It is already correct, and moving it would
+     hand the compositor a pose for a frame it is not displaying.
+   - ⚠️ **`0.00 ms` is bookkeeping, not tracking quality.** With pacing locked the metric is
+     arithmetically exact and is measuring its own arithmetic. It proves the timestamp we ask for matches
+     the frame the geometry lands in; it says nothing about whether the runtime's *prediction* at that
+     timestamp is good. The remaining risk is **overshoot on sharp reversals**, since prediction error
+     grows with lead time — judged in the headset, not in the log.
+6. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
    option on, **the hidden arms turn BLACK instead of staying invisible.** So whatever hides the
    first-person meshes is not reaching the pass that HQ Decals enables — the arms are still being
    drawn there, at their original position. That is a much sharper lead than "decals are broken":
@@ -194,14 +319,16 @@ game → menu is rotated.
 >   the wrapper had already been proven defective on the soldier by then. **An independently
 >   confirmed defect should not be dismissed on a one-line argument.**
 
-5. **Leftover arm/hand pieces during reload.** Extra meshes that exist only in the reload
+7. **Leftover arm/hand pieces during reload.** Seen and photographed in run 189 — black blobs and
+   stretched geometry where the reload arms should be. Tabled deliberately; it is a latching problem,
+   not a transform one. Extra meshes that exist only in the reload
    animation, so they are absent from the foreground list when the counts are latched. The fix is
    probably to latch a SET of counts rather than two, or to match on something steadier than
    vertex count.
-6. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+8. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-7. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+9. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
 

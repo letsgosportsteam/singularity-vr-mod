@@ -12,6 +12,57 @@ there too — but the mod must still resolve them by **signature scan, not hardc
 
 ---
 
+## ⭐ The UObject property layout — solved, and it makes any property offset readable
+
+Run 186. UE3 stores every property's byte offset in the object model, so offsets never have to be
+scanned for again. **Solved by search against answers we already had**, not guessed: the only
+candidate accepted was the one that reproduced `Actor.Location = +0x0054` **and**
+`Actor.Rotation = +0x0060`.
+
+| Field | Offset | How to use it |
+|---|---|---|
+| `UStruct::Children` | **`+0x4C`** | head of the property linked list on a UClass |
+| `UField::Next` | **`+0x40`** | next property; `SuperField` is immediately before it at `+0x3C` |
+| `UProperty::Offset` | **`+0x64`** | the property's byte offset within an instance |
+
+Walk `Children`, follow `Next`, compare `*(int32*)(prop + 0x2C)` (the `FName` index) against the
+name you want, then read `*(int32*)(prop + 0x64)`. Climb `SuperField` for inherited properties.
+
+**Corroborated by a spacing the solver was never asked to satisfy** — `SkeletalMeshComponent`
+came out as `Translation +0x190` → `Rotation +0x19C` (+12, an FVector) → `Scale +0x1A8` (+12, an
+FRotator) → `Scale3D +0x1AC` (+4, a float). UE3's declared order at exactly its declared sizes.
+
+`RvWeaponFX` (used by the muzzle-FX suppression): `mMuzzleFlash1stPerson +0x068`,
+`mLoopingMuzzleFlash1stPerson +0x06C`, `mMuzzleFlashIronsights +0x080`,
+`mLoopingMuzzleFlashIronsights +0x084`, `mLoopingMuzzleFXEmitter +0x088`.
+
+> ⚠️ **Bools share an offset.** `HiddenGame` and `bOwnerNoSee` both report `+0x110`, and the two
+> `Absolute*` flags both report `+0x1C4`. That is correct — UE3 packs bools into a shared dword and
+> distinguishes them by a bitmask, which this reader does not yet extract. Any bool needs the mask too.
+
+> ⚠️ **Compare name INDICES, not strings.** `NameOf` calls `Readable`, which is a `VirtualQuery`
+> syscall. Comparing property names as strings inside the layout search cost roughly a million
+> lookups in one frame and froze load-in for seconds (run 188). UE3 interns names, so
+> `*(int32*)(obj + 0x2C)` is a stable integer identity — resolve the names you want once, then compare
+> ints. This mistake was made three times in six runs; it is the default failure mode of this API.
+
+## 🛑 Writing a component's `Translation` does NOT move the mesh
+
+Run 188, measured. Wrote `SkeletalMeshComponent.Translation` (`+0x190`) with +50 UU on Z, on all
+three live meshes, and read back the derived world transform: **it moved by `+0.0` UU in every
+case.** The input holds our value; UE3 does not recompose `LocalToWorld` from it without a
+reattach.
+
+So relocating the first-person weapon through the object model needs
+`BeginDeferredReattach` / `ConditionalUpdateTransform` or the equivalent dirty flag, which is a
+materially harder problem than anything else attempted here. **The render-matrix gun transform
+remains the only mechanism that moves the gun.**
+
+Also established on the way: the live weapon is `RvWeaponShared ARPistol` under `PersistentLevel`,
+with its own `SkeletalMeshComponent` — but that component's transform **never updates**, so it is
+the world/pickup mesh, not the one in your hands. The pawn (`RvPlayerPawnSP`) carries two
+skeletal mesh components, and those do track the camera (to within 2.0 UU over five samples).
+
 ## Confirmed anchors
 
 | Address | What | Confidence |

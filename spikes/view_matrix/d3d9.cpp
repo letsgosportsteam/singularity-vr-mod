@@ -1,4 +1,4 @@
-﻿// view_matrix - Singularity VR mod, spike 9
+// view_matrix - Singularity VR mod, spike 9
 //
 // GOES AFTER THE ONE BLOCKING PROBLEM: camera POSITION, which gates both stereo (a per-eye
 // offset IS a position offset) and 6-DOF.
@@ -1105,7 +1105,30 @@ int g_camRotOffs[kRotFieldMax], g_camRotCount = 0;
 // in the same XR frame - see run 112. This is what the trace rotation uses.
 volatile LONG g_handDevYawUU = 0, g_handDevPitchUU = 0, g_handDevValid = 0;
 volatile LONG g_handDevRollUU = 0;
-volatile LONG g_handOffX = 0, g_handOffY = 0, g_handOffZ = 0;   // hand minus head, world UU
+// ---- 💥 run 190: the gun moved in STEPS, and it was integer truncation, not latency ----
+//
+// Reported, and the redescription is what solved it: not jitter but *"moving in steps, almost like a
+// deadzone - if I move the controller very slowly I can see it jumping."* Latency cannot do that. A
+// one-frame lag shifts smooth motion in time; it does not turn smooth motion into stairs. **Stepping on
+// slow, smooth input is quantisation**, and it is right here.
+//
+// These held the hand's offset from the head in WHOLE UNREAL UNITS. Eye separation is a measured
+// 3.32 UU = 6.3 cm, so 1 UU is about **1.9 cm** - the gun could only ever sit on a 1.9 cm lattice, and
+// moving the controller slowly walked it from one lattice point to the next. Exactly the reported
+// symptom, exactly the reported magnitude.
+//
+// Worse than plain rounding: `(LONG)` TRUNCATES TOWARD ZERO, so the step is asymmetric about the origin
+// and the error is biased inward rather than centred.
+//
+// ⚠️ The ROTATION was never the problem and is not changed. `g_handDev*UU` are in engine rotation units
+// at 65536 per turn, so one unit is 0.0055 degrees - four orders of magnitude below anything visible.
+// It would have been easy to "fix" both and never learn which mattered.
+//
+// Now MILLI-UU. The globals stay LONG because they cross from Present to the render thread and the
+// interlocked access is the point; only the scale changes. Resolution becomes 19 micrometres, which is
+// far below both the controller's own noise floor and anything an eye can resolve.
+const float kHandFixed = 1000.0f;      // milli-UU per UU
+volatile LONG g_handOffX = 0, g_handOffY = 0, g_handOffZ = 0;   // hand minus head, world MILLI-UU
 volatile LONG g_fireDepth = 0;
 volatile LONG g_fireSeq = 0;
 
@@ -1307,6 +1330,388 @@ uintptr_t FindCamera() {
     return 0;
 }
 
+// ============ ⭐ run 182 stage 1: what OWNS the first-person weapon's transform? ==============
+//
+// Run 181 closed off both of the routes that had been assumed:
+//
+//   the DRAW path    `WEAPON FX = HIDE PASS` dropped the ENTIRE first-person pass and the barrel
+//                    smoke SURVIVED. It is not in that pass, so no filter there can reach it.
+//   the SCRIPT path  RvGame.u: RvWeaponFX attaches the muzzle effects to `mMuzzleFlashBone`, and
+//                    GetMuzzleLocation / GetWeaponMesh / PlayMuzzleFX / PlayFireEffects are ALL
+//                    native (serial 61-72 bytes, no bytecode). The run-95 ProcessInternal hook only
+//                    ever sees native->script entry points, so there is nothing there to hook.
+//                    (`SetFlashLocation` carries the HIT location for tracers - which is exactly why
+//                    impact effects are already correct, and why it says nothing about the muzzle.)
+//
+// What is left is the mechanism itself: **a bone's world transform is its component's transform
+// composed with the skeleton.** Move the COMPONENT and the bone moves, so the effects spawn in the
+// right place - and the drawn mesh moves too, which is the render matrix's entire job today. That
+// would be one mechanism instead of two, and it cannot cost culling or LOD, because those follow the
+// camera and not a component's relative offset.
+//
+// ---- why this stage writes NOTHING ----
+//
+// The target is not guessable. The foreground pass holds THREE meshes - 5799 (gun), 3314 (arms), 390
+// (still unidentified) - and they could be three components, one component with three sections, or a
+// mesh with attachments. Each needs different code, and picking one on a guess is how runs 91-102
+// were spent. So: list what is actually there first.
+//
+// ⚠️ ONE SHOT. Walking GObjects is tens of thousands of objects and run 35 recorded what a scan that
+// repeats every frame costs. It fires at the first successful mesh latch - the one moment we know a
+// weapon is really in the player's hands - so it needs no keypress in a headset and cannot fire at
+// the main menu, where the object graph would be the wrong one anyway.
+volatile LONG g_weapDumpDone = 0;
+// ---- 🧹 run 188: the object census, the memory scan and the mesh nudge are GONE ----
+//
+// All three answered their questions and none needs to run again:
+//
+//   census (182)   mapped the object graph. The findings are in ENGINE_NOTES now, not in a probe.
+//   scan (183-185) hunted a world position by delta-tracking the camera. Superseded outright by the
+//                  property solver below, which reads exact offsets out of the object model instead of
+//                  inferring them - and which I should have written first.
+//   nudge (187-8)  answered the question this route rested on, with a clean NEGATIVE: writing a
+//                  component's `Translation` moved the derived transform by **+0.0 UU** on all three
+//                  meshes. UE3 does not recompose from it without a reattach.
+//
+// They also caused the reported load-in freeze: both fired at the mesh latch, which is exactly when a
+// save finishes loading. The census walked ~36,000 objects with two VirtualQuery syscalls per object,
+// and the solver's search was 2,223 combinations each walking up to 400 children with a NameOf per
+// child - on the order of a million name lookups in one frame.
+//
+// The solver SURVIVES because the suppression below needs it every launch, so it has been made cheap:
+// name INDEX comparisons instead of NameOf, and the known-good layout tried first with the search kept
+// only as a fallback. That was the recurring mistake across runs 183-188 - a string comparison where an
+// index compare would do - and it is now fixed at the root rather than throttled around.
+
+// A live instance, not a class default. `Outer` chain reaching PersistentLevel is the same rule
+// FindController uses, and applied up the whole chain it separates instances from archetypes outright -
+// which matters here because the archetype `RvWeaponFX` objects outnumber the live one nine to one.
+static bool IsLive(uintptr_t obj) {
+    uintptr_t o = obj;
+    for (int depth = 0; depth < 6; ++depth) {
+        if (!Readable((void*)o, 0x40)) return false;
+        uintptr_t ou = *reinterpret_cast<uintptr_t*>(o + OBJ_OUTER);
+        if (!ou || !Readable((void*)ou, 0x40)) return false;
+        char nm[64];
+        if (!NameOf(ou, nm, sizeof(nm))) return false;
+        if (!_stricmp(nm, "PersistentLevel")) return true;
+        if (!strncmp(nm, "Default__", 9))     return false;   // an archetype - stop, do not report
+        o = ou;
+    }
+    return false;
+}
+
+// Defined with the foreground-mesh code. Non-zero means the foreground pass has drawn a weapon, which
+// is the "a weapon really exists" gate the suppression uses - and the gate that keeps every GObjects
+// walk out of the splash screens.
+extern volatile LONG g_gunVerts;
+// Defined with the aim-method code. The suppression's AUTO mode follows it, exactly as the crosshair's
+// does - one question, one signal.
+extern volatile LONG g_aimMethod;
+bool VrModeOn();
+// ===== ⭐ run 186: read PROPERTY OFFSETS out of the object model instead of scanning for them =====
+//
+// Runs 182-185 scanned memory for a field that tracks the camera, and by run 185 the scan worked -
+// the pawn's mesh components hit within 2.0 UU while ARPistol's scored nothing real. But the result
+// pointed at the wrong CLASS of field, and no amount of fixing the scan would have changed that:
+//
+//   what the scan finds   a world position that tracks the camera. That is `LocalToWorld` - a DERIVED,
+//                         cached matrix the engine recomputes every frame from the attachment. Writing
+//                         it is writing an output; the next tick overwrites it.
+//   what we need          UE3's `Translation` / `Rotation` on PrimitiveComponent - relative offsets
+//                         that PERSIST and that the engine composes INTO the world matrix.
+//
+// And the relative ones are small values near zero in the parent's frame, so **they do not track the
+// camera** - a delta test cannot find them by construction. The instrument was sound and aimed at the
+// wrong target, which is a different failure from the four before it and worth recording as such.
+//
+// UE3 stores property offsets in the object model: every UClass has a linked list of UProperty
+// children, and each UProperty carries its own byte offset. Run 93 already read `UFunction::Func` at
+// `+0xAC` straight out of that model rather than disassembling for it. Same move, one level along.
+//
+// ---- it SOLVES for the layout rather than guessing it, against an answer we already have ----
+//
+// The three offsets needed - UStruct::Children, UField::Next, UProperty::Offset - are unknown for this
+// build. But `Actor.Location` is known to sit at 0x0054: it is `ACTOR_LOCATION`, read every frame by
+// the 6-DOF path, and proven. So try the candidate layouts and keep the one that makes Actor's own
+// property list report `Location` at 0x54. A search with a known answer is not a guess, and it fails
+// closed - if nothing reproduces 0x54, nothing is reported and no offset is trusted.
+int g_upChildren = 0, g_upNext = 0, g_upOffset = 0;   // 0 = not solved
+volatile LONG g_propSolveDone = 0;
+// ---- the layout, MEASURED in run 186 on this build. Tried first; the search is the fallback ----
+//
+// Verified then by reproducing Actor.Location=+0x054 and Actor.Rotation=+0x060, and corroborated by a
+// spacing the solver was never asked to satisfy: Translation +0x190 -> Rotation +0x19C (+12, an FVector)
+// -> Scale +0x1A8 (+12, an FRotator) -> Scale3D +0x1AC (+4, a float). UE3's declared order at exactly
+// its declared sizes.
+//
+// Hardcoding it as the FAST PATH rather than as the answer is the point: it is still validated on every
+// launch, and if a different build fails that validation the search runs and re-derives it. A constant
+// that is checked is not a guess; a constant that is trusted is.
+const int kKnownChildren = 0x4C, kKnownNext = 0x40, kKnownPropOffset = 0x64;
+
+// ---- FName indices, resolved ONCE. This is the fix for the load-in freeze ----
+//
+// Every version of this code compared property names as STRINGS, which meant NameOf per candidate, which
+// meant two VirtualQuery syscalls per candidate. Multiplied by the layout search it came to roughly a
+// million lookups in a single frame. UE3 interns names, so `*(int32_t*)(obj + OBJ_NAME)` is a stable
+// integer identity - resolve the handful of names we care about once, then the inner loop is an int
+// compare and the whole solve is microseconds.
+struct WantedName { const char* s; int32_t idx; };
+WantedName g_wantNames[] = {
+    { "Location", -1 }, { "Rotation", -1 },                     // the controls
+    { "mMuzzleFlash1stPerson", -1 }, { "mLoopingMuzzleFlash1stPerson", -1 },
+    { "mMuzzleFlashIronsights", -1 }, { "mLoopingMuzzleFlashIronsights", -1 },
+    { "mLoopingMuzzleFXEmitter", -1 },
+};
+const int kWantNameCount = (int)(sizeof(g_wantNames) / sizeof(g_wantNames[0]));
+
+static void ResolveWantedNames() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    if (!Readable((void*)kGNamesTArray, 12)) return;
+    uintptr_t nd = *reinterpret_cast<uintptr_t*>(kGNamesTArray);
+    int32_t nc = *reinterpret_cast<int32_t*>(kGNamesTArray + 4);
+    if (!nd || nc <= 0) return;
+    char buf[128];
+    for (int32_t i = 0; i < nc; ++i) {
+        if (!NameFromIndex(i, buf, sizeof(buf))) continue;
+        for (int w = 0; w < kWantNameCount; ++w)
+            if (g_wantNames[w].idx < 0 && !_stricmp(buf, g_wantNames[w].s)) g_wantNames[w].idx = i;
+    }
+}
+
+static int32_t WantedIdx(const char* s) {
+    for (int w = 0; w < kWantNameCount; ++w) if (!_stricmp(s, g_wantNames[w].s)) return g_wantNames[w].idx;
+    return -1;
+}
+
+// Walk one class's own property list under a candidate layout, looking for the name INDEX `wantIdx`.
+// Returns the offset it reports, or -1. Bounded hard: a wrong layout produces a garbage pointer chain,
+// and this must fail rather than wander.
+static int PropOffsetUnder(uintptr_t cls, int32_t wantIdx, int chOff, int nxOff, int offOff) {
+    if (wantIdx < 0 || !Readable((void*)(cls + chOff), 4)) return -1;
+    uintptr_t p = *reinterpret_cast<uintptr_t*>(cls + chOff);
+    for (int guard = 0; guard < 400 && p; ++guard) {
+        if (!Readable((void*)p, 0x100)) return -1;
+        if (*reinterpret_cast<const int32_t*>(p + OBJ_NAME) == wantIdx) {
+            const int off = *reinterpret_cast<const int32_t*>(p + offOff);
+            // A property offset is a small non-negative byte offset. Anything else says the layout is
+            // wrong, not that the property is exotic.
+            if (off < 0 || off > 0x8000) return -1;
+            return off;
+        }
+        p = *reinterpret_cast<uintptr_t*>(p + nxOff);
+    }
+    return -1;
+}
+
+// Look a property up through a class's SUPER chain - Translation lives on PrimitiveComponent, several
+// classes above SkeletalMeshComponent, and the muzzle properties are on RvWeaponFX itself.
+static int PropOffsetInChain(uintptr_t cls, const char* name) {
+    const int32_t idx = WantedIdx(name);
+    uintptr_t c = cls;
+    for (int depth = 0; depth < 8 && c; ++depth) {
+        const int found = PropOffsetUnder(c, idx, g_upChildren, g_upNext, g_upOffset);
+        if (found >= 0) return found;
+        if (!Readable((void*)(c + g_upNext - 4), 4)) break;
+        c = *reinterpret_cast<uintptr_t*>(c + g_upNext - 4);      // SuperField sits just before Next
+    }
+    return -1;
+}
+
+// A UClass by name. Restricted to script packages as its outer so an instance sharing the name cannot
+// be mistaken for the class.
+static uintptr_t FindClassByName(const char* want) {
+    if (!Readable((void*)kGObjectsTArray, 12)) return 0;
+    uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+    int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+    if (!data || count <= 0) return 0;
+    uintptr_t* objs = reinterpret_cast<uintptr_t*>(data);
+    for (int32_t i = 0; i < count; ++i) {
+        uintptr_t o = objs[i];
+        if (!o || !Readable((void*)o, 0x100)) continue;
+        char nm[80];
+        if (!NameOf(o, nm, sizeof(nm)) || _stricmp(nm, want)) continue;
+        uintptr_t ou = *reinterpret_cast<uintptr_t*>(o + OBJ_OUTER);
+        char on[80];
+        if (!ou || !Readable((void*)ou, 0x40) || !NameOf(ou, on, sizeof(on))) continue;
+        if (_stricmp(on, "Engine") && _stricmp(on, "Core") && _stricmp(on, "RvGame")) continue;
+        return o;
+    }
+    return 0;
+}
+
+// Offsets on RvWeaponFX, filled by the solve. -1 = not found, and the suppression refuses to write.
+int g_offMuzzle1st = -1, g_offMuzzleLoop1st = -1, g_offMuzzleIron = -1,
+    g_offMuzzleLoopIron = -1, g_offMuzzleEmitter = -1;
+uintptr_t g_weaponFxClass = 0;
+
+void SolvePropertyLayout() {
+    if (InterlockedExchange(&g_propSolveDone, 1)) return;
+    ResolveWantedNames();
+    const uintptr_t actor = FindClassByName("Actor");
+    if (!actor) { Log("property layout: could not find the Actor class - not solved"); return; }
+    const int32_t iLoc = WantedIdx("Location"), iRot = WantedIdx("Rotation");
+
+    // Validate the known layout first. Two proven numbers, both required - `Rotation` following
+    // `Location` at 0x0060 kills a coincidence that satisfies one of them, which is the same bracketing
+    // that settled CAM_POV_ROT rather than a single observation.
+    auto tryLayout = [&](int ch, int nx, int of) {
+        return PropOffsetUnder(actor, iLoc, ch, nx, of) == ACTOR_LOCATION &&
+               PropOffsetUnder(actor, iRot, ch, nx, of) == ACTOR_ROTATION;
+    };
+    if (tryLayout(kKnownChildren, kKnownNext, kKnownPropOffset)) {
+        g_upChildren = kKnownChildren; g_upNext = kKnownNext; g_upOffset = kKnownPropOffset;
+    } else {
+        Log("property layout: the run-186 layout did NOT validate on this build - searching");
+        for (int ch = 0x38; ch <= 0x68 && !g_upChildren; ch += 4)
+          for (int nx = 0x38; nx <= 0x58 && !g_upChildren; nx += 4)
+            for (int of = 0x40; of <= 0x88; of += 4)
+                if (tryLayout(ch, nx, of)) { g_upChildren = ch; g_upNext = nx; g_upOffset = of; break; }
+    }
+    if (!g_upChildren) {
+        Log("property layout: NOT SOLVED. Nothing reproduced Actor.Location=+0x%03X AND"
+            " Actor.Rotation=+0x%03X, so no offset is trusted and NOTHING will be written.",
+            ACTOR_LOCATION, ACTOR_ROTATION);
+        return;
+    }
+    Log("property layout: Children +0x%02X, Next +0x%02X, Offset +0x%02X (validated against"
+        " Actor.Location=+0x%03X and Actor.Rotation=+0x%03X)",
+        g_upChildren, g_upNext, g_upOffset, ACTOR_LOCATION, ACTOR_ROTATION);
+
+    g_weaponFxClass = FindClassByName("RvWeaponFX");
+    if (!g_weaponFxClass) { Log("    RvWeaponFX class not found - muzzle suppression unavailable"); return; }
+    g_offMuzzle1st       = PropOffsetInChain(g_weaponFxClass, "mMuzzleFlash1stPerson");
+    g_offMuzzleLoop1st   = PropOffsetInChain(g_weaponFxClass, "mLoopingMuzzleFlash1stPerson");
+    g_offMuzzleIron      = PropOffsetInChain(g_weaponFxClass, "mMuzzleFlashIronsights");
+    g_offMuzzleLoopIron  = PropOffsetInChain(g_weaponFxClass, "mLoopingMuzzleFlashIronsights");
+    g_offMuzzleEmitter   = PropOffsetInChain(g_weaponFxClass, "mLoopingMuzzleFXEmitter");
+    Log("    RvWeaponFX 0x%08X: mMuzzleFlash1stPerson +0x%03X, mLoopingMuzzleFlash1stPerson +0x%03X,"
+        " mMuzzleFlashIronsights +0x%03X, mLoopingMuzzleFlashIronsights +0x%03X,"
+        " mLoopingMuzzleFXEmitter +0x%03X",
+        (unsigned)g_weaponFxClass, g_offMuzzle1st, g_offMuzzleLoop1st, g_offMuzzleIron,
+        g_offMuzzleLoopIron, g_offMuzzleEmitter);
+}
+
+// ============ ⭐ run 189: suppress the first-person muzzle FX at the source ==================
+//
+// The barrel smoke and the muzzle flash are ONE asset. RvGame.u lists no smoke property at all - the
+// smoke is an emitter inside the muzzle-flash particle system, which is ordinary UE3 authoring and
+// explains why both sit at screen centre and why they were reported separately for sixty runs.
+//
+// So nulling the first-person muzzle TEMPLATES stops both from ever spawning. The templates, not the
+// spawned component: nothing is created in the first place, so there is nothing to chase, move or
+// clean up. `PlayMuzzleFX(bool bFirstPerson, vector muzzleLoc)` is native and reads these pointers.
+//
+// ⚠️ The THIRD-PERSON variants are deliberately left alone. They are what other viewers and mirrors
+// see, they are authored at world scale, and they are not the artefact.
+//
+// ---- why this rather than relocating it ----
+//
+// Relocating needs the mesh to move in the engine, and run 188 measured that writing a component's
+// `Translation` moves the derived transform by **+0.0 UU**. UE3 will not recompose without a reattach.
+// Suppression needs none of that: one pointer, on an object we can already find, at an offset read out
+// of the object model. **The true fix is tabled, not abandoned** - see STATUS.
+//
+// ---- ⭐ run 189 RESULT: it is BINARY, and the reason kills the whole engine-side theory ----
+//
+// I shipped an AUTO mode on the reasoning that HEAD aiming draws the gun at the engine's own position,
+// so the flash should line up with the barrel there. It does not, and the observation that settles it
+// came from the flat monitor rather than the headset:
+//
+//     **the flash is at the dead centre of the MONITOR - on the seam, between the two stereo images.**
+//
+// A single instance on the seam is not an effect in the wrong world position. World geometry goes
+// through StereoPair and is drawn TWICE, once per scissored half; if the flash were merely mis-placed we
+// would see two of them, one near each gun. Seeing ONE, straddling the middle, means its clip position
+// is (0,0) in the FULL side-by-side frame - so each eye's scissor keeps the half that falls in its
+// region and the two halves meet at the seam.
+//
+// Which means the aim method cannot matter, because the effect never receives a per-eye position at all.
+// That was predicted from the seam alone, before the run confirmed it.
+//
+// ⚠️ **So runs 182-188 were chasing a phantom.** The engine's muzzle position may have been correct the
+// whole time; what is wrong is that this draw is not being remapped per eye - it is ours, not Raven's.
+// The lead is `ExtraCamReg` / the unremapped-register family already recorded in STATUS, not the
+// component transform, and `HIDE PASS` not removing it fits: it is drawn in the main scene.
+//
+// Hence 0/1 rather than 0/1/2. Nothing here depends on aim method, and an AUTO that cannot differ from
+// ALWAYS is a setting that lies about having a reason to exist.
+volatile LONG g_hideMuzzleFx = 1;         // ini [Render] HideMuzzleFx: 0 show, 1 hide
+const int kFxMax = 8;
+struct FxTarget { uintptr_t obj; uintptr_t orig[5]; bool have; };
+FxTarget g_fx[kFxMax];
+int g_fxN = 0;
+volatile LONG g_fxApplied = 0;            // what state the pointers are currently in
+
+void ApplyMuzzleFxSuppression() {
+    if (g_offMuzzle1st < 0 || !g_weaponFxClass) return;      // unsolved - never write on a guess
+    const LONG mode = InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0);
+    // No aim-method term. See the run-189 result above: the effect lands on the frame seam, so it is
+    // wrong in both aim methods and gating on one of them would be theatre.
+    const bool want = mode != 0;
+    if (!want && !InterlockedCompareExchange(&g_fxApplied, 0, 0) && g_fxN) return;   // already idle
+
+    // Gathered when a weapon demonstrably exists, and re-gathered only when the cached objects stop
+    // validating - a weapon swap frees the old RvWeaponFX. The gate keeps this walk out of the splash
+    // screens, which is where the census's identical walk cost seconds.
+    bool stale = g_fxN == 0;
+    for (int i = 0; i < g_fxN && !stale; ++i)
+        if (!Readable((void*)g_fx[i].obj, 0x40) ||
+            *reinterpret_cast<uintptr_t*>(g_fx[i].obj + OBJ_CLASS) != g_weaponFxClass) stale = true;
+
+    if (stale) {
+        if (!InterlockedCompareExchange(&g_gunVerts, 0, 0)) return;   // no weapon on screen yet
+        g_fxN = 0;
+        InterlockedExchange(&g_fxApplied, 0);
+        if (!Readable((void*)kGObjectsTArray, 12)) return;
+        uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+        int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+        if (!data || count <= 0) return;
+        uintptr_t* objs = reinterpret_cast<uintptr_t*>(data);
+        const int offs[5] = { g_offMuzzle1st, g_offMuzzleLoop1st, g_offMuzzleIron,
+                              g_offMuzzleLoopIron, g_offMuzzleEmitter };
+        for (int32_t i = 0; i < count && g_fxN < kFxMax; ++i) {
+            uintptr_t o = objs[i];
+            if (!o || !Readable((void*)o, 0x40)) continue;
+            if (*reinterpret_cast<uintptr_t*>(o + OBJ_CLASS) != g_weaponFxClass) continue;
+            // LIVE only. Nine of the ten RvWeaponFX objects in memory are class archetypes, and editing
+            // an archetype would change every weapon spawned afterwards - including ones we never
+            // measured, and in a way no restore here would undo.
+            if (!IsLive(o)) continue;
+            bool ok = true;
+            for (int k = 0; k < 5; ++k)
+                if (offs[k] < 0 || !Readable((void*)(o + offs[k]), 4)) { ok = false; break; }
+            if (!ok) continue;
+            g_fx[g_fxN].obj = o;
+            for (int k = 0; k < 5; ++k)
+                g_fx[g_fxN].orig[k] = *reinterpret_cast<uintptr_t*>(o + offs[k]);
+            g_fx[g_fxN].have = true;
+            ++g_fxN;
+        }
+        if (g_fxN) Log("muzzle fx: %d live RvWeaponFX object(s) found, originals saved", g_fxN);
+        else return;
+    }
+
+    if ((LONG)want == InterlockedCompareExchange(&g_fxApplied, 0, 0)) return;   // nothing to change
+    const int offs[5] = { g_offMuzzle1st, g_offMuzzleLoop1st, g_offMuzzleIron,
+                          g_offMuzzleLoopIron, g_offMuzzleEmitter };
+    for (int i = 0; i < g_fxN; ++i) {
+        if (!g_fx[i].have) continue;
+        for (int k = 0; k < 5; ++k) {
+            if (offs[k] < 0 || !Readable((void*)(g_fx[i].obj + offs[k]), 4)) continue;
+            // Restoring writes the SAVED pointer back, not a zero. A property that legitimately held
+            // something would otherwise be cleared for the rest of the session.
+            *reinterpret_cast<uintptr_t*>(g_fx[i].obj + offs[k]) = want ? 0 : g_fx[i].orig[k];
+        }
+    }
+    InterlockedExchange(&g_fxApplied, want ? 1 : 0);
+    Log("muzzle fx: first-person muzzle flash and barrel smoke %s on %d object(s) (mode %ld)",
+        want ? "SUPPRESSED" : "restored", g_fxN, mode);
+}
+
 // ================================================================ the view matrix probe
 //
 // A world->clip matrix has one property we can test without knowing anything about the
@@ -1355,6 +1760,9 @@ MatHit g_hits[kMaxHits];
 int    g_hitCount = 0;
 
 volatile LONG g_scanArmed  = 0;   // F7: scan this frame
+// Run 191: this scan is a fire-window PROBE - report the candidate windows and lock nothing. See the
+// warning at the top of ReportScan for why an automatic scan must never be allowed to re-lock.
+volatile LONG g_scanReportOnly = 0;
 volatile LONG g_injectOn   = 0;   // F3: offset the camera through the matrix
 volatile LONG g_scanReport = 0;   // set by the scan, consumed by Present
 
@@ -1407,6 +1815,10 @@ bool  g_haveCentrePos = false;
 // folds in aspect ratio - we never ask, we just read what came out.
 volatile LONG g_vrProjection = 1;      // on by default: it is the correct behaviour
 UINT  g_lockedReg  = 0;
+// Run 191: how many fire-window scans are left, and the trigger edge detector for them.
+int  g_muzzleRegProbe = 0;        // ini [Render] MuzzleRegProbe - number of shots to scan
+bool g_probeTrigWasDown = false;
+
 // ini ExtraCamReg: a second vertex-shader register to remap alongside the locked one. -1 = off.
 // Run 42 found a view-projection at c13 that nothing was remapping; see the note where it is used.
 int   g_extraCamReg = -1;
@@ -3275,6 +3687,11 @@ int  g_triggerGate = -1;                      // ini [Input] TriggerTouchGate, r
 XrAction g_actHandPose = XR_NULL_HANDLE;
 XrSpace  g_handSpace[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
 bool     g_handPoseValid[2] = { false, false };
+// Run 190: the gun-pose timing experiment. See the long note in SyncXRInput.
+int      g_poseLeadFrames = 0;          // ini [Input] PoseLeadFrames: display periods to predict ahead
+XrTime   g_lastHandPoseTime = 0;        // what time the previous sample was predicted FOR
+XrTime   g_lastDisplayPeriod = 8333333; // ns; replaced by the real one from xrWaitFrame
+double   g_poseStaleNs = 0.0;           // how stale that pose was by the time its geometry was drawn
 float    g_handYawRad[2] = { 0.0f, 0.0f };
 float    g_handPitchRad[2] = { 0.0f, 0.0f };
 float    g_handRollRad[2] = { 0.0f, 0.0f };
@@ -4030,7 +4447,7 @@ inline SHORT DebugKey(int vk) {
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
 enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
        PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
-       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND,
+       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND, PR_WEAPONFX, PR_MUZZLEFX,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -4053,10 +4470,14 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_MOVEDIR, PR_SWAPSTICKS,
       PR_LEFTHAND, PR_BACK },
     { PR_CINESTICK, PR_CINECAM, PR_BACK },
-    { PR_CROSSHAIR, PR_BACK },
-    { PR_OCCLUSION, PR_DEBUG, PR_BACK },
+    // MUZZLE FX joins CROSSHAIR here rather than going on ADVANCED: both are "the game draws something
+    // at the centre of your view that VR makes wrong", both are things a player judges by looking, and
+    // the DISPLAY page was created in run 165 expecting exactly this company.
+    { PR_CROSSHAIR, PR_MUZZLEFX, PR_BACK },
+    { PR_OCCLUSION, PR_WEAPONFX, PR_DEBUG, PR_BACK },
 };
-const int kPageCount[kPanelPages] = { 6, 8, 3, 2, 3 };   // ADVANCED lost MENU CAM in run 180
+// ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
+const int kPageCount[kPanelPages] = { 6, 8, 3, 3, 4 };
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -4112,6 +4533,11 @@ extern float g_turnSpeedDeg;
 extern int   g_turnSign;
 // Defined with the UI draw path, where the crosshair is identified and skipped.
 extern volatile LONG g_hideCrosshair;
+// Defined with the foreground-mesh code, next to the gun transform it widens.
+extern volatile LONG g_fgRideAll;
+// Defined with the component-write test (run 187). Diagnostic; deliberately never persisted.
+// Defined with the muzzle-FX suppression (run 189). Same 0/1/2 vocabulary as HideCrosshair.
+extern volatile LONG g_hideMuzzleFx;
 // Defined beside the turn code, which is the first thing that reads them.
 extern volatile LONG g_cineStickTurn;
 extern volatile LONG g_cutsceneLockCamera;
@@ -4174,6 +4600,19 @@ void PanelSaveRow(int rowId, const char* path) {
         case PR_OCCLUSION:
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_occlusionMode);
             WritePrivateProfileStringA("Render", "OcclusionQueryMode", v, path); return;
+        case PR_MUZZLEFX:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0));
+            WritePrivateProfileStringA("Render", "HideMuzzleFx", v, path); return;
+        case PR_WEAPONFX: {
+            // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
+            // survives a relaunch is a state somebody meets tomorrow as a bug report - with the
+            // panel row scrolled off screen and no memory of having set it. Saved as 1 instead,
+            // which is what the tester almost certainly wants back.
+            const LONG f = InterlockedCompareExchange(&g_fgRideAll, 0, 0);
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", f == 2 ? 1 : f);
+            WritePrivateProfileStringA("Render", "WeaponFxRideGun", v, path); return;
+        }
         case PR_DEBUG:
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
                         InterlockedCompareExchange(&g_debugOn, 0, 0));
@@ -4276,6 +4715,13 @@ void PanelRowText(int row, char* out, size_t cap) {
                         h == 0 ? "ALWAYS SHOW" : h == 1 ? "AUTO" : "ALWAYS HIDE");
             break;
         }
+        case PR_MUZZLEFX: {
+            // "MUZZLE FX" covers both, because they ARE both - the barrel smoke is an emitter inside the
+            // muzzle-flash particle system, so a row named "smoke" would be describing half of one asset.
+            _snprintf_s(out, cap, _TRUNCATE, "MUZZLE FX      %s",
+                        InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? "HIDDEN" : "SHOWN");
+            break;
+        }
         case PR_OCCLUSION:
             // Worded as what it DOES, not as the mode number. "ENGINE CULL" is the engine's own
             // occlusion culling left alone (mode 2); "DRAW ALL" stops the engine hiding geometry
@@ -4284,6 +4730,19 @@ void PanelRowText(int row, char* out, size_t cap) {
                         g_occlusionMode == 0 ? "AUTO" :
                         g_occlusionMode == 1 ? "DRAW ALL" : "ENGINE CULL");
             break;
+        case PR_WEAPONFX: {
+            // Worded as where the effects GO, not as what the code does. "STAY" is the old
+            // behaviour and it is the honest word for it - the flash and smoke stay at the centre
+            // of the view, which is where the engine still thinks the weapon is.
+            //
+            // HIDE PASS is labelled TEST because it deliberately breaks the picture: it drops the
+            // whole first-person pass, and run 117 established the gun goes BLACK rather than
+            // vanishing. A row that makes the game look broken has to say so on the row.
+            const LONG f = InterlockedCompareExchange(&g_fgRideAll, 0, 0);
+            _snprintf_s(out, cap, _TRUNCATE, "WEAPON FX      %s",
+                        f == 0 ? "STAY" : f == 1 ? "RIDE GUN" : "HIDE PASS (TEST)");
+            break;
+        }
         case PR_CINESTICK: {
             const LONG s = InterlockedCompareExchange(&g_cineStickTurn, 0, 0);
             _snprintf_s(out, cap, _TRUNCATE, "CUTSCENE TURN  %s",
@@ -4384,6 +4843,19 @@ void PanelAdjust(int row, int dir) {
             if (g_occlusionMode < 0) g_occlusionMode = 0;
             if (g_occlusionMode > 2) g_occlusionMode = 2;
             break;
+        case PR_MUZZLEFX:
+            InterlockedExchange(&g_hideMuzzleFx,
+                                InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? 0 : 1);
+            break;
+        case PR_WEAPONFX: {
+            // Clamped, not wrapped - run 143's lesson. Wrapping would put one press past RIDE GUN
+            // into a state that blacks out the weapon, which reads as a crash rather than a setting.
+            LONG f = InterlockedCompareExchange(&g_fgRideAll, 0, 0) + dir;
+            if (f < 0) f = 0;
+            if (f > 2) f = 2;
+            InterlockedExchange(&g_fgRideAll, f);
+            break;
+        }
         case PR_CINESTICK: {
             LONG s = InterlockedCompareExchange(&g_cineStickTurn, 0, 0) + dir;
             if (s < 0) s = 0;
@@ -5072,6 +5544,49 @@ void SyncXRInput(XrTime displayTime) {
     radialDeadzone(&mx, &my, 0.30f);
     radialDeadzone(&tx, &ty, 0.20f);
 
+    // ================= ⭐ run 190: the gun lags the head by a FRAME, and the head hides it ==========
+    //
+    // Reported: the gun tracking feels low-latency-but-jittery, "like it's not tracking at the full
+    // framerate". The head feels fine. That asymmetry is the diagnosis, because of WHERE each one is
+    // consumed:
+    //
+    //   the HEAD   is submitted to the compositor as the projection layer's pose, and the runtime
+    //              REPROJECTS the image to the real head pose at scan-out. Late error is corrected for
+    //              us, every frame, in hardware.
+    //   the GUN    is baked into GEOMETRY by BuildGunC during the draw calls. Reprojection cannot
+    //              correct a vertex position. Whatever staleness is in the pose stays in the picture.
+    //
+    // And there is staleness, structurally. D3D9 renders the frame and THEN calls Present, so:
+    //
+    //     Present N   xrWaitFrame -> predictedDisplayTime for the frame being submitted now
+    //                 SyncXRInput samples poses predicted for THAT time
+    //     frame N+1   the game draws, and BuildGunC reads those globals
+    //     Present N+1 that image is submitted, one display period LATER than the pose was predicted for
+    //
+    // So the gun geometry is always transformed by a pose predicted for the PREVIOUS frame's scan-out -
+    // about 8.3 ms at 120 Hz - while the head is corrected to the current one. A constant offset would
+    // read as lag; what makes it read as JITTER is that the prediction error is not constant, so the gun
+    // wobbles against a head that does not.
+    //
+    // ---- the fix is one term, and `PoseLeadFrames` A/Bs it ----
+    //
+    // Predict the hands for when the geometry will actually be seen: `predictedDisplayTime +
+    // predictedDisplayPeriod`. OpenXR is being asked the same question either way; it is just being
+    // given the right timestamp.
+    //
+    // ⚠️ The HEAD's layer pose must NOT move with this - it is correct already, and shifting it would
+    // hand the compositor a pose for a frame it is not displaying. This applies to the hand locate only.
+    //
+    // ⚠️ **Measured, not assumed.** `pose lead` in the frame budget reports how stale the pose was when
+    // the geometry that used it was drawn. If that reads ~0 with PoseLeadFrames=0, this whole account is
+    // wrong and the jitter is something else - so the number is printed whether the fix is on or off.
+    const XrTime kPoseLead = (XrTime)g_poseLeadFrames * g_lastDisplayPeriod;
+    const XrTime handTime = displayTime + kPoseLead;
+    // How far in the past the PREVIOUS sample's target now is. This is the staleness that reached the
+    // screen, and it is what the report is about.
+    if (g_lastHandPoseTime) g_poseStaleNs = (double)(displayTime - g_lastHandPoseTime);
+    g_lastHandPoseTime = handTime;
+
     // ---- where the hands are ----
     LARGE_INTEGER tPose = Now();
     for (int i = 0; i < 2; ++i) {
@@ -5079,7 +5594,9 @@ void SyncXRInput(XrTime displayTime) {
         g_handTracked[i] = false;
         if (g_handSpace[i] == XR_NULL_HANDLE) continue;
         XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
-        if (XR_FAILED(xrLocateSpace(g_handSpace[i], g_xrSpace, displayTime, &loc))) continue;
+        // handTime, not displayTime - see the run-190 note above. With PoseLeadFrames=0 these are equal,
+        // so the old behaviour is bit-identical and the A/B is honest.
+        if (XR_FAILED(xrLocateSpace(g_handSpace[i], g_xrSpace, handTime, &loc))) continue;
         // TRACKED, not merely VALID. A set-down controller keeps reporting a valid last-known
         // pose long after it has stopped being tracked, so the valid bit alone cannot tell a live
         // controller from a sleeping one - which is exactly the distinction under investigation.
@@ -5586,6 +6103,9 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
     // xrLocateViews so the yaw base is settled for the whole frame that follows - the 6-DOF
     // transform below reads g_baseYaw too, and a snap applied between the two would rotate the
     // view and the positional frame by different amounts for one frame.
+    // Published before SyncXRInput uses it: the pose-lead term is a multiple of the REAL display period,
+    // not of an assumed 120 Hz. A hardcoded 8.33 ms would silently be wrong on a 72 or 90 Hz headset.
+    if (fs.predictedDisplayPeriod > 0) g_lastDisplayPeriod = fs.predictedDisplayPeriod;
     SyncXRInput(fs.predictedDisplayTime);
     if (g_padTurnAccum) {
         // Discarded rather than applied before the first centre: g_baseYaw is seeded from the
@@ -5969,9 +6489,13 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 const float right =  (hx * cc2) - (hz * sc2);
                 const float byr = g_baseYaw * (6.2831853f / 65536.0f);
                 const float bc2 = cosf(byr), bs2 = sinf(byr);
-                InterlockedExchange(&g_handOffX, (LONG)((bc2 * fwd - bs2 * right) * kMetresToUU));
-                InterlockedExchange(&g_handOffY, (LONG)((bs2 * fwd + bc2 * right) * kMetresToUU));
-                InterlockedExchange(&g_handOffZ, (LONG)(hy * kMetresToUU));
+                // Milli-UU, and ROUNDED rather than truncated - see the note at g_handOffX. Truncation
+                // toward zero was both coarse and asymmetric about the origin.
+                InterlockedExchange(&g_handOffX,
+                    (LONG)lroundf((bc2 * fwd - bs2 * right) * kMetresToUU * kHandFixed));
+                InterlockedExchange(&g_handOffY,
+                    (LONG)lroundf((bs2 * fwd + bc2 * right) * kMetresToUU * kHandFixed));
+                InterlockedExchange(&g_handOffZ, (LONG)lroundf(hy * kMetresToUU * kHandFixed));
             }
             InterlockedExchange(&g_handDevValid, 1);
         } else {
@@ -6460,6 +6984,10 @@ const UINT kScratchVecs    = 256;   // vs_3_0's full float-constant file
 // because they belong beside the HUD probe that consumes them, not beside the constant hook that
 // merely feeds it.
 extern volatile LONG g_vsWriteMask;
+// Run 193's per-draw write mask, defined with the flash probe further down. The constant hook sets the
+// bits; the draw hooks clear them.
+extern volatile LONG g_drawWriteLo, g_drawWriteHi;
+extern int g_flashProbeLeft;
 extern int           g_upXformDump;
 extern volatile LONG g_hudConstsWritten;
 extern bool          g_inHudRemap;
@@ -6499,6 +7027,35 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
         LONG cur, want;
         do { cur = InterlockedCompareExchange(&g_vsWriteMask, 0, 0); want = cur | add; }
         while (InterlockedCompareExchange(&g_vsWriteMask, want, cur) != cur);
+    }
+
+    // ---- ⭐ run 193: which registers were written just before the muzzle-flash draw? ----
+    //
+    // Run 192 named the draw: `DrawIndexedPrimitiveUP`, **stride 72**, ~16-18 primitives, unique to
+    // firing, world-space vertices, and already split per eye. So the split works and the TRANSFORM is
+    // not being remapped, which means it reads a register we do not track.
+    //
+    // Run 191's matrix scan could not find that register and structurally never could: it tests whether
+    // the CAMERA transforms to w=0, which is only true of a full world->clip matrix in translated-world
+    // space. A local->clip matrix for an effect fails that test while still being the transform. **That
+    // scan was the wrong instrument, not evidence against the theory.**
+    //
+    // This is run 148's method instead, which does not care what shape the matrix is: the game sets a
+    // draw's constants immediately before issuing it, so the registers written since the PREVIOUS draw
+    // are that draw's own. Reset per draw by the hooks, unlike `g_vsWriteMask`, which accumulates for
+    // a whole HUD interval and by the time any given draw arrives holds nearly everything.
+    //
+    // 64 registers, because the run-191 candidates reached c37 and a 32-bit mask would have silently
+    // truncated exactly the range worth looking at.
+    if (g_flashProbeLeft > 0) {
+        const UINT last = (startReg + vec4Count > 64) ? 64 : startReg + vec4Count;
+        for (UINT i = startReg; i < last && i < 64; ++i) {
+            volatile LONG* w = (i < 32) ? &g_drawWriteLo : &g_drawWriteHi;
+            const LONG bit = 1L << (i & 31);
+            LONG cur, want;
+            do { cur = InterlockedCompareExchange(w, 0, 0); want = cur | bit; }
+            while (InterlockedCompareExchange(w, want, cur) != cur);
+        }
     }
 
     // Nothing below may touch `data` before this. The verify block used to dereference it three
@@ -7215,7 +7772,12 @@ HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
 HWND g_gameWindow = nullptr;
 extern volatile LONG g_frameDrawIdx;
 extern volatile LONG g_inForeground, g_hideMeshIdx, g_fgDrawCount;
+// Defined with the foreground-mesh code. StereoPair reads it; the non-indexed draw hook above sets
+// it as of run 181, and that hook comes before the definition.
+extern bool g_thisDrawMoved;
 static bool FgHidden(UINT verts);
+static bool FgRidesGun(UINT verts);
+static bool FgHideWholePass();
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 
 // ================================================================ the video-quad probe (run 160)
@@ -7261,6 +7823,417 @@ const int kVidMaxDumps = 40;        // enough for the splashes and a cutscene; n
 const char* VidSrcName(uint8_t s) {
     return s == 0 ? "DrawPrim   " : s == 1 ? "DrawIdxPrim" :
            s == 2 ? "DrawPrimUP " : "DrawIdxPrUP";
+}
+
+// ========== ⭐ run 192: the fire-window DRAW census. What IS this draw? ======================
+//
+// Run 191 scanned for a view-projection register the muzzle flash might ride and found nothing that
+// survives scrutiny - only `c0 ROW` passes all three tests, in fire frames and ordinary ones alike, and
+// the six windows unique to the fire frame were all `hits=1, shape=BAD`, indistinguishable from one
+// contiguous constant block read as overlapping 4-register windows.
+//
+// So the question moves down a level, from *which register does it read* to *how is this draw handled
+// at all*. That was the more basic question and should have been asked first.
+//
+// ---- the hypothesis this is built to kill or confirm ----
+//
+// `UserPtrQuad` classifies a draw as a pass-through fullscreen quad when it is **small AND its first
+// vertex is inside NDC**. A muzzle-flash sprite positioned by projecting a world point on the CPU is
+// exactly that: two primitives, vertices already in clip space. It would be **passed through
+// undivided**, drawn once, and land wherever its NDC coordinates put it - the centre of the FULL
+// side-by-side frame. One effect, on the seam. Which is the report.
+//
+// **The missing test is EXTENT.** A real fullscreen quad SPANS NDC, roughly (-1,-1) to (+1,+1). A
+// small centred sprite passes "first vertex is inside NDC" while spanning almost nothing. `v0` alone
+// cannot tell them apart, so this census records the **bounding box** of the vertices - the datum that
+// separates the two outright.
+//
+// If that is what is happening, the fix is the one this codebase already has for the Bink video quad
+// (run 160): draw it once per eye with `x' = x/2 + eyeOffset`. Same defect, same shape, same remedy.
+const int kFireSigMax = 20;
+struct FireSig {
+    uint8_t  src, wasQuad;
+    uint32_t primType, primCount, stride;
+    float    minX, minY, maxX, maxY;
+    uint32_t count;
+};
+FireSig g_fireSig[kFireSigMax]{};
+int  g_fireSigN = 0;
+int  g_fireCensusBudget = 0;         // ini [Render] FireDrawCensus: how many shots to record
+volatile LONG g_fireCensusFrames = 0;
+bool g_fireTrigWasDown = false;
+int  g_fireSplitSeen = 0, g_fireQuadSeen = 0;
+int  g_fireBySrc[4] = {};            // draws per hook, so "not on a user-pointer path" is visible
+bool g_fireIsBaseline = false;       // this window was taken with the trigger UP
+bool g_fireBaselineDone = false;
+
+// ---- run 193: the flash's register, found by what was written just before its draw ----
+//
+// Run 192's handle: stride 72 on DrawIndexedPrimitiveUP, unique to firing. `g_drawWrite{Lo,Hi}` is a
+// 64-register write mask that the DRAW hooks clear, so at any draw it holds exactly the registers set
+// since the previous draw - that draw's own constants. See the long note in the constant hook.
+volatile LONG g_drawWriteLo = 0, g_drawWriteHi = 0;
+int g_flashProbeLeft = 0;            // ini [Render] FlashRegProbe: how many stride-72 draws to dump
+const UINT kFlashStride = 72;
+
+// ---- ⭐ the validation that should have come FIRST (run 196) ----
+//
+// `MuzzleFxDropStride=<n>`: skip every user-pointer draw with that vertex stride. Set it to 72 and fire.
+//
+//   the seam artefact DISAPPEARS  stride 72 IS the flash - and since its shader reads c0, which we do
+//                                 remap, the cause is something other than an untracked register.
+//   the seam artefact REMAINS     stride 72 was never the flash. Runs 193-196 measured the wrong draw,
+//                                 and the census needs to look at the indexed paths instead.
+//
+// This is the same discriminator as `WEAPON FX = HIDE PASS`, which settled the foreground-pass question
+// in one run: what vanishes when you drop it is what it was. Cheap, visual, and it cannot be fooled by
+// any inference of mine - which is exactly why it belonged before three runs of register archaeology.
+//
+// Kept in the code rather than left as a note, because the next session should be able to ask the
+// question with one ini key instead of rebuilding the instrument.
+int g_dropStride = 0;                // ini [Render] MuzzleFxDropStride, 0 = off
+
+// Reads and clears the mask. Called at the top of every draw hook, so the value returned describes the
+// draw that is about to be issued rather than an accumulation over the whole frame.
+static inline void TakeDrawWriteMask(LONG* lo, LONG* hi) {
+    *lo = InterlockedExchange(&g_drawWriteLo, 0);
+    *hi = InterlockedExchange(&g_drawWriteHi, 0);
+}
+
+// ===== ⭐ run 196: ASK THE SHADER which constant registers it reads =====================
+//
+// Every measurement so far has inferred the transform from constant VALUES, and values cannot say who
+// reads them. `c26..c28` looks exactly like a world->view matrix, but "looks like" is what has cost
+// this thread run after run - it could equally be leftover state from another shader.
+//
+// The bytecode is authoritative. `GetFunction` returns it, and a D3D9 shader names every constant
+// register it references in its source parameter tokens. No alignment guessing, no shape heuristics,
+// no inference from what happens to be in memory.
+//
+// ---- the parse, and the one thing that would make it lie ----
+//
+// Shader model 2.0+ puts an instruction's length in bits 27:24 of its opcode token, which is what lets
+// this walk operands without a per-opcode operand table. **SM 1.x has no such field**, so the same walk
+// would march through 1.x bytecode producing confident nonsense. That is checked and refused rather
+// than assumed.
+//
+// `def`/`defi`/`defb` payloads are skipped without inspection: they are float literals, and a negative
+// float has bit 31 set, which is exactly the bit that marks a parameter token. Scanning raw DWORDs for
+// bit 31 - the obvious shortcut - would report every negative constant as a register reference.
+//
+// Relative addressing (`c[a0.x + n]`) is reported when present, because then the set of registers read
+// is not statically knowable and a complete list is not on offer.
+const DWORD kSprConst = 2;                      // D3DSPR_CONST
+
+static void DumpShaderConstUsage(IDirect3DVertexShader9* vs) {
+    UINT size = 0;
+    if (!vs || FAILED(vs->GetFunction(nullptr, &size)) || size < 8) {
+        Log("    shader bytecode: unavailable");
+        return;
+    }
+    static DWORD buf[4096];                     // 16 KB; reported if the shader exceeds it
+    if (size > sizeof(buf)) {
+        Log("    ⚠️ shader bytecode is %u bytes, larger than the %u-byte buffer - NOT parsed."
+            " Raise the buffer; do not conclude anything from a partial parse.",
+            size, (unsigned)sizeof(buf));
+        return;
+    }
+    if (FAILED(vs->GetFunction(buf, &size))) { Log("    shader bytecode: GetFunction failed"); return; }
+
+    const DWORD nTok = size / 4;
+    const DWORD ver = buf[0];
+    const int major = (int)((ver >> 8) & 0xFF), minor = (int)(ver & 0xFF);
+    if (major < 2) {
+        Log("    ⚠️ shader is vs_%d_%d - shader model 1.x has NO instruction-length field, so this"
+            " parser cannot walk it and would report nonsense. Refusing.", major, minor);
+        return;
+    }
+
+    bool used[256] = {};
+    bool relative = false;
+    int  defd = 0;
+    DWORD i = 1;
+    DWORD guard = 0;
+    bool truncated = false;
+    while (i < nTok) {
+        if (++guard > 8192) { truncated = true; break; }
+        const DWORD tok = buf[i];
+        const DWORD op = tok & 0xFFFF;
+        if (op == 0xFFFF) break;                            // D3DSIO_END
+        if (op == 0xFFFE) {                                 // D3DSIO_COMMENT
+            i += 1 + ((tok >> 16) & 0x7FFF);
+            continue;
+        }
+        const DWORD len = (tok >> 24) & 0x0F;
+        ++i;
+        // 81 DEF, 48 DEFB, 49 DEFI - literal payloads, skipped unexamined. These registers are baked
+        // into the shader, NOT supplied by SetVertexShaderConstantF, so they are counted separately.
+        if (op == 81 || op == 48 || op == 49) { ++defd; i += len; continue; }
+        for (DWORD k = 0; k < len && i + k < nTok; ++k) {
+            const DWORD t = buf[i + k];
+            if (!(t & 0x80000000)) continue;                // not a parameter token
+            const DWORD rt = ((t & 0x70000000) >> 28) | ((t & 0x00001800) >> 8);
+            if (rt != kSprConst) continue;
+            if (t & 0x00002000) relative = true;            // D3DSHADER_ADDRMODE_RELATIVE
+            const DWORD rn = t & 0x7FF;
+            if (rn < 256) used[rn] = true;
+        }
+        i += len;
+    }
+
+    char list[256]; int off = 0, n = 0, shown = 0;
+    for (int r = 0; r < 256; ++r) {
+        if (!used[r]) continue;
+        ++n;
+        if (off < 220) { off += _snprintf_s(list + off, sizeof(list) - off, _TRUNCATE,
+                                           "%sc%d", shown ? " " : "", r); ++shown; }
+    }
+    Log("    shader vs_%d_%d, %u bytes: reads %d constant register(s): %s", major, minor, size, n,
+        n ? list : "(none)");
+    if (shown < n)
+        Log("    ⚠️ register list truncated: %d of %d shown", shown, n);
+    if (truncated)
+        Log("    ⚠️ token walk hit its 8192 guard - the parse is INCOMPLETE and the list above may be"
+            " missing registers.");
+    if (relative)
+        Log("    ⚠️ this shader uses RELATIVE constant addressing (c[a0.x + n]), so the registers it"
+            " reads are not statically knowable and the list above is a lower bound.");
+    if (defd)
+        Log("    (%d def/defi/defb literal block(s) skipped - those constants are baked into the shader,"
+            " not set through the API)", defd);
+    Log("    ⭐ THE ANSWER: whichever of these is a world->view or view->clip matrix is what must be"
+        " remapped per eye. If c0 is absent from this list, that is why our c0 remap never reaches the"
+        " flash - and the register that IS here is the fix.");
+}
+
+// Dumped from the draw hook - which normally would be forbidden, and is the one thing to be careful
+// about here. Run 24/25 lost two runs to file I/O inside a draw hook, so this is bounded to a handful
+// of draws for the whole session by g_flashProbeLeft and is off by default.
+void FlashRegDump(IDirect3DDevice9* dev, LONG lo, LONG hi, UINT primCount, UINT stride) {
+    if (g_flashProbeLeft <= 0) return;
+    --g_flashProbeLeft;
+
+    // Is there a vertex shader at all? If not, the transform is in fixed-function D3DTS_* state and NO
+    // register remap can ever reach it - the fix would have to intercept SetTransform instead. That is
+    // a different fix, so it has to be known before anything is built.
+    IDirect3DVertexShader9* vs = nullptr;
+    const bool haveVs = SUCCEEDED(dev->GetVertexShader(&vs)) && vs != nullptr;
+
+    // ---- caps ANNOUNCE THEMSELVES from here on ----
+    //
+    // Four runs were lost to bounds chosen for readable output that silently dropped the answer. The
+    // lesson is not "never bound a log" - unbounded I/O in a draw hook is what hung runs 24/25 - it is
+    // that **a bound must say when it bites.** Every truncation below reports itself.
+    int totalWritten = 0;
+    for (int i = 0; i < 64; ++i) {
+        const LONG m = (i < 32) ? lo : hi;
+        if (m & (1L << (i & 31))) ++totalWritten;
+    }
+    char regs[192]; int off = 0, n = 0;
+    for (int i = 0; i < 64; ++i) {
+        const LONG m = (i < 32) ? lo : hi;
+        if (!(m & (1L << (i & 31)))) continue;
+        if (off >= 150) break;
+        off += _snprintf_s(regs + off, sizeof(regs) - off, _TRUNCATE, "%sc%d", n ? " " : "", i);
+        ++n;
+    }
+    if (n < totalWritten)
+        Log("    ⚠️ register LIST truncated: %d of %d shown (string budget). The count is what matters -"
+            " every one of the %d is dumped below unless the block cap also reports biting.",
+            n, totalWritten, totalWritten);
+    Log("flash reg probe: stride %u prims %u  vertex shader %s  registers written since the previous"
+        " draw: %s", stride, primCount, haveVs ? "YES" : "*** NONE (fixed function)", n ? regs : "(none)");
+
+    // ⭐ The authoritative question, asked before any of the value-based guessing below: which registers
+    // does this shader actually READ? Everything else in this dump is inference from memory contents.
+    if (haveVs) DumpShaderConstUsage(vs);
+    if (vs) vs->Release();
+
+    // ---- ⭐ the CHEAP hypothesis, checked before hunting any further for a register ----
+    //
+    // The flash may ride the scene's own c0 and simply arrive at a moment when there is nothing to
+    // remap. `g_camMatrixBound` is cleared whenever a shadow or post pass takes the tracked register,
+    // and `InvalidateCamMats()` fires on a partial overlap. StereoPair loops over the VALID slots - so
+    // with none valid it duplicates the draw and modifies nothing, and both copies land at the same
+    // clip position. That is this artefact exactly, and it needs no unknown register at all.
+    //
+    // If `valid slots` reads 0 here, the fix is not ExtraCamReg - it is that the draw is being issued
+    // while the tracked matrix is unavailable, and the answer is to restore/cache it for this pass.
+    {
+        int nValid = 0;
+        char slots[128]; int so = 0;
+        for (int s = 0; s < g_camMatUsed && s < kMaxCamMats; ++s) {
+            if (!g_camMats[s].valid) continue;
+            ++nValid;
+            if (so < 100)
+                so += _snprintf_s(slots + so, sizeof(slots) - so, _TRUNCATE, "%sc%u",
+                                  so ? " " : "", g_camMats[s].reg);
+        }
+        Log("    remap state at THIS draw: %d valid cam-matrix slot(s)%s%s | camMatrixBound %s |"
+            " haveLock %s (locked c%u) | %s",
+            nValid, nValid ? " covering " : "", nValid ? slots : "(nothing to remap)",
+            g_camMatrixBound ? "YES" : "no", g_haveLock ? "YES" : "no",
+            g_haveLock ? g_lockedReg : 0u,
+            nValid == 0
+                ? "*** NOTHING IS BEING REMAPPED FOR THIS DRAW. It is duplicated but unmodified, so both"
+                  " copies land identically and meet at the seam. This is sufficient to explain the"
+                  " artefact WITHOUT any unknown register - chase this before ExtraCamReg."
+                : "slots are live, so the eye remap IS being applied to those registers - if the flash"
+                  " still lands on the seam it does not read any of them");
+    }
+
+    // ---- ⚠️ this used to `break` after the FIRST block, and that hid the answer ----
+    //
+    // Run 193 dumped only c5..c8 and stopped. c5..c8 turned out to be the effect's local->world matrix -
+    // its last column is (0,0,0,1), so it carries no projection at all - which means the register that
+    // actually puts the flash on screen was in the part I chose not to print. A dump truncated to keep
+    // the log short cost a whole run, which is the same shape as the caps in runs 183 and 192.
+    //
+    // Now every 4-aligned written block, with the test that separates them: **a view-PROJECTION has a
+    // non-trivial w column; an affine world matrix has (0,0,0,1).** Only a projective block can be the
+    // one whose remap moves the draw between eyes.
+    // ---- 💥 run 194: the 4-ALIGNMENT FILTER EXCLUDED THE KNOWN ANSWER ----
+    //
+    // This said `if (i & 3) continue;` - dump only 4-aligned starts, on the assumption that a matrix
+    // does not straddle a multiple of four. **The flash's matrix is at c5..c8**, established the run
+    // before, and c5 is not 4-aligned. So the filter skipped the one block already confirmed, printed
+    // five misaligned windows instead, and the "live w column" test called every one of them
+    // PROJECTIVE - which it would, since a block of scalar parameters trivially has a non-zero fourth
+    // column. c8..c11's first row was just c5..c8's translation row, seen through a window one register
+    // out of step.
+    //
+    // The alignment assumption was wrong in both directions: the view matrix visible in the c24..c27
+    // dump (unit axes with translations) is not 4-aligned either. **Shader constants have no alignment
+    // requirement at all** - a compiler packs them wherever they fit.
+    //
+    // No filter now. Every written register is a candidate start.
+    const int kBlockCap = 24;             // >= the 18 registers observed written, so it should not bite
+    int blocks = 0, skippedByCap = 0, failedRead = 0;
+    for (int i = 0; i < 61; ++i) {
+        const LONG m = (i < 32) ? lo : hi;
+        if (!(m & (1L << (i & 31)))) continue;
+        if (blocks >= kBlockCap) { ++skippedByCap; continue; }
+        float c[16]{};
+        if (FAILED(dev->GetVertexShaderConstantF(i, c, 4))) { ++failedRead; continue; }
+        ++blocks;
+        const bool affine = fabsf(c[3]) < 1e-4f && fabsf(c[7]) < 1e-4f &&
+                            fabsf(c[11]) < 1e-4f && fabsf(c[15] - 1.0f) < 1e-3f;
+        Log("    c%-2d..c%-2d %s  [%8.3f %8.3f %8.3f %8.3f] [%8.3f %8.3f %8.3f %8.3f]"
+            " [%8.3f %8.3f %8.3f %8.3f] [%8.3f %8.3f %8.3f %8.3f]",
+            i, i + 3, affine ? "AFFINE (w col 0,0,0,1 - a world matrix, NOT the screen transform)"
+                             : "*** PROJECTIVE (w column is live - THIS is a candidate)",
+            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+            c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15]);
+    }
+    // Every exclusion, stated. A silent zero here is what cost runs 193 and 194.
+    Log("    dumped %d block(s) of %d written register(s)%s%s", blocks, totalWritten,
+        skippedByCap ? "" : " - NOTHING EXCLUDED",
+        skippedByCap ? "  ⚠️ CAP BIT: see the next line" : "");
+    if (skippedByCap)
+        Log("    ⚠️ BLOCK CAP HIT - %d written register(s) were NOT dumped. Raise kBlockCap; do not draw"
+            " a conclusion from this dump.", skippedByCap);
+    if (failedRead)
+        Log("    ⚠️ %d register read(s) FAILED (GetVertexShaderConstantF) and are missing from the dump.",
+            failedRead);
+    Log("    Reading this: a PROJECTIVE block whose rows look like axes plus a translation is a"
+        " candidate - set [Render] ExtraCamReg to its first register and fire. But check the remap-state"
+        " line above FIRST: if it says nothing is being remapped, no register is missing and the cause"
+        " is that the tracked matrix was unavailable when this draw was issued.");
+}
+
+// Bounding box over the draw's vertices, in whatever space they are already in. Bounded to 16
+// vertices and guarded - this runs on the render thread inside a draw hook, so it does no I/O and
+// touches nothing it has not range-checked.
+static void FireBBox(const void* vtx, UINT stride, D3DPRIMITIVETYPE t, UINT primCount,
+                     float* mnx, float* mny, float* mxx, float* mxy) {
+    *mnx = *mny = 1e9f; *mxx = *mxy = -1e9f;
+    if (!vtx || stride < 8) return;
+    UINT n = (t == D3DPT_TRIANGLESTRIP || t == D3DPT_TRIANGLEFAN) ? primCount + 2 : primCount * 3;
+    if (n > 16) n = 16;
+    for (UINT i = 0; i < n; ++i) {
+        const void* p = static_cast<const char*>(vtx) + (size_t)i * stride;
+        if (!Readable(p, 8)) return;
+        const float* v = static_cast<const float*>(p);
+        if (!(v[0] == v[0]) || !(v[1] == v[1])) continue;          // NaN
+        if (v[0] < *mnx) *mnx = v[0];
+        if (v[0] > *mxx) *mxx = v[0];
+        if (v[1] < *mny) *mny = v[1];
+        if (v[1] > *mxy) *mxy = v[1];
+    }
+}
+
+// ---- 💥 run 192: the table SATURATED on indexed geometry and reported nothing useful ----
+//
+// First version recorded every small draw. Indexed draws carry no vertex pointer, so they have no
+// bounding box - and they have a distinct signature for every primitive count, so all 20 slots filled
+// with `DrawIdxPrim prims 2..29, no vertex data` before a single user-pointer draw arrived. Twenty rows
+// of zeros. The counters worked; the table was spent on draws that could not answer the question.
+//
+// Narrowed to the draws that CAN answer it: user-pointer paths only, which are the ones with vertex
+// data and the ones the quad classifier actually judges. Other sources are still counted, because
+// "the flash is not on a user-pointer path" would itself be the finding - but they no longer consume
+// slots they cannot use.
+//
+// And a FIRE window alone was never enough. `104 passed through` over 8 frames is ~13 a frame, exactly
+// the session-wide rate, so pass-throughs are constant background - a number with nothing to compare
+// against. The census now also takes a BASELINE with the trigger up, and the answer is the DIFFERENCE.
+void FireCensusRecord(uint8_t src, D3DPRIMITIVETYPE t, UINT primCount, UINT stride,
+                      const void* vtx, bool wasQuad) {
+    if (InterlockedCompareExchange(&g_fireCensusFrames, 0, 0) <= 0) return;
+    if (wasQuad) ++g_fireQuadSeen; else ++g_fireSplitSeen;
+    if (src < 4) ++g_fireBySrc[src];
+    // User-pointer paths only - see the note above. src 2 = DrawPrimUP, 3 = DrawIndexedPrimUP.
+    if (src != 2 && src != 3) return;
+    for (int i = 0; i < g_fireSigN; ++i) {
+        FireSig& e = g_fireSig[i];
+        if (e.src == src && e.primType == (uint32_t)t && e.primCount == primCount &&
+            e.stride == stride && e.wasQuad == (wasQuad ? 1 : 0)) { ++e.count; return; }
+    }
+    if (g_fireSigN >= kFireSigMax) return;
+    FireSig& e = g_fireSig[g_fireSigN++];
+    e.src = src; e.wasQuad = wasQuad ? 1 : 0;
+    e.primType = (uint32_t)t; e.primCount = primCount; e.stride = stride;
+    e.count = 1;
+    FireBBox(vtx, stride, t, primCount, &e.minX, &e.minY, &e.maxX, &e.maxY);
+}
+
+// Printed from Present, never from a draw hook - run 24/25's startup hang was file I/O inside one.
+void FireCensusDump() {
+    Log("---- %s draw census: %d user-pointer signature(s); %d draw(s) split per eye, %d passed through"
+        " as fullscreen quads ----", g_fireIsBaseline ? "BASELINE (trigger UP)" : "FIRE-WINDOW",
+        g_fireSigN, g_fireSplitSeen, g_fireQuadSeen);
+    Log("    draws by hook: DrawPrim %d, DrawIdxPrim %d, DrawPrimUP %d, DrawIdxPrimUP %d"
+        " (only the UP paths are listed below - they are the ones with vertex data)",
+        g_fireBySrc[0], g_fireBySrc[1], g_fireBySrc[2], g_fireBySrc[3]);
+    for (int i = 0; i < g_fireSigN; ++i) {
+        const FireSig& e = g_fireSig[i];
+        const bool haveBox = e.minX < 1e8f;
+        const float w = haveBox ? e.maxX - e.minX : 0.0f;
+        const float h = haveBox ? e.maxY - e.minY : 0.0f;
+        // "SPANS NDC" is the discriminator. A pass-through is only correct for a quad that really does
+        // cover the frame; anything small that got passed through is drawn once, wherever its
+        // coordinates put it, and that is the artefact being chased.
+        Log("    %s type %u prims %-4u stride %-3u %s  box x[%+.3f %+.3f] y[%+.3f %+.3f]"
+            " (%.3f x %.3f)%s  x%u",
+            VidSrcName(e.src), e.primType, e.primCount, e.stride,
+            e.wasQuad ? "PASSED THROUGH" : "split per eye ",
+            haveBox ? e.minX : 0.0f, haveBox ? e.maxX : 0.0f,
+            haveBox ? e.minY : 0.0f, haveBox ? e.maxY : 0.0f, w, h,
+            !haveBox ? "  (no vertex data - indexed draw)"
+                     : (e.wasQuad && (w < 1.0f || h < 1.0f))
+                         ? "  <-- PASSED THROUGH BUT DOES NOT SPAN NDC. This is the bug: drawn once,"
+                           " at the centre of the full frame."
+                         : "",
+            e.count);
+    }
+    if (!g_fireSigN)
+        Log("    (no user-pointer draws at all in this window - if the flash was visible, it is on an"
+            " indexed path and the quad classifier is not involved)");
+    if (!g_fireIsBaseline)
+        Log("    Compare against the BASELINE block: a signature present HERE and absent there is the"
+            " shot's own geometry. That is the muzzle flash, and its box says whether it spans NDC.");
+    g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
+    for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
 }
 
 // Only called for SMALL draws - the ones that could be a quad - so the device queries below never
@@ -7339,11 +8312,26 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
     InterlockedIncrement(&g_frameDrawIdx);
     ++g_vidFrameDraws;
     if (count <= 4) VidProbeRecord(dev, 0, t, count, nullptr, 0);
+    // No vertex data on this path, so no bounding box - but its PRESENCE still matters. If the flash
+    // turns out to be here rather than on a user-pointer path, the quad classifier is not involved at
+    // all and the whole hypothesis changes.
+    FireCensusRecord(0, t, count, 0, nullptr, false);
+    // Cleared here so the mask stays scoped to a single draw - see TakeDrawWriteMask.
+    if (g_flashProbeLeft > 0) { LONG lo, hi; TakeDrawWriteMask(&lo, &hi); }
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, 0, count, (uint32_t)t);
+        // WEAPON FX = HIDE PASS. This path learns no signatures, so there is nothing to order it
+        // against - but it must be inside the pass check, not outside it.
+        if (FgHideWholePass()) return D3D_OK;
     }
-    return StereoPair(dev, [&] { return g_origDrawPrim(dev, t, start, count); });
+    // Run 181: this path could not move anything at all before - g_thisDrawMoved was only ever set
+    // in the indexed hook. Zero for the vertex count because a non-indexed draw does not report one;
+    // see FgRidesGun for why that is the right thing to pass rather than a gap.
+    g_thisDrawMoved = FgRidesGun(0);
+    const HRESULT phr = StereoPair(dev, [&] { return g_origDrawPrim(dev, t, start, count); });
+    g_thisDrawMoved = false;
+    return phr;
 }
 // ================= ⭐ run 114: find the FOREGROUND pass =======================================
 //
@@ -7411,6 +8399,104 @@ volatile LONG g_hideMeshIdx = 0;       // 0 none, 1..3 index into the learned si
 volatile LONG g_fgMoveOn = 0;          // APPS selects a mesh; this says move it rather than hide it
 bool g_thisDrawMoved = false;          // set per draw on the render thread, read inside StereoPair
 volatile LONG g_fgDrawCount = 0;       // how many draws landed in the pass this frame
+
+// ---- ⭐ run 181: the weapon EFFECTS were never moved, only the weapon MESH ----
+//
+// Reported: the smoke that should come out of the pistol barrel is stuck at the centre of the
+// screen. That is this - and it is not a bug in the transform, it is the transform's reach.
+//
+// FgMoved matches ONE vertex count, the latched gun. Everything else the first-person pass draws
+// is left exactly where the engine put it, and the engine still has the weapon attached to the
+// camera - route 2 deliberately never moved it, which is why culling and LOD cost nothing. So a
+// muzzle effect spawns at the engine's muzzle, which is the middle of the view, and it stays there
+// while the mesh it is supposed to be coming out of is over on the controller.
+//
+// ⚠️ **The premise this replaces named the wrong effect, and STATUS chased it for sixty-odd runs:**
+// *"barrel smoke IS correctly aligned, so find what it rides on that the flash does not."* The
+// aligned smoke is the IMPACT smoke off the wall. The split is the space each effect lives in:
+//
+//   impact smoke              spawned in WORLD space at the trace hit point. Route 2 rotates the
+//                             trace, so the hit point is right and so is the puff - for free.
+//   flash and barrel smoke    attached to the FIRST-PERSON WEAPON, which the engine still has at
+//                             the camera and route 2 deliberately never moves.
+//
+// So the flash and the barrel smoke are one system and always were, and the asymmetry as written had
+// no answer to find. The observation was accurate; its subject was misnamed. **World-space vs
+// view-space is the first question to ask about any effect that lands in the wrong place** - and it
+// is why impact smoke needs nothing from this code and must stay untouched by it.
+//
+// The rule that generalises: **the foreground pass IS the first-person weapon pass.** The engine
+// already separated this geometry for us (run 114) - flash, smoke, shells, the third 390-vertex
+// mesh - so everything in it belongs on the controller, and matching one vertex count was always
+// narrower than the thing being described. The arms stay the one exception, because they are
+// hidden rather than moved.
+//
+// ---- 🔬 run 181 RESULT: the mechanism engaged and the smoke was not in it ----
+//
+// Measured, not argued. `weapon fx: N ... (new peak)` climbed 0 -> 2 -> 3 -> 4 over the run, so
+// draws beyond the gun mesh really are in the foreground pass and really did ride the transform.
+// **The barrel smoke stayed at screen centre anyway, and the impact smoke correctly did not move.**
+//
+// So the widening is right as far as it goes and the smoke is not in the pass. That leaves one
+// question worth a run, and it is a WHERE question, not a HOW question:
+//
+//   in the pass, transform wrong    it would have MOVED, just to the wrong place. It did not move.
+//   not in the pass                 then it is mixed into the main scene with everything else, no
+//                                   filter on this path can single it out, and the fix is not here.
+//
+// Mode 2 settles it by construction rather than by inference - see FgHideWholePass. A thing that
+// vanishes when you drop the pass is in the pass; a thing that survives is not. No log to read and
+// nothing to trust but your own eyes, which is the point.
+//
+// ---- what the answer selects ----
+//
+// If the smoke SURVIVES mode 2, the leading explanation is that it is a WORLD emitter anchored to
+// the weapon's muzzle socket - the same kind of thing as the impact smoke that already works, just
+// anchored to the gun instead of to a trace hit point. That would make it correctly RENDERED and
+// wrongly PLACED, and the seam is engine-side: move where it spawns, do not chase how it draws.
+// `SetFlashLocation` is the named candidate (run 95's census, 88.9% enriched under fire).
+//
+// That also explains the asymmetry the run-112 note stumbled over without naming: impact effects
+// derive their position from the trace, which route 2 already rotates, so they are right for free.
+// Muzzle effects derive theirs from the weapon, which route 2 deliberately never moves.
+volatile LONG g_fgRideAll = 1;          // ini [Render] WeaponFxRideGun, panel row WEAPON FX
+volatile LONG g_fgRodeDraws = 0;        // draws that took the ride this frame - see the report
+const LONG    kFgRideMax = 64;          // sanity bound on the pass - see the note in FgRidesGun
+volatile LONG g_fgRideBailed = 0;       // the bound tripped - Present counts them, see ReportFgRide
+volatile LONG g_fgRideBailCount = 0;
+
+// Mode 2: drop EVERY draw in the foreground pass. Purely diagnostic, and the one instrument that can
+// answer "is this geometry in the first-person pass" without a single inference - the thing either
+// disappears or it does not.
+//
+// ⚠️ Expect the gun to go BLACK rather than vanish. Run 117 established why and it is not a fault
+// here: the pass renders into its own target and is composited through a mask, so removing the
+// geometry leaves the mask with nothing to show. **Black where the gun was is a correct result for
+// this test.** What is being read is the SMOKE, not the gun.
+//
+// ⚠️ Must be called AFTER FgLearnSignature. Hiding before learning would drop the mesh out of next
+// frame's list, the latch would go with it, and the test would be measuring its own side effect -
+// which is exactly the run-120 regression, arrived at from a different direction.
+static bool FgHideWholePass() {
+    return InterlockedCompareExchange(&g_fgRideAll, 0, 0) == 2 &&
+           InterlockedCompareExchange(&g_inForeground, 0, 0) != 0;
+}
+
+// Which vertex counts actually rode. 2-4 draws rode and nobody knows what they were; a count is a
+// handle for the next question - "is 390 in here, is the flash in here" - and printing them next to
+// the peak costs one line per new peak.
+const int kRodeSigMax = 8;
+volatile LONG g_rodeSig[kRodeSigMax] = {};
+volatile LONG g_rodeSigN = 0;
+
+static void RodeLearn(UINT verts) {
+    const LONG n = InterlockedCompareExchange(&g_rodeSigN, 0, 0);
+    for (LONG i = 0; i < n && i < kRodeSigMax; ++i)
+        if ((UINT)InterlockedCompareExchange(&g_rodeSig[i], 0, 0) == verts) return;
+    if (n >= kRodeSigMax) return;
+    InterlockedExchange(&g_rodeSig[n], (LONG)verts);
+    InterlockedIncrement(&g_rodeSigN);
+}
 
 // ---- run 116: are these meshes drawn ANYWHERE ELSE in the frame? ----
 //
@@ -7768,9 +8854,10 @@ static void BuildGunC(float C[4][4]) {
 
     float H[3] = { G[0], G[1], G[2] };          // no position following -> translation cancels
     if (g_gunFollowPos) {
-        H[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0);
-        H[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0);
-        H[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0));
+        // Milli-UU back to UU. This is the read side of the run-190 stepping fix.
+        H[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0) / kHandFixed;
+        H[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0) / kHandFixed;
+        H[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0)) / kHandFixed;
     }
     int sy, sp, sr; GunSigns(sy, sp, sr);
     BuildGunTransform(C, G,
@@ -7821,6 +8908,108 @@ static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
     const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
     const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
     return (m == 1 || m == 3) && g && (UINT)g == verts;
+}
+
+// Everything else the first-person pass draws - the muzzle flash, the barrel smoke, ejected shells,
+// the 390-vertex third mesh - rides the same transform as the gun. See the note at g_fgRideAll.
+//
+// ⚠️ Gated on the gun being LATCHED, not just on the mode. Run 158d's lesson: with the latch not yet
+// taken the gun is still at the engine's position, so moving the effects onto the controller would
+// separate them from the very mesh they are meant to be attached to - a state that looks more broken
+// than the bug. Nothing moves until the thing it follows is moving.
+//
+// `verts == 0` reaches this from the NON-indexed path, where there is no count to match. That is
+// deliberate: the gun and the arms are indexed meshes, so a plain DrawPrimitive inside this pass is
+// an effect by elimination, and it was previously unreachable by any transform at all.
+// The gun and the arms are excluded because FgMoved and FgHidden already own them. That keeps
+// g_fgRodeDraws honest: it counts the draws THIS change reaches and nothing else, so a run where
+// the smoke did not move can say whether the mechanism found anything at all - which separates
+// "engaged, and the effects are not in this pass" from "never engaged". Those need opposite fixes
+// and look identical in a headset.
+//
+// ⚠️ The counter is bumped from inside the predicate. Called exactly once per draw from each hook,
+// which is why that is safe here - do not start calling this speculatively.
+static bool FgRidesGun(UINT verts) {
+    const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    if (m != 1 && m != 3) return false;
+    // == 1 exactly. Mode 2 is the hide-the-pass test and must not also transform what it keeps.
+    if (InterlockedCompareExchange(&g_fgRideAll, 0, 0) != 1) return false;
+    if (!InterlockedCompareExchange(&g_inForeground, 0, 0)) return false;
+    // ---- ⚠️ the boundary is LOOSE, and widening what rides it raises the stakes ----
+    //
+    // Run 115 set g_inForeground on "a depth-only Clear once some draws have happened" and wrote
+    // down, at the time, that a shadow or reflection pass clearing depth mid-frame would trip it
+    // early - accepting that because the consequence was only a wrong-looking log line. It was
+    // harmless while exactly one vertex count could move. It is not harmless now: an early trip
+    // would fling HUNDREDS of scene draws onto the controller.
+    //
+    // So the count is the sanity check. Six draws is the measured pass and effects add a handful;
+    // 64 is far above anything real and far below "the rest of the level". Past it we are not in
+    // the first-person pass at all, whatever the flag says, and riding stops for the frame.
+    // g_fgDrawCount is already incremented before either hook reaches this.
+    if (InterlockedCompareExchange(&g_fgDrawCount, 0, 0) > kFgRideMax) {
+        InterlockedExchange(&g_fgRideBailed, 1);
+        InterlockedIncrement(&g_fgRideBailCount);
+        return false;
+    }
+    const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+    if (!g) return false;                            // not latched yet - see above
+    if ((UINT)g == verts) return false;              // the gun itself, already moved by FgMoved
+    const LONG a = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+    if (a && (UINT)a == verts) return false;         // the arms are hidden, not moved
+    InterlockedIncrement(&g_fgRodeDraws);
+    RodeLearn(verts);
+    return true;
+}
+
+// Once per frame from Present, reporting only a NEW PEAK. The count varies every frame under fire -
+// a particle emitter's draw count follows the live particle count - so logging each frame would be
+// noise, while the peak is the one number the question needs: **did this ever reach anything?**
+//
+// The first line printed is the baseline, which is normally 0 or 1 (the 390-vertex third mesh). If
+// firing never raises it, the flash and the smoke are not in the foreground pass at all and the
+// panel toggle will look broken when it is in fact reporting an honest negative.
+void ReportFgRide() {
+    const LONG n = InterlockedExchange(&g_fgRodeDraws, 0);
+    // ---- ⚠️ this used to print ONCE, which hid the only thing worth knowing about it ----
+    //
+    // Run 181 caught one of these at load-in and the print-once guard meant the log could not say
+    // whether it happened again during gameplay - i.e. whether the run-115 depth-clear boundary is
+    // reliable in the state that matters. A diagnostic that fires once and then goes quiet reports
+    // that the event exists and nothing else, which is the shape of half the instruments this
+    // project has had to rebuild. So: first occurrence in full, then a running count on a slow tick.
+    if (InterlockedExchange(&g_fgRideBailed, 0)) {
+        static bool said = false;
+        static ULONGLONG lastMs = 0;
+        const ULONGLONG now = GetTickCount64();
+        const LONG total = InterlockedCompareExchange(&g_fgRideBailCount, 0, 0);
+        if (!said) {
+            said = true; lastMs = now;
+            Log("weapon fx: STOPPED RIDING - more than %ld draws claimed to be in the foreground"
+                " pass. The run-115 depth-clear boundary tripped early (a shadow or reflection pass"
+                " clearing depth mid-frame), so this is NOT the first-person pass. The gun mesh is"
+                " unaffected; only the widened effects path bails. Count follows if it recurs.",
+                kFgRideMax);
+        } else if (now - lastMs > 5000) {
+            lastMs = now;
+            Log("weapon fx: STOPPED RIDING again - %ld draw(s) bailed so far. If this is climbing"
+                " during GAMEPLAY the foreground boundary is not reliable and the gun transform"
+                " rests on it too.", total);
+        }
+    }
+    static LONG peak = -1;                 // -1 so the first frame prints the baseline
+    if (n <= peak) return;
+    peak = n;
+    // The counts, not just the tally. 2-4 draws rode in run 181 and nothing recorded WHAT they were,
+    // so the obvious follow-up question had no answer in the log.
+    char sig[128]; int off = 0;
+    const LONG sn = InterlockedCompareExchange(&g_rodeSigN, 0, 0);
+    for (LONG i = 0; i < sn && i < kRodeSigMax && off < 100; ++i)
+        off += _snprintf_s(sig + off, sizeof(sig) - off, _TRUNCATE, "%s%ld", i ? " " : "",
+                           InterlockedCompareExchange(&g_rodeSig[i], 0, 0));
+    Log("weapon fx: %ld foreground draw(s) rode the gun transform in one frame (new peak)%s%s%s", n,
+        n ? "" : " - nothing besides the gun and the arms is in the pass yet",
+        sn ? "  vertex counts seen riding: " : "", sn ? sig : "");
 }
 
 // Any first-person mesh, wherever it is drawn - used to catch the near-plane depth prime at
@@ -7948,7 +9137,20 @@ void UpdateFgLatch() {
     InterlockedExchange(&g_armsVerts, b);
     Log("mesh latch: gun=%ld verts, arms=%ld verts (steady for %d frames)", a, b, kLatchSteady);
     LogFgList("at the TAKE - everything that was on screen when this was chosen");
+    // ---- run 182 stage 1, and this is the right moment for it ----
+    //
+    // A GObjects walk needs a state where the player really is holding a weapon. The latch taking IS
+    // that state, established over kLatchSteady frames, so this needs no keypress in a headset and
+    // cannot fire at the main menu where the object graph is the wrong one. One shot, read-only, and
+    // this call site runs from Present - never from a draw hook.
+    // Run 186/189. One shot, read-only, and it needs this same "a weapon is really live" moment - it
+    // walks GObjects for the Actor and RvWeaponFX classes. Cheap since run 188 made it index-compare
+    // and try the known layout first, so it no longer costs the load-in freeze it used to.
+    SolvePropertyLayout();
 }
+
+// Declared for the Present-side caller; defined with the property solver it depends on.
+void ApplyMuzzleFxSuppression();
 
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     if (InterlockedCompareExchange(&g_dpgProbeFrames, 0, 0) <= 0) return;
@@ -8028,6 +9230,8 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // Indexed geometry cannot expose its vertices cheaply here, so v0 stays zero on these rows -
     // the texture and render-target columns are what this path contributes.
     if (primCount <= 4) VidProbeRecord(dev, 1, t, primCount, nullptr, 0);
+    FireCensusRecord(1, t, primCount, 0, nullptr, false);
+    if (g_flashProbeLeft > 0) { LONG lo, hi; TakeDrawWriteMask(&lo, &hi); }
     // LEARN FIRST, THEN HIDE. If hiding skipped the learning, the hidden mesh would drop out of
     // the list next frame and every index after it would shift - the toggle would walk through a
     // moving target and nothing would be reproducible.
@@ -8035,6 +9239,8 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         FgLearnSignature(numVertices);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, numVertices, primCount, (uint32_t)t);
+        // WEAPON FX = HIDE PASS. Deliberately after the learn, per the note above and FgHideWholePass.
+        if (FgHideWholePass()) return D3D_OK;
         if (FgHidden(numVertices)) return D3D_OK;
         // Returning S_OK without drawing is how the mod already drops draws elsewhere - the
         // device state is untouched, so the next draw behaves normally.
@@ -8045,7 +9251,10 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         DpgRecord(4, 0.0f, 0.0f, (uint32_t)InterlockedCompareExchange(&g_frameDrawIdx, 0, 0),
                   numVertices, primCount, 0);
     }
-    g_thisDrawMoved = FgMoved(numVertices);
+    // Run 181: the latched gun mesh, OR anything else the first-person pass draws - the muzzle
+    // flash and the barrel smoke are the reported cases. FgRidesGun excludes the gun and the arms,
+    // so the two matchers cannot both claim a draw.
+    g_thisDrawMoved = FgMoved(numVertices) || FgRidesGun(numVertices);
     const HRESULT dhr = StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
     });
@@ -8258,25 +9467,92 @@ int g_uiDumpLeft = 0;
 // ⚠️ Deliberately NOT keyed on primitive count. 10 is what these four ticks happen to be, and a
 // different weapon's reticle almost certainly differs - the TMD especially. Position and stride
 // describe what the thing IS; the primitive count describes one instance of it.
+//
+// ---- ⭐ run 181: the JUMP spread escaped the box, and the box was aspect-blind ----
+//
+// Reported: with the crosshair hidden, TWO crosshair lines come back while the player is jumping.
+// Spread pushes the four ticks outward, and the old test was a SQUARE box - |cx| < 0.15 AND
+// |cy| < 0.15 - in a space where x and y are not the same scale. Clip x spans the frame's full
+// WIDTH and clip y its full HEIGHT, so one tick at a given PIXEL radius reads 16/9 = 1.8x larger
+// in y than in x. That ratio is already in the measurement above and was read straight past:
+// 0.045 / 0.025 = 1.8, i.e. the four ticks are equidistant in pixels and the numbers differ only
+// because the units do.
+//
+// So the vertical pair leaves a square box FIRST and alone, and two lines come back while the
+// horizontal pair is still comfortably inside. That is the report, exactly - down to the count.
+//
+// The fix uses the part of the measurement the box threw away: **each tick sits ON one of the two
+// centre axes.** Left/right have cy = +0.000, up/down have cx = -0.000. Test for "on an axis,
+// within reach of the centre" instead of "inside a square":
+//
+//   TIGHTER across the axis - a stride-8 element that is merely NEAR the middle is no longer
+//                             taken for a reticle, which the old 0.15 box would have swallowed
+//   LOOSER along it         - which is the only direction spread can move a tick
+//
+// The reach stays finite rather than becoming "anywhere on the axis". At full spread the reticle
+// is still a reticle, but a stride-8 element at the very edge of the frame is something else, and
+// a rule that cannot be wrong is a rule nobody will ever check.
+const float kXhairAxis  = 0.006f;   // measured |0.000| - slack for a float, not a window
+const float kXhairReach = 0.60f;    // spread grows a long way; the frame edge is 1.0
+
 inline bool LooksLikeCrosshair(UINT stride, float cx, float cy) {
-    return stride == 8 && fabsf(cx) < 0.15f && fabsf(cy) < 0.15f;
+    if (stride != 8) return false;
+    const bool onVertAxis  = fabsf(cx) < kXhairAxis && fabsf(cy) < kXhairReach;  // up / down tick
+    const bool onHorizAxis = fabsf(cy) < kXhairAxis && fabsf(cx) < kXhairReach;  // left / right
+    return onVertAxis || onHorizAxis;
 }
 
-// ini HideCrosshair: 0 never, 1 while the right controller is in hand, 2 always.
+// ---- the instrument for it, because "it looks fixed now" is not a measurement ----
 //
-// ⚠️ **MODE 1 IS TWITCHY AND THE FAULT IS THE SIGNAL, NOT THIS CODE.** `g_handHeld[1]` comes from
-// the Touch capacitive sensors - thumbrest and trigger touch - so simply LIFTING YOUR THUMB off a
-// controller you are still holding reads as "not in hand" and the crosshair flickers back.
+// Recorded in the UI draw path and printed from PRESENT. Run 24/25 lost two runs to a startup hang
+// that was a fopen/fwrite/fclose inside a draw hook, and that rule has no exceptions here.
 //
-// Run 77 chose those sensors over motion for auto-pad, and for that job they are right: a hand
-// resting still on a controller still registers, a controller on a desk does not. But auto-pad
-// asks "is this being held at all" on a several-second timescale, while this asks the same
-// question frame by frame, and the sensor is not steady enough for that.
+// The resting signature measured in run 153 is four ticks each drawn twice: **8 seen, 8 dropped.**
+// So the two numbers disagreeing IS the bug, in whatever form it comes back - a later weapon's
+// reticle, the TMD, or spread going further than kXhairReach. `seen` climbing past 8 says there is
+// a stride-8 element on screen that is not part of this reticle, which is the other way this rule
+// can be wrong and the one no amount of looking at the headset would reveal.
 //
-// Deliberately not patched around here. Debouncing it locally would put a second, differently
-// tuned notion of "held" next to auto-pad's, and this project has already paid for two mechanisms
-// answering one question. Revisit when auto-pad is revisited - one hysteresis, shared.
-// Until then `HideCrosshair=2` is the setting that behaves.
+// maxR is the largest radius any stride-8 element reached, which is what says how far spread
+// actually throws them - the number kXhairReach should be judged against rather than guessed at.
+volatile LONG g_xh8Seen = 0, g_xh8Drop = 0, g_xh8MaxR = 0;   // radius in 1/1000 clip units
+
+// Called once per frame from Present, which reads AND clears - so every number is one frame's, not
+// a session total. Reports on a CHANGE rather than on a tick: "8 seen, 8 dropped" is the resting
+// state and printing it at 120 fps would bury the rest of the log, while the frames worth seeing are
+// exactly the ones where the pair moves. A jump does that.
+void ReportXhairCensus() {
+    const LONG seen = InterlockedExchange(&g_xh8Seen, 0);
+    const LONG drop = InterlockedExchange(&g_xh8Drop, 0);
+    const LONG maxR = InterlockedExchange(&g_xh8MaxR, 0);
+    if (!seen) return;
+    static LONG lastSeen = -1, lastDrop = -1, lastR = -1;
+    static ULONGLONG lastMs = 0;
+    const ULONGLONG now = GetTickCount64();
+    const LONG dR = maxR > lastR ? maxR - lastR : lastR - maxR;
+    const bool pairChanged = seen != lastSeen || drop != lastDrop;
+    // The radius drifts every frame while spread is growing, so it gets a time floor of its own.
+    // The pair changing never does - that is the line this instrument exists to print.
+    if (!pairChanged && !(dR > 15 && now - lastMs > 250)) return;
+    lastSeen = seen; lastDrop = drop; lastR = maxR; lastMs = now;
+    Log("crosshair census: %ld stride-8 element(s) this frame, %ld dropped, furthest at"
+        " r=%.3f clip%s", seen, drop, maxR / 1000.0f,
+        seen == drop ? ""
+                     : "   <- SOME GOT THROUGH. The rule did not match them; check whether they are"
+                       " still on a centre axis and whether r has passed kXhairReach");
+}
+
+// ini HideCrosshair: 0 never, 1 AUTO - hidden while AIM METHOD is MOTION CONTROLLER, 2 always.
+//
+// ⚠️ **This comment used to say mode 1 was twitchy and that `HideCrosshair=2` was "the setting that
+// behaves". Both stopped being true in run 158** and the note sat here anyway, describing a
+// mechanism - `g_handHeld[1]`, the Touch capacitive sensors - that this code has not consulted
+// since. The live reasoning is at the drop site in HudStereoPair: the question is not "is a
+// controller in a hand" but "does the crosshair mean anything", and AIM METHOD answers that
+// deterministically, so the flicker is gone by construction rather than by tuning a threshold.
+//
+// Kept as a warning rather than deleted, because the stale version was quoted as current in STATUS
+// for twenty-odd runs and sent a session hunting for a sensor nothing reads.
 volatile LONG g_hideCrosshair = 1;
 
 const int kUpConstRegs = 32;
@@ -8510,10 +9786,18 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
         const LONG hide = InterlockedCompareExchange(&g_hideCrosshair, 0, 0);
         const bool aimIsController =
             InterlockedCompareExchange(&g_aimMethod, 0, 0) != 0 && VrModeOn();
-        if (hide && LooksLikeCrosshair(stride, r[3].x, r[3].y) &&
-            (hide == 2 || aimIsController)) {
-            return S_OK;
+        const bool isXhair = LooksLikeCrosshair(stride, r[3].x, r[3].y);
+        const bool dropIt  = hide && isXhair && (hide == 2 || aimIsController);
+        // Census before the drop, and over every stride-8 element rather than only the matches -
+        // a rule that only counts its own hits cannot report a miss. See g_xh8Seen.
+        if (stride == 8) {
+            InterlockedIncrement(&g_xh8Seen);
+            if (dropIt) InterlockedIncrement(&g_xh8Drop);
+            const LONG rad = (LONG)(sqrtf(r[3].x * r[3].x + r[3].y * r[3].y) * 1000.0f);
+            if (rad > InterlockedCompareExchange(&g_xh8MaxR, 0, 0))
+                InterlockedExchange(&g_xh8MaxR, rad);
         }
+        if (dropIt) return S_OK;
     }
 
     g_inHudRemap = true;      // our own c5-c8 writes below must not re-arm the UI marker
@@ -8709,6 +9993,14 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     // project's established tool for this. It just has to run FIRST.
     const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
+    // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
+    // rather than re-deriving it and risking disagreement with the code it is measuring.
+    FireCensusRecord(2, t, primCount, vtxStride, vtxData, quad);
+    if (g_flashProbeLeft > 0) {
+        LONG lo, hi; TakeDrawWriteMask(&lo, &hi);
+        if (vtxStride == kFlashStride) FlashRegDump(dev, lo, hi, primCount, vtxStride);
+    }
+    if (g_dropStride && vtxStride == (UINT)g_dropStride) return D3D_OK;
     if (hudArmed && g_hudRemap && !quad)
         return HudStereoPair(dev, primCount, vtxStride, [&] { return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride); });
     if (quad) {
@@ -8754,6 +10046,17 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     // Quad test first - see the note in Hook_DrawPrimUP for what happens when it is not.
     const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
+    // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
+    // rather than re-deriving it and risking disagreement with the code it is measuring.
+    FireCensusRecord(3, t, primCount, vtxStride, vtxData, quad);
+    // ⭐ Run 192 found shot geometry on THIS hook at stride 72.
+    if (g_flashProbeLeft > 0) {
+        LONG lo, hi; TakeDrawWriteMask(&lo, &hi);
+        if (vtxStride == kFlashStride) FlashRegDump(dev, lo, hi, primCount, vtxStride);
+    }
+    // The identification test - see g_dropStride. Returning S_OK without drawing is how the mod drops
+    // draws everywhere else: device state untouched, so the next draw behaves normally.
+    if (g_dropStride && vtxStride == (UINT)g_dropStride) return D3D_OK;
     if (hudArmed && g_hudRemap && !quad)
         return HudStereoPair(dev, primCount, vtxStride, [&] {
             return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
@@ -9636,6 +10939,25 @@ void ApplyVrFov() {
 }
 
 void ReportScan() {
+    // ---- ⭐ run 191: a REPORT-ONLY scan, taken while the muzzle flash is on screen ----
+    //
+    // The flash draws on the stereo seam because its transform comes from a register we do not track:
+    // since run 11 every draw is split unconditionally, but only TRACKED registers get the eye remap,
+    // so an untracked draw is issued twice at the same clip position and each copy is scissored into
+    // its own half. This scan already finds every window that looks like a view-projection and ranks
+    // them by upload count - and its own note records "50 uploads for the real one against 4-9 for the
+    // impostors". A weapon effect's matrix is exactly such an impostor, so the register we need is in
+    // this list already; it just has to be captured on a frame where the flash exists.
+    //
+    // ⚠️ **MUST NOT RE-LOCK.** This function locks `g_lockedReg` whenever a window passes and does NOT
+    // check whether a lock already exists - which is correct for a deliberate F7 press and catastrophic
+    // for an automatic scan armed on the trigger. Re-locking onto the flash's matrix on a fire frame
+    // would take stereo with it. So probe scans report and lock nothing.
+    const bool reportOnly = InterlockedExchange(&g_scanReportOnly, 0) != 0;
+    if (reportOnly)
+        Log("--- FIRE-WINDOW scan (report only, nothing will be locked): taken with the trigger down, so"
+            " a window that appears HERE and not in an ordinary scan is a weapon-effect matrix -"
+            " the muzzle flash's register is expected to be one of the low-upload-count entries");
     Log("--- scan complete: %d candidate window(s), camera (%.1f, %.1f, %.1f) POV (%.1f, %.1f, %.1f)",
         g_hitCount, g_camPos[0], g_camPos[1], g_camPos[2], g_povPos[0], g_povPos[1], g_povPos[2]);
     Log("    camera facing (%.3f, %.3f, %.3f), right (%.3f, %.3f, %.3f)",
@@ -9681,6 +11003,12 @@ void ReportScan() {
     // A rarely-uploaded window is not the scene matrix however well it scores otherwise, so
     // require it to carry a real share of the frame before trusting it.
     const int kMinUploadsToLock = 8;
+    if (reportOnly) {
+        Log("    (report only - the lock is untouched, still c%u %s)",
+            g_lockedReg, g_lockedConv == CONV_ROW ? "ROW" : "COL");
+        Log("    To test a candidate: set [Render] ExtraCamReg=<n> and fire. If the flash lands in"
+            " front of the gun in BOTH eyes instead of on the seam, that register is the answer.");
+    } else
     if (passing > 0 && IsViewMatrix(g_hits[0].w, g_hits[0].dotFwd, g_hits[0].pt, g_hits[0].shape)) {
         // ---- refuse to lock on anything but the translated-world probe ----
         //
@@ -11862,9 +13190,12 @@ static bool ProjectToScreen(const float* mat, int conv, const float p[3],
 static int AnchorMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
     float G[3]; GunAnchorWorld(G);
     if (wantHand) {
-        G[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0);
-        G[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0);
-        G[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0));
+        // Milli-UU, same as BuildGunC reads it. This marker and the transform MUST divide by the same
+        // scale - a readout in different units from the thing it describes is the run-174 trap, where the
+        // panel showed one number while another was applied and calibrating by feel became impossible.
+        G[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0) / kHandFixed;
+        G[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0) / kHandFixed;
+        G[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0)) / kHandFixed;
     }
 
     int slot = -1;
@@ -13175,6 +14506,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         //
         // Two interlocked reads a frame until it takes, then nothing.
         UpdateFgLatch();
+        // Run 189: suppress the first-person muzzle flash and barrel smoke. On this slow tick because it
+        // only ever acts on a CHANGE of state - a few interlocked reads per second while nothing is
+        // happening, and a GObjects walk only when the cached objects stop validating (a weapon swap).
+        ApplyMuzzleFxSuppression();
         // Once per frame, and it prints only for frames that look like video or a splash.
         VidProbeFrameEnd();
 
@@ -13506,6 +14841,18 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     wf, copy, eng, xs, ms - wf - copy - eng - xs, ms,
                     g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
                     g_displayPeriodMs);
+                // ---- run 190: how stale was the pose the GUN GEOMETRY was built from? ----
+                //
+                // The head is reprojected and so cannot show this; the gun is baked into vertices and so
+                // shows all of it. If this reads about one display period with PoseLeadFrames=0, the
+                // frame-ordering account of the jitter is confirmed and PoseLeadFrames=1 should drive it
+                // toward zero. If it reads ~0 already, that account is WRONG and the jitter is elsewhere.
+                Log("    pose lead: hand poses predicted %d frame(s) ahead (PoseLeadFrames=%d);"
+                    " the pose the geometry was drawn with was %.2f ms stale by then%s",
+                    g_poseLeadFrames, g_poseLeadFrames, g_poseStaleNs / 1.0e6,
+                    g_poseStaleNs > 0.6 * g_displayPeriodMs * 1.0e6
+                        ? "  <- about a whole frame: this is the gun-vs-head asymmetry"
+                        : "");
                 // The peak matters more than the mean here. A one-second average hides a single
                 // 200 ms submission among a hundred fast ones, and a stall that long is exactly
                 // what a seconds-long dip is made of.
@@ -13790,6 +15137,23 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_scanArmed, 1);
             Log("F7: scanning one frame for the view matrix...");
         }
+    } else if (g_muzzleRegProbe > 0 && g_haveLock &&
+               InterlockedCompareExchange(&g_camPosValid, 0, 0) &&
+               InterlockedCompareExchange(&g_rawTrigger, 0, 0) > 40 && !g_probeTrigWasDown) {
+        // ---- ⭐ run 191: arm the scan on the TRIGGER, so it lands on a frame with a flash in it ----
+        //
+        // Bounded to a handful of shots: a scan tests every window of every upload and is far too
+        // expensive to leave running, which the rescan branch below already says.
+        //
+        // Gated on g_haveLock so it can never run while a lock is being acquired, and it sets
+        // report-only so it cannot disturb the lock it finds.
+        --g_muzzleRegProbe;
+        g_probeTrigWasDown = true;
+        g_hitCount = 0;
+        InterlockedExchange(&g_scanReportOnly, 1);
+        InterlockedExchange(&g_scanArmed, 1);
+        Log("muzzle register probe: trigger down, scanning ONE frame (%d probe(s) left)",
+            g_muzzleRegProbe);
     } else if (!g_haveLock && InterlockedCompareExchange(&g_camPosValid, 0, 0) &&
                (InterlockedCompareExchange(&g_dupDraws, 0, 0) ||
                 InterlockedCompareExchange(&g_vrProjection, 0, 0))) {
@@ -13807,6 +15171,44 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         }
     }
     p7 = k7;
+    // Rearm the edge detector once the trigger is released, so a held trigger spends one probe rather
+    // than one per frame.
+    if (InterlockedCompareExchange(&g_rawTrigger, 0, 0) < 20) g_probeTrigWasDown = false;
+
+    // ---- run 192: the fire-window draw census ----
+    //
+    // Recording runs for a few frames after the trigger, because the flash is not necessarily on the
+    // very first frame after the press - there is a script hop and an animation notify between the two.
+    {
+        const LONG left = InterlockedCompareExchange(&g_fireCensusFrames, 0, 0);
+        const LONG trig = InterlockedCompareExchange(&g_rawTrigger, 0, 0);
+        if (left > 0) {
+            if (InterlockedDecrement(&g_fireCensusFrames) == 0) FireCensusDump();
+        } else if (g_fireCensusBudget > 0 && !g_fireBaselineDone && trig < 20 &&
+                   InterlockedCompareExchange(&g_gunVerts, 0, 0)) {
+            // ---- the BASELINE, taken FIRST and with the trigger up ----
+            //
+            // Gated on the gun being latched so it is a real gameplay frame with a weapon on screen -
+            // the same state the fire window will be in, differing only by the shot. A baseline taken
+            // at the menu would share nothing with it and the diff would name every draw in the level.
+            g_fireBaselineDone = true;
+            g_fireIsBaseline = true;
+            g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
+            for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
+            InterlockedExchange(&g_fireCensusFrames, 8);
+            Log("draw census: BASELINE, trigger up, recording 8 frames - do not fire yet");
+        } else if (g_fireCensusBudget > 0 && g_fireBaselineDone && trig > 40 && !g_fireTrigWasDown) {
+            --g_fireCensusBudget;
+            g_fireTrigWasDown = true;
+            g_fireIsBaseline = false;
+            g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
+            for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
+            InterlockedExchange(&g_fireCensusFrames, 8);
+            Log("draw census: FIRE window, trigger down, recording 8 frames (%d shot(s) left)",
+                g_fireCensusBudget);
+        }
+        if (InterlockedCompareExchange(&g_rawTrigger, 0, 0) < 20) g_fireTrigWasDown = false;
+    }
 
     UpdateFromHeadset(s);
     ApplyPadTestOverrides();   // must follow SyncXRInput - see the note on the function
@@ -14124,6 +15526,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_frameDrawIdx, 0);
             InterlockedExchange(&g_inForeground, 0);
             InterlockedExchange(&g_fgDrawCount, 0);
+            ReportXhairCensus();
+            ReportFgRide();
             // Promote this frame's learned list to the stable one the matchers use, THEN clear the
             // learning list. The stable copy is therefore populated when the depth-prime draws
             // arrive at the start of the next frame - which is what makes hiding remove a mesh
@@ -14320,6 +15724,65 @@ void LoadIniSettings() {
     // -1 = off. 13 is the register run 42 identified. Switchable because this touches the matrix
     // path, which is the most fragile code here - runs 15, 19, 20 and 27 all broke something in it,
     // and the failure mode is losing head tracking entirely.
+    // Run 191. Default 3: three fire-window scans, then silent. Each costs one expensive frame, which
+    // is a hitch on a shot and nothing else - and the whole point is to catch the register the muzzle
+    // flash rides, which only exists on frames where a flash is being drawn.
+    // Run 192. Records a few frames after each of the first N shots and prints one deduplicated table.
+    // Cheap: a signature compare per small draw, no I/O in the hook, and it stops after its budget.
+    // Run 193. Default 6 stride-72 draws, then silent for the session. This one logs from inside a draw
+    // hook, which run 24/25 proved can hang startup - so it is hard-bounded rather than rate-limited,
+    // and the bound is the whole safety argument.
+    // ---- 🛑 run 196: OFF, because the draw this probes is not the artefact ----
+    //
+    // The stride-72 shader reads **c0** - confirmed from its own bytecode - and c0 is locked, valid and
+    // remapped at that draw. So its transform IS eye-remapped and it cannot be what lands on the seam.
+    //
+    // Run 192 found stride 72 by diffing a fire window against a baseline, which was sound: it IS shot
+    // geometry. **The error was reading "unique to firing" as "is the muzzle flash".** A tracer, an
+    // ejected casing or an impact effect all appear only when firing and all render correctly. Runs
+    // 193-196 then built three instruments on an identification that was never validated, and the
+    // bytecode was the first measurement capable of contradicting it.
+    //
+    // The validation that was skipped is one line and is `MuzzleFxDropStride` below: drop the draw and
+    // see whether the artefact goes. Confirm what a thing IS before measuring its properties.
+    g_flashProbeLeft = GetPrivateProfileIntA("Render", "FlashRegProbe", 0, path);
+
+    // The identification test. 0 = off; set to 72 with HideMuzzleFx=0 to settle whether stride 72 is
+    // the flash at all. See the note at g_dropStride.
+    g_dropStride = GetPrivateProfileIntA("Render", "MuzzleFxDropStride", 0, path);
+    if (g_dropStride < 0 || g_dropStride > 512) g_dropStride = 0;
+    if (g_dropStride)
+        Log("ini: MuzzleFxDropStride=%d - DROPPING every user-pointer draw at that vertex stride."
+            " If the seam artefact disappears, that stride IS the muzzle flash; if it remains, it never"
+            " was and runs 193-196 measured the wrong draw.", g_dropStride);
+    if (g_flashProbeLeft < 0)  g_flashProbeLeft = 0;
+    if (g_flashProbeLeft > 20) g_flashProbeLeft = 20;
+    Log("ini: FlashRegProbe=%d (%s)", g_flashProbeLeft,
+        g_flashProbeLeft ? "dump the constant registers written just before each stride-72 draw - the"
+                           " muzzle flash, identified in run 192"
+                         : "off");
+
+    // Run 192's census has done its job (the flash is DrawIndexedPrimitiveUP stride 72), so it no longer
+    // runs by default. Set it to 1-3 to re-take the baseline/fire diff for a different weapon.
+    g_fireCensusBudget = GetPrivateProfileIntA("Render", "FireDrawCensus", 0, path);
+    if (g_fireCensusBudget < 0)  g_fireCensusBudget = 0;
+    if (g_fireCensusBudget > 10) g_fireCensusBudget = 10;
+    Log("ini: FireDrawCensus=%d (%s)", g_fireCensusBudget,
+        g_fireCensusBudget ? "record how each small draw during a shot is classified - looking for a"
+                             " draw PASSED THROUGH as a fullscreen quad that does not span NDC"
+                           : "off");
+
+    // Run 191's register probe. Turned OFF by default now: it came back negative - no plausible
+    // view-projection register is unique to a fire frame - so paying an expensive scan per shot on
+    // every launch buys nothing. Set it to 1-3 only to re-open that question.
+    g_muzzleRegProbe = GetPrivateProfileIntA("Render", "MuzzleRegProbe", 0, path);
+    if (g_muzzleRegProbe < 0)  g_muzzleRegProbe = 0;
+    if (g_muzzleRegProbe > 10) g_muzzleRegProbe = 10;
+    Log("ini: MuzzleRegProbe=%d (%s)", g_muzzleRegProbe,
+        g_muzzleRegProbe ? "scan for view-projection registers on the first few shots, report only -"
+                           " looking for the register the muzzle flash rides"
+                         : "off");
+
     g_extraCamReg = GetPrivateProfileIntA("Render", "ExtraCamReg", -1, path);
     if (g_extraCamReg < -1 || g_extraCamReg > 200) g_extraCamReg = -1;
     Log("ini: ExtraCamReg=%d (%s)", g_extraCamReg,
@@ -14407,12 +15870,75 @@ void LoadIniSettings() {
     LONG xhairIni = GetPrivateProfileIntA("Render", "HideCrosshair", 1, path);
     if (xhairIni < 0 || xhairIni > 2) xhairIni = 1;
     InterlockedExchange(&g_hideCrosshair, xhairIni);
+    // Mode 1's description is AIM METHOD, not the capacitive sensor. It said "while the right
+    // controller is IN HAND" for twenty-odd runs after run 158 stopped consulting that sensor, and
+    // the panel row was corrected while this line was not - which is the whole "doc errors become
+    // code bugs" note arriving as a log line that would send someone hunting for g_handHeld.
     Log("ini: HideCrosshair=%ld (%s)", xhairIni,
         xhairIni == 0 ? "never - the game's crosshair is always drawn" :
-        xhairIni == 1 ? "hidden while the right controller is IN HAND - the bullet follows the"
-                        " controller then, so a centre-screen crosshair points somewhere the shot"
-                        " is not going"
+        xhairIni == 1 ? "AUTO - hidden while AIM METHOD is MOTION CONTROLLER, because the bullet"
+                        " follows the controller then and a centre-screen reticle points somewhere"
+                        " the shot is not going"
                       : "always hidden");
+
+    // Run 181. Default ON: the effects belonging to a weapon that is on your controller is the
+    // correct behaviour, not an experiment. OFF is the A/B - see the note at g_fgRideAll for what
+    // each answer means, since "no change either way" is a real and informative outcome here.
+    LONG fxIni = GetPrivateProfileIntA("Render", "WeaponFxRideGun", 1, path);
+    if (fxIni < 0 || fxIni > 2) fxIni = 1;
+    InterlockedExchange(&g_fgRideAll, fxIni);
+    Log("ini: WeaponFxRideGun=%ld (%s)", fxIni,
+        fxIni == 0 ? "off - only the gun mesh moves; the effects stay where the engine put them, at"
+                     " the centre of the view"
+      : fxIni == 1 ? "everything in the first-person pass rides the same transform as the gun"
+                   : "TEST - the whole first-person pass is DROPPED. The gun will be black (run 117:"
+                     " the pass is composited through a mask). Read the SMOKE, not the gun: it"
+                     " vanishing means it is in this pass, it surviving means it is not");
+
+    // ---- 💥 run 188: these probes are the "framerate is 0 for a couple of seconds" on load-in ----
+    //
+    // Reported, and it is mine. Both fire at the mesh latch, which is exactly the moment a save finishes
+    // loading and the gun first appears:
+    //
+    //   DumpWeaponObjects   walks ~36,000 objects calling NameOf - and NameOf is two VirtualQuery
+    //                       syscalls.
+    //   SolvePropertyLayout is far worse. The layout search is 13 x 9 x 19 = **2,223 candidate
+    //                       combinations**, each walking up to 400 children with a NameOf per child.
+    //                       That is on the order of a MILLION name lookups, several million syscalls,
+    //                       in one frame. Seconds, not milliseconds.
+    //
+    // I wrote a 2,223-combination brute force with a syscall in its innermost loop, in the same file
+    // that already records the same mistake twice (run 35's repeating failed scan, run 183's per-object
+    // NameOf). The recurring shape is a STRING comparison where an index compare would do.
+    //
+    // ---- and the correct fix now is not to optimise it, it is to stop running it ----
+    //
+    // The probes have answered their questions: the object graph is mapped, the property layout is
+    // solved and written down in ENGINE_NOTES, and the component-write test returned a clean negative.
+    // Re-deriving all of that on every launch buys nothing and costs a load-in freeze. Default OFF.
+    // Set it to 1 for one launch when a new weapon or a new question needs the same measurements.
+    // Run 189: BINARY, not tri-state. The effect lands on the frame SEAM, so it is wrong in both aim
+    // methods - an AUTO mode here could never differ from ALWAYS. Default hidden, because a flash on the
+    // seam is worse than no flash, and because this is a WORKAROUND: the real fix is to remap the draw
+    // per eye, after which this setting stops being needed at all.
+    // Run 190. Default 0 = the behaviour every previous run had, so the first run with this build
+    // MEASURES the staleness before changing it. 1 predicts the hands one display period ahead.
+    g_poseLeadFrames = GetPrivateProfileIntA("Input", "PoseLeadFrames", 0, path);
+    if (g_poseLeadFrames < 0) g_poseLeadFrames = 0;
+    if (g_poseLeadFrames > 2) g_poseLeadFrames = 2;
+    Log("ini: PoseLeadFrames=%d (%s)", g_poseLeadFrames,
+        g_poseLeadFrames == 0 ? "unchanged - hand poses predicted for the frame being submitted, which is"
+                                " one frame BEFORE the frame their geometry lands in. See `pose lead` in"
+                                " the frame budget"
+                              : "hand poses predicted ahead, so the gun's geometry is built for when it"
+                                " will actually be seen");
+
+    LONG fxHide = GetPrivateProfileIntA("Render", "HideMuzzleFx", 1, path) ? 1 : 0;
+    InterlockedExchange(&g_hideMuzzleFx, fxHide);
+    Log("ini: HideMuzzleFx=%ld (%s)", fxHide,
+        fxHide ? "the first-person muzzle flash and barrel smoke are suppressed - they are ONE particle"
+                 " system, and it currently draws on the stereo seam"
+               : "off - the game's own muzzle flash and barrel smoke play, on the seam");
 
     Log("ini: HudStereo=%d (%s)", g_hudRemap,
         g_hudRemap ? "the game's HUD and menus are drawn into BOTH eyes"
