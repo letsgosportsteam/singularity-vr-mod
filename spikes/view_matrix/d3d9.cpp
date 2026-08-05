@@ -886,6 +886,10 @@ WORD g_btnProbeMask   = 0;
 // home on a Touch controller once the TMD powers have taken the grips and the face buttons.
 WORD g_stickUpMask   = XI_Y;         // ini StickUp   - CycleWeapon
 WORD g_stickDownMask = XI_DPAD_UP;   // ini StickDown - Health
+// Run 198's heal window. Defined with the foreground-mesh code, which is what consumes it; the input
+// path only arms it. See the note at g_healArmsMs.
+extern volatile LONG   g_healArmsMs, g_healDelayMs;
+extern volatile LONG64 g_healUntilMs, g_healFromMs;
 
 // The NUMPAD4/NUMPAD5 test inputs, laid OVER whatever the controllers just published.
 //
@@ -1463,6 +1467,8 @@ WantedName g_wantNames[] = {
     { "mMuzzleFlash1stPerson", -1 }, { "mLoopingMuzzleFlash1stPerson", -1 },
     { "mMuzzleFlashIronsights", -1 }, { "mLoopingMuzzleFlashIronsights", -1 },
     { "mLoopingMuzzleFXEmitter", -1 },
+    // Run 199: the heal window asks "can this heal do anything" before showing the arms.
+    { "Health", -1 }, { "HealthMax", -1 },
 };
 const int kWantNameCount = (int)(sizeof(g_wantNames) / sizeof(g_wantNames[0]));
 
@@ -1509,15 +1515,35 @@ static int PropOffsetUnder(uintptr_t cls, int32_t wantIdx, int chOff, int nxOff,
 
 // Look a property up through a class's SUPER chain - Translation lives on PrimitiveComponent, several
 // classes above SkeletalMeshComponent, and the muzzle properties are on RvWeaponFX itself.
-static int PropOffsetInChain(uintptr_t cls, const char* name) {
+// ---- 💥 run 199: an 8-LEVEL cap hid Pawn.Health, and it is the same mistake again ----
+//
+// `Pawn.Health +0xFFFFFFFF` - not found. The walk stopped after eight super-classes, and
+// `RvPlayerPawnSP` is deeper than that before it reaches `Engine.Pawn`: RvPlayerPawnSP, RvPlayerPawn,
+// RvSharedPawn, the Rv intermediates, GamePawn, Pawn, Actor, Object. Eight was a number I picked because
+// it looked generous, and it silently truncated the search.
+//
+// **Fifth time in this file.** Owner cap (183), signature table (192), first-block break (193), the
+// 4-alignment filter (194), and now a class-chain depth. Every one a bound chosen without checking the
+// real range, every one excluding the answer without saying so.
+//
+// Fixed properly: walk to the actual END of the chain - SuperField null - with a loop guard only to stop
+// a corrupt pointer looping forever, and REPORT when the guard is what stopped it. The bound is now a
+// safety net rather than a search limit.
+static int PropOffsetInChain(uintptr_t cls, const char* name, int* depthOut = nullptr) {
     const int32_t idx = WantedIdx(name);
     uintptr_t c = cls;
-    for (int depth = 0; depth < 8 && c; ++depth) {
+    int depth = 0;
+    const int kGuard = 64;                 // corrupt-pointer backstop, not a search bound
+    for (; c && depth < kGuard; ++depth) {
         const int found = PropOffsetUnder(c, idx, g_upChildren, g_upNext, g_upOffset);
-        if (found >= 0) return found;
+        if (found >= 0) { if (depthOut) *depthOut = depth; return found; }
         if (!Readable((void*)(c + g_upNext - 4), 4)) break;
         c = *reinterpret_cast<uintptr_t*>(c + g_upNext - 4);      // SuperField sits just before Next
     }
+    if (depthOut) *depthOut = depth;
+    if (depth >= kGuard)
+        Log("    ⚠️ property '%s': class chain hit the %d-level GUARD - the walk was cut short, so this"
+            " 'not found' is not trustworthy.", name, kGuard);
     return -1;
 }
 
@@ -1547,6 +1573,63 @@ static uintptr_t FindClassByName(const char* want) {
 int g_offMuzzle1st = -1, g_offMuzzleLoop1st = -1, g_offMuzzleIron = -1,
     g_offMuzzleLoopIron = -1, g_offMuzzleEmitter = -1;
 uintptr_t g_weaponFxClass = 0;
+
+// ---- ⭐ run 199: read the player's health, so the heal window is not opened for nothing ----
+//
+// Reported: *"if I hit the heal button and I'm already full health, I don't heal, so my arms show up for
+// a few seconds but I'm not healing."* Correct - run 198 keyed on the button press alone, which I had
+// noted as a caveat and which turns out to matter in practice.
+//
+// ⚠️ The obvious fix - wait and see whether health INCREASES - is a trap. Health is applied by the
+// animation, possibly at its end, so verification arrives LATE: a window opened at that moment would run
+// on past the animation it was supposed to cover. Asking "could this heal do anything" BEFORE the press
+// has no timing dependency at all.
+int g_offHealth = -1, g_offHealthMax = -1;
+uintptr_t g_playerPawn = 0, g_playerPawnClass = 0;
+
+// The live player pawn, cached and revalidated by class word like FindCamera. Rewalks at most once every
+// 30 misses - a pawn does not exist at the menu and asking every frame is the run-35 failure.
+static uintptr_t FindPlayerPawn() {
+    if (g_playerPawn && g_playerPawnClass && Readable((void*)g_playerPawn, 0x40) &&
+        *reinterpret_cast<uintptr_t*>(g_playerPawn + OBJ_CLASS) == g_playerPawnClass)
+        return g_playerPawn;
+    g_playerPawn = 0;
+    static int missTick = 0;
+    if ((++missTick % 30) != 1) return 0;
+    if (!Readable((void*)kGObjectsTArray, 12)) return 0;
+    uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+    int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+    if (!data || count <= 0) return 0;
+    uintptr_t* objs = reinterpret_cast<uintptr_t*>(data);
+    for (int32_t i = 0; i < count; ++i) {
+        uintptr_t o = objs[i];
+        if (!o || !Readable((void*)o, 0x40) || !IsLive(o)) continue;
+        uintptr_t cls = *reinterpret_cast<uintptr_t*>(o + OBJ_CLASS);
+        char cn[80];
+        if (!cls || !NameOf(cls, cn, sizeof(cn))) continue;
+        if (!strstr(cn, "PlayerPawn")) continue;
+        g_playerPawn = o;
+        g_playerPawnClass = cls;
+        Log("player pawn: 0x%08X (%s)", (unsigned)o, cn);
+        return o;
+    }
+    return 0;
+}
+
+// true only when a heal could actually do something. `unknown` is reported separately so a failure to
+// read never silently disables the feature - it falls back to the old always-open behaviour and says so.
+bool HealWouldDoSomething(bool* unknown) {
+    *unknown = true;
+    if (g_offHealth < 0 || g_offHealthMax < 0) return true;
+    const uintptr_t p = FindPlayerPawn();
+    if (!p) return true;
+    if (!Readable((void*)(p + g_offHealth), 4) || !Readable((void*)(p + g_offHealthMax), 4)) return true;
+    const int32_t hp  = *reinterpret_cast<const int32_t*>(p + g_offHealth);
+    const int32_t max = *reinterpret_cast<const int32_t*>(p + g_offHealthMax);
+    if (max <= 0) return true;                       // nonsense reading - do not act on it
+    *unknown = false;
+    return hp < max;
+}
 
 void SolvePropertyLayout() {
     if (InterlockedExchange(&g_propSolveDone, 1)) return;
@@ -1588,6 +1671,34 @@ void SolvePropertyLayout() {
     g_offMuzzleIron      = PropOffsetInChain(g_weaponFxClass, "mMuzzleFlashIronsights");
     g_offMuzzleLoopIron  = PropOffsetInChain(g_weaponFxClass, "mLoopingMuzzleFlashIronsights");
     g_offMuzzleEmitter   = PropOffsetInChain(g_weaponFxClass, "mLoopingMuzzleFXEmitter");
+    // Run 199: Health and HealthMax live on Engine.Pawn, several classes above RvPlayerPawnSP, which is
+    // exactly what PropOffsetInChain's super-chain walk is for.
+    if (const uintptr_t pawn = FindPlayerPawn()) {
+        const uintptr_t pc = *reinterpret_cast<uintptr_t*>(pawn + OBJ_CLASS);
+        int dh = 0, dm = 0;
+        g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
+        g_offHealthMax = PropOffsetInChain(pc, "HealthMax", &dm);
+        // The DEPTH is logged because the previous failure was a depth cap, and a bare "-1" could not
+        // distinguish "the property is not there" from "the search stopped early".
+        Log("    Pawn.Health +0x%03X (found at super-chain depth %d), Pawn.HealthMax +0x%03X (depth %d)%s",
+            g_offHealth, dh, g_offHealthMax, dm,
+            (g_offHealth < 0 || g_offHealthMax < 0)
+                ? "  <- NOT both found: the heal window falls back to opening on the button alone"
+                : "  - the heal window will only open when a heal can actually do something");
+        // Name the chain when something is missing, so the next attempt starts from facts.
+        if (g_offHealth < 0 || g_offHealthMax < 0) {
+            char chain[256]; int co = 0;
+            uintptr_t c = pc;
+            for (int d = 0; d < 16 && c && co < 220; ++d) {
+                char cn[64];
+                if (!NameOf(c, cn, sizeof(cn))) break;
+                co += _snprintf_s(chain + co, sizeof(chain) - co, _TRUNCATE, "%s%s", co ? " < " : "", cn);
+                if (!Readable((void*)(c + g_upNext - 4), 4)) break;
+                c = *reinterpret_cast<uintptr_t*>(c + g_upNext - 4);
+            }
+            Log("    pawn class chain: %s", chain);
+        }
+    }
     Log("    RvWeaponFX 0x%08X: mMuzzleFlash1stPerson +0x%03X, mLoopingMuzzleFlash1stPerson +0x%03X,"
         " mMuzzleFlashIronsights +0x%03X, mLoopingMuzzleFlashIronsights +0x%03X,"
         " mLoopingMuzzleFXEmitter +0x%03X",
@@ -5772,6 +5883,41 @@ void SyncXRInput(XrTime displayTime) {
         stickMask = (ty > 0) ? g_stickUpMask : g_stickDownMask;
         stickHold = 8;
         stickArmed = false;
+        // ---- ⭐ run 198: stick DOWN is the health item, so this is the heal signal ----
+        //
+        // Taken from the button WE inject rather than detected in the engine: there is no inference to
+        // get wrong, because we are the ones asking for the heal. The window shows the arms and puts the
+        // gun back at the engine's position for its duration - see g_healArmsMs.
+        //
+        // ---- run 199: gated on the heal being able to DO something ----
+        //
+        // At full health the button does nothing, so showing the arms is a pure misfire. Checked before
+        // the press rather than verified after it - see HealWouldDoSomething for why "wait for health to
+        // rise" is the wrong shape.
+        //
+        // ⚠️ Still fires when health is low but you have NO ITEMS. Narrower than before and the same
+        // class of miss; closing it needs the inventory count, which is more property archaeology than
+        // the remaining annoyance is worth.
+        if (ty < 0.0f && InterlockedCompareExchange(&g_healArmsMs, 0, 0) > 0) {
+            bool unknown = false;
+            if (!HealWouldDoSomething(&unknown)) {
+                static ULONGLONG lastSaid = 0;
+                const ULONGLONG now = GetTickCount64();
+                if (now - lastSaid > 3000) {
+                    lastSaid = now;
+                    Log("heal window: SKIPPED - already at full health, so the item would do nothing and"
+                        " the arms stay hidden");
+                }
+            } else {
+                const LONG64 now = (LONG64)GetTickCount64();
+                const LONG dly = InterlockedCompareExchange(&g_healDelayMs, 0, 0);
+                const LONG end = InterlockedCompareExchange(&g_healArmsMs, 0, 0);
+                InterlockedExchange64(&g_healFromMs,  now + dly);
+                InterlockedExchange64(&g_healUntilMs, now + (end > dly ? end : dly + 1));
+                Log("heal window: arms shown from +%ld ms to +%ld ms after the press%s", dly, end,
+                    unknown ? " (health could NOT be read - opening on the button alone)" : "");
+            }
+        }
     } else if (fabsf(ty) < 0.4f) {
         stickArmed = true;
     }
@@ -8547,6 +8693,88 @@ volatile LONG g_fgStableCount = 0;
 // selected and matched by value from then on.
 volatile LONG g_gunVerts = 0, g_armsVerts = 0;
 
+// ---- ⭐ run 198: the BASELINE set, and the two animation windows ----
+//
+// `g_fgBaseVerts` is every mesh the first-person pass drew at the moment the latch took - a weapon idle
+// in hand. Anything appearing later was brought in by an animation, which is exactly the reload arm and
+// hand geometry reported since run 122. Hiding "not in the baseline" catches those without needing to
+// know their counts in advance, and without touching the 390-vertex mesh that IS in the baseline and
+// rides with the gun (so a gun sight or magazine cannot be hidden by accident).
+volatile LONG g_fgBaseVerts[kFgSigMax] = {};
+volatile LONG g_fgBaseCount = 0;
+int g_hideStrayArms = 1;              // ini [Render] HideStrayArms
+
+// ---- 💥 run 199: the "reload arms" are NOT reload geometry. They are the 390-vertex mesh ----
+//
+// Reported, and it corrects two wrong assumptions at once: *"those are actually always there during
+// gameplay but hidden under where the player could normally see... and they move with the gun, so when I
+// move the controller up they are pretty visible. And no, they don't disappear when I reload."*
+//
+// Measured agreement: the baseline set is `[5799 gun, 3314 arms, 390]`, and run 181's rider census says
+// `vertex counts seen riding: 390`. So the artefact is **in the baseline** - which is why run 198's
+// "hide what was not in the baseline" rule could never touch it - and it **rides the gun transform**,
+// which is why it tracks the controller.
+//
+// It was invisible in the flat game because it sits below the bottom of a 16:9 frame. VR's much taller
+// field of view plus a gun that now moves with your hand brings it into view. **A cosmetic defect that
+// only exists because of what the mod changed**, which is why sixty runs never saw it.
+//
+// So: hide the baseline mesh that is neither the gun nor the arms. Defined by ROLE rather than as the
+// literal 390, so a weapon whose leftover fragment has a different count is covered too.
+//
+// ⚠️ Kept as a toggle because the risk is real and specific: 390 rides the gun, so if it turns out to be
+// gun geometry - a sight, a magazine - hiding it removes part of the weapon. `HideExtraArms=0` restores
+// it without a rebuild, and the log names the count being hidden so a wrong call is diagnosable.
+int g_hideExtraArms = 1;              // ini [Render] HideExtraArms
+
+// The baseline mesh that is neither gun nor arms - the leftover hand/arm fragment.
+static bool FgIsExtraArm(UINT verts) {
+    if (!g_hideExtraArms || !verts) return false;
+    const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+    const LONG a = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+    if (!g || !a) return false;                    // not latched: no roles are known yet
+    if ((UINT)g == verts || (UINT)a == verts) return false;
+    const LONG n = InterlockedCompareExchange(&g_fgBaseCount, 0, 0);
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i)
+        if ((UINT)InterlockedCompareExchange(&g_fgBaseVerts[i], 0, 0) == verts) return true;
+    return false;
+}
+
+// ---- the HEAL window: the one time the arms SHOULD be visible ----
+//
+// The health injector animation is performed by the arms we normally hide, so hiding them leaves the
+// player watching nothing happen. During the window the arms are shown AND the gun is left at the
+// engine's own position - moving the gun onto the controller while the arms perform an animation at the
+// engine position would tear the two halves of the same animation apart.
+//
+// Driven by the health button WE inject, so the signal is exact rather than inferred: there is no
+// guessing whether a heal started, because we are the ones asking for it.
+//
+// ⚠️ Duration is a guess and therefore an ini value. Too short and the arms vanish mid-animation; too
+// long and they linger after it. Wall-clock rather than frames, so it does not change with frame rate.
+// The window is [from, until), both measured from the button press. `until` trims the END (the arms were
+// lingering past the animation); `from` trims the START (they were appearing a touch before it began).
+// Two knobs rather than one because the two edges were reported separately and move independently -
+// shortening the duration to fix a late finish would also have made it start early.
+volatile LONG g_healArmsMs = 2150;    // ini [Render] HealArmsMs      - end, from the press
+volatile LONG g_healDelayMs = 100;    // ini [Render] HealArmsDelayMs - start, from the press
+volatile LONG64 g_healUntilMs = 0, g_healFromMs = 0;
+
+inline bool HealWindowActive() {
+    const LONG64 until = InterlockedCompareExchange64(&g_healUntilMs, 0, 0);
+    if (!until) return false;
+    const LONG64 now = (LONG64)GetTickCount64();
+    return now >= InterlockedCompareExchange64(&g_healFromMs, 0, 0) && now < until;
+}
+
+// Was this mesh on screen when the latch was taken?
+static bool FgIsBaseline(UINT verts) {
+    const LONG n = InterlockedCompareExchange(&g_fgBaseCount, 0, 0);
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i)
+        if ((UINT)InterlockedCompareExchange(&g_fgBaseVerts[i], 0, 0) == verts) return true;
+    return false;
+}
+
 // ---- ⭐ run 158: the latch, extracted so it is not owned by one keypress ----
 //
 // This used to live inline in the APPS handler and ran only when the cycle passed through mode 1.
@@ -8900,12 +9128,28 @@ static bool FgIsMesh(UINT verts, int idx1) {          // idx1 is 1-based into th
 
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    if (m != 2 && m != 3) return false;
+    // The heal animation is the arms' one legitimate appearance - see the note at g_healArmsMs.
+    if (HealWindowActive()) return false;
     const LONG a = InterlockedCompareExchange(&g_armsVerts, 0, 0);
-    return (m == 2 || m == 3) && a && (UINT)a == verts;
+    if (a && (UINT)a == verts) return true;
+    // ⭐ run 199: the leftover hand/arm fragment - the 390-vertex mesh. Checked before the stray rule
+    // below because it IS in the baseline and that rule would never reach it.
+    if (FgIsExtraArm(verts)) return true;
+    // ---- run 198: stray animation geometry, hidden by NOT being in the baseline ----
+    //
+    // Gated on the latch being taken: with no baseline set, "not in the baseline" is true of everything
+    // including the gun, and this would blank the whole pass. That is the run-158d shape - a matcher
+    // that silently means something else before its data exists - so it is checked, not assumed.
+    if (!g_hideStrayArms) return false;
+    if (!InterlockedCompareExchange(&g_fgBaseCount, 0, 0)) return false;
+    if (!InterlockedCompareExchange(&g_gunVerts, 0, 0)) return false;
+    return !FgIsBaseline(verts);
 }
 
 static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
     const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    if (HealWindowActive()) return false;              // leave the gun where the animation expects it
     const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
     return (m == 1 || m == 3) && g && (UINT)g == verts;
 }
@@ -8932,6 +9176,9 @@ static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
 static bool FgRidesGun(UINT verts) {
     const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
     if (m != 1 && m != 3) return false;
+    // Nothing rides during the heal - the gun itself is not being moved, so an attachment that followed
+    // the controller would be the only thing off the animation.
+    if (HealWindowActive()) return false;
     // == 1 exactly. Mode 2 is the hide-the-pass test and must not also transform what it keeps.
     if (InterlockedCompareExchange(&g_fgRideAll, 0, 0) != 1) return false;
     if (!InterlockedCompareExchange(&g_inForeground, 0, 0)) return false;
@@ -9135,7 +9382,24 @@ void UpdateFgLatch() {
     steady = 0;
     InterlockedExchange(&g_gunVerts,  a);
     InterlockedExchange(&g_armsVerts, b);
-    Log("mesh latch: gun=%ld verts, arms=%ld verts (steady for %d frames)", a, b, kLatchSteady);
+    // ---- ⭐ run 198: capture the whole BASELINE set, not just the top two ----
+    //
+    // The reload artefact is arm and hand geometry that exists only in the reload animation, so it is
+    // absent from the list when the counts are latched and nothing hides it. STATUS has carried "latch a
+    // SET of counts rather than two" as the fix since run 122 - this is that.
+    //
+    // The set is taken at the same steady moment as the gun and arms: a weapon idle in hand, which is
+    // the state everything else is judged against. A count NOT in this set appeared later, which for the
+    // first-person pass means an animation brought it in - reload, melee, a device. See FgHidden.
+    {
+        const LONG bn = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
+        for (LONG i = 0; i < kFgSigMax; ++i)
+            InterlockedExchange(&g_fgBaseVerts[i],
+                                i < bn ? InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0) : 0);
+        InterlockedExchange(&g_fgBaseCount, bn);
+    }
+    Log("mesh latch: gun=%ld verts, arms=%ld verts (steady for %d frames), baseline set of %ld",
+        a, b, kLatchSteady, InterlockedCompareExchange(&g_fgBaseCount, 0, 0));
     LogFgList("at the TAKE - everything that was on screen when this was chosen");
     // ---- run 182 stage 1, and this is the right moment for it ----
     //
@@ -15932,6 +16196,35 @@ void LoadIniSettings() {
                                 " the frame budget"
                               : "hand poses predicted ahead, so the gun's geometry is built for when it"
                                 " will actually be seen");
+
+    // Run 198: the reload-arms fix. Default on - it is the reported artefact, and it cannot reach the
+    // gun or the 390-vertex mesh because both are in the baseline set.
+    g_hideStrayArms = GetPrivateProfileIntA("Render", "HideStrayArms", 1, path) ? 1 : 0;
+    Log("ini: HideStrayArms=%d (%s)", g_hideStrayArms,
+        g_hideStrayArms ? "hide first-person meshes that were NOT on screen when the latch was taken -"
+                          " the leftover reload arms and hands"
+                        : "off - only the latched arms mesh is hidden");
+
+    g_hideExtraArms = GetPrivateProfileIntA("Render", "HideExtraArms", 1, path) ? 1 : 0;
+    Log("ini: HideExtraArms=%d (%s)", g_hideExtraArms,
+        g_hideExtraArms ? "hide the leftover hand/arm fragment - the baseline first-person mesh that is"
+                          " neither the gun nor the arms (measured as 390 verts on the pistol)"
+                        : "off - the fragment is drawn and rides the gun");
+
+    // Run 198/199: how long the arms stay visible after a health item is used. Trimmed from 2500 on the
+    // report that they linger slightly past the end of the animation. Still a guess, hence still a knob.
+    LONG healMs = GetPrivateProfileIntA("Render", "HealArmsMs", 2150, path);
+    if (healMs < 0)     healMs = 0;
+    if (healMs > 15000) healMs = 15000;
+    InterlockedExchange(&g_healArmsMs, healMs);
+    LONG healDelay = GetPrivateProfileIntA("Render", "HealArmsDelayMs", 100, path);
+    if (healDelay < 0)    healDelay = 0;
+    if (healDelay > 2000) healDelay = 2000;
+    InterlockedExchange(&g_healDelayMs, healDelay);
+    Log("ini: HealArmsMs=%ld HealArmsDelayMs=%ld (%s)", healMs, healDelay,
+        healMs ? "the arms are visible from DelayMs to Ms after the health button, and the gun returns to"
+                 " the engine's position for that span, so the injector animation reads as one piece"
+               : "off - the arms stay hidden through the heal animation");
 
     LONG fxHide = GetPrivateProfileIntA("Render", "HideMuzzleFx", 1, path) ? 1 : 0;
     InterlockedExchange(&g_hideMuzzleFx, fxHide);

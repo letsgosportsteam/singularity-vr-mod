@@ -319,16 +319,44 @@ game → menu is rotated.
 >   the wrapper had already been proven defective on the soldier by then. **An independently
 >   confirmed defect should not be dismissed on a one-line argument.**
 
-7. **Leftover arm/hand pieces during reload.** Seen and photographed in run 189 — black blobs and
-   stretched geometry where the reload arms should be. Tabled deliberately; it is a latching problem,
-   not a transform one. Extra meshes that exist only in the reload
-   animation, so they are absent from the foreground list when the counts are latched. The fix is
-   probably to latch a SET of counts rather than two, or to match on something steadier than
-   vertex count.
-8. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+7. **✅ FIXED (run 199) — the "reload arms" were never reload geometry.** `HideExtraArms=1`. Reload now
+   looks natural.
+   - ⛔ **Carried as a reload/latching problem from run 122 to run 198, and it was neither.** Reported
+     correctly at last: *"they're actually always there during gameplay but hidden under where the player
+     could normally see... and they move with the gun, so when I move the controller up they're pretty
+     visible. And no, they don't disappear when I reload."*
+   - **It is the 390-vertex mesh.** The baseline set is `[5799 gun, 3314 arms, 390]` and run 181's rider
+     census reads `vertex counts seen riding: 390`. So it is **in** the baseline — which is why run 198's
+     "hide what was not in the baseline" rule could not reach it — and it **rides the gun transform**,
+     which is why it tracks the controller.
+   - **A defect the mod created**, which is why sixty runs never saw it: the fragment sits below the
+     bottom of a 16:9 frame, and VR's much taller field of view plus a gun that follows your hand brings
+     it into view.
+   - Hidden by **role** — "the baseline mesh that is neither the gun nor the arms" — not as the literal
+     390, so another weapon's fragment is covered. ⚠️ It rides the gun, so if a weapon's third baseline
+     mesh turns out to be a sight or magazine this would remove it; `HideExtraArms=0` reverts.
+   - **Method note:** run 198 fixed a problem nobody had (stray animation meshes) because the label on
+     the report was taken as the diagnosis. The user's description contained the answer — *always
+     present*, *moves with the gun* — and both facts were already in the logs.
+
+8. **✅ The arms reappear for the health injector animation (run 198–199).** `HealArmsMs=2150`,
+   `HealArmsDelayMs=100`.
+   - The arms are shown **and the gun is returned to the engine's position** for the window — moving the
+     gun onto the controller while the arms animate at the engine position tears one animation in half.
+   - **Gated on the heal being able to do anything.** Reads `Pawn.Health` / `Pawn.HealthMax` (see
+     `ENGINE_NOTES.md`) at the press, so at full health the arms never appear.
+   - ⚠️ **Do NOT "verify" by waiting for health to rise.** Health is applied by the animation, possibly
+     at its end, so the confirmation arrives *late* and a window opened then runs on past the animation
+     it was meant to cover. Asking "could this heal do anything" *before* the press has no timing
+     dependency.
+   - Both edges are knobs measured from the press, because they were reported separately and move
+     independently: shortening the duration to fix a late finish would also have made it start early.
+   - **Remaining gap:** low health with **no items** still opens the window. Same class of miss, much
+     narrower; closing it needs the inventory count.
+9. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-9. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+10. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
 

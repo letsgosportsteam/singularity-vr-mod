@@ -36,6 +36,15 @@ FRotator) → `Scale3D +0x1AC` (+4, a float). UE3's declared order at exactly it
 `mLoopingMuzzleFlash1stPerson +0x06C`, `mMuzzleFlashIronsights +0x080`,
 `mLoopingMuzzleFlashIronsights +0x084`, `mLoopingMuzzleFXEmitter +0x088`.
 
+**`Engine.Pawn`, reached from `RvPlayerPawnSP`: `Health +0x2E4`, `HealthMax +0x2E8`** — two adjacent
+`int32`s, found at **super-chain depth 10**. Used by the heal window to ask whether a health item could
+do anything before showing the arms.
+
+> ⚠️ **Depth 10 is why a "generous" 8-level walk found nothing.** The chain is
+> `RvPlayerPawnSP → … → GamePawn → Pawn → Actor → Object`, and it is longer than it looks. Walk to
+> `SuperField == 0`; use a depth limit only as a corrupt-pointer backstop, and **report when the limit is
+> what stopped the search** — otherwise a truncated walk is indistinguishable from an absent property.
+
 > ⚠️ **Bools share an offset.** `HiddenGame` and `bOwnerNoSee` both report `+0x110`, and the two
 > `Absolute*` flags both report `+0x1C4`. That is correct — UE3 packs bools into a shared dword and
 > distinguishes them by a bitmask, which this reader does not yet extract. Any bool needs the mask too.

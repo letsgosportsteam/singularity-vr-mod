@@ -24,6 +24,70 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Runs 198–199: the "reload arms" were never reload geometry, and the heal window
+
+Two visual fixes before a full playthrough, and the first one had been misdiagnosed in this file since
+run 122.
+
+### ✅ The extra arms are the 390-vertex mesh, not reload geometry
+
+Carried for seventy-odd runs as *"extra meshes that exist only in the reload animation, so they are
+absent from the list when the counts are latched"*. Run 198 implemented exactly that — latch the whole
+baseline set, hide anything not in it — and it changed nothing, because the premise was wrong.
+
+The report that solved it: **always present during gameplay, hidden below where a monitor player would
+see, and they MOVE WITH THE GUN.** Both facts were already in the logs and neither had been joined up:
+
+| evidence | already recorded |
+|---|---|
+| `[0]=5799 [1]=3314 [2]=390` | the baseline set — so 390 is *in* it, and "hide what is not in the baseline" could never reach it |
+| `vertex counts seen riding: 390` | run 181's rider census — so it follows the gun transform |
+
+**It is a defect the mod created.** The fragment sits below the bottom of a 16:9 frame; VR's much taller
+field of view plus a gun that now follows your hand brings it into view. That is why sixty runs of flat
+comparison never saw it.
+
+Fixed by hiding the baseline mesh that is neither gun nor arms — by ROLE, so another weapon's fragment is
+covered too.
+
+> **The lesson is not "measure more".** Run 198 measured carefully and built a working mechanism for a
+> problem nobody had, because it took the LABEL on the report ("reload arms") as the diagnosis. The two
+> facts that identified it were a user sentence and a log line from eighteen runs earlier.
+
+### ✅ The arms come back for the health injector, and only when it does something
+
+The animation is performed by the arms we hide, so hiding them left the player watching nothing. The
+window shows the arms **and returns the gun to the engine's position** — moving the gun onto the
+controller while the arms animate at the engine position tears one animation in half.
+
+Gated on `Pawn.Health < Pawn.HealthMax`, read at the press, so a heal at full health shows nothing.
+
+> ### ⚠️ Why "wait for health to rise" is the wrong shape
+>
+> The obvious verification is a trap: health is applied BY the animation, possibly at its end, so the
+> confirmation arrives late and a window opened at that moment runs on past the animation it was supposed
+> to cover. Asking *"could this heal do anything"* before the press has no timing dependency at all.
+
+Both edges are separate knobs measured from the press (`HealArmsDelayMs`, `HealArmsMs`), because they
+were reported independently — shortening the duration to fix a late finish would also have made it start
+early.
+
+### 💥 A fifth silent cap: an 8-level class walk hid `Pawn.Health`
+
+`PropOffsetInChain` walked eight super-classes. `Pawn.Health` is at **depth 10** from `RvPlayerPawnSP`,
+so it reported "not found" and the heal window fell back to the button alone.
+
+That is **owner cap (183), signature table (192), first-block break (193), 4-alignment filter (194), and
+class-chain depth (199)** — five times, one shape: *a bound chosen because it looked generous, silently
+excluding the answer.*
+
+Now it walks to `SuperField == 0`, keeps a 64-level guard purely as a corrupt-pointer backstop, **reports
+when the guard is what stopped it**, and logs the depth at which each property was found so a future
+`-1` can be told apart from a truncated search. The one thing that worked correctly on the failing run
+was the fallback saying `health could NOT be read` out loud instead of silently doing nothing.
+
+---
+
 ## ⭐ Runs 182–190: the gun's feel fixed twice, and a nine-run hunt aimed at the wrong thing
 
 Two wins on how the mod *feels*, one workaround, and an expensive lesson about what a measurement
