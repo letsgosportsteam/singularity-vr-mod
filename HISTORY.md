@@ -72,6 +72,25 @@ Both edges are separate knobs measured from the press (`HealArmsDelayMs`, `HealA
 were reported independently — shortening the duration to fix a late finish would also have made it start
 early.
 
+### 💥 Run 200: matching `"HUD"` as a substring found `RvCE_HUDMessage`
+
+The heal gate's second half — skip when the player has no health packs — needed the HUD. The finder
+matched class names containing `"HUD"` and picked **`RvCE_HUDMessage`**, a combat-event object with none
+of these properties. Both checks then degraded to *"assume the heal works"*, the window opened anyway,
+and the wrong object was CACHED — so every retry re-found it and logged again, hundreds of identical
+lines burying the one line that named the object it had picked.
+
+**Same mistake as run 197's `stride 72`: a name that looks right is not an identification.** Third time
+in this stretch that a plausible label was taken as a fact.
+
+Fixed by identifying with the thing actually needed: resolve `RvGameSharedHUD` — the class that
+*declares* `mHealthPackCount` — and accept only instances whose `SuperField` chain reaches it. A
+coincidence cannot satisfy that. The live instance is `RvHUD`; the property is at `+0x588`, depth 1.
+
+Also: `IsLive` deliberately does **not** gate the HUD. A UE3 HUD hangs off the PlayerController rather
+than `PersistentLevel`, so the liveness rule that correctly separates pawn instances from archetypes
+rejects every real HUD — reusing it without checking would have been a silent no-op.
+
 ### 💥 A fifth silent cap: an 8-level class walk hid `Pawn.Health`
 
 `PropOffsetInChain` walked eight super-classes. `Pawn.Health` is at **depth 10** from `RvPlayerPawnSP`,

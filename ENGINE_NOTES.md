@@ -40,6 +40,17 @@ FRotator) → `Scale3D +0x1AC` (+4, a float). UE3's declared order at exactly it
 `int32`s, found at **super-chain depth 10**. Used by the heal window to ask whether a health item could
 do anything before showing the arms.
 
+**`RvGameSharedHUD.mHealthPackCount +0x588`** — the live instance is `RvHUD`, found at chain depth 1.
+Used by the heal window to skip when the player has no health packs.
+
+> ⚠️ **Find the HUD by the class that DECLARES the property, not by name.** Matching class names for the
+> substring `"HUD"` picks up `RvCE_HUDMessage`, a combat-event object, which has none of these properties.
+> Resolve `RvGameSharedHUD` and accept only instances whose `SuperField` chain reaches it.
+>
+> ⚠️ **`IsLive` does NOT apply to the HUD.** A UE3 HUD hangs off the PlayerController, not off
+> `PersistentLevel`, so the liveness rule that correctly separates pawn instances from archetypes rejects
+> every real HUD. Exclude archetypes by name (`Default__`) instead.
+
 > ⚠️ **Depth 10 is why a "generous" 8-level walk found nothing.** The chain is
 > `RvPlayerPawnSP → … → GamePawn → Pawn → Actor → Object`, and it is longer than it looks. Walk to
 > `SuperField == 0`; use a depth limit only as a corrupt-pointer backstop, and **report when the limit is

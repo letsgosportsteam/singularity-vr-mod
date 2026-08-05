@@ -1469,6 +1469,8 @@ WantedName g_wantNames[] = {
     { "mLoopingMuzzleFXEmitter", -1 },
     // Run 199: the heal window asks "can this heal do anything" before showing the arms.
     { "Health", -1 }, { "HealthMax", -1 },
+    // Run 200: ...and "do I even have an item". See the note at FindHudObject.
+    { "mHealthPackCount", -1 },
 };
 const int kWantNameCount = (int)(sizeof(g_wantNames) / sizeof(g_wantNames[0]));
 
@@ -1586,6 +1588,7 @@ uintptr_t g_weaponFxClass = 0;
 // has no timing dependency at all.
 int g_offHealth = -1, g_offHealthMax = -1;
 uintptr_t g_playerPawn = 0, g_playerPawnClass = 0;
+void ResolveGameplayOffsets();          // retryable; see its definition below SolvePropertyLayout
 
 // The live player pawn, cached and revalidated by class word like FindCamera. Rewalks at most once every
 // 30 misses - a pawn does not exist at the menu and asking every frame is the run-35 failure.
@@ -1616,19 +1619,117 @@ static uintptr_t FindPlayerPawn() {
     return 0;
 }
 
+// ---- ⭐ run 200: "do I have a health pack" - the second half of the heal gate ----
+//
+// Reported: low health with NO ITEMS still opened the window. Run 199 closed the full-health case and
+// left this one, and it is the same misfire from the other direction.
+//
+// `RvGameSharedHUD.mHealthPackCount` is the handle, chosen over the more obviously authoritative
+// `RvGameSharedInventoryManager.mCounts` for one reason: `mCounts` is an array indexed by an
+// `ERvCountItem` enum, so using it means decoding the enum to learn which slot is the health pack -
+// a guess at an index, which is precisely the class of assumption that has cost this project runs.
+// `mHealthPackCount` is a single int whose name states exactly what it holds, and it is the number the
+// player is already looking at on the HUD.
+//
+// A frame of lag against the true inventory would not matter: this is read once, at the button press,
+// to decide whether an animation is worth showing.
+// ---- 💥 run 200: matching "HUD" as a SUBSTRING found RvCE_HUDMessage ----
+//
+// `HUD object: 0x0A61DD60 (RvCE_HUDMessage / RvCE_HUDMessage)` - a combat-event object whose class name
+// merely contains "HUD". The property was of course not on its chain, both checks degraded to "assume the
+// heal works", and the window opened anyway. It also CACHED the wrong object, so every retry re-found it
+// and logged again.
+//
+// The lesson is the same one as run 197's stride-72: **a name that looks right is not an identification.**
+// So this no longer guesses at a name at all - it finds the class that DECLARES `mHealthPackCount`
+// (`RvGameSharedHUD`) and then accepts only instances deriving from it. The thing we need is the thing
+// used to identify it, which cannot match a coincidence.
+int g_offHealthPacks = -1;
+uintptr_t g_hudObject = 0, g_hudClass = 0, g_hudBaseClass = 0;
+
+static bool ClassDerivesFrom(uintptr_t cls, uintptr_t base) {
+    uintptr_t c = cls;
+    for (int d = 0; d < 64 && c; ++d) {
+        if (c == base) return true;
+        if (!Readable((void*)(c + g_upNext - 4), 4)) return false;
+        c = *reinterpret_cast<uintptr_t*>(c + g_upNext - 4);       // SuperField
+    }
+    return false;
+}
+
+static uintptr_t FindHudObject() {
+    if (g_hudObject && g_hudClass && Readable((void*)g_hudObject, 0x40) &&
+        *reinterpret_cast<uintptr_t*>(g_hudObject + OBJ_CLASS) == g_hudClass)
+        return g_hudObject;
+    g_hudObject = 0;
+    static int missTick = 0;
+    if ((++missTick % 30) != 1) return 0;
+    if (!g_upChildren) return 0;                     // the derives-from walk needs the layout
+    if (!g_hudBaseClass) g_hudBaseClass = FindClassByName("RvGameSharedHUD");
+    if (!g_hudBaseClass) return 0;
+    if (!Readable((void*)kGObjectsTArray, 12)) return 0;
+    uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
+    int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
+    if (!data || count <= 0) return 0;
+    uintptr_t* objs = reinterpret_cast<uintptr_t*>(data);
+    for (int32_t i = 0; i < count; ++i) {
+        uintptr_t o = objs[i];
+        if (!o || !Readable((void*)o, 0x40)) continue;
+        // ⚠️ NOT gated on IsLive. A UE3 HUD hangs off the PlayerController, not off PersistentLevel, so
+        // the liveness rule that correctly separates pawn instances from archetypes would reject every
+        // real HUD. Archetypes are excluded by name instead.
+        char nm[80];
+        if (!NameOf(o, nm, sizeof(nm)) || strncmp(nm, "Default__", 9) == 0) continue;
+        uintptr_t cls = *reinterpret_cast<uintptr_t*>(o + OBJ_CLASS);
+        if (!cls || cls == g_hudBaseClass) continue;            // the class object itself, not an instance
+        if (!ClassDerivesFrom(cls, g_hudBaseClass)) continue;
+        g_hudObject = o;
+        g_hudClass = cls;
+        char cn[80];
+        NameOf(cls, cn, sizeof(cn));
+        Log("HUD object: 0x%08X (%s / %s) - derives from RvGameSharedHUD", (unsigned)o, nm, cn);
+        return o;
+    }
+    return 0;
+}
+
 // true only when a heal could actually do something. `unknown` is reported separately so a failure to
 // read never silently disables the feature - it falls back to the old always-open behaviour and says so.
+//
+// Two independent reasons a heal does nothing, and BOTH are checked: already at full health, or no packs.
+// Either one unreadable degrades to "assume it would work" rather than to "assume it would not" - a
+// missing animation is a worse failure than a spurious one.
 bool HealWouldDoSomething(bool* unknown) {
-    *unknown = true;
-    if (g_offHealth < 0 || g_offHealthMax < 0) return true;
-    const uintptr_t p = FindPlayerPawn();
-    if (!p) return true;
-    if (!Readable((void*)(p + g_offHealth), 4) || !Readable((void*)(p + g_offHealthMax), 4)) return true;
-    const int32_t hp  = *reinterpret_cast<const int32_t*>(p + g_offHealth);
-    const int32_t max = *reinterpret_cast<const int32_t*>(p + g_offHealthMax);
-    if (max <= 0) return true;                       // nonsense reading - do not act on it
-    *unknown = false;
-    return hp < max;
+    bool anyUnknown = false;
+
+    bool healthFull = false, healthKnown = false;
+    if (g_offHealth >= 0 && g_offHealthMax >= 0) {
+        if (const uintptr_t p = FindPlayerPawn()) {
+            if (Readable((void*)(p + g_offHealth), 4) && Readable((void*)(p + g_offHealthMax), 4)) {
+                const int32_t hp  = *reinterpret_cast<const int32_t*>(p + g_offHealth);
+                const int32_t max = *reinterpret_cast<const int32_t*>(p + g_offHealthMax);
+                if (max > 0) { healthKnown = true; healthFull = hp >= max; }
+            }
+        }
+    }
+    if (!healthKnown) anyUnknown = true;
+
+    bool haveNoPacks = false, packsKnown = false;
+    if (g_offHealthPacks >= 0) {
+        if (const uintptr_t h = FindHudObject()) {
+            if (Readable((void*)(h + g_offHealthPacks), 4)) {
+                const int32_t packs = *reinterpret_cast<const int32_t*>(h + g_offHealthPacks);
+                // A negative count is a bad read, not an empty pocket - do not act on it.
+                if (packs >= 0) { packsKnown = true; haveNoPacks = packs == 0; }
+            }
+        }
+    }
+    if (!packsKnown) anyUnknown = true;
+
+    *unknown = anyUnknown;
+    if (healthKnown && healthFull) return false;
+    if (packsKnown && haveNoPacks) return false;
+    return true;
 }
 
 void SolvePropertyLayout() {
@@ -1671,9 +1772,22 @@ void SolvePropertyLayout() {
     g_offMuzzleIron      = PropOffsetInChain(g_weaponFxClass, "mMuzzleFlashIronsights");
     g_offMuzzleLoopIron  = PropOffsetInChain(g_weaponFxClass, "mLoopingMuzzleFlashIronsights");
     g_offMuzzleEmitter   = PropOffsetInChain(g_weaponFxClass, "mLoopingMuzzleFXEmitter");
+    ResolveGameplayOffsets();
+}
+
+// ---- ⭐ run 200: RETRYABLE, because the objects do not all exist at the same moment ----
+//
+// SolvePropertyLayout is one-shot and fires at the mesh latch. The pawn exists by then; **the HUD may
+// not**, and a one-shot resolve would have left the health-pack offset at -1 for the whole session with
+// nothing to say why. That is the run-158d shape - a resolve that appears to succeed while silently
+// giving up - so this is called again from the slow tick until it has what it needs, then costs nothing.
+void ResolveGameplayOffsets() {
+    if (!g_upChildren) return;                       // layout not solved - nothing can be looked up
+    if (g_offHealth >= 0 && g_offHealthMax >= 0 && g_offHealthPacks >= 0) return;   // done
+
     // Run 199: Health and HealthMax live on Engine.Pawn, several classes above RvPlayerPawnSP, which is
     // exactly what PropOffsetInChain's super-chain walk is for.
-    if (const uintptr_t pawn = FindPlayerPawn()) {
+    if ((g_offHealth < 0 || g_offHealthMax < 0)) if (const uintptr_t pawn = FindPlayerPawn()) {
         const uintptr_t pc = *reinterpret_cast<uintptr_t*>(pawn + OBJ_CLASS);
         int dh = 0, dm = 0;
         g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
@@ -1697,6 +1811,32 @@ void SolvePropertyLayout() {
                 c = *reinterpret_cast<uintptr_t*>(c + g_upNext - 4);
             }
             Log("    pawn class chain: %s", chain);
+        }
+    }
+    // Run 200: the health-pack count, on the HUD. Same super-chain walk - mHealthPackCount is declared
+    // on RvGameSharedHUD and the live object is a class derived from it.
+    if (g_offHealthPacks < 0) {
+        if (const uintptr_t hud = FindHudObject()) {
+            const uintptr_t hc = *reinterpret_cast<uintptr_t*>(hud + OBJ_CLASS);
+            int dp = 0;
+            g_offHealthPacks = PropOffsetInChain(hc, "mHealthPackCount", &dp);
+            // ⚠️ Logged on SUCCESS, or once on failure. The previous version logged every retry and, with
+            // a wrong object cached that kept validating, produced hundreds of identical lines - noise
+            // that buried the one line saying which object it had actually picked.
+            static bool saidFail = false;
+            if (g_offHealthPacks >= 0)
+                Log("    HUD.mHealthPackCount +0x%03X (depth %d) - the heal window will also skip when"
+                    " you have no health packs", g_offHealthPacks, dp);
+            else if (!saidFail) {
+                saidFail = true;
+                Log("    HUD.mHealthPackCount NOT found (searched %d level(s) of the chain) - the heal"
+                    " window cannot tell whether you have an item and will open on health alone", dp);
+            }
+        } else {
+            // Once, not every tick - the retry itself is silent, and a permanent failure shows up as the
+            // heal window logging "could NOT be read" when it opens.
+            static bool said = false;
+            if (!said) { said = true; Log("    no HUD object yet - retrying on the slow tick"); }
         }
     }
     Log("    RvWeaponFX 0x%08X: mMuzzleFlash1stPerson +0x%03X, mLoopingMuzzleFlash1stPerson +0x%03X,"
@@ -14770,6 +14910,9 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         //
         // Two interlocked reads a frame until it takes, then nothing.
         UpdateFgLatch();
+        // Run 200: the heal gate's offsets, retried until resolved. Free once it has them, and the HUD
+        // often does not exist at the mesh latch where the first attempt runs.
+        ResolveGameplayOffsets();
         // Run 189: suppress the first-person muzzle flash and barrel smoke. On this slow tick because it
         // only ever acts on a CHANGE of state - a few interlocked reads per second while nothing is
         // happening, and a GObjects walk only when the cached objects stop validating (a weapon swap).

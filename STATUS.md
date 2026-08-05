@@ -351,8 +351,14 @@ game → menu is rotated.
      dependency.
    - Both edges are knobs measured from the press, because they were reported separately and move
      independently: shortening the duration to fix a late finish would also have made it start early.
-   - **Remaining gap:** low health with **no items** still opens the window. Same class of miss, much
-     narrower; closing it needs the inventory count.
+   - **✅ The no-items case is closed too (run 200).** Also reads `RvGameSharedHUD.mHealthPackCount`, so
+     the window is skipped when the player has no packs. Both reasons a heal does nothing are now checked.
+   - ⚠️ **Chose the HUD's count over `RvGameSharedInventoryManager.mCounts` deliberately.** `mCounts` is
+     an array indexed by an `ERvCountItem` enum, so using it means guessing which slot is the health pack.
+     `mHealthPackCount` is a single int whose name states what it holds, and a frame of HUD lag cannot
+     matter for a check made once at a button press.
+   - ⚠️ **Both checks fail OPEN.** If either property cannot be read the window opens anyway and the log
+     says so — a *missing* animation is a worse failure than a spurious one.
 9. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
