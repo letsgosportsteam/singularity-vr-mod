@@ -1886,6 +1886,15 @@ bool HealWouldDoSomething(bool* unknown) {
 //   WeaponActorExists needs          g_upChildren / g_upNext, from the property layout
 //   the property layout was solved   only at the latch TAKE
 //
+// 🧹 `WeaponActorExists()` itself is GONE as of run 209 - do not go looking for it. It never once
+// returned true: `if (!cls || cls == g_weaponActorClass) continue;` skipped the objects whose class
+// IS `RvWeaponShared`, which is exactly what `ARPistol` is. (Copied from `FindHudObject`, where the
+// same line is harmless because the live HUD is a DERIVED class.) Worse, it walked GObjects every
+// tick and caused an audible ~2 s stutter even on the splash screen. The latch gate is now
+// `MinFgMeshes` - a count of meshes already in the foreground pass, which needs no object graph at
+// all. The deadlock described above is therefore doubly dead, but the two fixes below still stand
+// on their own merits.
+//
 // Reported as "it played similarly to head mode" - which is exactly what an untaken latch looks like: the
 // gun stays at the engine's position because FgMoved never matches.
 //
@@ -16999,11 +17008,23 @@ void LoadIniSettings() {
             " %s. Set it back to 3 for normal behaviour.", amp,
             (amp & 1) ? "ON" : "off", (amp & 2) ? "ON" : "off");
 
-    g_timeOurWork = GetPrivateProfileIntA("Render", "TimeOurWork", 1, path) ? 1 : 0;
+    // 🧹 Run 211: default flipped 1 -> 0. This is a MEASURING tool, and it is the only diagnostic in
+    // this file whose cost scales with DRAW COUNT rather than with frames: two QueryPerformanceCounter
+    // calls per StereoPair and two per mesh-match, at the 3,000-4,400 draws/frame this game reaches.
+    // It earned its keep finding the runs 206-210 framerate tanks, and those are closed - so it should
+    // not keep charging rent on every future run. Kept, not deleted: this project has repeatedly been
+    // stuck for want of an instrument, and its own note below is the reason the residual was ever
+    // understood. Turn it on when a frame-budget question comes up.
+    //
+    // ⚠️ I have NOT measured the overhead, so do not quote a number for it. If a future run wants one,
+    // that is an A/B of TimeOurWork=0 against =1 at a fixed spot - and note that the instrument cannot
+    // measure its own cost, which is exactly the class of error that let SSW halve every frame-rate
+    // number for thirty runs.
+    g_timeOurWork = GetPrivateProfileIntA("Render", "TimeOurWork", 0, path) ? 1 : 0;
     Log("ini: TimeOurWork=%d (%s)", g_timeOurWork,
         g_timeOurWork ? "time StereoPair and the mesh matchers per frame, reported beside the frame"
                         " budget - 'our work' there is a RESIDUAL and contains the game's frame too"
-                      : "off");
+                      : "off (default) - set TimeOurWork=1 to time StereoPair and the mesh matchers");
 
     // Run 209: how many meshes the first-person pass must hold before the gun/arms roles are believed.
     // Measured 3 with a weapon (gun, arms, fragment) and 2 without. An ini value rather than a constant

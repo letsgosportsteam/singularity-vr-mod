@@ -456,6 +456,32 @@ FrameCopyMode=1
 GpuFenceProbe=1
 
 ; ---------------------------------------------------------------------------
+; TimeOurWork -- what does OUR code actually cost? (runs 206-211)
+;
+; Times StereoPair and the mesh matchers and reports both beside the frame
+; budget. This is the tool that found the runs 206-210 framerate tanks, and it
+; is kept for the next frame-budget question.
+;
+; ⚠️ OFF by default, and deliberately: it is the only diagnostic here whose cost
+; scales with DRAW COUNT rather than with frames -- two QueryPerformanceCounter
+; calls per StereoPair and two per mesh-match, at the 3,000-4,400 draws/frame
+; this game reaches. A closed investigation should not charge rent on every run.
+;
+; ⚠️ The overhead has NOT been measured, so do not quote a figure. Measuring it
+; means an A/B of 0 against 1 at a fixed spot -- the instrument cannot measure
+; its own cost, which is the same class of error that let SSW silently halve
+; every frame-rate number for thirty runs.
+;
+; ⚠️ Read "our work" in the budget as a RESIDUAL, not a measurement. It absorbs
+; anyone's latency, including the game's whole frame, while looking exactly like
+; our own bug.
+;
+;   0 = off                                                       <- default
+;   1 = time StereoPair and the mesh matchers
+; ---------------------------------------------------------------------------
+TimeOurWork=0
+
+; ---------------------------------------------------------------------------
 ; 🚨 BEFORE TRUSTING ANY PERFORMANCE NUMBER: TURN OFF SSW
 ;
 ; Virtual Desktop's Synchronous Spacewarp (and Meta's ASW) pins the application
