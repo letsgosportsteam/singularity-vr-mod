@@ -24,6 +24,76 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 211: menu double vision and broken controls were one bug — a dead camera
+
+Reported after a quit-to-menu-and-reload: **double vision in the main menu**, making it unusable,
+then **controls and culling wrong** back in the same save. The user explicitly separated the first
+from the long-tabled *menu rotation* bug, and that mattered — rotation and double vision are
+different mechanisms, and treating them as one would have sent this at the rotation repro.
+
+**Diagnosed with no new instrument.** Everything needed was already in `view_matrix.log`:
+
+| | working boot menu | post-gameplay menu |
+|---|---|---|
+| split / mono | `split 332 (332 with parallax), mono-fallback 0` | `split 0, mono-fallback 399` |
+| register slot | `c0 (peak live in a frame 1)` | `c0(stale) (peak live in a frame 0)` |
+
+100% mono fallback means every draw goes out **unsplit across the full side-by-side frame**, so
+each eye sees a different half. That is double vision — and note it presents as *wrong* content,
+not missing content, which is why it did not look like a stereo failure.
+
+The cause was named by a line that was already being logged: `identification: 36 of 120 frames lost
+the matrix entirely; best rejected dotFwd +0.6964 (gate 0.80)`. dotFwd 0.696 is 45.9°, and the
+camera being read reported yaw **+44.5°** while the matrix carried ~0°. Two different cameras.
+
+**Readability is not liveness.** A level transition leaves the previous level's `RvPlayerCamera` in
+`GObjects` with its memory mapped and its class pointer intact, so both tests `FindCamera` applied
+passed on a dead object, and the walk took the first non-archetype match in `GObjects` order. The
+boot menu worked only because a single camera existed then — which is exactly what made this look
+like a regression from the day's other work, and it was not.
+
+Two fixes, both the same root condition:
+
+- `FindCamera` **prefers a live instance, falling back to the first match**, so it can never return
+  less than before; an `IsLive` false negative costs a re-walk, not the camera. Liveness rechecked
+  every 15 frames (~0.125 s) since the condition only arises at a transition.
+- `RefreshCameraPosition` clears `g_inCinematic` when the camera **instance** changes. This was the
+  approved "option 1" for a separate open bug: `SetCinematicMode` is only ever observed with
+  `arg raw 0x00000001`, because the run-95 script hook sees native→script entry points and the
+  cutscene **exit is not one of them**. The flag latched ON and leaked cutscene configuration into
+  gameplay — measured as `view drift -21.5 deg ... cine ON` every frame, the engine refusing the
+  yaw we wrote. A level transition is a signal we can actually see, unlike the exit event.
+
+**Verified, user-confirmed on all three symptoms.** Menu: `split 334 (334 with parallax),
+mono-fallback 0` at 120 fps. Flag: alternates 29 OFF / 11 ON / 51 OFF / 2 ON / 28 OFF instead of
+sticking; the detector logged all 5 transitions and caught the stuck flag twice. Controls: all 21
+`view drift` lines read `cine off`, `engine-vs-asked residual` back to 0.10–1.03° from a 3.5° mean.
+The `identification:` line vanished from the log entirely — it only prints when frames are lost.
+
+**Still open / residue, recorded rather than filtered:**
+- The cutscene **exit event remains invisible**. A cutscene ending without a level change keeps the
+  flag set until the next transition.
+- Three windows still show heavy mono-fallback (549, 1340, 4386) at 38/29/37 fps, all on
+  load/transition moments while the camera is replaced. A long enough transient reads as a flash.
+- The **menu rotation** bug is untouched and still has its own repro.
+
+### Method note
+
+Two of this project's standing lessons paid out here, and one nearly cost the run:
+
+- **The user's symptom distinction was load-bearing.** "This is not the same menu bug as earlier"
+  is what kept this off the rotation repro. Extends the existing note that his *conditions* are as
+  reliable as his commit attributions.
+- **A stale-premise check, not a hard problem.** The instinct was that the day's feature work had
+  regressed stereo. The log said the classifier was innocent — passthrough quad counts were
+  *identical* between the working and broken menus (2,239 vs 2,215) — and the first hypothesis
+  (the fullscreen-quad classifier) died on that one line. Check the control before bisecting.
+- **`Readable` is not a liveness test, anywhere.** This is the second time a cached engine pointer
+  survived readability after the object died. `ENGINE_NOTES.md` now records which objects `IsLive`
+  applies to (camera: yes) and which it must not (HUD: no).
+
+---
+
 ## ⭐ Run 201: world scale, and the gun was anchored to the wrong eye
 
 Asked how world scaling is done and whether it could be adjustable. The answer turned out to be tidy,

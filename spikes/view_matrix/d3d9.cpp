@@ -888,7 +888,7 @@ WORD g_stickUpMask   = XI_Y;         // ini StickUp   - CycleWeapon
 WORD g_stickDownMask = XI_DPAD_UP;   // ini StickDown - Health
 // Run 198's heal window. Defined with the foreground-mesh code, which is what consumes it; the input
 // path only arms it. See the note at g_healArmsMs.
-extern volatile LONG   g_healArmsMs, g_healDelayMs;
+extern volatile LONG   g_healArmsMs, g_healDelayMs, g_healPending;
 extern volatile LONG64 g_healUntilMs, g_healFromMs;
 
 // The NUMPAD4/NUMPAD5 test inputs, laid OVER whatever the controllers just published.
@@ -1019,6 +1019,16 @@ const uintptr_t kGObjectsTArray = 0x01CD4A4C;
 const int OBJ_OUTER = 0x28, OBJ_NAME = 0x2C, OBJ_CLASS = 0x34;
 const int ACTOR_ROTATION = 0x0060;    // pitch, yaw, roll
 const int CTL_ROTATION_2 = 0x05D4;
+
+// ---- ⭐ run 203: a plain read, because `InterlockedCompareExchange(&x, 0, 0)` is a locked WRITE ----
+//
+// Used to read a `volatile LONG` on the hot draw path. On x86 an aligned 32-bit read is already atomic;
+// the interlocked form takes the cache line exclusively and dirties it on every call. Done per draw from
+// the render thread against variables Present also writes, that is two threads fighting over one cache
+// line tens of thousands of times a frame - and it is what collapsed the dock from 120 fps to 11.
+//
+// ⚠️ Reads only. Anything that WRITES, or needs read-modify-write, must stay interlocked.
+inline LONG Rd(const volatile LONG& v) { return v; }
 
 bool Readable(const void* p, size_t n) {
     MEMORY_BASIC_INFORMATION mbi{};
@@ -1297,16 +1307,47 @@ uintptr_t FindController() {
     return 0;
 }
 
+// Defined below, with the object-graph helpers. Forward-declared because the camera search is the
+// first thing that needs it.
+static bool IsLive(uintptr_t obj);
+
+// ---- ⭐ run 211: readability is not liveness, and the FIRST match is not the LIVE one ----
+//
+// A level transition leaves the previous level's RvPlayerCamera in GObjects with its memory still
+// mapped and its class pointer intact. Both tests this function used to apply - Readable plus a
+// class compare - pass on that dead object, and the walk below took the first non-archetype match
+// in GObjects order, so after a transition the STALE camera could win and then be revalidated
+// forever.
+//
+// What that cost, measured in view_matrix.log: the post-transition main menu reported
+// `identification: 36 of 120 frames lost the matrix entirely; best rejected dotFwd +0.6964
+// (gate 0.80)`. dotFwd 0.696 is 45.9 degrees, and the camera being read reported yaw +44.5 while
+// the matrix carried ~0 - two different cameras. Every rejection invalidates the register slot, so
+// the menu ran at `split 0, mono-fallback 399`: every draw unsplit across the full side-by-side
+// frame, which is one image with each eye seeing a different half. That is the reported double
+// vision. The boot menu was fine only because just one camera existed at that point.
+//
+// Both loops now PREFER a live instance and fall back to the first match, so this can never return
+// less than it did before - a false negative from IsLive costs a periodic re-walk, not the camera.
+// The liveness recheck is throttled: the condition only arises at a transition, so 15 frames is
+// 0.125 s of detection latency against a bounded handful of VirtualQuery calls.
 uintptr_t FindCamera() {
+    uintptr_t fallback = 0;
     if (g_camera && g_camClass && Readable((void*)g_camera, 0x700) &&
-        *reinterpret_cast<uintptr_t*>(g_camera + OBJ_CLASS) == g_camClass) return g_camera;
+        *reinterpret_cast<uintptr_t*>(g_camera + OBJ_CLASS) == g_camClass) {
+        static int liveTick = 0;
+        if ((++liveTick % 15) != 0 || IsLive(g_camera)) return g_camera;
+        // Readable and the right class, just not provably live. Re-walk to look for a better
+        // instance, but hold this one as the fallback so a false negative cannot blind us.
+        fallback = g_camera;
+    }
     g_camera = 0;
     static ULONGLONG s_gate = 0;
-    if (!ScanAllowed(s_gate)) return 0;
-    if (!Readable((void*)kGObjectsTArray, 12)) return 0;
+    if (!ScanAllowed(s_gate)) return (g_camera = fallback);
+    if (!Readable((void*)kGObjectsTArray, 12)) return (g_camera = fallback);
     uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
     int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
-    if (!data || count < 100) return 0;
+    if (!data || count < 100) return (g_camera = fallback);
     auto* objs = reinterpret_cast<uintptr_t*>(data);
     char nm[128], on[128];
     if (!g_camClass) {
@@ -1320,18 +1361,25 @@ uintptr_t FindCamera() {
                 g_camClass = o; break;
             }
         }
-        if (!g_camClass) return 0;
+        if (!g_camClass) return (g_camera = fallback);
     }
+    // Prefer a LIVE instance. The class compare runs first, so IsLive is only ever called on the
+    // handful of real RvPlayerCamera objects - not on the 112,000-entry list.
+    uintptr_t first = 0;
     for (int i = 0; i < count; ++i) {
         if (!Readable((void*)(data + i*4), 4)) continue;
         uintptr_t o = objs[i];
         if (!o || !Readable((void*)o, 0x700)) continue;
         if (*reinterpret_cast<uintptr_t*>(o + OBJ_CLASS) != g_camClass) continue;
         if (!NameOf(o, nm, sizeof(nm)) || strncmp(nm, "Default__", 9) == 0) continue;
+        if (!first) first = o;
+        if (!IsLive(o)) continue;
         g_camera = o;
         return o;
     }
-    return 0;
+    // No live one. Previous behaviour was the first match, so keep that rather than going blind.
+    g_camera = first ? first : fallback;
+    return g_camera;
 }
 
 // ============ ⭐ run 182 stage 1: what OWNS the first-person weapon's transform? ==============
@@ -1409,6 +1457,9 @@ static bool IsLive(uintptr_t obj) {
 // is the "a weapon really exists" gate the suppression uses - and the gate that keeps every GObjects
 // walk out of the splash screens.
 extern volatile LONG g_gunVerts;
+// Defined with the camera-position probe. Non-zero means there is a live player camera, i.e. GAMEPLAY -
+// which is the gate that keeps the offset resolver's object walks out of the menus (run 210).
+extern volatile LONG g_camPosValid;
 // Defined with the aim-method code. The suppression's AUTO mode follows it, exactly as the crosshair's
 // does - one question, one signal.
 extern volatile LONG g_aimMethod;
@@ -1441,7 +1492,8 @@ bool VrModeOn();
 // property list report `Location` at 0x54. A search with a known answer is not a guess, and it fails
 // closed - if nothing reproduces 0x54, nothing is reported and no offset is trusted.
 int g_upChildren = 0, g_upNext = 0, g_upOffset = 0;   // 0 = not solved
-volatile LONG g_propSolveDone = 0;
+// Run 208: g_upChildren being non-zero IS the "solved" flag now. The old separate one-shot marked itself
+// done before trying, which made a single early failure permanent - see SolvePropertyLayout.
 // ---- the layout, MEASURED in run 186 on this build. Tried first; the search is the fallback ----
 //
 // Verified then by reproducing Actor.Location=+0x054 and Actor.Rotation=+0x060, and corroborated by a
@@ -1591,6 +1643,8 @@ uintptr_t g_weaponFxClass = 0;
 int g_offHealth = -1, g_offHealthMax = -1;
 uintptr_t g_playerPawn = 0, g_playerPawnClass = 0;
 void ResolveGameplayOffsets();          // retryable; see its definition below SolvePropertyLayout
+// Consecutive failed resolve attempts, for the backoff. Cleared the moment everything resolves.
+int g_offMisses = 0;
 
 // ---- ⭐ run 201: eye height, READ ONLY - is the game's number unusual, or perfectly ordinary? ----
 //
@@ -1644,8 +1698,35 @@ static uintptr_t FindPlayerPawn() {
 
 // Printed on a slow tick and only when something CHANGES, so it costs nothing while standing still and
 // shows the crouch transition when it happens.
+// ---- 💥 run 202: this logged EVERY FRAME and cost 120 fps -> 11 fps ----
+//
+// Reported: "I loaded a save and framerate went to shit." The frame budget put 90 ms of 90.87 in
+// "our work", and the log showed 41 of these reports inside a 400-line window.
+//
+// Three mistakes stacked:
+//
+//   1. **It was placed in a PER-FRAME block, not the slow tick.** The comment three lines above the call
+//      site says "Two interlocked reads A FRAME until it takes" - I read that block as once-per-second
+//      because `ApplyMuzzleFxSuppression` sits in it and I had described that as a slow tick too. Both
+//      descriptions were wrong.
+//   2. **The change threshold was BELOW the natural oscillation.** 0.5 UU against head bob of +-2 UU, so
+//      "only when it changes" was true almost every frame. A change gate is only a rate limit if the
+//      value is actually stable.
+//   3. **Log() is fopen/fwrite/fclose**, and this printed TWO lines per fire. That is run 24/25's
+//      startup hang, which this file warns about above the draw hooks, reproduced in Present instead.
+//
+// Fixed three ways, because any one of them alone would have left the trap armed: OFF by default now that
+// the measurement is recorded in ENGINE_NOTES, a hard 2-second rate limit independent of the values, and
+// the explanatory second line printed once per session rather than per fire.
+int g_eyeHeightLog = 0;                 // ini [Render] EyeHeightLog
+
 void ReportEyeHeight() {
+    if (!g_eyeHeightLog) return;
     if (g_offBaseEyeHeight < 0 || g_offEyeHeight < 0) return;
+    // Time-based and FIRST, so nothing below it can run per frame regardless of the values.
+    static ULONGLONG lastMs = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+    if (lastMs && nowMs - lastMs < 2000) return;
     const uintptr_t p = FindPlayerPawn();
     if (!p) return;
     if (!Readable((void*)(p + g_offBaseEyeHeight), 4) || !Readable((void*)(p + g_offEyeHeight), 4)) return;
@@ -1653,9 +1734,12 @@ void ReportEyeHeight() {
     const float eyeUU  = *reinterpret_cast<const float*>(p + g_offEyeHeight);
     if (!(baseUU == baseUU) || !(eyeUU == eyeUU)) return;              // NaN - run 185's lesson
 
-    static float lastBase = -1e9f, lastEye = -1e9f;
-    if (fabsf(baseUU - lastBase) < 0.5f && fabsf(eyeUU - lastEye) < 0.5f) return;
-    lastBase = baseUU; lastEye = eyeUU;
+    // Keyed on BaseEyeHeight, the STABLE value. EyeHeight oscillating with bob and crouch is not news -
+    // watching it was what made "only when it changes" fire continuously.
+    static float lastBase = -1e9f;
+    if (fabsf(baseUU - lastBase) < 0.5f) return;
+    lastBase = baseUU;
+    lastMs = nowMs;
 
     // Our own vertical offset, in the SAME units, because it is the likelier cause of a height that feels
     // wrong and the two are indistinguishable from inside the headset. g_hmdOffset is already in UU and
@@ -1666,11 +1750,17 @@ void ReportEyeHeight() {
         baseUU, baseUU * 1.905f, eyeUU, eyeUU * 1.905f,
         g_hmdOffset[2], g_hmdOffset[2] * 1.905f,
         InterlockedCompareExchange(&g_worldScalePct, 0, 0), m2u);
-    Log("    Reading this: EyeHeight interpolating toward BaseEyeHeight is the crouch mechanism, so a gap"
-        " between them mid-crouch is correct. If BaseEyeHeight looks ordinary (a standing human is roughly"
-        " 90 UU / 170 cm) and the view still feels wrong, the RECENTRE is the suspect - our offset above is"
-        " measured from wherever your head was when F8 was last pressed, and it is added to the engine's"
-        " number rather than replacing it.");
+    // Once per session. Explanatory text does not need repeating, and repeating it is what doubled the
+    // per-frame I/O cost.
+    static bool explained = false;
+    if (!explained) {
+        explained = true;
+        Log("    Reading this: EyeHeight interpolating toward BaseEyeHeight is the crouch mechanism, so a"
+            " gap between them mid-crouch is correct. BaseEyeHeight is measured from the actor's Location"
+            " - the CENTRE of the collision cylinder, NOT the floor - so do not convert it straight to a"
+            " human height. If the view feels wrong, the RECENTRE is the suspect: our offset above is"
+            " measured from wherever your head was when it was last taken.");
+    }
 }
 
 // ---- ⭐ run 200: "do I have a health pack" - the second half of the heal gate ----
@@ -1786,11 +1876,38 @@ bool HealWouldDoSomething(bool* unknown) {
     return true;
 }
 
+// ---- 💥 run 208: this was one-shot ON ENTRY, and it deadlocked the mesh latch ----
+//
+// `if (InterlockedExchange(&g_propSolveDone, 1)) return;` marked the solve done BEFORE attempting it, so a
+// single failed attempt was permanent. Combined with the run-207 latch gate that produced a circular
+// dependency and the latch never took at all:
+//
+//   the latch will not take          until WeaponActorExists() says a weapon exists
+//   WeaponActorExists needs          g_upChildren / g_upNext, from the property layout
+//   the property layout was solved   only at the latch TAKE
+//
+// Reported as "it played similarly to head mode" - which is exactly what an untaken latch looks like: the
+// gun stays at the engine's position because FgMoved never matches.
+//
+// Fixed two ways, because either alone leaves a trap: the flag is now latched only on SUCCESS, and the
+// solve is called from the slow tick as well as the latch, so it no longer depends on the thing that
+// depends on it. Retries are throttled - an unsolved layout is polled every tick and FindClassByName walks
+// GObjects with a NameOf per object, which is the run-35 shape this file has already paid for three times.
 void SolvePropertyLayout() {
-    if (InterlockedExchange(&g_propSolveDone, 1)) return;
+    if (g_upChildren) return;                       // already solved - the only true early exit
+    {
+        static ULONGLONG lastTry = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (lastTry && nowMs - lastTry < 2000) return;
+        lastTry = nowMs;
+    }
     ResolveWantedNames();
     const uintptr_t actor = FindClassByName("Actor");
-    if (!actor) { Log("property layout: could not find the Actor class - not solved"); return; }
+    if (!actor) {
+        static bool said = false;
+        if (!said) { said = true; Log("property layout: no Actor class yet - retrying every 2 s"); }
+        return;
+    }
     const int32_t iLoc = WantedIdx("Location"), iRot = WantedIdx("Rotation");
 
     // Validate the known layout first. Two proven numbers, both required - `Rotation` following
@@ -1835,9 +1952,37 @@ void SolvePropertyLayout() {
 // not**, and a one-shot resolve would have left the health-pack offset at -1 for the whole session with
 // nothing to say why. That is the run-158d shape - a resolve that appears to succeed while silently
 // giving up - so this is called again from the slow tick until it has what it needs, then costs nothing.
+// ---- 💥 run 210: this tanked the MENU, and it is the FOURTH instance of the same mistake ----
+//
+// Measured: 11-12 fps at the splash and main menu, recovering the instant `Pawn.Health` resolved. This
+// runs every frame until it has all three offsets, and at the menu there IS no player pawn - so
+// `FindPlayerPawn()` never succeeded and walked GObjects with a `NameOf` per object (~72,000 VirtualQuery
+// syscalls) every 30 frames, for ever.
+//
+// Run 206 (the muzzle gather), run 183 (the mesh scan), run 209 (the weapon-actor check) and now this: the
+// same shape four times. **A retry loop over the object graph, running from a frame path, with no notion of
+// whether the thing it wants can exist yet.** A 1-in-30 frame throttle does not fix that - it just turns a
+// constant cost into a periodic one, which is what was audible as a stutter last build.
+//
+// Two gates, and both are needed:
+//   g_camPosValid   there is a live player camera, i.e. this is GAMEPLAY. At a menu the answer to "where
+//                   is the pawn" is "nowhere", and the cheapest way to not pay for a question is to not
+//                   ask it.
+//   time + backoff  even in gameplay a miss must not repeat per frame. 2 s, dropping to 15 s after three
+//                   empty attempts, re-armed by anything that changes the situation.
 void ResolveGameplayOffsets() {
     if (!g_upChildren) return;                       // layout not solved - nothing can be looked up
     if (g_offHealth >= 0 && g_offHealthMax >= 0 && g_offHealthPacks >= 0) return;   // done
+    // ⭐ Not in gameplay: the pawn and HUD cannot exist, so asking costs a full object walk for nothing.
+    if (!InterlockedCompareExchange(&g_camPosValid, 0, 0)) return;
+    {
+        static ULONGLONG lastTry = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        const ULONGLONG waitMs = (g_offMisses >= 3) ? 15000 : 2000;
+        if (lastTry && nowMs - lastTry < waitMs) return;
+        lastTry = nowMs;
+        ++g_offMisses;              // cleared at the bottom of this function once everything resolves
+    }
 
     // Run 199: Health and HealthMax live on Engine.Pawn, several classes above RvPlayerPawnSP, which is
     // exactly what PropOffsetInChain's super-chain walk is for.
@@ -1899,8 +2044,13 @@ void ResolveGameplayOffsets() {
             // Once, not every tick - the retry itself is silent, and a permanent failure shows up as the
             // heal window logging "could NOT be read" when it opens.
             static bool said = false;
-            if (!said) { said = true; Log("    no HUD object yet - retrying on the slow tick"); }
+            if (!said) { said = true; Log("    no HUD object yet - retrying, backing off after 3 tries"); }
         }
+    }
+    // Everything found: stop retrying, and clear the backoff so a later level load starts fresh.
+    if (g_offHealth >= 0 && g_offHealthMax >= 0 && g_offHealthPacks >= 0) {
+        g_offMisses = 0;
+        Log("    gameplay offsets all resolved - no further object-graph walks from this path.");
     }
     Log("    RvWeaponFX 0x%08X: mMuzzleFlash1stPerson +0x%03X, mLoopingMuzzleFlash1stPerson +0x%03X,"
         " mMuzzleFlashIronsights +0x%03X, mLoopingMuzzleFlashIronsights +0x%03X,"
@@ -1976,8 +2126,44 @@ void ApplyMuzzleFxSuppression() {
         if (!Readable((void*)g_fx[i].obj, 0x40) ||
             *reinterpret_cast<uintptr_t*>(g_fx[i].obj + OBJ_CLASS) != g_weaponFxClass) stale = true;
 
+    // ---- 💥 run 206: THIS was the dock collapse. A failed walk, repeating every frame ----
+    //
+    // The gather only stopped once it FOUND a live RvWeaponFX. At the dock the player has no weapon, so
+    // there is none to find: `g_fxN` stayed 0, `stale` stayed true, and this ran a **full GObjects walk
+    // every frame** - `Readable()` is a VirtualQuery SYSCALL, called on ~36,000 objects. At 1-2 us each
+    // that is 36-72 ms per frame, which is the 80-90 ms that was sitting in "our work".
+    //
+    // It explains every observation that six earlier theories could not:
+    //
+    //   MOTION CONTROLLER slow   the mesh latch is taken, so g_gunVerts != 0 and the walk runs
+    //   HEAD fast                ApplyAimMethod CLEARS the latch when leaving MC, so the walk returns
+    //                            immediately at the g_gunVerts check
+    //   AimModeParts=2 at        hideMeshIdx was never 3, so UpdateFgLatch never took the latch, so
+    //   STARTUP was fast         g_gunVerts stayed 0 - which is why toggling AIM PARTS at runtime did
+    //                            NOT reproduce it: by then the latch was already taken and nothing
+    //                            clears it while the aim METHOD is still MOTION CONTROLLER
+    //   only in some areas       an area WITH a weapon finds one, caches it, and stops walking
+    //
+    // **This is run 35's lesson for the third time in this file**: a scan that fails is not free, and a
+    // failed scan that repeats every frame is unbounded work. FindWeaponMesh and FindPlayerPawn both got
+    // a miss throttle for exactly this reason; I wrote this gather in run 189 without one, and the guard
+    // I did write - "return if no weapon" - protects the case where the LATCH is empty, not the case
+    // where the latch is set and the object genuinely does not exist.
+    //
+    // Fixed with a time-based retry plus backoff: a miss costs one walk every 2 s, and after three
+    // consecutive empty results it drops to one every 15 s. A weapon appearing re-arms it immediately,
+    // because g_gunVerts changing is the signal that the object graph has a new weapon in it.
     if (stale) {
-        if (!InterlockedCompareExchange(&g_gunVerts, 0, 0)) return;   // no weapon on screen yet
+        if (!Rd(g_gunVerts)) return;                       // no weapon on screen yet
+        static ULONGLONG lastScanMs = 0;
+        static int       emptyScans = 0;
+        static LONG      lastGunVerts = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        const LONG gv = Rd(g_gunVerts);
+        if (gv != lastGunVerts) { lastGunVerts = gv; emptyScans = 0; lastScanMs = 0; }
+        const ULONGLONG waitMs = (emptyScans >= 3) ? 15000 : 2000;
+        if (lastScanMs && nowMs - lastScanMs < waitMs) return;
+        lastScanMs = nowMs;
         g_fxN = 0;
         InterlockedExchange(&g_fxApplied, 0);
         if (!Readable((void*)kGObjectsTArray, 12)) return;
@@ -2005,8 +2191,18 @@ void ApplyMuzzleFxSuppression() {
             g_fx[g_fxN].have = true;
             ++g_fxN;
         }
-        if (g_fxN) Log("muzzle fx: %d live RvWeaponFX object(s) found, originals saved", g_fxN);
-        else return;
+        if (g_fxN) {
+            emptyScans = 0;
+            Log("muzzle fx: %d live RvWeaponFX object(s) found, originals saved", g_fxN);
+        } else {
+            // Said once per backoff step, not per scan - and it MUST be said, because "found nothing"
+            // repeating silently is exactly what made this cost 110 fps.
+            if (++emptyScans <= 3)
+                Log("muzzle fx: no live RvWeaponFX found (attempt %d) - the player has no weapon here."
+                    " Retrying in %d s%s", emptyScans, emptyScans >= 3 ? 15 : 2,
+                    emptyScans >= 3 ? " (backed off; a weapon appearing re-arms it immediately)" : "");
+            return;
+        }
     }
 
     if ((LONG)want == InterlockedCompareExchange(&g_fxApplied, 0, 0)) return;   // nothing to change
@@ -3136,6 +3332,34 @@ int    g_copyFrames = 0;
 double g_msWaitFrame = 0.0;
 // xrBeginFrame + xrEndFrame, the frame submission. Broken out of "our work" in run 56 because it is
 // the only part of this mod that talks to the wireless link, and the unmodded game runs clean.
+// ================= ⭐ run 204: stop guessing. Measure OUR share of the frame ====================
+//
+// Six attributions for the dock collapse have been wrong: the area, my own eye-height logging, the mesh
+// features, occlusion culling, locked reads, and the LineCheck hook. Every one came from reading code and
+// reasoning about plausible cost. The frame budget says `our work 91 ms`, but **"our work" is a residual**
+// - it is frame time minus the phases that ARE measured, so it contains the game's entire frame as well
+// as ours. STATUS says exactly this at the top of the file and I kept treating it as our number.
+//
+// So: time the mod's own per-draw work directly. Two accumulators, both reset per frame:
+//
+//   g_msStereoPair   everything inside StereoPair - the duplication, the matrix maths, the extra
+//                    SetVertexShaderConstantF uploads, the scissor changes.
+//   g_msMeshMatch    the mesh matchers in the draw hooks BEFORE StereoPair - FgHidden, FgMoved,
+//                    FgRidesGun, FgLearnSignature.
+//
+// If those two come to a couple of milliseconds while the frame takes 91, the mod's per-draw code is
+// exonerated and the cost is the GAME's, driven by something we do to it - and the next question is what,
+// not where. If either is tens of milliseconds, it names the culprit outright.
+//
+// ⚠️ QPC per draw is itself a cost (~20-30 ns). At 2900 draws that is under 0.2 ms, acceptable for a
+// diagnostic, and it is behind an ini key so it is not paid in normal play.
+int    g_timeOurWork = 0;              // ini [Render] TimeOurWork
+// Run 205: which halves of MOTION CONTROLLER are enabled. bit0 = mesh work, bit1 = aim mode 11.
+// 3 is normal; 2 and 1 isolate the halves. See the note in ApplyAimMethod.
+volatile LONG g_aimModeParts = 3;      // ini [Input] AimModeParts
+double g_msStereoPair = 0.0, g_msMeshMatch = 0.0;
+double g_msStereoPairPeak = 0.0, g_msMeshMatchPeak = 0.0;
+
 double g_msXrSubmit = 0.0;
 int    g_xrSubmitFrames = 0;
 double g_msXrSubmitPeak = 0.0;
@@ -4804,6 +5028,7 @@ inline SHORT DebugKey(int vk) {
 enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
        PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
        PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND, PR_WEAPONFX, PR_MUZZLEFX, PR_WORLDSCALE,
+       PR_AIMPARTS,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -4833,10 +5058,15 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // setting judged by looking has to be adjustable while you are looking. A relaunch per guess is what
     // this project's own notes call out - "a sign is not worth a headset session each".
     { PR_CROSSHAIR, PR_MUZZLEFX, PR_WORLDSCALE, PR_BACK },
-    { PR_OCCLUSION, PR_WEAPONFX, PR_DEBUG, PR_BACK },
+    // ⭐ run 205: AIM PARTS is on the panel, not just the ini, because the ONLY sound way to compare
+    // these is to toggle them IN PLACE - same spot, same view direction, seconds apart. Draw count in a
+    // headset is dominated by where you are LOOKING, so two runs "in the same place" can differ by 3x
+    // (1,400 vs 3,800 draws was measured) and a cross-run comparison is worthless. That mistake cost a
+    // test run and it was mine.
+    { PR_OCCLUSION, PR_WEAPONFX, PR_AIMPARTS, PR_DEBUG, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 6, 8, 3, 4, 4 };
+const int kPageCount[kPanelPages] = { 6, 8, 3, 4, 5 };
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -4959,6 +5189,10 @@ void PanelSaveRow(int rowId, const char* path) {
         case PR_OCCLUSION:
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_occlusionMode);
             WritePrivateProfileStringA("Render", "OcclusionQueryMode", v, path); return;
+        case PR_AIMPARTS:
+            // ⚠️ Always saved as 3. It is a diagnostic split, and a half-disabled aim method that
+            // survives a relaunch is tomorrow's bug report - the same trap WEAPON FX mode 2 sprang.
+            WritePrivateProfileStringA("Input", "AimModeParts", "3", path); return;
         case PR_MUZZLEFX:
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
                         InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0));
@@ -5094,6 +5328,13 @@ void PanelRowText(int row, char* out, size_t cap) {
                                       p > 100 ? "BIGGER" : "SMALLER");
             break;
         }
+        case PR_AIMPARTS: {
+            const LONG p = InterlockedCompareExchange(&g_aimModeParts, 0, 0);
+            _snprintf_s(out, cap, _TRUNCATE, "AIM PARTS      %s",
+                        p == 3 ? "BOTH (NORMAL)" : p == 2 ? "AIM ONLY (TEST)"
+                      : p == 1 ? "MESH ONLY (TEST)" : "NEITHER (TEST)");
+            break;
+        }
         case PR_OCCLUSION:
             // Worded as what it DOES, not as the mode number. "ENGINE CULL" is the engine's own
             // occlusion culling left alone (mode 2); "DRAW ALL" stops the engine hiding geometry
@@ -5205,6 +5446,17 @@ void PanelAdjust(int row, int dir) {
             if (h < 0) h = 0;
             if (h > 2) h = 2;
             InterlockedExchange(&g_hideCrosshair, h);
+            break;
+        }
+        case PR_AIMPARTS: {
+            // Wraps deliberately - this is a diagnostic you cycle, and BOTH is one press from anywhere.
+            LONG p = InterlockedCompareExchange(&g_aimModeParts, 0, 0) + dir;
+            if (p < 0) p = 3;
+            if (p > 3) p = 0;
+            InterlockedExchange(&g_aimModeParts, p);
+            ApplyAimMethod(false);            // takes effect immediately - the whole point of the row
+            Log("AIM PARTS -> %ld (mesh %s, aim mode 11 %s)", p,
+                (p & 1) ? "ON" : "off", (p & 2) ? "ON" : "off");
             break;
         }
         case PR_OCCLUSION:
@@ -6184,6 +6436,7 @@ void SyncXRInput(XrTime displayTime) {
                 const LONG end = InterlockedCompareExchange(&g_healArmsMs, 0, 0);
                 InterlockedExchange64(&g_healFromMs,  now + dly);
                 InterlockedExchange64(&g_healUntilMs, now + (end > dly ? end : dly + 1));
+                InterlockedExchange(&g_healPending, 1);   // arm the cheap gate LAST, after the deadlines
                 Log("heal window: arms shown from +%ld ms to +%ld ms after the press%s", dly, end,
                     unknown ? " (health could NOT be read - opening on the button alone)" : "");
             }
@@ -7108,10 +7361,20 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 // rotating the POSITIONAL offset. That is the actual defect, and no toggle here can
                 // substitute for it.
                 //
-                // ⚠️ The gate below is `g_inCinematic`, and that flag is KNOWN BAD - menus report
-                // CINE YES. Everything hanging off it leaks out of cutscenes, including the two
-                // cutscene comfort settings, which the user observed affecting normal gameplay.
-                // Fix `g_inCinematic` and several reported symptoms go with it.
+                // The gate below is `g_inCinematic`. It used to latch ON permanently: SetCinematicMode
+                // is only ever OBSERVED with arg raw 1, because the script hook sees native->script
+                // entry points and the cutscene EXIT is not one of them. Everything hanging off the
+                // flag then leaked out of cutscenes, which is why the two cutscene comfort settings
+                // were seen affecting normal gameplay.
+                //
+                // Run 211 fixed that from the other end - RefreshCameraPosition clears the flag when
+                // the camera INSTANCE changes, which is an unambiguous level transition and needs no
+                // exit event. Measured: the flag now alternates (29 OFF / 11 ON / 51 OFF / 2 ON /
+                // 28 OFF across one run) instead of sticking, and the drift lines all read `cine off`
+                // with the engine-vs-asked residual back to 0.1-1.0 deg from 21.5.
+                //
+                // ⚠️ Still not a true fix: a cutscene that ENDS without a level change will keep the
+                // flag set until the next transition. The exit event remains invisible.
                 const bool inCine = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0;
                 if (inCine || gameOwnsCam) {
                     if (!g_haveCineAnchor) { g_cineAnchorYaw = camYaw; g_haveCineAnchor = true; }
@@ -7968,8 +8231,24 @@ void ReportRenderTargets() {
 // discards pixels WITHOUT altering the NDC->pixel transform, so it costs nothing in shader
 // correctness - it just stops draws we could not remap (their transform comes from a register we
 // do not track) from spilling across the seam into the other eye.
+// Run 204: the timed wrapper. Split out so the body is untouched and the timing cannot change control
+// flow - a diagnostic that alters what it measures is the trap this file keeps recording.
+template <typename DrawFn>
+HRESULT StereoPairBody(IDirect3DDevice9* dev, DrawFn&& draw);
+
 template <typename DrawFn>
 HRESULT StereoPair(IDirect3DDevice9* dev, DrawFn&& draw) {
+    if (!g_timeOurWork) return StereoPairBody(dev, draw);
+    const LARGE_INTEGER t0 = Now();
+    const HRESULT hr = StereoPairBody(dev, draw);
+    const double d = MsSince(t0);
+    g_msStereoPair += d;
+    if (d > g_msStereoPairPeak) g_msStereoPairPeak = d;
+    return hr;
+}
+
+template <typename DrawFn>
+HRESULT StereoPairBody(IDirect3DDevice9* dev, DrawFn&& draw) {
     ++g_drawsTotal;
     if (g_rtCurrent >= 0 && g_rtCurrent < 16) ++g_rtSeen[g_rtCurrent].draws;
     if (!InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
@@ -8894,8 +9173,7 @@ volatile LONG g_fgRideBailCount = 0;
 // frame's list, the latch would go with it, and the test would be measuring its own side effect -
 // which is exactly the run-120 regression, arrived at from a different direction.
 static bool FgHideWholePass() {
-    return InterlockedCompareExchange(&g_fgRideAll, 0, 0) == 2 &&
-           InterlockedCompareExchange(&g_inForeground, 0, 0) != 0;
+    return Rd(g_fgRideAll) == 2 && Rd(g_inForeground) != 0;
 }
 
 // Which vertex counts actually rode. 2-4 draws rode and nobody knows what they were; a count is a
@@ -8933,6 +9211,37 @@ static void RodeLearn(UINT verts) {
 // Rebuilt every frame from the current foreground pass, so the list is what is actually on screen
 // now. Eight slots rather than four, because truncation is what caused this and a table that
 // silently drops the entry you need is the same defect as a filter that encodes its answer.
+// ================= ⭐ run 203: the dock collapse. Locked reads on a hot path =====================
+//
+// Reported: 120 fps in HEAD aiming, 11 fps in MOTION CONTROLLER, in the same spot, switching back and
+// forth reproducibly. That mode difference is `g_hideMeshIdx` - 0 versus 3 - and it decides whether the
+// per-draw mesh matchers do any work.
+//
+// The multiplier is the foreground boundary being wrong here: **`weapon fx: STOPPED RIDING again -
+// 11172 draw(s) bailed`**. Run 115's "a depth-only Clear late in the frame opens the first-person pass"
+// mis-fires at the dock (a shadow or reflection pass clears depth mid-frame), so `g_inForeground` is true
+// for THOUSANDS of draws instead of six. Every one of them then runs FgLearnSignature, FgHidden and
+// FgRidesGun.
+//
+// ---- and those are built out of LOCKED reads ----
+//
+// `InterlockedCompareExchange(&x, 0, 0)` reads x - but it is a locked read-modify-WRITE. It takes the
+// cache line exclusively and dirties it, every call. Done tens of thousands of times per frame from the
+// render thread, against variables Present also touches, it serialises the two threads on those lines.
+// That is why the cost is wildly non-linear: 1.8x the draws for 24x the frame time.
+//
+// **On x86 an aligned 32-bit volatile read is already atomic.** Nothing here needs the write. `Rd()` is
+// that read (defined up beside Readable, since the draw hooks need it earlier than this), and it is what
+// the hot matchers use now.
+//
+// ⚠️ Kept interlocked wherever the value is WRITTEN or read-modify-written - Rd is for reads only.
+//
+// The frame-level sanity bound. FgRidesGun already had this idea (kFgRideMax) and it was right; the rest
+// of the mesh path did not, so a mis-fired boundary still cost thousands of draws' worth of matcher work.
+// Six draws is the measured size of the real first-person pass, so 64 is generous by an order of
+// magnitude - past it, the identification is wrong and there is nothing worth matching against.
+const LONG kFgSanePass = 64;
+
 const int kFgSigMax = 8;
 volatile LONG g_fgSigVerts[kFgSigMax] = {};
 volatile LONG g_fgSigCount = 0;
@@ -9000,13 +9309,13 @@ int g_hideExtraArms = 1;              // ini [Render] HideExtraArms
 // The baseline mesh that is neither gun nor arms - the leftover hand/arm fragment.
 static bool FgIsExtraArm(UINT verts) {
     if (!g_hideExtraArms || !verts) return false;
-    const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
-    const LONG a = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+    const LONG g = Rd(g_gunVerts);
+    const LONG a = Rd(g_armsVerts);
     if (!g || !a) return false;                    // not latched: no roles are known yet
     if ((UINT)g == verts || (UINT)a == verts) return false;
-    const LONG n = InterlockedCompareExchange(&g_fgBaseCount, 0, 0);
+    const LONG n = Rd(g_fgBaseCount);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
-        if ((UINT)InterlockedCompareExchange(&g_fgBaseVerts[i], 0, 0) == verts) return true;
+        if ((UINT)Rd(g_fgBaseVerts[i]) == verts) return true;
     return false;
 }
 
@@ -9029,19 +9338,28 @@ static bool FgIsExtraArm(UINT verts) {
 volatile LONG g_healArmsMs = 2150;    // ini [Render] HealArmsMs      - end, from the press
 volatile LONG g_healDelayMs = 100;    // ini [Render] HealArmsDelayMs - start, from the press
 volatile LONG64 g_healUntilMs = 0, g_healFromMs = 0;
+// The cheap 32-bit gate for the hot path - see HealWindowActive.
+volatile LONG g_healPending = 0;
 
+// ⚠️ run 203: the 32-bit flag exists so the HOT path never touches the 64-bit deadlines. On a 32-bit
+// build `InterlockedCompareExchange64` compiles to `lock cmpxchg8b` - a locked read-modify-WRITE that
+// dirties the cache line on every call. This was being called per draw from the render thread while
+// Present wrote the same variables, which is a two-thread fight over one cache line, tens of thousands
+// of times a frame. The flag is a plain aligned 32-bit read: free, and atomic on x86.
 inline bool HealWindowActive() {
+    if (!Rd(g_healPending)) return false;          // the common case, and it costs nothing
     const LONG64 until = InterlockedCompareExchange64(&g_healUntilMs, 0, 0);
     if (!until) return false;
     const LONG64 now = (LONG64)GetTickCount64();
-    return now >= InterlockedCompareExchange64(&g_healFromMs, 0, 0) && now < until;
+    if (now >= until) { InterlockedExchange(&g_healPending, 0); return false; }   // expired: latch off
+    return now >= InterlockedCompareExchange64(&g_healFromMs, 0, 0);
 }
 
 // Was this mesh on screen when the latch was taken?
 static bool FgIsBaseline(UINT verts) {
-    const LONG n = InterlockedCompareExchange(&g_fgBaseCount, 0, 0);
+    const LONG n = Rd(g_fgBaseCount);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
-        if ((UINT)InterlockedCompareExchange(&g_fgBaseVerts[i], 0, 0) == verts) return true;
+        if ((UINT)Rd(g_fgBaseVerts[i]) == verts) return true;
     return false;
 }
 
@@ -9055,6 +9373,55 @@ static bool FgIsBaseline(UINT verts) {
 //
 // Returns false while the foreground pass has not been seen yet, which is the normal state at
 // startup and through the menus - so callers retry rather than treating it as a failure.
+// ================= ⭐ run 207: do not latch unless a WEAPON ACTUALLY EXISTS ====================
+//
+// The dock produced `mesh latch: gun=3314 verts, arms=390 verts, baseline set of 2`. 3314 is the ARMS and
+// 390 the hand fragment: with no weapon in hand the pass holds only two meshes, and the latch takes the
+// top two of whatever is there without ever asking whether a weapon exists. So the roles shift by one and
+//
+//   * `FgMoved` moves the player's ARMS onto the controller, and
+//   * the baseline set describes a weaponless pass, so when a gun IS picked up its mesh (5799) is not in
+//     it and `HideStrayArms` HIDES THE NEW GUN.
+//
+// And it could not recover: the drop rule is "the latched gun has not been drawn for kLatchMiss frames",
+// but the arms are ALWAYS drawn, so `FgMatchesSignature(gun)` kept succeeding forever.
+//
+// ---- why this and not "re-latch when the mesh list grows" ----
+//
+// That was the first fix I wrote, and it is wrong: **a reload also grows the list** - that is the entire
+// premise of HideStrayArms - and a reload lasts far longer than kLatchSteady, so it would drop the latch
+// mid-reload and re-assign the roles from reload geometry. It would trade a rare bug for one on every
+// reload. Prevent the bad latch instead of trying to recover from it.
+//
+// ⚠️ Also deliberately NOT "require 3 meshes": three is what one pistol happened to draw, and hardcoding a
+// count measured from a single sample is how run 118's table came to point at things that were not the gun.
+//
+// ---- 🛑 run 209: the weapon-actor WALK is removed. Two regressions, and a walk was the wrong tool ----
+//
+// It was gated on a live actor deriving from RvWeaponShared, found by walking GObjects. That cost:
+//
+//   * a **~2 s stutter** (120 / 84 / 120 / 84 fps, and audible on the splash screen). The unlatched state
+//     is polled every frame, so a "throttled" 2 s walk is a periodic hitch forever wherever there is no
+//     weapon - which is the exact case it existed to detect.
+//   * and it never worked anyway: `if (cls == g_weaponActorClass) continue;` was meant to skip the CLASS
+//     object but skips every object whose class IS RvWeaponShared - which is what ARPistol is. Copied
+//     from FindHudObject, where it was harmless only because the live HUD is a DERIVED class.
+//
+// **Three of my recent additions put GObjects walks into per-frame gameplay paths and every one cost
+// framerate** (run 206's muzzle gather, run 183's mesh scan, this). The lesson is not "throttle harder",
+// it is that the object graph is not a thing to poll from a frame path.
+//
+// So: use what the renderer already tells us. With a weapon the first-person pass draws THREE meshes
+// (gun, arms, fragment); without one it draws TWO. That number is already in hand every frame at zero
+// cost, and the fragile part - hardcoding 3 - is answered by making it an ini value rather than a
+// constant, so a weapon that draws a different number is one edit away and needs no rebuild.
+//
+// ⚠️ This IS the count-based rule I argued against earlier, and the argument was right in principle: 3 is
+// what one pistol happened to draw. It is chosen anyway because the alternative has now failed twice and
+// cost performance both times, and because a wrong count fails SAFELY - the latch simply does not take,
+// which is the current dock behaviour and is harmless.
+int g_minFgMeshes = 3;                  // ini [Render] MinFgMeshes
+
 bool LatchFgMeshes() {
     if (InterlockedCompareExchange(&g_fgStableCount, 0, 0) < 2) return false;
     const LONG g = InterlockedCompareExchange(&g_fgStableVerts[0], 0, 0);
@@ -9096,8 +9463,24 @@ void ApplyAimMethod(bool preset) {
     // legitimately fail this early; Present retries on a slow tick.
     if (mc) EnsureRouteTwoHooks();
 
+    // ---- ⭐ run 205: SPLIT the two things MOTION CONTROLLER turns on ----
+    //
+    // Measured: same 3,844 draws, 120 fps in HEAD and 23.8 fps in MOTION CONTROLLER, with our own
+    // per-draw timers 5x higher for identical work. Six theories have failed because every test moved
+    // BOTH of the things this mode changes:
+    //
+    //   aim mode 11   route 2 - the script hook, the trace hooks, the null fire window
+    //   meshes 3      the mesh hide/move path and g_thisDrawMoved
+    //
+    // `AimModeParts` isolates them, so one run says which half carries the cost:
+    //   3 both (normal)   2 aim only, no mesh work   1 mesh only, aim mode 0   0 neither
+    //
+    // This is the discriminator that should have come first: it cannot be fooled by a theory of mine,
+    // because it changes exactly one of the two and leaves the other alone.
+    const LONG parts = InterlockedCompareExchange(&g_aimModeParts, 0, 0);
+    if (mc && !(parts & 2)) InterlockedExchange(&g_aimMode, 0);      // aim half suppressed
     // 3 = gun moved onto the controller AND arms hidden; 0 = both left alone.
-    InterlockedExchange(&g_hideMeshIdx, mc ? 3 : 0);
+    InterlockedExchange(&g_hideMeshIdx, (mc && (parts & 1)) ? 3 : 0);
     // ⚠️ Deliberately does NOT latch here. This runs from the ini at startup, where the foreground
     // list holds menu geometry - taking it produced a latch that was wrong AND that silenced its
     // own retry (run 158d). UpdateFgLatch owns the latch now and vets it continuously; clearing on
@@ -9132,9 +9515,9 @@ void ApplyAimMethod(bool preset) {
 }
 
 static void FgLearnSignature(UINT verts) {
-    const LONG n = InterlockedCompareExchange(&g_fgSigCount, 0, 0);
+    const LONG n = Rd(g_fgSigCount);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
-        if ((UINT)InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0) == verts) return;
+        if ((UINT)Rd(g_fgSigVerts[i]) == verts) return;
     if (n >= kFgSigMax) return;
     InterlockedExchange(&g_fgSigVerts[n], (LONG)verts);
     InterlockedIncrement(&g_fgSigCount);
@@ -9420,11 +9803,14 @@ static bool FgIsMesh(UINT verts, int idx1) {          // idx1 is 1-based into th
 }
 
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
-    const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    const LONG m = Rd(g_hideMeshIdx);
     if (m != 2 && m != 3) return false;
+    // ⭐ run 203: a "pass" this large is not the first-person pass, so there is nothing here worth
+    // matching - and matching anyway is what cost 120 fps at the dock. See kFgSanePass.
+    if (Rd(g_fgDrawCount) > kFgSanePass) return false;
     // The heal animation is the arms' one legitimate appearance - see the note at g_healArmsMs.
     if (HealWindowActive()) return false;
-    const LONG a = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+    const LONG a = Rd(g_armsVerts);
     if (a && (UINT)a == verts) return true;
     // ⭐ run 199: the leftover hand/arm fragment - the 390-vertex mesh. Checked before the stray rule
     // below because it IS in the baseline and that rule would never reach it.
@@ -9435,16 +9821,20 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     // including the gun, and this would blank the whole pass. That is the run-158d shape - a matcher
     // that silently means something else before its data exists - so it is checked, not assumed.
     if (!g_hideStrayArms) return false;
-    if (!InterlockedCompareExchange(&g_fgBaseCount, 0, 0)) return false;
-    if (!InterlockedCompareExchange(&g_gunVerts, 0, 0)) return false;
+    if (!Rd(g_fgBaseCount)) return false;
+    if (!Rd(g_gunVerts)) return false;
     return !FgIsBaseline(verts);
 }
 
 static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
-    const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
-    if (HealWindowActive()) return false;              // leave the gun where the animation expects it
-    const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
-    return (m == 1 || m == 3) && g && (UINT)g == verts;
+    // ⚠️ Mode FIRST. This used to read the mode, then call HealWindowActive(), then read g_gunVerts,
+    // and only THEN check the mode - so every indexed draw in the frame paid for all three even with
+    // the feature off. Cheapest test first is not style here, it is the hot path.
+    const LONG m = Rd(g_hideMeshIdx);
+    if (m != 1 && m != 3) return false;
+    const LONG g = Rd(g_gunVerts);
+    if (!g || (UINT)g != verts) return false;
+    return !HealWindowActive();                        // leave the gun where the animation expects it
 }
 
 // Everything else the first-person pass draws - the muzzle flash, the barrel smoke, ejected shells,
@@ -9467,14 +9857,15 @@ static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
 // ⚠️ The counter is bumped from inside the predicate. Called exactly once per draw from each hook,
 // which is why that is safe here - do not start calling this speculatively.
 static bool FgRidesGun(UINT verts) {
-    const LONG m = InterlockedCompareExchange(&g_hideMeshIdx, 0, 0);
+    const LONG m = Rd(g_hideMeshIdx);
     if (m != 1 && m != 3) return false;
-    // Nothing rides during the heal - the gun itself is not being moved, so an attachment that followed
-    // the controller would be the only thing off the animation.
-    if (HealWindowActive()) return false;
     // == 1 exactly. Mode 2 is the hide-the-pass test and must not also transform what it keeps.
-    if (InterlockedCompareExchange(&g_fgRideAll, 0, 0) != 1) return false;
-    if (!InterlockedCompareExchange(&g_inForeground, 0, 0)) return false;
+    if (Rd(g_fgRideAll) != 1) return false;
+    if (!Rd(g_inForeground)) return false;
+    // Nothing rides during the heal - the gun itself is not being moved, so an attachment that followed
+    // the controller would be the only thing off the animation. Moved BELOW the cheap gates in run 203:
+    // it was the second test in the function, so every draw paid for a 64-bit interlocked read.
+    if (HealWindowActive()) return false;
     // ---- ⚠️ the boundary is LOOSE, and widening what rides it raises the stakes ----
     //
     // Run 115 set g_inForeground on "a depth-only Clear once some draws have happened" and wrote
@@ -9487,15 +9878,15 @@ static bool FgRidesGun(UINT verts) {
     // 64 is far above anything real and far below "the rest of the level". Past it we are not in
     // the first-person pass at all, whatever the flag says, and riding stops for the frame.
     // g_fgDrawCount is already incremented before either hook reaches this.
-    if (InterlockedCompareExchange(&g_fgDrawCount, 0, 0) > kFgRideMax) {
+    if (Rd(g_fgDrawCount) > kFgRideMax) {
         InterlockedExchange(&g_fgRideBailed, 1);
         InterlockedIncrement(&g_fgRideBailCount);
         return false;
     }
-    const LONG g = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+    const LONG g = Rd(g_gunVerts);
     if (!g) return false;                            // not latched yet - see above
     if ((UINT)g == verts) return false;              // the gun itself, already moved by FgMoved
-    const LONG a = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+    const LONG a = Rd(g_armsVerts);
     if (a && (UINT)a == verts) return false;         // the arms are hidden, not moved
     InterlockedIncrement(&g_fgRodeDraws);
     RodeLearn(verts);
@@ -9556,9 +9947,9 @@ void ReportFgRide() {
 // draws 2-3 so it is hidden or moved along with the foreground copy.
 static bool FgMatchesSignature(UINT verts) {
     if (!verts) return false;
-    const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
+    const LONG n = Rd(g_fgStableCount);
     for (LONG i = 0; i < n && i < kFgSigMax; ++i)
-        if ((UINT)InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0) == verts) return true;
+        if ((UINT)Rd(g_fgStableVerts[i]) == verts) return true;
     return false;
 }
 
@@ -9651,12 +10042,14 @@ void UpdateFgLatch() {
 
     if (gun && arms) {
         if (n == 0) return;                       // nothing being drawn: no evidence either way
+
         static int miss = 0;
         if (FgMatchesSignature((UINT)gun)) { miss = 0; return; }
         if (++miss < kLatchMiss) return;
         miss = 0;
         InterlockedExchange(&g_gunVerts, 0);
         InterlockedExchange(&g_armsVerts, 0);
+        InterlockedExchange(&g_fgBaseCount, 0);   // the baseline described the old weapon - drop it too
         Log("mesh latch: gun=%ld has not been drawn for %d frames - dropping the latch and"
             " re-taking it from what is on screen now", gun, kLatchMiss);
         LogFgList("at the DROP - this is what it will re-take from");
@@ -9672,6 +10065,21 @@ void UpdateFgLatch() {
     if (!a || !b) { steady = 0; return; }
     if (a != candGun || b != candArms) { candGun = a; candArms = b; steady = 0; return; }
     if (++steady < kLatchSteady) return;
+    // ⭐ run 209: the roles are only meaningful if there IS a weapon, and the pass size says so at zero
+    // cost - see the note at g_minFgMeshes. With no weapon the top two are the ARMS and the hand
+    // fragment; latching those moves the arms onto the controller and hides the real gun once one is
+    // picked up.
+    if (n < g_minFgMeshes) {
+        static LONG saidFor = -1;
+        if (saidFor != n) {
+            saidFor = n;
+            Log("mesh latch: the list has settled on %ld/%ld but the pass holds only %ld mesh(es) and"
+                " %d are needed - that is the no-weapon state, so not latching. (ini MinFgMeshes)",
+                a, b, n, g_minFgMeshes);
+        }
+        steady = 0;
+        return;
+    }
     steady = 0;
     InterlockedExchange(&g_gunVerts,  a);
     InterlockedExchange(&g_armsVerts, b);
@@ -9792,6 +10200,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // LEARN FIRST, THEN HIDE. If hiding skipped the learning, the hidden mesh would drop out of
     // the list next frame and every index after it would shift - the toggle would walk through a
     // moving target and nothing would be reproducible.
+    const LARGE_INTEGER tMatch = g_timeOurWork ? Now() : LARGE_INTEGER{};
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         FgLearnSignature(numVertices);
@@ -9812,6 +10221,11 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // flash and the barrel smoke are the reported cases. FgRidesGun excludes the gun and the arms,
     // so the two matchers cannot both claim a draw.
     g_thisDrawMoved = FgMoved(numVertices) || FgRidesGun(numVertices);
+    if (g_timeOurWork) {
+        const double dm = MsSince(tMatch);
+        g_msMeshMatch += dm;
+        if (dm > g_msMeshMatchPeak) g_msMeshMatchPeak = dm;
+    }
     const HRESULT dhr = StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
     });
@@ -11311,6 +11725,28 @@ void RefreshCameraPosition() {
     if (!g_camera && (++missTick % 30) != 1) { InterlockedExchange(&g_camPosValid, 0); return; }
     uintptr_t cam = FindCamera();
     if (!cam) { InterlockedExchange(&g_camPosValid, 0); return; }
+
+    // ---- ⭐ run 211: clear level-scoped cutscene state on a level transition ----
+    //
+    // SetCinematicMode is only ever OBSERVED with `arg raw 0x00000001`. The run-95 script hook sees
+    // native->script entry points and the cutscene EXIT is not one of them, so `g_inCinematic`
+    // latches ON and never clears. What that cost after quitting to the menu and reloading, from
+    // view_matrix.log: `view drift -21.5 deg: camera 8096 (+44.5) vs our wantYaw 12001 (+65.9) |
+    // cine ON` on every frame - the engine refusing the yaw we write, which is the reported broken
+    // controls.
+    //
+    // A change of camera INSTANCE is an unambiguous level transition, and unlike the exit event it
+    // is something we can actually see. Logged once per transition, so it costs nothing per frame.
+    static uintptr_t s_lastCam = 0;
+    if (cam != s_lastCam) {
+        if (s_lastCam) {
+            Log("level transition: camera %p -> %p, CINE was %s%s", (void*)s_lastCam, (void*)cam,
+                InterlockedCompareExchange(&g_inCinematic, 0, 0) ? "ON" : "OFF",
+                InterlockedCompareExchange(&g_inCinematic, 0, 0) ? " - clearing it" : "");
+            InterlockedExchange(&g_inCinematic, 0);
+        }
+        s_lastCam = cam;
+    }
     bool ok = false;
     if (Readable((void*)(cam + ACTOR_LOCATION), 12)) {
         memcpy(g_camPos, (void*)(cam + ACTOR_LOCATION), 12);
@@ -15062,14 +15498,22 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // CONTROLLER, which is the exact silent no-op the latch was extracted to prevent.
         //
         // Two interlocked reads a frame until it takes, then nothing.
+        // ⭐ run 208: solved HERE as well as at the latch take, and BEFORE UpdateFgLatch. The run-207 latch
+        // gate needs the property layout, and the layout used to be solved only by the latch itself - a
+        // circular dependency that meant the latch never took at all. Self-throttling; a no-op once solved.
+        SolvePropertyLayout();
         UpdateFgLatch();
         // Run 200: the heal gate's offsets, retried until resolved. Free once it has them, and the HUD
         // often does not exist at the mesh latch where the first attempt runs.
         ResolveGameplayOffsets();
-        // Run 201, read only: prints only when the numbers change, so standing still costs nothing.
+        // ⚠️ EVERYTHING FROM HERE RUNS ONCE PER FRAME. Not on a slow tick - see UpdateFgLatch's own note
+        // above ("two interlocked reads a frame"). Run 202 lost 120 fps to a logging call placed here on
+        // the belief that this block was periodic. **Nothing added here may call Log() unconditionally.**
+        //
+        // Run 201, read only, and OFF by default since run 202 - it is internally rate-limited by time.
         ReportEyeHeight();
-        // Run 189: suppress the first-person muzzle flash and barrel smoke. On this slow tick because it
-        // only ever acts on a CHANGE of state - a few interlocked reads per second while nothing is
+        // Run 189: suppress the first-person muzzle flash and barrel smoke. Cheap enough for a per-frame
+        // call because it only ACTS on a change of state - a few interlocked reads while nothing is
         // happening, and a GObjects walk only when the cached objects stop validating (a weapon swap).
         ApplyMuzzleFxSuppression();
         // Once per frame, and it prints only for frames that look like video or a splash.
@@ -15403,6 +15847,22 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     wf, copy, eng, xs, ms - wf - copy - eng - xs, ms,
                     g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
                     g_displayPeriodMs);
+                // ---- ⭐ run 204: how much of that residual is actually OURS? ----
+                //
+                // Printed right next to the budget deliberately: "our work" is frame time minus the
+                // measured phases, so it contains the GAME's whole frame as well as ours. These two are
+                // the mod's own per-draw cost, measured instead of inferred - which is what six wrong
+                // attributions for the dock collapse were missing.
+                if (g_timeOurWork) {
+                    Log("    OUR per-draw cost, MEASURED: StereoPair %.2f ms/sec (peak %.3f ms in one"
+                        " draw) + mesh matchers %.2f ms/sec (peak %.3f) against a %.2f ms frame."
+                        " ⚠️ StereoPair INCLUDES issuing both duplicated draws, so a big number there is"
+                        " the cost of drawing twice - not of our arithmetic.",
+                        g_msStereoPair, g_msStereoPairPeak,
+                        g_msMeshMatch, g_msMeshMatchPeak, ms);
+                    g_msStereoPair = g_msMeshMatch = 0.0;
+                    g_msStereoPairPeak = g_msMeshMatchPeak = 0.0;
+                }
                 // ---- run 190: how stale was the pose the GUN GEOMETRY was built from? ----
                 //
                 // The head is reprojected and so cannot show this; the gun is baked into vertices and so
@@ -16505,6 +16965,14 @@ void LoadIniSettings() {
 
     // Run 201. 100 is the DERIVED value (16 UU per foot), not a preference - see the note at
     // g_worldScalePct. Clamped to the same 50-200 the panel row allows.
+    // Run 202: OFF by default. The measurement it existed for is recorded in ENGINE_NOTES, and leaving a
+    // logging call live in a per-frame block is what cost 120 fps -> 11 fps. Set it to 1 for one launch if
+    // the numbers are wanted again; it is rate-limited to one report every 2 seconds even then.
+    g_eyeHeightLog = GetPrivateProfileIntA("Render", "EyeHeightLog", 0, path) ? 1 : 0;
+    if (g_eyeHeightLog)
+        Log("ini: EyeHeightLog=1 - reporting Pawn.BaseEyeHeight/EyeHeight, rate-limited to one line every"
+            " 2 seconds");
+
     // Run 201: the gun follows the 6-DOF head displacement. Default on - without it the weapon slides
     // against the view as you lean, and jumps whenever you recentre.
     g_gunHeadOffset = GetPrivateProfileIntA("Input", "GunFollowsHeadOffset", 1, path) ? 1 : 0;
@@ -16519,6 +16987,33 @@ void LoadIniSettings() {
     Log("ini: WorldScalePct=%ld (a metre of real movement maps to %.1f UU; 100%% = 52.5 UU/m, which is"
         " UE3's 16 units per foot exactly. Above 100 the world feels BIGGER)", wsp,
         kMetresToUU * 100.0f / (float)wsp);
+
+    // Run 204: measure the mod's own per-draw cost instead of inferring it. Default ON for now - the dock
+    // question is open and the diagnostic is cheap (one QPC pair per draw, under 0.2 ms at 2900 draws).
+    // Run 205: the MOTION CONTROLLER bisection. 3 = normal.
+    LONG amp = GetPrivateProfileIntA("Input", "AimModeParts", 3, path);
+    if (amp < 0 || amp > 3) amp = 3;
+    InterlockedExchange(&g_aimModeParts, amp);
+    if (amp != 3)
+        Log("ini: AimModeParts=%ld - MOTION CONTROLLER is SPLIT for diagnosis: mesh work %s, aim mode 11"
+            " %s. Set it back to 3 for normal behaviour.", amp,
+            (amp & 1) ? "ON" : "off", (amp & 2) ? "ON" : "off");
+
+    g_timeOurWork = GetPrivateProfileIntA("Render", "TimeOurWork", 1, path) ? 1 : 0;
+    Log("ini: TimeOurWork=%d (%s)", g_timeOurWork,
+        g_timeOurWork ? "time StereoPair and the mesh matchers per frame, reported beside the frame"
+                        " budget - 'our work' there is a RESIDUAL and contains the game's frame too"
+                      : "off");
+
+    // Run 209: how many meshes the first-person pass must hold before the gun/arms roles are believed.
+    // Measured 3 with a weapon (gun, arms, fragment) and 2 without. An ini value rather than a constant
+    // because 3 came from one pistol - if a weapon never latches, this is the number to lower.
+    g_minFgMeshes = GetPrivateProfileIntA("Render", "MinFgMeshes", 3, path);
+    if (g_minFgMeshes < 2)  g_minFgMeshes = 2;
+    if (g_minFgMeshes > 8)  g_minFgMeshes = 8;
+    Log("ini: MinFgMeshes=%d (the first-person pass must hold this many meshes before the gun/arms roles"
+        " are latched - 2 means 'no weapon' and latching then puts the ARMS on your controller)",
+        g_minFgMeshes);
 
     g_hideExtraArms = GetPrivateProfileIntA("Render", "HideExtraArms", 1, path) ? 1 : 0;
     Log("ini: HideExtraArms=%d (%s)", g_hideExtraArms,

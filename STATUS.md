@@ -104,12 +104,50 @@ dropped beside the game exe. No game files modified.
 `YawDelta()` exists now. The one at the FRotator write path carries the same false
 `int32 wrap is correct` comment and is the first to check.
 
-**C. 🐛 `g_inCinematic` is wrong — menus report `CINE YES`.** Everything gated on it leaks out of
-cutscenes, which is why the two cutscene comfort settings were seen affecting normal gameplay.
-Both settings gate on it *correctly*; the flag is the bug. Fixing it should take several reported
-symptoms with it, and it is the likeliest lead on the tabled **menu rotation bug** — whose exact
-repro is recorded: free/follows → enter game → pause → free/locked → exit to main menu → start
-game → menu is rotated.
+**C. ⚠️ PARTLY FIXED (run 211) — `g_inCinematic` latched ON permanently.** `SetCinematicMode` is
+only ever *observed* with `arg raw 0x00000001`: the run-95 script hook sees native→script entry
+points and the cutscene **exit is not one of them**, so a `0` never arrives. Everything gated on
+the flag then leaked out of cutscenes, which is why the two cutscene comfort settings were seen
+affecting normal gameplay. Both settings gate on it *correctly*; the flag was the bug.
+
+Fixed from the other end rather than by finding the exit event: `RefreshCameraPosition` clears the
+flag when the camera **instance** changes, which is an unambiguous level transition. Verified —
+the flag now alternates (29 OFF / 11 ON / 51 OFF / 2 ON / 28 OFF in one run) instead of sticking,
+all `view drift` lines read `cine off`, and `engine-vs-asked residual` is back to 0.10–1.03° from
+a 3.5° mean with a standing 21.5° drift. User-confirmed: turning behaves after a reload.
+
+**⚠️ Still not a true fix.** A cutscene that ends *without* a level change keeps the flag set
+until the next transition. The exit event remains invisible.
+
+The tabled **menu rotation bug** is still open and was NOT this — repro: free/follows → enter game
+→ pause → free/locked → exit to main menu → start game → menu is rotated. Do not confuse it with
+the run-211 menu *double vision*, which was a different bug and is fixed (see D).
+
+**D. ✅ FIXED and VERIFIED (run 211) — menu double vision after returning from gameplay.**
+Readability is not liveness. A level transition leaves the previous level's `RvPlayerCamera` in
+`GObjects` with its memory mapped and its class pointer intact, so both tests `FindCamera` applied
+— `Readable` plus a class compare — passed on a **dead** object; the walk took the first
+non-archetype match in `GObjects` order, so the stale camera could win and then be revalidated
+forever.
+
+Diagnosed entirely from `view_matrix.log`, no new instrument needed: the post-transition main menu
+reported `identification: 36 of 120 frames lost the matrix entirely; best rejected dotFwd +0.6964
+(gate 0.80)`. dotFwd 0.696 is 45.9°, and the camera being read reported yaw **+44.5°** while the
+matrix carried ~0° — two different cameras. Every rejection invalidates the register slot, so the
+menu ran at `split 0, mono-fallback 399`: every draw unsplit across the full side-by-side frame,
+i.e. one image with each eye seeing a different half. The boot menu was fine only because just one
+camera existed at that point, which is what made this look like a regression.
+
+`FindCamera` now **prefers a live instance and falls back to the first match**, so it can never
+return less than before — a false negative from `IsLive` costs a periodic re-walk, not the camera.
+The liveness recheck is throttled to every 15 frames (~0.125 s), because the condition only arises
+at a transition. After: `split 334 (334 with parallax), mono-fallback 0` at 120 fps in the same
+menu, and no window in the run carries the broken `peak live in a frame 0` signature except four
+splash-screen windows that read `registers tracked: none` — before any camera exists.
+
+**Known residue:** three windows still show heavy mono-fallback (549, 1340, 4386) at 38/29/37 fps,
+all landing exactly on load/transition moments while the camera is being replaced. Expected, but
+recorded rather than filtered out, because a long enough transient reads as a visible flash.
 
 0. **📋 The BACKSPACE keyboard exemption can now go** — `VR MODE` is on the panel as of run 159, so the last reason to keep it live under `Debug=0` is gone.
    Run 157's `[Render] Debug` makes every keyboard key inert except **BACKSPACE** (VR mode on/off)

@@ -60,6 +60,21 @@ Used by the heal window to skip when the player has no health packs.
 > ⚠️ **`IsLive` does NOT apply to the HUD.** A UE3 HUD hangs off the PlayerController, not off
 > `PersistentLevel`, so the liveness rule that correctly separates pawn instances from archetypes rejects
 > every real HUD. Exclude archetypes by name (`Default__`) instead.
+>
+> ⚠️ **`IsLive` DOES apply to the camera, and skipping it cost run 211.** A level transition leaves the
+> previous level's `RvPlayerCamera` in `GObjects` with its memory still mapped and its class pointer
+> intact, so `Readable` + a class compare both pass on a **dead** object. `FindCamera` took the first
+> non-archetype match in `GObjects` order and could therefore lock onto the corpse and revalidate it
+> forever. The live one's `Outer` is `PersistentLevel` (see the outer table below), so `IsLive` separates
+> them. **Prefer a live instance but fall back to the first match** — that way a false negative costs a
+> re-walk, not the camera.
+>
+> The tell that names this failure, and it is cheap to check: `identification: N of 120 frames lost the
+> matrix entirely; best rejected dotFwd +0.6964 (gate 0.80)`. A `dotFwd` stuck just under the gate means
+> the camera being READ and the camera the matrix came FROM are two different objects — 0.696 is 45.9°,
+> against a camera reporting yaw +44.5° while the matrix carried ~0°. Every rejection invalidates the
+> register slot, and 100% invalidation renders every draw unsplit across the full side-by-side frame,
+> which in the headset is **double vision**, not a missing image.
 
 > ⚠️ **Depth 10 is why a "generous" 8-level walk found nothing.** The chain is
 > `RvPlayerPawnSP → … → GamePawn → Pawn → Actor → Object`, and it is longer than it looks. Walk to
