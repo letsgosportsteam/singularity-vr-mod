@@ -1471,6 +1471,8 @@ WantedName g_wantNames[] = {
     { "Health", -1 }, { "HealthMax", -1 },
     // Run 200: ...and "do I even have an item". See the note at FindHudObject.
     { "mHealthPackCount", -1 },
+    // Run 201: READ ONLY - what does the game think the player's eye height is? See ReportEyeHeight.
+    { "BaseEyeHeight", -1 }, { "EyeHeight", -1 },
 };
 const int kWantNameCount = (int)(sizeof(g_wantNames) / sizeof(g_wantNames[0]));
 
@@ -1590,6 +1592,27 @@ int g_offHealth = -1, g_offHealthMax = -1;
 uintptr_t g_playerPawn = 0, g_playerPawnClass = 0;
 void ResolveGameplayOffsets();          // retryable; see its definition below SolvePropertyLayout
 
+// ---- ⭐ run 201: eye height, READ ONLY - is the game's number unusual, or perfectly ordinary? ----
+//
+// Asked whether the eye height can be changed at all. It can: `Pawn.BaseEyeHeight` is the standing target
+// and `Pawn.EyeHeight` the interpolated current value, both floats on Engine.Pawn, both reachable with the
+// offset reader. But changing it alters GAMEPLAY - you would see over cover a designer assumed you could
+// not - so the number is worth looking at before a knob is built on a hunch.
+//
+// ⚠️ **And there may be nothing to fix.** 6-DOF is measured relative to the RECENTRE point, so the in-game
+// eye position is `game eye height + (real head height - head height at recentre)`. Recentre while
+// standing as you play and the two agree; recentre while leaning or with the headset on a desk and
+// everything afterwards carries that error - which feels exactly like a wrong eye height.
+//
+// So this prints both the engine's numbers AND our own offset, in the same units, because the second is
+// the far more likely culprit and the two are indistinguishable from inside the headset.
+int g_offBaseEyeHeight = -1, g_offEyeHeight = -1;
+void ReportEyeHeight();
+// All three are defined with the 6-DOF code, which sits below this census.
+extern float g_hmdOffset[3];
+extern volatile LONG g_worldScalePct;
+float MetresToUU();
+
 // The live player pawn, cached and revalidated by class word like FindCamera. Rewalks at most once every
 // 30 misses - a pawn does not exist at the menu and asking every frame is the run-35 failure.
 static uintptr_t FindPlayerPawn() {
@@ -1617,6 +1640,37 @@ static uintptr_t FindPlayerPawn() {
         return o;
     }
     return 0;
+}
+
+// Printed on a slow tick and only when something CHANGES, so it costs nothing while standing still and
+// shows the crouch transition when it happens.
+void ReportEyeHeight() {
+    if (g_offBaseEyeHeight < 0 || g_offEyeHeight < 0) return;
+    const uintptr_t p = FindPlayerPawn();
+    if (!p) return;
+    if (!Readable((void*)(p + g_offBaseEyeHeight), 4) || !Readable((void*)(p + g_offEyeHeight), 4)) return;
+    const float baseUU = *reinterpret_cast<const float*>(p + g_offBaseEyeHeight);
+    const float eyeUU  = *reinterpret_cast<const float*>(p + g_offEyeHeight);
+    if (!(baseUU == baseUU) || !(eyeUU == eyeUU)) return;              // NaN - run 185's lesson
+
+    static float lastBase = -1e9f, lastEye = -1e9f;
+    if (fabsf(baseUU - lastBase) < 0.5f && fabsf(eyeUU - lastEye) < 0.5f) return;
+    lastBase = baseUU; lastEye = eyeUU;
+
+    // Our own vertical offset, in the SAME units, because it is the likelier cause of a height that feels
+    // wrong and the two are indistinguishable from inside the headset. g_hmdOffset is already in UU and
+    // already carries the world-scale divisor, so this is what actually reaches the view.
+    const float m2u = MetresToUU();
+    Log("eye height: engine BaseEyeHeight %.1f UU (%.1f cm), EyeHeight %.1f UU (%.1f cm)"
+        " | our 6-DOF vertical offset %+.1f UU (%+.1f cm) | scale %ld%% = %.1f UU/m",
+        baseUU, baseUU * 1.905f, eyeUU, eyeUU * 1.905f,
+        g_hmdOffset[2], g_hmdOffset[2] * 1.905f,
+        InterlockedCompareExchange(&g_worldScalePct, 0, 0), m2u);
+    Log("    Reading this: EyeHeight interpolating toward BaseEyeHeight is the crouch mechanism, so a gap"
+        " between them mid-crouch is correct. If BaseEyeHeight looks ordinary (a standing human is roughly"
+        " 90 UU / 170 cm) and the view still feels wrong, the RECENTRE is the suspect - our offset above is"
+        " measured from wherever your head was when F8 was last pressed, and it is added to the engine's"
+        " number rather than replacing it.");
 }
 
 // ---- ⭐ run 200: "do I have a health pack" - the second half of the heal gate ----
@@ -1787,11 +1841,20 @@ void ResolveGameplayOffsets() {
 
     // Run 199: Health and HealthMax live on Engine.Pawn, several classes above RvPlayerPawnSP, which is
     // exactly what PropOffsetInChain's super-chain walk is for.
-    if ((g_offHealth < 0 || g_offHealthMax < 0)) if (const uintptr_t pawn = FindPlayerPawn()) {
+    if ((g_offHealth < 0 || g_offHealthMax < 0 || g_offBaseEyeHeight < 0))
+    if (const uintptr_t pawn = FindPlayerPawn()) {
         const uintptr_t pc = *reinterpret_cast<uintptr_t*>(pawn + OBJ_CLASS);
         int dh = 0, dm = 0;
         g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
         g_offHealthMax = PropOffsetInChain(pc, "HealthMax", &dm);
+        // Run 201, read only. Same super-chain walk - both are declared on Engine.Pawn.
+        {
+            int db = 0, de = 0;
+            g_offBaseEyeHeight = PropOffsetInChain(pc, "BaseEyeHeight", &db);
+            g_offEyeHeight     = PropOffsetInChain(pc, "EyeHeight", &de);
+            Log("    Pawn.BaseEyeHeight +0x%03X (depth %d), Pawn.EyeHeight +0x%03X (depth %d)",
+                g_offBaseEyeHeight, db, g_offEyeHeight, de);
+        }
         // The DEPTH is logged because the previous failure was a depth cap, and a bare "-1" could not
         // distinguish "the property is not there" from "the search stopped early".
         Log("    Pawn.Health +0x%03X (found at super-chain depth %d), Pawn.HealthMax +0x%03X (depth %d)%s",
@@ -2041,6 +2104,48 @@ float g_offsetUU = 300.0f;
 // UE3 scale is 16 units per foot, so 1 UU is 1.905 cm and a metre is 52.5 UU. If head movement
 // comes out feeling too large or too small in game, this is the number to adjust.
 const float kMetresToUU = 52.5f;
+
+// ================= ⭐ run 201: WORLD SCALE, and it is one number for a reason ==================
+//
+// **Every real-world quantity the mod feeds the engine goes through `kMetresToUU`** - and that is what
+// makes a single scale knob correct rather than a hack. The three consumers are:
+//
+//   g_eyeDeltaUU   the stereo baseline. Your IPD in game units, which is what sets apparent SIZE.
+//   g_hmdOffset    6-DOF head translation. How far you travel in game per metre you move.
+//   g_handOff*     the hand position the gun rides, so the weapon stays with your real hand.
+//
+// Those three MUST scale together. Scaling the IPD alone changes how big things look but not how far you
+// walk, which reads as the world resizing when you move - the exact complaint world-scale sliders exist
+// to fix. Scaling head but not hand would slide the gun around your body. One conversion, three users.
+//
+// ---- the direction, stated because it is the easy thing to get backwards ----
+//
+// `WorldScalePct > 100` makes the world feel **BIGGER** (you feel smaller), by making a real metre map
+// to FEWER game units:
+//
+//   smaller stereo baseline -> less parallax -> objects read as further away and LARGER
+//   less travel per step    -> the same room takes more walking to cross
+//
+// Both cues move the same way, which is why they have to share the number.
+//
+// ⚠️ **What this cannot change: your EYE HEIGHT.** The game owns that - it is the pawn's eye offset in
+// UU - so scaling does not alter how tall you feel relative to the floor. It changes how large the world
+// reads and how far you travel through it. A player who feels the wrong height is describing a different
+// problem from one who feels the wrong scale, and this knob only addresses the second.
+//
+// 100 is not a guess: 16 units per foot is UE3's documented scale and 52.5 UU/m follows from it exactly.
+// The default should stay 100 unless the headset says otherwise.
+volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DISPLAY panel row
+
+// Run 201: does the gun follow the 6-DOF head displacement? It must - see the note in BuildGunC. Kept as
+// an escape hatch rather than hardcoded, because the SIGN of a position fix is the kind of thing this
+// project has had to flip more than once, and reverting should not need a rebuild.
+int g_gunHeadOffset = 1;                // ini [Input] GunFollowsHeadOffset
+
+float MetresToUU() {
+    const LONG p = InterlockedCompareExchange(&g_worldScalePct, 0, 0);
+    return (p > 0) ? kMetresToUU * 100.0f / (float)p : kMetresToUU;
+}
 volatile LONG g_sixDof = 0;        // F10 - cold start is flat; BACKSPACE = all three at once
 float g_hmdOffset[3] = {0,0,0};    // game-world offset from the recentre point, in UU
 float g_centrePos[3] = {0,0,0};    // headset position captured at recentre, in XR metres
@@ -4698,7 +4803,7 @@ inline SHORT DebugKey(int vk) {
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
 enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE,
        PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
-       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND, PR_WEAPONFX, PR_MUZZLEFX,
+       PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND, PR_WEAPONFX, PR_MUZZLEFX, PR_WORLDSCALE,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -4724,11 +4829,14 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // MUZZLE FX joins CROSSHAIR here rather than going on ADVANCED: both are "the game draws something
     // at the centre of your view that VR makes wrong", both are things a player judges by looking, and
     // the DISPLAY page was created in run 165 expecting exactly this company.
-    { PR_CROSSHAIR, PR_MUZZLEFX, PR_BACK },
+    // WORLD SCALE belongs here for the reason the DISPLAY page exists: it is judged by LOOKING, and a
+    // setting judged by looking has to be adjustable while you are looking. A relaunch per guess is what
+    // this project's own notes call out - "a sign is not worth a headset session each".
+    { PR_CROSSHAIR, PR_MUZZLEFX, PR_WORLDSCALE, PR_BACK },
     { PR_OCCLUSION, PR_WEAPONFX, PR_DEBUG, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 6, 8, 3, 3, 4 };
+const int kPageCount[kPanelPages] = { 6, 8, 3, 4, 4 };
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -4855,6 +4963,10 @@ void PanelSaveRow(int rowId, const char* path) {
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
                         InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0));
             WritePrivateProfileStringA("Render", "HideMuzzleFx", v, path); return;
+        case PR_WORLDSCALE:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_worldScalePct, 0, 0));
+            WritePrivateProfileStringA("Render", "WorldScalePct", v, path); return;
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
             // survives a relaunch is a state somebody meets tomorrow as a bug report - with the
@@ -4971,6 +5083,15 @@ void PanelRowText(int row, char* out, size_t cap) {
             // muzzle-flash particle system, so a row named "smoke" would be describing half of one asset.
             _snprintf_s(out, cap, _TRUNCATE, "MUZZLE FX      %s",
                         InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? "HIDDEN" : "SHOWN");
+            break;
+        }
+        case PR_WORLDSCALE: {
+            // Shown as a percentage with 100 marked as the derived value, so it is obvious that the
+            // default is arithmetic (16 UU/foot) rather than somebody's preference.
+            const LONG p = InterlockedCompareExchange(&g_worldScalePct, 0, 0);
+            if (p == 100) _snprintf_s(out, cap, _TRUNCATE, "WORLD SCALE    100%% (TRUE)");
+            else          _snprintf_s(out, cap, _TRUNCATE, "WORLD SCALE    %ld%% %s", p,
+                                      p > 100 ? "BIGGER" : "SMALLER");
             break;
         }
         case PR_OCCLUSION:
@@ -5098,6 +5219,15 @@ void PanelAdjust(int row, int dir) {
             InterlockedExchange(&g_hideMuzzleFx,
                                 InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? 0 : 1);
             break;
+        case PR_WORLDSCALE: {
+            // 5% a press: coarse enough to feel a difference in one press, fine enough that the useful
+            // range is a few presses wide rather than a dozen. Clamped, like every numeric row.
+            LONG p = InterlockedCompareExchange(&g_worldScalePct, 0, 0) + dir * 5;
+            if (p < 50)  p = 50;
+            if (p > 200) p = 200;
+            InterlockedExchange(&g_worldScalePct, p);
+            break;
+        }
         case PR_WEAPONFX: {
             // Clamped, not wrapped - run 143's lesson. Wrapping would put one press past RIDE GUN
             // into a state that blacks out the weapon, which reads as a crash rather than a setting.
@@ -6655,9 +6785,9 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
 
             const float baseYawRad = g_baseYaw * (6.2831853f / 65536.0f);
             const float bc = cosf(baseYawRad), bs = sinf(baseYawRad);
-            g_hmdOffset[0] = (bc * fwdAmt - bs * rightAmt) * kMetresToUU;
-            g_hmdOffset[1] = (bs * fwdAmt + bc * rightAmt) * kMetresToUU;
-            g_hmdOffset[2] = upAmt * kMetresToUU;
+            g_hmdOffset[0] = (bc * fwdAmt - bs * rightAmt) * MetresToUU();
+            g_hmdOffset[1] = (bs * fwdAmt + bc * rightAmt) * MetresToUU();
+            g_hmdOffset[2] = upAmt * MetresToUU();
 
             // ---- ⭐ run 175: is the 6-DOF offset being COMPUTED, or just not applied? ----
             //
@@ -6702,9 +6832,9 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 float dz = views[1].pose.position.z - views[0].pose.position.z;
                 float dFwd   = -(dx * sc) - (dz * cc);
                 float dRight =  (dx * cc) - (dz * sc);
-                g_eyeDeltaUU[0] = (bc * dFwd - bs * dRight) * kMetresToUU;
-                g_eyeDeltaUU[1] = (bs * dFwd + bc * dRight) * kMetresToUU;
-                g_eyeDeltaUU[2] = dy * kMetresToUU;
+                g_eyeDeltaUU[0] = (bc * dFwd - bs * dRight) * MetresToUU();
+                g_eyeDeltaUU[1] = (bs * dFwd + bc * dRight) * MetresToUU();
+                g_eyeDeltaUU[2] = dy * MetresToUU();
             }
         }
         // Published for next frame's walk-direction transform - see the note on g_headYawRad.
@@ -6778,10 +6908,10 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 // Milli-UU, and ROUNDED rather than truncated - see the note at g_handOffX. Truncation
                 // toward zero was both coarse and asymmetric about the origin.
                 InterlockedExchange(&g_handOffX,
-                    (LONG)lroundf((bc2 * fwd - bs2 * right) * kMetresToUU * kHandFixed));
+                    (LONG)lroundf((bc2 * fwd - bs2 * right) * MetresToUU() * kHandFixed));
                 InterlockedExchange(&g_handOffY,
-                    (LONG)lroundf((bs2 * fwd + bc2 * right) * kMetresToUU * kHandFixed));
-                InterlockedExchange(&g_handOffZ, (LONG)lroundf(hy * kMetresToUU * kHandFixed));
+                    (LONG)lroundf((bs2 * fwd + bc2 * right) * MetresToUU() * kHandFixed));
+                InterlockedExchange(&g_handOffZ, (LONG)lroundf(hy * MetresToUU() * kHandFixed));
             }
             InterlockedExchange(&g_handDevValid, 1);
         } else {
@@ -9226,6 +9356,29 @@ static void BuildGunC(float C[4][4]) {
         H[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0) / kHandFixed;
         H[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0) / kHandFixed;
         H[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0)) / kHandFixed;
+    }
+    // ---- 💥 run 201: the gun was anchored to the ENGINE's eye, not to YOURS ----
+    //
+    // Reported: *"when I recentered, the gun came closer to me."* That is this, and it is a real defect
+    // rather than a recentring artefact.
+    //
+    // 6-DOF displaces the VIEW: the camera matrix has `g_hmdOffset` folded into it by the constant hook,
+    // so you are looking from `engine eye + g_hmdOffset`. But H is `(hand - head)` applied relative to the
+    // origin of translated-world space, which is the ENGINE's eye - it never received that displacement.
+    // So the gun sits at `engine eye + H` while you view from `engine eye + g_hmdOffset`, and its apparent
+    // position is wrong by exactly however far you have drifted from the recentre point.
+    //
+    // Recentring zeroes `g_hmdOffset`, so the gun jumps by the accumulated drift - toward you or away
+    // depending on which way you had moved, which is why the direction was not obviously diagnostic.
+    //
+    // Your hand's true position relative to the engine's eye is `g_hmdOffset + (hand - head)`, so this is
+    // the missing term. Added unconditionally, including the follow-off case: with position following off
+    // the gun should stay glued to the view exactly as the flat game's does, and without this it slides
+    // against the view as you lean.
+    if (g_gunHeadOffset) {
+        H[0] += g_hmdOffset[0];
+        H[1] += g_hmdOffset[1];
+        H[2] += g_hmdOffset[2];
     }
     int sy, sp, sr; GunSigns(sy, sp, sr);
     BuildGunTransform(C, G,
@@ -14913,6 +15066,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Run 200: the heal gate's offsets, retried until resolved. Free once it has them, and the HUD
         // often does not exist at the mesh latch where the first attempt runs.
         ResolveGameplayOffsets();
+        // Run 201, read only: prints only when the numbers change, so standing still costs nothing.
+        ReportEyeHeight();
         // Run 189: suppress the first-person muzzle flash and barrel smoke. On this slow tick because it
         // only ever acts on a CHANGE of state - a few interlocked reads per second while nothing is
         // happening, and a GObjects walk only when the cached objects stop validating (a weapon swap).
@@ -16347,6 +16502,23 @@ void LoadIniSettings() {
         g_hideStrayArms ? "hide first-person meshes that were NOT on screen when the latch was taken -"
                           " the leftover reload arms and hands"
                         : "off - only the latched arms mesh is hidden");
+
+    // Run 201. 100 is the DERIVED value (16 UU per foot), not a preference - see the note at
+    // g_worldScalePct. Clamped to the same 50-200 the panel row allows.
+    // Run 201: the gun follows the 6-DOF head displacement. Default on - without it the weapon slides
+    // against the view as you lean, and jumps whenever you recentre.
+    g_gunHeadOffset = GetPrivateProfileIntA("Input", "GunFollowsHeadOffset", 1, path) ? 1 : 0;
+    Log("ini: GunFollowsHeadOffset=%d (%s)", g_gunHeadOffset,
+        g_gunHeadOffset ? "the gun is anchored to YOUR head, so leaning and recentring do not move it"
+                        : "off - the gun is anchored to the engine's eye and will shift as you lean");
+
+    LONG wsp = GetPrivateProfileIntA("Render", "WorldScalePct", 100, path);
+    if (wsp < 50)  wsp = 50;
+    if (wsp > 200) wsp = 200;
+    InterlockedExchange(&g_worldScalePct, wsp);
+    Log("ini: WorldScalePct=%ld (a metre of real movement maps to %.1f UU; 100%% = 52.5 UU/m, which is"
+        " UE3's 16 units per foot exactly. Above 100 the world feels BIGGER)", wsp,
+        kMetresToUU * 100.0f / (float)wsp);
 
     g_hideExtraArms = GetPrivateProfileIntA("Render", "HideExtraArms", 1, path) ? 1 : 0;
     Log("ini: HideExtraArms=%d (%s)", g_hideExtraArms,

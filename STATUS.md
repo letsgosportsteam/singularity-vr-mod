@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-05** (end of run 190). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-05** (end of run 201). Read this first, then `ENGINE_NOTES.md`.
 
 **This file is current state only.** The run-by-run log moved to `HISTORY.md` on 2026-08-04 — you
 do not need it cold, but go there before building on any premise you inherited.
@@ -274,7 +274,46 @@ game → menu is rotated.
      the frame the geometry lands in; it says nothing about whether the runtime's *prediction* at that
      timestamp is good. The remaining risk is **overshoot on sharp reversals**, since prediction error
      grows with lead time — judged in the headset, not in the log.
-6. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
+6. **✅ WORLD SCALE is adjustable (run 201).** Panel → `DISPLAY` → `WORLD SCALE`, live, 5% steps,
+   50–200%, saved as `WorldScalePct`. Above 100% the world feels **bigger**.
+   - **One constant governs scale and that is why one knob is correct**: `kMetresToUU = 52.5`, which is
+     not a guess — UE3's documented 16 units per foot gives 52.5 UU/m exactly. Everything real-world
+     flows through `MetresToUU()`: the **stereo baseline** (apparent size), the **6-DOF translation**
+     (distance travelled per step), and the **hand position** the gun rides.
+   - ⚠️ **All three must scale together.** Scaling the IPD alone changes how big things look but not how
+     far you walk, which reads as the world resizing *as you move* — the exact complaint the slider
+     exists to fix. Scaling head but not hand slides the gun around your body.
+   - ⚠️ **It cannot change EYE HEIGHT** — the game owns that. A player who feels the wrong height is
+     describing a different problem from one who feels the wrong scale.
+
+7. **✅ FIXED (run 201) — the gun was anchored to the ENGINE's eye, not to yours.** Reported as *"when I
+   recentered, the gun came closer to me."*
+   - 6-DOF folds `g_hmdOffset` into the **camera matrix**, so you view from `engine eye + g_hmdOffset`.
+     But `BuildGunC` applied `H = (hand − head)` relative to the origin of translated-world space — the
+     **engine's** eye — which never received that displacement. The gun's apparent position was therefore
+     wrong by however far you had drifted from the recentre point, and recentring zeroed the drift so it
+     jumped. Direction depended on which way you had moved, which is why it was not obviously diagnostic.
+   - Fixed by adding `g_hmdOffset` to `H`. Applied unconditionally, including with position-following
+     off: the gun should stay glued to the view exactly as the flat game's does.
+   - `GunFollowsHeadOffset=0` reverts without a rebuild — the *sign* of a position fix is something this
+     project has had to flip more than once.
+   - **Method note: no instrument in the session would have caught this.** The eye-height probe read
+     `+0.0 UU` right after recentring and looked like a clean pass. A symptom that only exists when two
+     things which should share a reference frame don't, needs someone wearing the headset.
+
+8. **📋 Eye height: measured, and probably NOT a problem.** `Pawn.BaseEyeHeight = 70.0` (stable),
+   `EyeHeight` 67.4–71.4 with bob and crouch. Offsets in `ENGINE_NOTES.md`, and both are writable if a
+   knob is ever wanted.
+   - ⚠️ **`BaseEyeHeight` is measured from the actor's Location — the CENTRE of the collision cylinder,
+     not the floor.** So 70 UU is not eye height above ground and converting it to 133 cm invites the
+     wrong conclusion that the character is child-sized. Log `CollisionHeight` before comparing to a
+     human.
+   - **Recentre is confirmed working from seated** (offset `+0.0 UU` immediately after). Sitting versus
+     standing is handled by recentring, not by a setting: **hold MENU ~1 s**, which re-zeroes yaw, lean
+     and height together. If the view ever feels too low or high mid-session, hold MENU before assuming
+     a bug.
+
+9. **Shadows are broken when High Quality Decals is ON, and run 139 found a new clue.** With that
    option on, **the hidden arms turn BLACK instead of staying invisible.** So whatever hides the
    first-person meshes is not reaching the pass that HQ Decals enables — the arms are still being
    drawn there, at their original position. That is a much sharper lead than "decals are broken":
@@ -319,7 +358,7 @@ game → menu is rotated.
 >   the wrapper had already been proven defective on the soldier by then. **An independently
 >   confirmed defect should not be dismissed on a one-line argument.**
 
-7. **✅ FIXED (run 199) — the "reload arms" were never reload geometry.** `HideExtraArms=1`. Reload now
+10. **✅ FIXED (run 199) — the "reload arms" were never reload geometry.** `HideExtraArms=1`. Reload now
    looks natural.
    - ⛔ **Carried as a reload/latching problem from run 122 to run 198, and it was neither.** Reported
      correctly at last: *"they're actually always there during gameplay but hidden under where the player
@@ -339,7 +378,7 @@ game → menu is rotated.
      the report was taken as the diagnosis. The user's description contained the answer — *always
      present*, *moves with the gun* — and both facts were already in the logs.
 
-8. **✅ The arms reappear for the health injector animation (run 198–199).** `HealArmsMs=2150`,
+11. **✅ The arms reappear for the health injector animation (run 198–199).** `HealArmsMs=2150`,
    `HealArmsDelayMs=100`.
    - The arms are shown **and the gun is returned to the engine's position** for the window — moving the
      gun onto the controller while the arms animate at the engine position tears one animation in half.
@@ -359,10 +398,10 @@ game → menu is rotated.
      matter for a check made once at a button press.
    - ⚠️ **Both checks fail OPEN.** If either property cannot be read the window opens anyway and the log
      says so — a *missing* animation is a worse failure than a spurious one.
-9. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
+12. **The TMD**, when the game reaches it. Left-hand device, so it needs the same treatment driven
    by `g_handPoseValid[0]` instead of `[1]`. Everything generalises; it is unverifiable until that
    point in the game, and `Singularity.exe <map>` makes reaching one practical.
-10. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
+13. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
 

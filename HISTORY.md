@@ -24,6 +24,55 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 201: world scale, and the gun was anchored to the wrong eye
+
+Asked how world scaling is done and whether it could be adjustable. The answer turned out to be tidy,
+and asking the question surfaced a real bug that no instrument here would have found.
+
+### ✅ WORLD SCALE, on the DISPLAY page
+
+Scale is governed by **one constant** — `kMetresToUU = 52.5`, which is UE3's documented 16 units per foot
+exactly, not a tuned guess. That is why it looked right without anyone adjusting it. All three real-world
+quantities flow through it: the stereo baseline (apparent size), the 6-DOF translation (distance travelled
+per step), and the hand position the gun rides.
+
+Those three **must** move together. Scaling the IPD alone changes how big things look but not how far you
+walk, which reads as the world resizing *as you move* — the exact complaint a world-scale slider exists to
+fix. One conversion, three users, one knob.
+
+### 💥 The gun was anchored to the ENGINE's eye, not to the player's
+
+Reported in passing: *"when I recentered, the gun came closer to me."*
+
+6-DOF folds `g_hmdOffset` into the **camera matrix**, so the view is at `engine eye + g_hmdOffset`. But
+`BuildGunC` applied `H = (hand − head)` relative to the origin of translated-world space — the **engine's**
+eye — which never received that displacement. So the gun's apparent position was off by however far the
+player had drifted from the recentre point, and recentring zeroed the drift, moving the gun.
+
+The direction depended on which way you had drifted, which is exactly why it never looked like a
+systematic fault. Fixed by adding `g_hmdOffset` to `H`.
+
+> **No instrument in this session would have caught it.** The eye-height probe read `+0.0 UU` immediately
+> after recentring and looked like a clean pass — which it was, for the question it was asked. A symptom
+> that only exists when two things which *should* share a reference frame don't, needs someone wearing the
+> headset to notice.
+
+### 📋 Eye height: measured, and a conversion that would have misled
+
+`Pawn.BaseEyeHeight = 70.0` (stable), `EyeHeight` 67.4–71.4 with bob and crouch. Both writable if a knob
+is ever wanted.
+
+> ⚠️ **`BaseEyeHeight` is measured from the actor's `Location` — the CENTRE of the collision cylinder, not
+> the floor.** Reporting it as "133 cm" invited the wrong conclusion that the character is child-sized. The
+> real eye height above ground is roughly `CollisionHeight + BaseEyeHeight`, and `CollisionHeight` has not
+> been read. **A unit conversion is not a measurement if the datum it starts from is not what you think.**
+
+Also confirmed: **recentre works from seated**, and it re-zeroes yaw, lean and height together because
+`g_centrePos` is captured in the same block gated by `g_haveCentre`. Sitting versus standing is therefore
+handled by holding MENU, not by a setting — worth knowing before reaching for a height knob.
+
+---
+
 ## ⭐ Runs 198–199: the "reload arms" were never reload geometry, and the heal window
 
 Two visual fixes before a full playthrough, and the first one had been misdiagnosed in this file since

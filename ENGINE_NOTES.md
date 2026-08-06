@@ -40,6 +40,16 @@ FRotator) → `Scale3D +0x1AC` (+4, a float). UE3's declared order at exactly it
 `int32`s, found at **super-chain depth 10**. Used by the heal window to ask whether a health item could
 do anything before showing the arms.
 
+**`Engine.Pawn`: `BaseEyeHeight +0x2C4`, `EyeHeight +0x2C8`** — floats, chain depth 10. Measured
+`BaseEyeHeight = 70.0` (stable) and `EyeHeight` oscillating 67.4–71.4 with head bob and the crouch
+interpolation.
+
+> ⚠️ **`BaseEyeHeight` is measured from the actor's `Location`, which is the CENTRE of the collision
+> cylinder — not from the floor.** So 70 UU is not the player's eye height above ground; that is roughly
+> `CollisionHeight + BaseEyeHeight`. Converting 70 UU straight to centimetres gives 133 cm and invites
+> the wrong conclusion that the character is child-sized. Log `CollisionHeight` before comparing this to
+> a real human.
+
 **`RvGameSharedHUD.mHealthPackCount +0x588`** — the live instance is `RvHUD`, found at chain depth 1.
 Used by the heal window to skip when the player has no health packs.
 
