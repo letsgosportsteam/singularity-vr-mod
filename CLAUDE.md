@@ -72,3 +72,8 @@ belongs in `HISTORY.md`, newest at the top.
 
 Numbers in prose go stale within hours. Prefer "newest first" to "runs 1–179", and a rough size to
 an exact line count — this file claimed both within a day of being written.
+
+**No machine-specific absolute paths in committed files.** Write `C:\Users\<you>\...` or
+`%LOCALAPPDATA%\...` — never a real home directory. `R:\` paths are fine; a username is not. The
+whole history had to be rewritten once to strip two such lines out of `ENVIRONMENT.md`, and the
+only reason that was cheap is that they were the only two in the repo.

@@ -32,6 +32,11 @@ uscript/
 *.upk
 *.xxx
 
+# Claude Code local settings. Records absolute paths from this machine, including the
+# home directory, so it must never reach the remote. A global ignore covered this before
+# the remote moved; that protects one machine, not the repo.
+.claude/settings.local.json
+
 # ---- editor / OS ----
 .vs/
 .vscode/
