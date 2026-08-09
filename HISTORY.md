@@ -24,6 +24,106 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 212: the run-207 role shift came back, past the gate that was built to stop it
+
+**Reported, and the differentiator was the whole diagnosis:** playing **from the very beginning** to
+the pistol, the arms are visible (low, where the flat game would never show them) and **the pistol is
+invisible**. Loading the save immediately before the pistol and picking it up works correctly — no
+arms, gun on the controller.
+
+### The bug is run 207's, and `MinFgMeshes` did not close it
+
+Diagnosed entirely from a log already on disk, `view_matrix_2026-08-07_23-11-44.log` (88,575 lines,
+the from-the-beginning run):
+
+```
+line 16550  mesh latch: the list has settled on 3314/390 but the pass holds only 2 mesh(es) ... not latching
+line 21546  mesh latch: gun=11387 verts, arms=3314 verts, baseline set of 4
+line 27730  mesh latch: gun=11387 has not been drawn for 240 frames - dropping the latch
+line 27731  fg census (at the DROP): 2 entries: [0]=3314 [1]=390          <- weaponless
+line 37863  mesh latch: gun=3314 verts, arms=390 verts, baseline set of 3
+line 37864  fg census (at the TAKE): 3 entries: [0]=3314 [1]=390 [2]=662  <- a stray third mesh
+```
+
+A **662-vertex mesh** joined the weaponless pass. `n` reached 3, `MinFgMeshes` passed, and the roles
+shifted by one exactly as in run 207: the **arms** took the gun role and were moved onto the
+controller, the fragment took the arms role, and the baseline set described a weaponless pass — so
+when the pistol arrived, `5799` was not in it and `HideStrayArms` **hid the weapon**.
+
+**`MinFgMeshes` is a FLOOR.** The run-209 note argued a wrong count "fails SAFELY"; that is true of a
+count set too high and false of one defeated from below. An extra mesh satisfies it as well as a
+weapon does.
+
+⚠️ **662 appears in exactly one census line in the whole 9 MB log.** The gate is evaluated only on the
+frame `steady` reaches `kLatchSteady`, so a **single frame** of a stray prop poisons the session.
+
+### Why the save-load run was fine
+
+Loading straight into the save before the pistol never presents a 3-mesh weaponless pass, so the gate
+holds and the first latch happens with the pistol genuinely in hand. Playing from the start walks
+through whatever draws the 662 mesh. **The two runs differ in the states traversed, not in the code.**
+
+### Sticky, but not permanent — and the distinction was measured
+
+The drop rule watches the latched gun, which in the shifted state is the arms, and the arms are drawn
+whenever there is a first-person pass. It clears only where the pass is **non-empty and lacks them**:
+`view_matrix_2026-08-04_21-45-47.log` recovered that way at its line 16303, via menu geometry. Four
+level transitions in the Aug 7 run did **not** clear it, because empty frames are not counted as
+misses (`n == 0` returns early). So in practice it lasted the rest of the session.
+
+### The fix: the gun cannot be a mesh that is drawn when you have no gun
+
+`VetoQuietGun=1`. The weaponless pass is already detected and logged by the `MinFgMeshes` branch, so
+record what it holds and refuse the **gun role** to anything in it. Replaced wholesale, never
+accumulated — an accumulating set would carry menu geometry into gameplay forever, and a count wrongly
+in it is a weapon that can never latch.
+
+**Checked against every latch in every log kept — 71 takes:**
+
+| census at the take | takes | verdict |
+|---|---|---|
+| `[5799 3314 390]` | 52 | 5799 not in the set → unaffected |
+| `[11387 3314 390 9]` | 2 | 11387 not in the set → unaffected |
+| `[3314 390]` | 15 | blocked (`MinFgMeshes` already blocks these) |
+| `[3314 390 662]` | 1 | **blocked — this is the reported bug** |
+| `[4 251 745 …]` | 1 | menu geometry; 4 is not in the set → **still not caught** |
+
+**0 false positives on 54 good latches.** The last row is run 158d's menu latch — a separate, still-open
+hole, and this does not claim to close it.
+
+### And a backstop, because the veto has a precondition
+
+`RelatchWrongRoles=1`. The veto needs a weaponless pass to have settled first; a session poisoned
+before one does gets the old behaviour. So the latch also drops on either of two contradictions, after
+`kWrongRoleFrames` (600 — 5 s at 120 fps, deliberately far longer than a ~2 s reload or the 2.15 s
+heal window, because "a mesh outside the baseline" is also what a reload looks like):
+
+- **quiet** — the gun role is held by a mesh seen drawn with no weapon in hand. Cannot be true of a
+  good latch. Needs the weaponless observation.
+- **bigger** — a non-baseline mesh is larger than the latched gun. In all 54 good censuses the weapon
+  is the largest mesh in the pass (`5799 > 3314 > 390`, `11387 > 3314 > 390 > 9`). Needs nothing
+  observed in advance, which is the point.
+
+⚠️ **`bigger` can in principle fire on a good latch** — a scope, the TMD, a large first-person prop
+that outlasts the window. The misfire is **benign and self-healing**: the drop is followed immediately
+by a re-take whose first list entry is the gun, so it costs ~0.25 s of the gun at the engine position
+against a session that otherwise stays broken. `RelatchWrongRoles=0` reverts.
+
+### What was NOT measured
+
+- **No log contains a clean in-session weapon swap** (A drawn → B drawn without the pass emptying).
+  Both A→B transitions on disk went through a weaponless or menu pass first. Reasoning from code, a
+  live swap gives **~2–2.5 s of invisible gun** — B is outside A's baseline, so `HideStrayArms` hides
+  it until the 240-frame drop — then it re-takes correctly. That is pre-existing and unchanged here.
+  The two clean `11387` latches are evidence the re-take path handles a second weapon.
+- **`CheckFgCoexist` has still never fired**, so "is 11387 a second weapon or the pistol in another
+  state" remains open — and that diagnostic **cannot** answer it, since only the weapon in your hands
+  is drawn. Do not read its silence as evidence.
+- The fix is designed against **one** logged instance of the failure. Both knobs are ini toggles for
+  that reason.
+
+---
+
 ## ⭐ Run 211: menu double vision and broken controls were one bug — a dead camera
 
 Reported after a quit-to-menu-and-reload: **double vision in the main menu**, making it unusable,

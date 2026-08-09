@@ -9409,6 +9409,64 @@ static bool FgIsBaseline(UINT verts) {
     return false;
 }
 
+// ---- ⭐ run 212: the WEAPONLESS set, and why MinFgMeshes alone was not enough ----
+//
+// Reported: playing from the VERY BEGINNING, the pistol arrives invisible and the arms are on the
+// controller - the run-207 role shift, which MinFgMeshes was supposed to have closed. Loading the save
+// immediately before the pistol behaves correctly, which is what made it look like a different bug.
+//
+// It is not. The log names the moment, in `view_matrix_2026-08-07_23-11-44.log`:
+//
+//   line 27731  fg census (at the DROP): 2 entries: [0]=3314 [1]=390        <- weaponless
+//   line 37863  mesh latch: gun=3314 verts, arms=390 verts, baseline set of 3
+//   line 37864  fg census (at the TAKE): 3 entries: [0]=3314 [1]=390 [2]=662
+//
+// A THIRD mesh (662) joined the weaponless pass, `n` reached 3, the gate passed - and the ARMS took the
+// gun role with the fragment behind them, exactly as in run 207. MinFgMeshes is a FLOOR, so an extra
+// mesh satisfies it just as well as a weapon does. The note at g_minFgMeshes argued a wrong count
+// "fails SAFELY"; that holds for a count set too HIGH and not for one defeated from below, which is the
+// case that actually occurred.
+//
+// ⚠️ 662 appears in exactly ONE census line of an 88,575-line log. The gate is evaluated only on the
+// frame `steady` reaches kLatchSteady, so a SINGLE frame of a stray prop poisons the whole session.
+//
+// ---- the discriminator that is not a count ----
+//
+// The gun is, by definition, a mesh that is not drawn when you have no weapon. The weaponless pass is
+// directly observable - it is the state MinFgMeshes already detects - so record what it holds and
+// refuse to give the GUN role to anything in it.
+//
+// Checked against every latch in every log kept - 71 takes:
+//
+//   [5799 3314 390]      52 takes   5799 not in the set  -> unaffected
+//   [11387 3314 390 9]    2 takes   11387 not in the set -> unaffected
+//   [3314 390]           15 takes   blocked (MinFgMeshes already blocks these)
+//   [3314 390 662]        1 take    BLOCKED - this is the reported bug
+//   [4 251 745 ...]       1 take    menu geometry; 4 is not in the set -> STILL NOT CAUGHT
+//
+// **0 false positives on 54 good latches, and it catches the one that broke the playthrough.** The last
+// row is run 158d's menu latch - a separate, still-open hole, and this does not claim to close it.
+//
+// ⚠️ This needs a weaponless pass to have been SEEN first. A session poisoned before one settles gets
+// the old behaviour: no worse, but not fixed. That is what RelatchWrongRoles below is for.
+//
+// Replaced wholesale rather than accumulated, for the same reason g_fgStableVerts is: an accumulating
+// set would carry menu geometry into gameplay forever, and a count wrongly in this set is a weapon that
+// can never latch again.
+volatile LONG g_fgQuietVerts[kFgSigMax] = {};
+volatile LONG g_fgQuietCount = 0;
+int g_vetoQuietGun = 1;               // ini [Render] VetoQuietGun
+int g_relatchWrongRoles = 1;          // ini [Render] RelatchWrongRoles
+
+// Was this mesh drawn by the last SETTLED pass that held no weapon?
+static bool FgIsQuiet(UINT verts) {
+    if (!verts) return false;
+    const LONG n = Rd(g_fgQuietCount);
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i)
+        if ((UINT)Rd(g_fgQuietVerts[i]) == verts) return true;
+    return false;
+}
+
 // ---- ⭐ run 158: the latch, extracted so it is not owned by one keypress ----
 //
 // This used to live inline in the APPS handler and ran only when the cycle passed through mode 1.
@@ -10029,6 +10087,10 @@ static bool FgMatchesSignature(UINT verts) {
 // side.
 const int kLatchSteady = 30;    // ~0.25 s at 120 fps
 const int kLatchMiss   = 240;   // ~2 s of the mesh genuinely not being drawn
+// Run 212. Deliberately far longer than kLatchMiss, because the evidence it waits on - a mesh outside
+// the baseline - is also what a RELOAD looks like (see HideStrayArms). 600 frames is 5 s at 120 fps and
+// longer below that, against a ~2 s reload and the 2.15 s heal window. See the recovery in UpdateFgLatch.
+const int kWrongRoleFrames = 600;
 
 // ---- diagnostic: is the gun ONE mesh in two states, or TWO meshes? ----
 //
@@ -10089,6 +10151,67 @@ void UpdateFgLatch() {
     if (gun && arms) {
         if (n == 0) return;                       // nothing being drawn: no evidence either way
 
+        // ---- ⭐ run 212: RECOVER from a role shift, not only prevent it ----
+        //
+        // The veto below needs a weaponless pass to have been seen first. Where it has not been, the old
+        // failure still happens - and it is STICKY, because the drop rule watches the latched gun, which
+        // in the shifted state is the ARMS, and the arms are drawn whenever there is a first-person pass
+        // at all. Not literally permanent: a MENU pass is non-empty and lacks them, which is how the
+        // 2026-08-04 21:45 log recovered at its line 16303. But four level transitions in the
+        // 2026-08-07 23:11 log did NOT clear it, because empty frames are not counted as misses - so in
+        // practice it lasts the rest of the session, which is what was reported.
+        //
+        // Gated on the latched GUN being a mesh seen with no weapon in hand. That is not a guess about
+        // this frame, it is a direct contradiction: the gun role is held by something that is drawn when
+        // there is no gun. **This branch can therefore only ever run from a state that is already wrong**,
+        // which is what makes giving it a drop trigger of its own safe - it cannot disturb a good latch.
+        //
+        // The stray mesh is visible here even while HideStrayArms is hiding it: the draw hook learns the
+        // signature BEFORE it hides (see Hook_DrawIndexedPrim), so the count stays in the stable list.
+        // TWO independent reasons to disbelieve the roles, because the first one has a precondition and
+        // the whole point of a backstop is to cover the case where the precondition was not met:
+        //
+        //   quiet   the gun role is held by a mesh seen drawn with NO weapon in hand. A direct
+        //          contradiction, and it cannot be true of a good latch. Needs a weaponless pass to
+        //          have settled at some point.
+        //   bigger  a mesh outside the baseline is LARGER than the latched gun. In all 54 good censuses
+        //          across every log, the weapon is the largest mesh in the first-person pass
+        //          (5799 > 3314 > 390; 11387 > 3314 > 390 > 9), so something bigger than the latched
+        //          gun that was not there when the latch was taken means the latch is not on the gun.
+        //          Needs nothing observed in advance, which is why it is here.
+        //
+        // ⚠️ `bigger` CAN in principle fire on a good latch - a scope, the TMD, some large first-person
+        // prop that outweighs the weapon and stays on screen past kWrongRoleFrames. That misfire is
+        // benign and self-healing: the drop is immediately followed by a re-take from a list whose first
+        // entry is the gun, so the cost is a quarter of a second of the gun sitting at the engine's
+        // position, against a session that otherwise stays broken. RelatchWrongRoles=0 if it ever bites.
+        static int wrongRole = 0;
+        if (g_relatchWrongRoles) {
+            LONG stray = 0;                       // largest non-baseline mesh in the pass this frame
+            for (LONG i = 0; i < n && i < kFgSigMax; ++i) {
+                const LONG v = InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0);
+                if (v && v > stray && !FgIsBaseline((UINT)v)) stray = v;
+            }
+            const bool quietGun = FgIsQuiet((UINT)gun);
+            if (!stray || !(quietGun || stray > gun)) wrongRole = 0;
+            else if (++wrongRole >= kWrongRoleFrames) {
+                wrongRole = 0;
+                InterlockedExchange(&g_gunVerts, 0);
+                InterlockedExchange(&g_armsVerts, 0);
+                InterlockedExchange(&g_fgBaseCount, 0);
+                Log("*** mesh latch: THE ROLES ARE WRONG - dropping and re-taking. gun=%ld, and %ld has"
+                    " been drawn outside the baseline for %d frames (%s). That is a real weapon being"
+                    " HIDDEN by a latch that is not on a weapon. (run 212; ini RelatchWrongRoles) ***",
+                    gun, stray, kWrongRoleFrames,
+                    quietGun ? "and the gun role is held by a mesh drawn with NO weapon in hand"
+                             : "and it is LARGER than the latched gun, which the weapon never is");
+                LogFgList("at the WRONG-ROLE drop - this is what it will re-take from");
+                return;
+            }
+        } else {
+            wrongRole = 0;
+        }
+
         static int miss = 0;
         if (FgMatchesSignature((UINT)gun)) { miss = 0; return; }
         if (++miss < kLatchMiss) return;
@@ -10116,12 +10239,44 @@ void UpdateFgLatch() {
     // fragment; latching those moves the arms onto the controller and hides the real gun once one is
     // picked up.
     if (n < g_minFgMeshes) {
+        // ⭐ run 212: this is the weaponless pass, and it has held for kLatchSteady frames - so record
+        // what it draws. Nothing in it may take the gun role afterwards. See FgIsQuiet. A one-frame
+        // flicker cannot enter the set, because this point is only reached after the settle.
+        {
+            bool changed = (n != Rd(g_fgQuietCount));
+            for (LONG i = 0; i < kFgSigMax; ++i) {
+                const LONG v = i < n ? InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0) : 0;
+                if (Rd(g_fgQuietVerts[i]) != v) changed = true;
+                InterlockedExchange(&g_fgQuietVerts[i], v);
+            }
+            InterlockedExchange(&g_fgQuietCount, n);
+            if (changed) LogFgList("WEAPONLESS - no mesh in this list may take the gun role (run 212)");
+        }
         static LONG saidFor = -1;
         if (saidFor != n) {
             saidFor = n;
             Log("mesh latch: the list has settled on %ld/%ld but the pass holds only %ld mesh(es) and"
                 " %d are needed - that is the no-weapon state, so not latching. (ini MinFgMeshes)",
                 a, b, n, g_minFgMeshes);
+        }
+        steady = 0;
+        return;
+    }
+    // ---- ⭐ run 212: and the count gate is not enough on its own ----
+    //
+    // A stray third mesh in a weaponless pass satisfies MinFgMeshes, and then the top two are the arms
+    // and the hand fragment. The gun role cannot belong to a mesh that is drawn when there is no gun.
+    // This is the whole fix for the reported "arms visible, pistol invisible" - see FgIsQuiet.
+    if (g_vetoQuietGun && FgIsQuiet((UINT)a)) {
+        static LONG saidFor = -1;
+        if (saidFor != a) {
+            saidFor = a;
+            Log("*** mesh latch: REFUSING this latch. The list settled on %ld/%ld across %ld mesh(es),"
+                " but %ld was drawn in the weaponless pass - so it is the ARMS, not a gun, and latching"
+                " it would put the arms on your controller and HIDE the real weapon. This is the run-207"
+                " role shift arriving past MinFgMeshes on a stray mesh. (run 212; ini VetoQuietGun) ***",
+                a, b, n, a);
+            LogFgList("at the REFUSED take");
         }
         steady = 0;
         return;
@@ -17094,6 +17249,23 @@ void LoadIniSettings() {
     Log("ini: MinFgMeshes=%d (the first-person pass must hold this many meshes before the gun/arms roles"
         " are latched - 2 means 'no weapon' and latching then puts the ARMS on your controller)",
         g_minFgMeshes);
+
+    // Run 212. MinFgMeshes above is a FLOOR, so a stray third mesh in a weaponless pass satisfies it and
+    // the run-207 role shift happens anyway - that is the reported "arms on the controller, pistol
+    // invisible" when playing from the start. Both of these key on the same evidence: what the pass draws
+    // when there is no weapon. Verified against 71 latches across every log kept - 0 of 54 good latches
+    // are affected. Toggles because the evidence for the failure is ONE logged run.
+    g_vetoQuietGun = GetPrivateProfileIntA("Render", "VetoQuietGun", 1, path) ? 1 : 0;
+    Log("ini: VetoQuietGun=%d (%s)", g_vetoQuietGun,
+        g_vetoQuietGun ? "a mesh drawn in the weaponless pass may never take the GUN role - it is the"
+                         " arms, and latching it hides the real weapon"
+                       : "off - the gun role is taken from the top of the list whatever it is");
+    g_relatchWrongRoles = GetPrivateProfileIntA("Render", "RelatchWrongRoles", 1, path) ? 1 : 0;
+    Log("ini: RelatchWrongRoles=%d (%s)", g_relatchWrongRoles,
+        g_relatchWrongRoles ? "if the latched gun turns out to be a mesh drawn with no weapon in hand,"
+                              " drop and re-take once a real weapon has been hidden for a while -"
+                              " recovers a bad latch instead of carrying it for the session"
+                            : "off - a bad latch is kept until the gun mesh stops being drawn");
 
     g_hideExtraArms = GetPrivateProfileIntA("Render", "HideExtraArms", 1, path) ? 1 : 0;
     Log("ini: HideExtraArms=%d (%s)", g_hideExtraArms,

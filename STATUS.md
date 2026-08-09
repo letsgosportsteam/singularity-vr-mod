@@ -446,6 +446,27 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      the report was taken as the diagnosis. The user's description contained the answer — *always
      present*, *moves with the gun* — and both facts were already in the logs.
 
+10b. **🔬 BUILT, NOT YET FLOWN (run 212) — the run-207 role shift came back past `MinFgMeshes`.**
+   `VetoQuietGun=1`, `RelatchWrongRoles=1`.
+   - **Reported:** playing **from the very beginning** to the pistol, the arms are visible (low, where
+     the flat game never shows them) and **the pistol is invisible**. Loading the save just before the
+     pistol works. The differentiator was the diagnosis: the two runs traverse different states.
+   - **Cause.** A stray 662-vertex mesh joined the weaponless pass, `n` reached 3, `MinFgMeshes` passed,
+     and the arms took the gun role. `MinFgMeshes` is a **floor** — an extra mesh satisfies it as well
+     as a weapon does. Named in `view_matrix_2026-08-07_23-11-44.log` line 37863.
+   - ⚠️ **662 appears in exactly one census line of an 88,575-line log.** The gate is evaluated only on
+     the frame the settle completes, so one frame of a stray prop poisons the session.
+   - **Fix:** the gun cannot be a mesh that is drawn when you have no gun. The weaponless pass is
+     already detected by the `MinFgMeshes` branch, so record it and refuse the gun role to anything in
+     it. Plus a backstop that drops a latch whose gun role is contradicted — see `HISTORY.md`.
+   - **Verified against data, not reasoning:** 71 takes across every log kept, **0 of 54 good latches
+     affected**, and the one bad take blocked. Also confirmed a no-op on the working save-load path,
+     which already records the weaponless set before latching 5799.
+   - ⚠️ **Designed against ONE logged instance.** Both knobs are ini toggles for that reason. The
+     run-158d **menu** latch (`[4 251 745 …]`, 8 meshes) is **not** covered and is still open.
+   - ⚠️ **A live weapon swap is unmeasured** — no log has one. Expect ~2–2.5 s of invisible gun on a
+     swap, then correct. Pre-existing, unchanged by this.
+
 11. **✅ The arms reappear for the health injector animation (run 198–199).** `HealArmsMs=2150`,
    `HealArmsDelayMs=100`.
    - The arms are shown **and the gun is returned to the engine's position** for the window — moving the
