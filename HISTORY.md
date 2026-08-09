@@ -1445,6 +1445,12 @@ before they are written. **Touch stick turning is unaffected either way** — sn
 
 ### 2. `D3D9ExMode=1` corrupts character textures
 
+⛔ **SUPERSEDED — fixed in run 139.** The shadow texture was never marked dirty, so `UpdateTexture`
+copied too little and returned `S_OK`. `D3D9ExMode=1` now matches `D3D9ExMode=0` visually; see
+STATUS.md. **Do not quote this section as a reason to keep `D3D9ExMode` off** — it was read as
+current a week after the fix and used to justify leaving the default at 0, which costs every player
+the ~9.8 ms CPU frame copy that zero-copy exists to remove.
+
 The soldier in the opening helicopter renders flat, red and washed out. `D3D9ExMode=0` fixes him
 completely. This is not the FOV bug — it does not respond to FOV or resolution.
 

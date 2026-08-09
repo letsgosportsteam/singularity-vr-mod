@@ -139,12 +139,19 @@ AutoResolution=1
 ; one is the known gap: the engine locking a surface instead of the texture
 ; would bypass the shadow entirely.
 ;
-;   0 = plain D3D9, MANAGED untouched - the known-good path       <- default
-;   1 = D3D9Ex + pool translation
+;   0 = plain D3D9, MANAGED untouched - the CPU frame copy, ~9.8 ms of a ~16 ms
+;       frame at 4K. This is the ESCAPE HATCH, not the good path.
+;   1 = D3D9Ex + pool translation, and the prerequisite for ZeroCopy   <- default
 ;
-; If the game fails to start, set this back to 0. No rebuild needed.
+; ⭐ The default was 0 for a long time, on the strength of run 137's finding that
+; the wrapper corrupted textures - the soldier's colours, the black dock floor and
+; the vanishing fire. Run 139 FIXED that (the shadow was never marked dirty, so
+; UpdateTexture copied too little and returned S_OK), and D3D9ExMode=1 has been on
+; par with 0 visually ever since. The default simply never got revisited.
+;
+; If the game fails to start, set this to 0. No rebuild needed.
 ; ---------------------------------------------------------------------------
-D3D9ExMode=0
+D3D9ExMode=1
 
 ; ---------------------------------------------------------------------------
 ; ZeroCopy   -- stage 2: what the D3D9Ex upgrade was FOR (run 39)
@@ -363,8 +370,12 @@ OcclusionQueryMode=0
 ; every key reads through DebugKey() instead of GetAsyncKeyState(). There is one
 ; exception inside Present and it is BACKSPACE, so any other raw GetAsyncKeyState
 ; there is a bug and greps as one.
+;
+; ⭐ Ships as 0: readout hidden, keyboard inert except BACKSPACE. The VR settings
+; panel has a Debug row, so it can be turned back on from inside the headset
+; without editing this file or relaunching. Set it to 1 here if you are tuning.
 ; ---------------------------------------------------------------------------
-Debug=1
+Debug=0
 
 ; ---------------------------------------------------------------------------
 ; FrameCopyMode   -- the performance measurement (run 31)
@@ -592,10 +603,22 @@ TimeOurWork=0
 ;
 ; [Input]
 ; GunSignYaw=1
-; GunSignPitch=1     ; combo 2 in run 125 - found with CAPS LOCK, not by guessing
+; GunSignPitch=1     ; run 125, found with CAPS LOCK - but ONLY with GunSignCombo=2
 ; GunSignRoll=1
 ; GunSignPosZ=-1
 ; GunFollowPosition=1     ; 0 freezes position, so rotation can be tuned alone
+;
+; ⚠️ GunSignPitch and GunSignCombo are HALVES OF ONE SETTING. Combo 2 has bit 1
+; set, and that bit NEGATES pitch. Copy the pair or copy neither: an ini that
+; sets pitch=1 and leaves the combo at 0 gets the sign BACKWARDS. This is the
+; renumbering hazard the comment at g_gunSignCombo describes, in its most
+; easily-tripped form.
+;
+; The code defaults are now GunSignPitch=1 + GunSignCombo=2 - the same pair the
+; tuned runs used, so CAPS LOCK cycles from the same origin they did. An earlier
+; pass shipped -1 + combo 0 on the argument that it resolved to the same effective
+; signs. Reading GunSigns() still says that, and it was still wrong to ship:
+; every run that worked was on 1/2 and every run that swivelled was on -1/0.
 ;
 ; The anchor is where the gun sits relative to your eye, in engine units
 ; (1 unit is about 1.9 cm), measured forward / right / up. It is the point the
@@ -605,6 +628,10 @@ TimeOurWork=0
 ;
 ;   gun orbits a point IN FRONT of it  -> increase GunAnchorFwd
 ;   gun orbits a point BEHIND it       -> decrease GunAnchorFwd
+;
+; These three are now the CODE DEFAULTS, so a fresh install gets the tuned pose
+; without an ini. They are listed here to document the pose and to give you a
+; starting point for per-user trim, not because they need setting.
 ;
 ; GunAnchorFwd=30      ; tuned by eye in run 131 with the on-screen marker
 ; GunAnchorRight=9

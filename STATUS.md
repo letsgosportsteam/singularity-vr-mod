@@ -1,6 +1,6 @@
 # STATUS — session handoff
 
-Last updated **2026-08-05** (end of run 201). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-08** (defaults audit). Read this first, then `ENGINE_NOTES.md`.
 
 **This file is current state only.** The run-by-run log moved to `HISTORY.md` on 2026-08-04 — you
 do not need it cold, but go there before building on any premise you inherited.
@@ -60,6 +60,36 @@ dropped beside the game exe. No game files modified.
 | **Smooth turning** | ✅ run 140 — `TurnMode=2`, degrees per second, works during cutscenes |
 | **VR settings panel** | ✅ run 142 — hold Y 1.3s anywhere; live changes, saved to the ini on close |
 | **The game's HUD and menus in both eyes** | ✅ run 151 — health, ammo, crosshair, prompts, pause menu. `HudStereo=1` |
+| **Shipping defaults = the tested configuration** | ✅ 2026-08-08 — a fresh install with no ini now behaves like the tuned dev machine. See below |
+
+### ⭐ The code defaults ARE the tested configuration (2026-08-08)
+
+Every validated run in this project's history ran against the dev machine's `SingularityVR.ini`.
+Nothing had ever run on the **code defaults** — the configuration a new user actually gets. A second
+install exposed the gap: with no ini, the gun swivelled about the wrong point, the debug readout was
+drawn, and the D3D9Ex wrapper was off so the frame took the ~9.8 ms CPU copy.
+
+All 48 keys were diffed mechanically against the source. These defaults were promoted to the tested
+values, and `SingularityVR.ini.example` — which shipped `D3D9ExMode=0` and `Debug=1` **uncommented**,
+overriding whatever the code said — was corrected to match:
+
+`GunAnchorFwd/Right/Up` 30/9/−13 · `GunSignPitch` 1 · `GunSignCombo` 2 · `D3D9ExMode` 1 ·
+`Debug` 0 · `PoseLeadFrames` 1 · `AimMethod` 1 · `AimFieldSet` 1 · `TurnMode` 2
+
+**`OcclusionQueryMode` is the one deliberate non-match** — default 2 against the dev ini's 0. Mode 0
+forces every query visible and costs roughly twice the draws (1500–1693 vs 737–943 per frame); mode 2
+has never been played on for a full session. Its risk is **geometry winking out** at distance or
+screen edges, not frame rate. If that appears, `OcclusionQueryMode=0` is the first suspect.
+
+⚠️ **`AutoResX`/`AutoResY` must never be shipped or hand-edited.** They are the mod's own cache of
+*this* headset's size. A shipped value injects one machine's resolution into everyone's first launch.
+
+**Two method notes this cost.** A comment describing a defect fixed a day later was quoted as current
+a week on, which is why the wrapper default stayed wrong — `HISTORY.md` now carries a ⛔ banner there.
+And the `GunSignPitch`/`GunSignCombo` pair was left unmatched on the argument that `GunSigns()`
+resolves −1/combo 0 and 1/combo 2 to identical signs. That reading may be correct; shipping on it was
+not. Every working run was on 1/2 and every broken one on −1/0, and a code argument was used to
+discount a perfect empirical correlation. **Matching a tested value costs nothing when you are right.**
 
 ### If you are picking this up cold, read these three things
 

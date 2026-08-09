@@ -5680,7 +5680,9 @@ bool InitXRInput() {
     {
         char path[MAX_PATH]{};
         if (IniPath(path)) {
-            g_turnMode     = GetPrivateProfileIntA("Input", "TurnMode",  1, path);
+            // ⭐ Default 1 -> 2, matching the tested config. 1 predates the smooth-turning work and
+            // was never revisited when mode 2 landed. Panel-writable, so it is one row to change.
+            g_turnMode     = GetPrivateProfileIntA("Input", "TurnMode",  2, path);
             if (g_turnMode < 0 || g_turnMode > 2) g_turnMode = 1;
             g_turnAngleDeg = (float)GetPrivateProfileIntA("Input", "TurnAngle", 30, path);
             // Clamped rather than trusted. This one multiplies elapsed time, so a typo'd 9000 is
@@ -5702,35 +5704,70 @@ bool InitXRInput() {
             g_aimPoseUUPer1 = GetPrivateProfileIntA("Input", "AimPoseUUPer1", 16384, path);
             g_aimPoseSignX  = GetPrivateProfileIntA("Input", "AimPoseSignX", 1, path) >= 0 ? 1.0f : -1.0f;
             g_aimPoseSignY  = GetPrivateProfileIntA("Input", "AimPoseSignY", 1, path) >= 0 ? 1.0f : -1.0f;
-            // Which fields aim mode 9 may write. 0 controller only (default), 1 + mCurrentPOV,
+            // Which fields aim mode 9 may write. 0 controller only, 1 + mCurrentPOV (default),
             // 2 every scanned field. See the note on g_aimFieldSet - set 2 moves the camera.
-            g_aimFieldSet   = GetPrivateProfileIntA("Input", "AimFieldSet", 0, path);
+            //
+            // ⭐ Default 0 -> 1, together with AimMethod above. These two are a tested PAIR - 1 has
+            // only ever run alongside motion-controller aiming - so promoting either alone would have
+            // shipped a combination no run has executed. Promoted together or not at all.
+            g_aimFieldSet   = GetPrivateProfileIntA("Input", "AimFieldSet", 1, path);
             // Mode 11 trace rotation: flip if the shot deflects the wrong way.
             g_traceSignYaw   = GetPrivateProfileIntA("Input", "AimTraceSignYaw", 1, path) >= 0 ? 1 : -1;
             g_traceSignPitch = GetPrivateProfileIntA("Input", "AimTraceSignPitch", 1, path) >= 0 ? 1 : -1;
             // AIM METHOD, applied rather than merely stored. Everything it drives - aim mode, the
             // gun and arms, move direction, the rot mode - has to be in the right state before the
             // first frame, not after the first panel visit. Applied last in this block, below.
+            //
+            // ⭐ Default 0 (head) -> 1 (motion controller). This is a VR mod whose gun anchor, pose
+            // lead and sign work all exist to serve controller aiming, and every validated run has
+            // been at 1 - so 0 shipped a first-run experience nothing had been tested against. The
+            // panel row switches it back for anyone who prefers head aiming.
             InterlockedExchange(&g_aimMethod,
-                                GetPrivateProfileIntA("Input", "AimMethod", 0, path) ? 1 : 0);
+                                GetPrivateProfileIntA("Input", "AimMethod", 1, path) ? 1 : 0);
             // Aim mode gun visual: signs and whether the gun follows the hand POSITION as well as
             // its direction. Up/down came back reversed, hence the -1 default on pitch.
             g_gunSignYaw   = GetPrivateProfileIntA("Input", "GunSignYaw",   1, path) >= 0 ? 1 : -1;
-            g_gunSignPitch = GetPrivateProfileIntA("Input", "GunSignPitch", -1, path) >= 0 ? 1 : -1;
+            // ⭐ Default -1 -> 1, to match the tested ini EXACTLY. Read the note on GunSignCombo
+            // below before changing either: these two only mean anything as a pair.
+            g_gunSignPitch = GetPrivateProfileIntA("Input", "GunSignPitch", 1, path) >= 0 ? 1 : -1;
             g_gunSignRoll  = GetPrivateProfileIntA("Input", "GunSignRoll",  1, path) >= 0 ? 1 : -1;
             g_gunFollowPos = GetPrivateProfileIntA("Input", "GunFollowPosition", 1, path);
             g_gunSignPosZ    = GetPrivateProfileIntA("Input", "GunSignPosZ", -1, path) >= 0 ? 1 : -1;
             // Where the gun sits relative to your eye, in engine units - forward, right, up. This
             // is the point it ROTATES ABOUT, so getting it near the grip is what stops the gun
             // swinging through an arc when you turn your wrist.
-            g_gunAnchorFwd   = GetPrivateProfileIntA("Input", "GunAnchorFwd",   25, path);
-            g_gunAnchorRight   = GetPrivateProfileIntA("Input", "GunAnchorRight",    8, path);
-            g_gunAnchorUp    = GetPrivateProfileIntA("Input", "GunAnchorUp",    -8, path);
+            //
+            // ⭐ Defaults are run 131's tuned values (30/9/-13), promoted from the example ini where
+            // they had sat COMMENTED OUT since they were measured. The old defaults (25/8/-8) were
+            // placeholders no run ever endorsed, and because the live ini has always set the tuned
+            // values explicitly, nothing here noticed - until a second install with no ini rendered
+            // the gun orbiting a point behind the grip. It swivels rather than rotates, which is
+            // run 124's bug reappearing through the defaults rather than through the code.
+            //
+            // A shipped build takes these unless the player overrides them, so the numbers that ship
+            // must be the numbers that were tuned. Per-user trim is still expected - this is an
+            // offset from YOUR eye - but it should start from the measured pose, not a placeholder.
+            g_gunAnchorFwd   = GetPrivateProfileIntA("Input", "GunAnchorFwd",   30, path);
+            g_gunAnchorRight   = GetPrivateProfileIntA("Input", "GunAnchorRight",    9, path);
+            g_gunAnchorUp    = GetPrivateProfileIntA("Input", "GunAnchorUp",    -13, path);
             // Which sign combination to START in. Set from the ini rather than by changing the
             // sign defaults, because changing those RENUMBERS the combos - which is what made
             // "combo 2" mean two different things in two sessions and cost a run.
+            // ⭐ Default 0 -> 2, with GunSignPitch above flipped to 1 in the same change, so the
+            // shipped pair is byte-identical to the ini every working run has used.
+            //
+            // Reading GunSigns() says -1/combo 0 and 1/combo 2 resolve to the same effective signs,
+            // and that reading may well be right. It was still the wrong call: every run that worked
+            // was on 1/2 and every run that swivelled was on -1/0, and a code argument was used to
+            // discount a perfect empirical correlation. Matching the tested pair costs nothing if the
+            // equivalence holds, and fixes the bug if it does not - there was never a reason to
+            // withhold it. If a future reader is tempted to "simplify" these back, that is the
+            // trade being made.
+            //
+            // The renumbering hazard the note below describes is also gone, precisely BECAUSE both
+            // halves moved together: CAPS LOCK now cycles from the same origin the tuned runs did.
             InterlockedExchange(&g_gunSignCombo,
-                GetPrivateProfileIntA("Input", "GunSignCombo", 0, path) & 15);
+                GetPrivateProfileIntA("Input", "GunSignCombo", 2, path) & 15);
             g_handStillFramesToDisable =
                 GetPrivateProfileIntA("Input", "AutoPadStillFrames", 600, path);
             InterlockedExchange(&g_cineStickTurn,
@@ -16647,10 +16684,21 @@ void LoadIniSettings() {
         Log("     render resolution, it only desynchronises it. Use the in-game video options.");
     }
 
-    // The zero-copy prerequisite. OFF by default: this replaces the resource management of a
-    // shipping engine, so its failure mode is "the game does not start" and it must be one
-    // relaunch away from off. See the big comment above Hook_CreateTexture.
-    g_d3d9ExMode = GetPrivateProfileIntA("Render", "D3D9ExMode", 0, path);
+    // The zero-copy prerequisite. ⭐ ON by default as of the defaults audit - see below. Still one
+    // ini line away from off, because this replaces the resource management of a shipping engine.
+    // See the big comment above Hook_CreateTexture.
+    //
+    // This default was 0 for a long time, and the reason expired without the default being revisited:
+    // run 137 proved the wrapper corrupted textures (the soldier's colours, the black dock floor, the
+    // vanishing fire - one defect, three symptoms), and run 139 FIXED it. STATUS.md records
+    // `D3D9ExMode=1` as on par with 0 visually. The comment that used to sit here predated that fix
+    // by a day and was still being quoted as current a week later.
+    //
+    // Leaving it off is not neutral. Zero-copy needs it - `ZeroCopy=1` on a plain device cannot create
+    // a shared surface and silently does nothing - and the frame copy it replaces is a CPU round-trip:
+    // 0.00 ms under zero-copy against ~9.8 ms of a ~16 ms frame at 4K on the CPU path. That cost falls
+    // hardest on weak CPUs, which is the opposite of what a conservative default is meant to protect.
+    g_d3d9ExMode = GetPrivateProfileIntA("Render", "D3D9ExMode", 1, path);
     if (g_d3d9ExMode < 0 || g_d3d9ExMode > 1) g_d3d9ExMode = 0;
     Log("ini: D3D9ExMode=%d (%s)", g_d3d9ExMode,
         g_d3d9ExMode ? "upgrade the device to D3D9Ex and translate D3DPOOL_MANAGED -> DEFAULT"
@@ -16701,6 +16749,11 @@ void LoadIniSettings() {
     // intermittent and view-dependent - it cost run 30 an entire session for that reason. If
     // objects start winking out at distance or near the edges of view, set this back to 0, which
     // restores the run-30 behaviour exactly.
+    // ⭐ Kept at 2 deliberately - the one setting that does NOT match the tested ini (which has 0).
+    // The measurement above is the reason: mode 0 forces every query visible and costs roughly twice
+    // the draws (1500-1693 vs 737-943 per frame). Its risk is geometry winking out at distance or
+    // screen edges, which is a visual judgement no run has made on 2 yet - so if objects start
+    // vanishing, set OcclusionQueryMode=0 in the ini and this is the first suspect.
     g_occlusionMode = GetPrivateProfileIntA("Render", "OcclusionQueryMode", 2, path);
     if (g_occlusionMode < 0 || g_occlusionMode > 3) g_occlusionMode = 2;
     Log("ini: OcclusionQueryMode=%d (%s)", g_occlusionMode,
@@ -16727,10 +16780,12 @@ void LoadIniSettings() {
 
     // ---- ⭐ run 157: debug mode ----
     //
-    // Default 1 while this is still being built. The value that ships to anyone else is 0, and the
-    // panel row is what makes that survivable - it can be turned back on from inside the headset
+    // Default was 1 while this was being built, with a note saying "the value that ships to anyone
+    // else is 0". ⭐ That flip is now made rather than deferred - a second install with no ini came up
+    // with the readout drawn and every key live, which is what the note was there to prevent.
+    // The panel row is what makes 0 survivable: debug can be turned back on from inside the headset
     // without editing a file or relaunching.
-    InterlockedExchange(&g_debugOn, GetPrivateProfileIntA("Render", "Debug", 1, path) ? 1 : 0);
+    InterlockedExchange(&g_debugOn, GetPrivateProfileIntA("Render", "Debug", 0, path) ? 1 : 0);
     Log("ini: Debug=%ld (%s)", InterlockedCompareExchange(&g_debugOn, 0, 0),
         InterlockedCompareExchange(&g_debugOn, 0, 0)
             ? "state readout drawn, every keyboard key live"
@@ -16954,7 +17009,11 @@ void LoadIniSettings() {
     // per eye, after which this setting stops being needed at all.
     // Run 190. Default 0 = the behaviour every previous run had, so the first run with this build
     // MEASURES the staleness before changing it. 1 predicts the hands one display period ahead.
-    g_poseLeadFrames = GetPrivateProfileIntA("Input", "PoseLeadFrames", 0, path);
+    //
+    // ⭐ That measurement happened and 1 won - the live ini has carried PoseLeadFrames=1 ever since,
+    // so every validated run has been at 1 while the default sat at 0. Promoted, because "the
+    // behaviour every previous run had" stopped being true the moment the ini started overriding it.
+    g_poseLeadFrames = GetPrivateProfileIntA("Input", "PoseLeadFrames", 1, path);
     if (g_poseLeadFrames < 0) g_poseLeadFrames = 0;
     if (g_poseLeadFrames > 2) g_poseLeadFrames = 2;
     Log("ini: PoseLeadFrames=%d (%s)", g_poseLeadFrames,
