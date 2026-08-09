@@ -1,12 +1,13 @@
 # Development environment
 
-Recorded 2026-07-28. Machine-specific; update if paths change.
+Recorded 2026-07-28, paths refreshed 2026-08-08. Machine-specific; update if paths change.
 
 ## Game installs
 
 | Purpose | Path | Notes |
 |---|---|---|
-| **Dev copy (disposable)** | `R:\SingularityVR-Dev\Singularity` | Work here. Verified byte-identical copy of the GOG install (2269 files, 7.58 GB). Safe to wedge, crash, or delete. |
+| **Dev copy (disposable)** | `R:\SingularityVR-Dev\Singularity` | Work here. Verified byte-identical copy of the GOG install (7.58 GB). Safe to wedge, crash, or delete. |
+| Superseded dev copy | `R:\SingularityVR-Dev-OLD\Singularity` | The previous dev copy, kept only so it can be deleted deliberately. Nothing points at it. |
 | GOG (clean, DRM-free) | `R:\GOG\Singularity` | Reference / static analysis. Leave untouched. |
 | Steam (DRM-wrapped) | `R:\SteamLibrary\steamapps\common\Singularity` | User asked this stay untouched. Use only for final Steam-compat verification. |
 
@@ -21,9 +22,23 @@ compiled code is the same build (see FEASIBILITY.md).
 The dev copy lives on `R:` deliberately — **not** under `C:\Users\...\OneDrive\`, so 7.58 GB does
 not get synced.
 
+### `R:\SingularityVR-Dev\` holds two different kinds of thing
+
+```
+R:\SingularityVR-Dev\
+    Singularity\        the disposable game copy  - delete and re-copy from R:\GOG freely
+    tools\              openxr-sdk, ghidra, jdk21 - NOT disposable, the build needs them
+    ghidra_projects\    accumulated analysis      - NOT disposable
+```
+
+`build.ps1` reads the OpenXR SDK from `tools\openxr-sdk` and installs to `Singularity\Binaries`,
+both as absolute paths. So renaming or replacing this folder moves **both** — a rename that carries
+the game copy but leaves `tools` behind fails the build at its own `missing:` guard, which is the
+loud version and the one to want.
+
 ## Repository location
 
-**`R:\code\claude\singularity_vr_mod`** — moved off OneDrive 2026-07-29.
+**`R:\code\claude\singularity_vr_mod_lgst`** — moved off OneDrive 2026-07-29, re-cloned 2026-08-08.
 
 It started under `OneDrive\Desktop\code\...`, which meant every rebuild pushed a fresh
 `d3d9.dll`, `.obj`, `.pdb` and `.ilk` to the cloud. `.gitignore` stops *git* tracking those but
@@ -58,6 +73,12 @@ new tooling. The reference project `mohamad-balouza/bioshock-vr` uses CMake; `bi
 `.vcxproj`, which is the cheaper match for this machine.
 
 **Everything builds x86/Win32.** The game is 32-bit; a 64-bit DLL cannot be injected into it.
+
+⚠️ **The build is not reproducible, so a DLL hash cannot identify a build.** Two links from
+identical source with a clean working tree produced `884C1E8E…` and `5AFF67AF…` — MSVC stamps a link
+timestamp and a fresh PDB GUID into every link. File *size* is a weak hint at best. To find out what
+a built DLL contains, check the commit it was built from or read the `ini:` lines it writes to the
+log; do not diff binaries and conclude anything from it.
 
 ## VR runtimes
 
