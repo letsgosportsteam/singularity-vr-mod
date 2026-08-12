@@ -8603,10 +8603,54 @@ const char* VidSrcName(uint8_t s) {
 const int kFireSigMax = 32;
 struct FireSig {
     uint8_t  src, wasQuad;
-    uint32_t primType, primCount, stride;
+    uint32_t primType, primCount, stride, verts;
     float    minX, minY, maxX, maxY;
     uint32_t count;
 };
+
+// ---- ⭐ run 213b: list what is NEW, not what is there ----
+//
+// Run 213a identified the scope as `stride 16, 2 prims, spans NDC` because it appeared in all three
+// scope windows and in no baseline. Drawing that draw once per eye fired **120 times a second, exactly
+// one per frame** - and the picture did not change. So the correlation was real and the causation was
+// not: stride 16 is something else that also only happens while scoped.
+//
+// The reason that was possible is that the census only lists the USER-POINTER hooks. The scope window's
+// own `draws by hook` line said DrawIdxPrim went from ~856/frame to ~1008/frame - about 150 extra
+// indexed draws per frame that the signature table never showed, because indexed draws come from vertex
+// buffers and carry no vertex pointer.
+//
+// So the table now covers every hook, and to keep it readable it lists only signatures that were NOT
+// present in the baseline. That is the actual question - "what appears when the scope comes up" - and
+// asking it directly is what would have avoided spending a run on a correlated draw.
+//
+// A hash set rather than a linear scan because this now sees every draw in the frame: ~1000/frame over
+// 60 frames is 60,000 lookups, and a linear scan over the baseline would be 60 million comparisons.
+const int kCensusKeyMax = 2048;               // power of two, open addressing
+uint32_t g_censusKeys[kCensusKeyMax]{};
+int      g_censusKeyN = 0;
+
+inline uint32_t CensusKey(uint8_t src, UINT primCount, UINT verts, UINT stride) {
+    uint32_t h = 2166136261u;
+    const uint32_t parts[4] = { src, primCount, verts, stride };
+    for (uint32_t v : parts) { h ^= v; h *= 16777619u; }
+    return h ? h : 1u;                        // 0 marks an empty slot, so never produce it
+}
+
+inline bool CensusKeySeen(uint32_t k, bool insert) {
+    uint32_t i = k & (kCensusKeyMax - 1);
+    for (int n = 0; n < kCensusKeyMax; ++n) {
+        if (!g_censusKeys[i]) {
+            if (insert && g_censusKeyN < kCensusKeyMax / 2) { g_censusKeys[i] = k; ++g_censusKeyN; }
+            return false;
+        }
+        if (g_censusKeys[i] == k) return true;
+        i = (i + 1) & (kCensusKeyMax - 1);
+    }
+    // Full. Report "seen" so a saturated table quietly stops adding rows rather than flooding the
+    // signature list with everything in the level - a wrong answer that looks like a long one.
+    return true;
+}
 FireSig g_fireSig[kFireSigMax]{};
 int  g_fireSigN = 0;
 int  g_fireCensusBudget = 0;         // ini [Render] FireDrawCensus: how many shots to record
@@ -8963,21 +9007,36 @@ static void FireBBox(const void* vtx, UINT stride, D3DPRIMITIVETYPE t, UINT prim
 // the session-wide rate, so pass-throughs are constant background - a number with nothing to compare
 // against. The census now also takes a BASELINE with the trigger up, and the answer is the DIFFERENCE.
 void FireCensusRecord(uint8_t src, D3DPRIMITIVETYPE t, UINT primCount, UINT stride,
-                      const void* vtx, bool wasQuad) {
+                      const void* vtx, bool wasQuad, UINT verts) {
     if (InterlockedCompareExchange(&g_fireCensusFrames, 0, 0) <= 0) return;
     if (wasQuad) ++g_fireQuadSeen; else ++g_fireSplitSeen;
     if (src < 4) ++g_fireBySrc[src];
-    // User-pointer paths only - see the note above. src 2 = DrawPrimUP, 3 = DrawIndexedPrimUP.
-    if (src != 2 && src != 3) return;
+
+    // ---- run 213b: the scope census covers EVERY hook and lists only what the baseline lacked ----
+    //
+    // The fire census keeps its original behaviour exactly - user-pointer paths only, everything
+    // listed - because runs 192-196 are recorded against it and changing what it reports would make
+    // those entries mean something different.
+    if (g_censusIsScope) {
+        const uint32_t key = CensusKey(src, primCount, verts, stride);
+        if (g_fireIsBaseline) { CensusKeySeen(key, true); return; }   // baseline only builds the set
+        if (CensusKeySeen(key, false)) return;                        // present with the trigger up
+        CensusKeySeen(key, true);            // and do not list the same new signature twice
+    } else if (src != 2 && src != 3) {
+        return;                              // src 2 = DrawPrimUP, 3 = DrawIndexedPrimUP
+    }
+
     for (int i = 0; i < g_fireSigN; ++i) {
         FireSig& e = g_fireSig[i];
         if (e.src == src && e.primType == (uint32_t)t && e.primCount == primCount &&
-            e.stride == stride && e.wasQuad == (wasQuad ? 1 : 0)) { ++e.count; return; }
+            e.stride == stride && e.verts == verts && e.wasQuad == (wasQuad ? 1 : 0)) {
+            ++e.count; return;
+        }
     }
     if (g_fireSigN >= kFireSigMax) return;
     FireSig& e = g_fireSig[g_fireSigN++];
     e.src = src; e.wasQuad = wasQuad ? 1 : 0;
-    e.primType = (uint32_t)t; e.primCount = primCount; e.stride = stride;
+    e.primType = (uint32_t)t; e.primCount = primCount; e.stride = stride; e.verts = verts;
     e.count = 1;
     FireBBox(vtx, stride, t, primCount, &e.minX, &e.minY, &e.maxX, &e.maxY);
 }
@@ -9001,9 +9060,9 @@ void FireCensusDump() {
         // "SPANS NDC" is the discriminator. A pass-through is only correct for a quad that really does
         // cover the frame; anything small that got passed through is drawn once, wherever its
         // coordinates put it, and that is the artefact being chased.
-        Log("    %s type %u prims %-4u stride %-3u %s  box x[%+.3f %+.3f] y[%+.3f %+.3f]"
+        Log("    %s type %u prims %-4u verts %-5u stride %-3u %s  box x[%+.3f %+.3f] y[%+.3f %+.3f]"
             " (%.3f x %.3f)%s  x%u",
-            VidSrcName(e.src), e.primType, e.primCount, e.stride,
+            VidSrcName(e.src), e.primType, e.primCount, e.verts, e.stride,
             e.wasQuad ? "PASSED THROUGH" : "split per eye ",
             haveBox ? e.minX : 0.0f, haveBox ? e.maxX : 0.0f,
             haveBox ? e.minY : 0.0f, haveBox ? e.maxY : 0.0f, w, h,
@@ -9030,12 +9089,15 @@ void FireCensusDump() {
             InterlockedCompareExchange(&g_armsVerts, 0, 0));
         LogFgList(g_fireIsBaseline ? "scope census BASELINE - first-person meshes, alt trigger up"
                                    : "scope census WINDOW - first-person meshes, alt trigger down");
-        if (!g_fireIsBaseline)
-            Log("    Read this against the SCOPE BASELINE block. A new user-pointer signature here that"
-                " is PASSED THROUGH and does not span NDC is the overlay (hypothesis A). No new"
-                " signature but a changed 'draws by hook' line means it is on an indexed path (B/D)."
-                " A new mesh in the list above, or one equal to the latched arms count, is geometry the"
-                " mod may be hiding (C).");
+        if (g_fireIsBaseline)
+            Log("    %d distinct draw signature(s) recorded across ALL hooks. The scope window will list"
+                " only what is NOT in this set.", g_censusKeyN);
+        else
+            Log("    Every row above is NEW - absent from the baseline taken with the alt trigger up."
+                " ⚠️ Run 213a picked `stride 16, 2 prims, spans NDC` from this same correlation, drew it"
+                " once per eye at 120/second, and the picture did not change - so being new is NOT"
+                " proof. Validate the candidate with MuzzleFxDropStride (user-pointer paths) before"
+                " building on it: if dropping it does not remove the scope, it is not the scope.");
     }
     g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
     for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
@@ -9120,7 +9182,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
     // No vertex data on this path, so no bounding box - but its PRESENCE still matters. If the flash
     // turns out to be here rather than on a user-pointer path, the quad classifier is not involved at
     // all and the whole hypothesis changes.
-    FireCensusRecord(0, t, count, 0, nullptr, false);
+    FireCensusRecord(0, t, count, 0, nullptr, false, 0);
     // Cleared here so the mask stays scoped to a single draw - see TakeDrawWriteMask.
     if (g_flashProbeLeft > 0) { LONG lo, hi; TakeDrawWriteMask(&lo, &hi); }
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
@@ -10460,7 +10522,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // Indexed geometry cannot expose its vertices cheaply here, so v0 stays zero on these rows -
     // the texture and render-target columns are what this path contributes.
     if (primCount <= 4) VidProbeRecord(dev, 1, t, primCount, nullptr, 0);
-    FireCensusRecord(1, t, primCount, 0, nullptr, false);
+    FireCensusRecord(1, t, primCount, 0, nullptr, false, numVertices);
     if (g_flashProbeLeft > 0) { LONG lo, hi; TakeDrawWriteMask(&lo, &hi); }
     // LEARN FIRST, THEN HIDE. If hiding skipped the learning, the hidden mesh would drop out of
     // the list next frame and every index after it would shift - the toggle would walk through a
@@ -11243,7 +11305,11 @@ bool DrawVideoQuadPerEye(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT primCou
 // **That trade is unmeasured**, which is why the Y scale is an ini percentage rather than a constant:
 // 50 keeps it circular, 100 fills the half and stretches it. One ini edit tries the other, no rebuild.
 int g_scopeQuadStride = 16;      // ini [Render] ScopeQuadStride  - 0 disables by stride
-int g_scopeQuadPerEye = 1;       // ini [Render] ScopeQuadPerEye
+// ⛔ run 213b: DEFAULT FLIPPED 1 -> 0. This fired 120 times a second, exactly one draw per frame while
+// scoped, and the picture did not change - so stride 16 is something that merely co-occurs with the
+// scope, not what paints it. The mechanism below is kept because it is the right remedy once the right
+// draw is identified, but it must not ship enabled on a draw that has been shown to do nothing.
+int g_scopeQuadPerEye = 0;       // ini [Render] ScopeQuadPerEye
 int g_scopeQuadYPct   = 50;      // ini [Render] ScopeQuadYPct
 volatile LONG g_scopeQuadDraws = 0;
 
@@ -11325,7 +11391,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
-    FireCensusRecord(2, t, primCount, vtxStride, vtxData, quad);
+    FireCensusRecord(2, t, primCount, vtxStride, vtxData, quad, 0);
     if (g_flashProbeLeft > 0) {
         LONG lo, hi; TakeDrawWriteMask(&lo, &hi);
         if (vtxStride == kFlashStride) FlashRegDump(dev, lo, hi, primCount, vtxStride);
@@ -11378,7 +11444,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
-    FireCensusRecord(3, t, primCount, vtxStride, vtxData, quad);
+    FireCensusRecord(3, t, primCount, vtxStride, vtxData, quad, numVertices);
     // ⭐ Run 192 found shot geometry on THIS hook at stride 72.
     if (g_flashProbeLeft > 0) {
         LONG lo, hi; TakeDrawWriteMask(&lo, &hi);
@@ -16631,6 +16697,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 // diff would name every draw in the level.
                 g_scopeBaselineDone = true;
                 g_fireIsBaseline = true; g_censusIsScope = true;
+                memset(g_censusKeys, 0, sizeof(g_censusKeys));   // a baseline starts the set over
+                g_censusKeyN = 0;
                 g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
                 for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
                 InterlockedExchange(&g_fireCensusFrames, 8);
@@ -17231,7 +17299,7 @@ void LoadIniSettings() {
                            : "off");
 
     // ---- run 213: the sniper scope overlay, drawn once per eye. See IsScopeQuad. ----
-    g_scopeQuadPerEye = GetPrivateProfileIntA("Render", "ScopeQuadPerEye", 1, path) ? 1 : 0;
+    g_scopeQuadPerEye = GetPrivateProfileIntA("Render", "ScopeQuadPerEye", 0, path) ? 1 : 0;
     g_scopeQuadStride = GetPrivateProfileIntA("Render", "ScopeQuadStride", 16, path);
     if (g_scopeQuadStride < 0)  g_scopeQuadStride = 0;
     if (g_scopeQuadStride > 64) g_scopeQuadStride = 64;
