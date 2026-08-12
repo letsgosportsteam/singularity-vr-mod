@@ -8531,6 +8531,7 @@ void LogFgList(const char* why);      // run 213: the scope census dumps the mes
 // globals it reads. Declared here rather than moved, so the fix stays next to the note explaining it.
 extern int g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount;
 extern volatile LONG g_scopeQuadDraws;
+void ScopeQuadDump(IDirect3DDevice9* dev, UINT primCount);   // run 213f
 
 // ================================================================ the video-quad probe (run 160)
 //
@@ -8858,6 +8859,107 @@ static void DumpShaderConstUsage(IDirect3DVertexShader9* vs) {
 // Dumped from the draw hook - which normally would be forbidden, and is the one thing to be careful
 // about here. Run 24/25 lost two runs to file I/O inside a draw hook, so this is bounded to a handful
 // of draws for the whole session by g_flashProbeLeft and is off by default.
+// ---- ⭐ run 213f: the scope quad SAMPLES THE SCENE, and that changes the fix ----
+//
+// Drawing the overlay per eye (run 213e) put a whole scope in each eye - and revealed that the world is
+// now drawn TWICE inside each one, with a vertical seam through the middle of each circle. So this quad
+// does not merely paint a mask over the frame: it reads the scene target, and its read still spans the
+// FULL side-by-side buffer while its geometry has been squeezed into one half.
+//
+// Two mechanisms produce that symptom exactly, and they need OPPOSITE fixes:
+//
+//   UV from the VERTEX BUFFER   the quad carries texcoords spanning the whole texture. Fix: per eye,
+//                               halve the U range - which means rewriting vertices, which means knowing
+//                               where TEXCOORD0 sits in a layout nobody has looked at.
+//   UV from the CLIP POSITION   UE3's ScreenPositionScaleBias (this file already documents it at ps c1 =
+//                               (0.5, -0.5, 0.50023, 0.50012), run 41/42). The shader derives the scene
+//                               UV from clip position, and clip x still spans -1..+1 whatever the
+//                               viewport is - so the read covers the whole target regardless. Fix: patch
+//                               that constant per eye. The overlay ART would keep its own vertex UVs and
+//                               stay complete, which is the outcome we actually want.
+//
+// The second is more likely AND has the better outcome, which is exactly the combination that has fooled
+// this project before. So: dump it. Declaration, the vertices themselves, the pixel-shader constants and
+// the bound textures - everything needed to tell the two apart in one look, and no fix until then.
+//
+// ⚠️ Logging from inside a draw hook is what hung startup in runs 24/25. It is safe HERE for the same
+// reason FlashRegDump is: a hard one-shot budget that nothing resets, so it cannot fire per frame.
+int g_scopeDumpLeft = 0;             // ini [Render] ScopeQuadDump
+void ScopeQuadDump(IDirect3DDevice9* dev, UINT primCount) {
+    if (g_scopeDumpLeft <= 0) return;
+    --g_scopeDumpLeft;
+    Log("---- scope quad dump (%d left) ----", g_scopeDumpLeft);
+
+    // The declaration says where TEXCOORD0 is, which is the whole question for the vertex-buffer case.
+    if (IDirect3DVertexDeclaration9* decl = nullptr;
+        SUCCEEDED(dev->GetVertexDeclaration(&decl)) && decl) {
+        D3DVERTEXELEMENT9 el[MAXD3DDECLLENGTH + 1]{};
+        UINT n = 0;
+        if (SUCCEEDED(decl->GetDeclaration(el, &n))) {
+            for (UINT i = 0; i < n && i < MAXD3DDECLLENGTH; ++i) {
+                if (el[i].Stream == 0xFF) break;               // D3DDECL_END
+                Log("    decl[%u] stream %u offset %2u type %2u usage %2u index %u",
+                    i, el[i].Stream, el[i].Offset, el[i].Type, el[i].Usage, el[i].UsageIndex);
+            }
+        }
+        decl->Release();
+    } else {
+        Log("    no vertex declaration - fixed-function FVF, which is a different fix again");
+    }
+
+    // The vertices. A 2-primitive strip is 4 of them; read a couple extra in case the type differs.
+    IDirect3DVertexBuffer9* vb = nullptr;
+    UINT vbOff = 0, vbStride = 0;
+    if (SUCCEEDED(dev->GetStreamSource(0, &vb, &vbOff, &vbStride)) && vb && vbStride &&
+        vbStride <= 128) {
+        const UINT nv = primCount + 2;
+        void* p = nullptr;
+        if (SUCCEEDED(vb->Lock(vbOff, nv * vbStride, &p, D3DLOCK_READONLY)) && p) {
+            for (UINT v = 0; v < nv && v < 6; ++v) {
+                const float* f = reinterpret_cast<const float*>(
+                    static_cast<uint8_t*>(p) + (size_t)v * vbStride);
+                char line[256]; int m = 0;
+                for (UINT k = 0; k < vbStride / 4 && k < 8; ++k)
+                    m += _snprintf_s(line + m, sizeof(line) - m, _TRUNCATE, " %+.4f", f[k]);
+                Log("    vtx[%u] stride %u:%s", v, vbStride, line);
+            }
+            vb->Unlock();
+        } else {
+            Log("    vertex buffer would not lock - probably DEFAULT pool without DYNAMIC. The"
+                " declaration above still answers where the texcoords are.");
+        }
+    } else {
+        Log("    no stream 0 vertex buffer");
+    }
+    if (vb) vb->Release();
+
+    // ScreenPositionScaleBias, if it is here. Looking for something near (0.5, -0.5, ~0.5, ~0.5).
+    float c[4 * 16]{};
+    if (SUCCEEDED(dev->GetPixelShaderConstantF(0, c, 16))) {
+        for (int r = 0; r < 16; ++r) {
+            const float* v = c + r * 4;
+            if (v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f && v[3] == 0.0f) continue;
+            const bool spsb = v[0] > 0.4f && v[0] < 0.6f && v[1] < -0.4f && v[1] > -0.6f;
+            Log("    ps c%-2d %+.5f %+.5f %+.5f %+.5f%s", r, v[0], v[1], v[2], v[3],
+                spsb ? "   <== shaped like ScreenPositionScaleBias" : "");
+        }
+    }
+
+    // And what it is sampling. A stage whose size equals the render target is the scene itself.
+    for (DWORD st = 0; st < 4; ++st) {
+        IDirect3DBaseTexture9* bt = nullptr;
+        if (FAILED(dev->GetTexture(st, &bt)) || !bt) continue;
+        if (bt->GetType() == D3DRTYPE_TEXTURE) {
+            D3DSURFACE_DESC d{};
+            if (SUCCEEDED(static_cast<IDirect3DTexture9*>(bt)->GetLevelDesc(0, &d)))
+                Log("    tex stage %lu: %ux%u fmt %u%s", st, d.Width, d.Height, (UINT)d.Format,
+                    (d.Width == g_srcW && d.Height == g_srcH)
+                        ? "   <== scene-sized: THIS is the read that spans both eyes" : "");
+        }
+        bt->Release();
+    }
+}
+
 void FlashRegDump(IDirect3DDevice9* dev, LONG lo, LONG hi, UINT primCount, UINT stride) {
     if (g_flashProbeLeft <= 0) return;
     --g_flashProbeLeft;
@@ -9290,6 +9392,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
         count == (UINT)g_scopeQuadPrimCount &&
         InterlockedCompareExchange(&g_dupDraws, 0, 0) &&
         InterlockedCompareExchange(&g_rtIsScene, 0, 0)) {
+        ScopeQuadDump(dev, count);
         D3DVIEWPORT9 full{};
         if (SUCCEEDED(dev->GetViewport(&full)) && full.Width >= 4) {
             static bool said = false;
@@ -17368,6 +17471,17 @@ void LoadIniSettings() {
             " primitive count%s is SKIPPED. This is an identification test, not a fix - set"
             " DropPrimCount=0 when finished.", g_dropPrimCount, g_dropPrimType,
             g_dropPrimType < 0 ? " (any type)" : " and type");
+
+    // Run 213f: one-shot dump of the scope quad's declaration, vertices, pixel constants and textures.
+    // Answers whether the scene read comes from vertex texcoords or from ScreenPositionScaleBias, which
+    // need opposite fixes. Bounded hard, because this logs from inside a draw hook.
+    g_scopeDumpLeft = GetPrivateProfileIntA("Render", "ScopeQuadDump", 0, path);
+    if (g_scopeDumpLeft < 0) g_scopeDumpLeft = 0;
+    if (g_scopeDumpLeft > 4) g_scopeDumpLeft = 4;
+    if (g_scopeDumpLeft)
+        Log("ini: ScopeQuadDump=%d - dump the scope overlay quad's vertex declaration, vertices, pixel"
+            " shader constants and bound textures, %d time(s). Diagnostic only.",
+            g_scopeDumpLeft, g_scopeDumpLeft);
 
     // ---- run 213e: the sniper scope overlay, drawn once per eye. See the note in Hook_DrawPrim. ----
     //
