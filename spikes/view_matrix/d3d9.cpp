@@ -8598,37 +8598,47 @@ const char* VidSrcName(uint8_t s) {
 //
 // If that is what is happening, the fix is the one this codebase already has for the Bink video quad
 // (run 160): draw it once per eye with `x' = x/2 + eyeOffset`. Same defect, same shape, same remedy.
-// Run 213: 20 -> 32. The scope window records far more frames than a fire window (the overlay does not
-// arrive on the first frame of the press), so more distinct signatures accumulate before the dump.
-const int kFireSigMax = 32;
+// Run 213c: 32 -> 768. The scope census records EVERY hook now, and a gameplay frame holds hundreds of
+// distinct signatures - at 32 the table filled with one-off scene geometry and truncated before it
+// reached anything that mattered. Indexed by hash, so size costs memory (~37 KB static) and not time.
+const int kFireSigMax = 768;
 struct FireSig {
-    uint8_t  src, wasQuad;
+    uint8_t  src, wasQuad, inBaseline;
     uint32_t primType, primCount, stride, verts;
     float    minX, minY, maxX, maxY;
     uint32_t count;
 };
 
-// ---- ⭐ run 213b: list what is NEW, not what is there ----
+// ---- 💥 run 213c: "new since the baseline" was the wrong question, twice over ----
 //
-// Run 213a identified the scope as `stride 16, 2 prims, spans NDC` because it appeared in all three
-// scope windows and in no baseline. Drawing that draw once per eye fired **120 times a second, exactly
-// one per frame** - and the picture did not change. So the correlation was real and the causation was
-// not: stride 16 is something else that also only happens while scoped.
+// Run 213b listed every signature absent from the baseline. It produced 32 rows, every one of them
+// `x1`, and not one of them was the scope. Two defects, both visible in that output:
 //
-// The reason that was possible is that the census only lists the USER-POINTER hooks. The scope window's
-// own `draws by hook` line said DrawIdxPrim went from ~856/frame to ~1008/frame - about 150 extra
-// indexed draws per frame that the signature table never showed, because indexed draws come from vertex
-// buffers and carry no vertex pointer.
+//   1. **Every row was a count of ONE.** Those are one-off scene draws - level geometry that simply was
+//      not on screen during the 8-frame baseline. An OVERLAY is drawn EVERY FRAME. The count column was
+//      already there and the filter was applied to the wrong property.
 //
-// So the table now covers every hook, and to keep it readable it lists only signatures that were NOT
-// present in the baseline. That is the actual question - "what appears when the scope comes up" - and
-// asking it directly is what would have avoided spending a run on a correlated draw.
+//   2. **The baseline was taken with a DIFFERENT WEAPON.** Baseline `[0]=11387`, scope window
+//      `[0]=11389`. The baseline was one-shot per session and fired the moment any weapon latched -
+//      long before the sniper was picked up - so the diff contained the whole rifle and everything
+//      else that had changed in between. A baseline that does not share the window's state is not a
+//      baseline; it is a second, unrelated sample.
 //
-// A hash set rather than a linear scan because this now sees every draw in the frame: ~1000/frame over
-// 60 frames is 60,000 lookups, and a linear scan over the baseline would be 60 million comparisons.
+// So the discriminator is PERSISTENCE, not novelty, and it comes from what an overlay IS rather than
+// from any guess about how it is drawn: **the scope overlay must appear in nearly every frame that the
+// scope is up.** Scene geometry comes and goes as the view moves. That single property would have cut
+// all 32 of those rows without knowing anything about the scope.
+//
+// Novelty is kept, demoted to an annotation. It is genuinely useful once persistence has done the
+// filtering - "drawn every frame AND absent with the trigger up" is a much stronger statement than
+// either half - but it is no longer allowed to decide what gets listed.
+//
+// The table is now indexed by an open-addressed hash so nothing truncates, and the baseline is re-taken
+// whenever the latched weapon changes, so it always describes the gun actually in your hands.
 const int kCensusKeyMax = 2048;               // power of two, open addressing
 uint32_t g_censusKeys[kCensusKeyMax]{};
-int      g_censusKeyN = 0;
+int32_t  g_censusIdx[kCensusKeyMax]{};        // -> index into g_fireSig
+LONG     g_censusBaseGun = 0;                 // the weapon the current baseline describes
 
 inline uint32_t CensusKey(uint8_t src, UINT primCount, UINT verts, UINT stride) {
     uint32_t h = 2166136261u;
@@ -8637,19 +8647,20 @@ inline uint32_t CensusKey(uint8_t src, UINT primCount, UINT verts, UINT stride) 
     return h ? h : 1u;                        // 0 marks an empty slot, so never produce it
 }
 
-inline bool CensusKeySeen(uint32_t k, bool insert) {
+// Returns the slot for this key. `*fresh` says whether it had to be created.
+inline int32_t CensusSlot(uint32_t k, bool create, bool* fresh, int32_t nextIdx) {
+    *fresh = false;
     uint32_t i = k & (kCensusKeyMax - 1);
     for (int n = 0; n < kCensusKeyMax; ++n) {
         if (!g_censusKeys[i]) {
-            if (insert && g_censusKeyN < kCensusKeyMax / 2) { g_censusKeys[i] = k; ++g_censusKeyN; }
-            return false;
+            if (!create || nextIdx < 0) return -1;
+            g_censusKeys[i] = k; g_censusIdx[i] = nextIdx; *fresh = true;
+            return nextIdx;
         }
-        if (g_censusKeys[i] == k) return true;
+        if (g_censusKeys[i] == k) return g_censusIdx[i];
         i = (i + 1) & (kCensusKeyMax - 1);
     }
-    // Full. Report "seen" so a saturated table quietly stops adding rows rather than flooding the
-    // signature list with everything in the level - a wrong answer that looks like a long one.
-    return true;
+    return -1;                                // full: stop adding rather than report nonsense
 }
 FireSig g_fireSig[kFireSigMax]{};
 int  g_fireSigN = 0;
@@ -9012,19 +9023,33 @@ void FireCensusRecord(uint8_t src, D3DPRIMITIVETYPE t, UINT primCount, UINT stri
     if (wasQuad) ++g_fireQuadSeen; else ++g_fireSplitSeen;
     if (src < 4) ++g_fireBySrc[src];
 
-    // ---- run 213b: the scope census covers EVERY hook and lists only what the baseline lacked ----
+    // ---- run 213c: the scope census counts EVERY hook, and the dump filters on persistence ----
     //
-    // The fire census keeps its original behaviour exactly - user-pointer paths only, everything
-    // listed - because runs 192-196 are recorded against it and changing what it reports would make
-    // those entries mean something different.
+    // The fire census keeps its original behaviour exactly - user-pointer paths only, linear scan,
+    // everything listed - because runs 192-196 are recorded against it and changing what it reports
+    // would make those entries mean something different.
     if (g_censusIsScope) {
         const uint32_t key = CensusKey(src, primCount, verts, stride);
-        if (g_fireIsBaseline) { CensusKeySeen(key, true); return; }   // baseline only builds the set
-        if (CensusKeySeen(key, false)) return;                        // present with the trigger up
-        CensusKeySeen(key, true);            // and do not list the same new signature twice
-    } else if (src != 2 && src != 3) {
-        return;                              // src 2 = DrawPrimUP, 3 = DrawIndexedPrimUP
+        bool fresh = false;
+        const int32_t slot = CensusSlot(key, true, &fresh,
+                                        g_fireSigN < kFireSigMax ? g_fireSigN : -1);
+        if (slot < 0) return;                       // table full
+        FireSig& e = g_fireSig[slot];
+        if (fresh) {
+            ++g_fireSigN;
+            e = FireSig{};
+            e.src = src; e.wasQuad = wasQuad ? 1 : 0;
+            e.inBaseline = g_fireIsBaseline ? 1 : 0;
+            e.primType = (uint32_t)t; e.primCount = primCount; e.stride = stride; e.verts = verts;
+            FireBBox(vtx, stride, t, primCount, &e.minX, &e.minY, &e.maxX, &e.maxY);
+        } else if (e.minX >= 1e8f && vtx) {         // 1e8 is FireBBox's "no vertex data" sentinel
+            // A signature first seen on a hook without vertex data can still get a box later.
+            FireBBox(vtx, stride, t, primCount, &e.minX, &e.minY, &e.maxX, &e.maxY);
+        }
+        ++e.count;
+        return;
     }
+    if (src != 2 && src != 3) return;               // src 2 = DrawPrimUP, 3 = DrawIndexedPrimUP
 
     for (int i = 0; i < g_fireSigN; ++i) {
         FireSig& e = g_fireSig[i];
@@ -9052,8 +9077,17 @@ void FireCensusDump() {
     Log("    draws by hook: DrawPrim %d, DrawIdxPrim %d, DrawPrimUP %d, DrawIdxPrimUP %d"
         " (only the UP paths are listed below - they are the ones with vertex data)",
         g_fireBySrc[0], g_fireBySrc[1], g_fireBySrc[2], g_fireBySrc[3]);
+    // ⭐ run 213c: an overlay is drawn EVERY frame. Scene geometry comes and goes as the view moves, and
+    // in run 213b every single listed row was a count of one. So the scope dump prints only signatures
+    // that persisted across most of the window - the property that follows from what an overlay is,
+    // rather than from any guess about how it is drawn.
+    const uint32_t persistMin = g_censusIsScope
+        ? (uint32_t)((g_fireIsBaseline ? 8 : kScopeCensusFrames) / 2) : 0u;
+    int shown = 0, hidden = 0;
     for (int i = 0; i < g_fireSigN; ++i) {
         const FireSig& e = g_fireSig[i];
+        if (e.count < persistMin) { ++hidden; continue; }
+        ++shown;
         const bool haveBox = e.minX < 1e8f;
         const float w = haveBox ? e.maxX - e.minX : 0.0f;
         const float h = haveBox ? e.maxY - e.minY : 0.0f;
@@ -9066,13 +9100,19 @@ void FireCensusDump() {
             e.wasQuad ? "PASSED THROUGH" : "split per eye ",
             haveBox ? e.minX : 0.0f, haveBox ? e.maxX : 0.0f,
             haveBox ? e.minY : 0.0f, haveBox ? e.maxY : 0.0f, w, h,
-            !haveBox ? "  (no vertex data - indexed draw)"
+            (g_censusIsScope && !g_fireIsBaseline && !e.inBaseline)
+                ? "  <== EVERY FRAME, and NOT drawn with the trigger up"
+                : !haveBox ? "  (no vertex data - indexed draw)"
                      : (e.wasQuad && (w < 1.0f || h < 1.0f))
                          ? "  <-- PASSED THROUGH BUT DOES NOT SPAN NDC. This is the bug: drawn once,"
                            " at the centre of the full frame."
                          : "",
             e.count);
     }
+    if (g_censusIsScope)
+        Log("    %d signature(s) shown, %d hidden as transient (fewer than %u of the window's frames)."
+            " A row marked EVERY FRAME + NOT WITH THE TRIGGER UP is the candidate.",
+            shown, hidden, persistMin);
     if (!g_fireSigN)
         Log("    (no user-pointer draws at all in this window - if the flash was visible, it is on an"
             " indexed path and the quad classifier is not involved)");
@@ -9090,16 +9130,27 @@ void FireCensusDump() {
         LogFgList(g_fireIsBaseline ? "scope census BASELINE - first-person meshes, alt trigger up"
                                    : "scope census WINDOW - first-person meshes, alt trigger down");
         if (g_fireIsBaseline)
-            Log("    %d distinct draw signature(s) recorded across ALL hooks. The scope window will list"
-                " only what is NOT in this set.", g_censusKeyN);
+            Log("    %d distinct signature(s) recorded across ALL hooks with the trigger up; the rows"
+                " above are the ones drawn in most frames. The window keeps this table, so a row there"
+                " can say BOTH that it is drawn every frame and that it was absent here.", g_fireSigN);
         else
-            Log("    Every row above is NEW - absent from the baseline taken with the alt trigger up."
-                " ⚠️ Run 213a picked `stride 16, 2 prims, spans NDC` from this same correlation, drew it"
-                " once per eye at 120/second, and the picture did not change - so being new is NOT"
-                " proof. Validate the candidate with MuzzleFxDropStride (user-pointer paths) before"
-                " building on it: if dropping it does not remove the scope, it is not the scope.");
+            Log("    ⚠️ A candidate is still only a candidate. Run 213a picked `stride 16, 2 prims,"
+                " spans NDC` on correlation alone, drew it once per eye at 120/second, and the picture"
+                " did not change. Drop the draw before building on it - if the scope survives, it is"
+                " not the scope. MuzzleFxDropStride reaches the user-pointer paths; an indexed draw"
+                " needs the equivalent building first, NOT a guess.");
     }
-    g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
+    // ⭐ run 213c: the scope table spans baseline AND window - the window resets counts but keeps the
+    // entries and their inBaseline flags. Clearing here would throw away the very thing the window
+    // compares against. The fire census still clears, exactly as it always did.
+    if (!g_censusIsScope || !g_fireIsBaseline) {
+        g_fireSigN = 0;
+        memset(g_censusKeys, 0, sizeof(g_censusKeys));
+        // ...and a completed scope window re-arms the baseline, so every window is compared against a
+        // baseline taken seconds earlier with the same weapon rather than against a stale one.
+        if (g_censusIsScope) g_scopeBaselineDone = false;
+    }
+    g_fireSplitSeen = 0; g_fireQuadSeen = 0;
     for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
 }
 
@@ -16690,24 +16741,33 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     {
         const LONG left = InterlockedCompareExchange(&g_fireCensusFrames, 0, 0);
         const LONG alt  = InterlockedCompareExchange(&g_rawAltTrigger, 0, 0);
+        const LONG gun = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+        // 💥 run 213c: the baseline must describe THE WEAPON IN YOUR HANDS. Run 213b took one baseline
+        // per session, the first time any weapon latched - so it was recorded on gun=11387 and compared
+        // against scope windows on gun=11389, and the diff contained the entire sniper. A baseline that
+        // does not share the window's state is not a baseline, it is a second unrelated sample.
+        if (gun && gun != g_censusBaseGun) g_scopeBaselineDone = false;
         if (left <= 0 && g_scopeCensusBudget > 0) {
-            if (!g_scopeBaselineDone && alt < 20 && InterlockedCompareExchange(&g_gunVerts, 0, 0)) {
-                // Baseline first, gated on a weapon being latched - the same reasoning as the fire
-                // baseline. A baseline taken at the menu shares nothing with the scope window and the
-                // diff would name every draw in the level.
+            if (!g_scopeBaselineDone && alt < 20 && gun) {
                 g_scopeBaselineDone = true;
+                g_censusBaseGun = gun;
                 g_fireIsBaseline = true; g_censusIsScope = true;
-                memset(g_censusKeys, 0, sizeof(g_censusKeys));   // a baseline starts the set over
-                g_censusKeyN = 0;
+                // The table spans the baseline AND the window: entries carry an inBaseline flag, so a
+                // signature seen with the trigger up is recognised rather than re-listed as new.
+                memset(g_censusKeys, 0, sizeof(g_censusKeys));
                 g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
                 for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
                 InterlockedExchange(&g_fireCensusFrames, 8);
-                Log("scope census: BASELINE, alt trigger UP, recording 8 frames - do not scope yet");
+                Log("scope census: BASELINE for gun=%ld, alt trigger UP, recording 8 frames -"
+                    " do not scope yet", gun);
             } else if (g_scopeBaselineDone && alt > 40 && !g_scopeTrigWasDown) {
                 --g_scopeCensusBudget;
                 g_scopeTrigWasDown = true;
                 g_fireIsBaseline = false; g_censusIsScope = true;
-                g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
+                // Counts reset, entries and their inBaseline flags KEPT - that is what lets the window
+                // say "drawn every frame AND absent with the trigger up" in one row.
+                for (int i = 0; i < g_fireSigN; ++i) g_fireSig[i].count = 0;
+                g_fireSplitSeen = 0; g_fireQuadSeen = 0;
                 for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
                 InterlockedExchange(&g_fireCensusFrames, kScopeCensusFrames);
                 Log("scope census: SCOPE window, alt trigger DOWN, recording %d frames - HOLD the left"
