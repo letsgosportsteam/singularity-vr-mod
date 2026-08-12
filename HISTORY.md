@@ -109,18 +109,50 @@ that outlasts the window. The misfire is **benign and self-healing**: the drop i
 by a re-take whose first list entry is the gun, so it costs ~0.25 s of the gun at the engine position
 against a session that otherwise stays broken. `RelatchWrongRoles=0` reverts.
 
-### What was NOT measured
+### ✅ VERIFIED, and the case was genuinely exercised
 
-- **No log contains a clean in-session weapon swap** (A drawn → B drawn without the pass emptying).
-  Both A→B transitions on disk went through a weaponless or menu pass first. Reasoning from code, a
-  live swap gives **~2–2.5 s of invisible gun** — B is outside A's baseline, so `HideStrayArms` hides
-  it until the 240-frame drop — then it re-takes correctly. That is pre-existing and unchanged here.
-  The two clean `11387` latches are evidence the re-take path handles a second weapon.
-- **`CheckFgCoexist` has still never fired**, so "is 11387 a second weapon or the pistol in another
-  state" remains open — and that diagnostic **cannot** answer it, since only the weapon in your hands
-  is drawn. Do not read its silence as evidence.
-- The fix is designed against **one** logged instance of the failure. Both knobs are ini toggles for
-  that reason.
+161,376 lines, played from the very beginning. `view_matrix.log` line 17471:
+
+```
+*** mesh latch: REFUSING this latch. The list settled on 3314/390 across 3 mesh(es), but 3314
+was drawn in the weaponless pass - so it is the ARMS, not a gun ... ***
+fg census (at the REFUSED take): 3 entries: [0]=3314 [1]=390 [2]=662
+```
+
+**The identical signature to the Aug 7 failure, down to the same 662 mesh.** The pistol then latched
+correctly at line 35663 as `[5799 3314 390]`. This was the outcome I said was *less* likely than a
+clean-but-inconclusive run — the false-pass mode was named in advance and did not occur.
+
+### ✅ And weapon swapping is measured now — it works
+
+The same run cycled **four** weapons — `5799`, `8297`, `11387`, `11389` — through **21 drop/re-take
+pairs**, every one re-taking the correct gun. So:
+
+- The "is 11387 a second weapon, or one mesh in two states?" question from run 158d's diagnostic is
+  **settled by ordinary play**: `8297` and `11387` are distinct weapons appearing in one session.
+  `CheckFgCoexist` never fired and never could — only the weapon in your hands is drawn.
+- **The `RelatchWrongRoles` backstop never fired.** The `bigger` misfire flagged as possible did not
+  occur. It also cannot pre-empt a swap by construction: the normal drop needs 240 frames and the
+  backstop 600, so the normal drop always wins that race — 21 swaps, zero backstop firings.
+
+### Still open, and not papered over
+
+- **The ~2 s of hidden gun after a swap is neither confirmed nor refuted.** The mechanism is still in
+  the code — the new weapon is outside the old baseline, so `HideStrayArms` hides it until the
+  240-frame drop — but the drop line marks the **end** of that window, so the log cannot size it, and
+  it was not reported across 21 swaps. Do not record this as "fine"; it is unmeasured.
+- **⚠️ NEW: the ARMS role can be misassigned, latently.** Line 156769 latched `gun=11389, arms=97`
+  from `[0]=11389 [1]=97 [2]=3314 [3]=390`. Slot [1] was a 97-vertex sub-mesh, not the real 3314 arms.
+  **No visible defect, and only by luck:** with `HideExtraArms=1` the real arms are hidden anyway, as
+  "a baseline mesh that is neither gun nor arms". With `HideExtraArms=0` they would be visible.
+  - The weak part is the role rule itself — "slot [0] is the gun, slot [1] is the arms". Run 212 fixed
+    the *gun* half with evidence; the arms half is still positional. **`3314` is invariant across every
+    weapon in every log**, and is the identifier the arms role should use.
+  - Not fixed, deliberately: it changes nothing visible in the shipping configuration, and the run that
+    would test it is expensive.
+- The fix remains designed against **one** logged instance of the original failure, now confirmed by a
+  second. Both knobs stay ini toggles.
+- The run-158d **menu** latch (`[4 251 745 …]`) is untouched and still open.
 
 ---
 

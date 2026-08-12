@@ -446,8 +446,13 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      the report was taken as the diagnosis. The user's description contained the answer — *always
      present*, *moves with the gun* — and both facts were already in the logs.
 
-10b. **🔬 BUILT, NOT YET FLOWN (run 212) — the run-207 role shift came back past `MinFgMeshes`.**
+10b. **✅ FIXED and VERIFIED (run 212) — the run-207 role shift came back past `MinFgMeshes`.**
    `VetoQuietGun=1`, `RelatchWrongRoles=1`.
+   - **Verified, and the case was genuinely exercised** — this is not a clean-run false pass. In a
+     161,376-line playthrough from the beginning, `view_matrix.log` line 17471 logs the veto firing on
+     `fg census (at the REFUSED take): 3 entries: [0]=3314 [1]=390 [2]=662` — **the identical signature
+     to the Aug 7 failure**, including the same 662 mesh. The pistol then latched correctly at line
+     35663, `[5799 3314 390]`. User-confirmed in play.
    - **Reported:** playing **from the very beginning** to the pistol, the arms are visible (low, where
      the flat game never shows them) and **the pistol is invisible**. Loading the save just before the
      pistol works. The differentiator was the diagnosis: the two runs traverse different states.
@@ -462,10 +467,25 @@ recorded rather than filtered out, because a long enough transient reads as a vi
    - **Verified against data, not reasoning:** 71 takes across every log kept, **0 of 54 good latches
      affected**, and the one bad take blocked. Also confirmed a no-op on the working save-load path,
      which already records the weaponless set before latching 5799.
-   - ⚠️ **Designed against ONE logged instance.** Both knobs are ini toggles for that reason. The
-     run-158d **menu** latch (`[4 251 745 …]`, 8 meshes) is **not** covered and is still open.
-   - ⚠️ **A live weapon swap is unmeasured** — no log has one. Expect ~2–2.5 s of invisible gun on a
-     swap, then correct. Pre-existing, unchanged by this.
+   - ⚠️ The run-158d **menu** latch (`[4 251 745 …]`, 8 meshes) is **not** covered and is still open.
+   - **✅ Weapon swapping is now measured, and works.** The same run cycled **four** weapons — `5799`,
+     `8297`, `11387`, `11389` — through **21 drop/re-take pairs**, every one re-taking the correct gun.
+     The old "is 11387 a second weapon or one mesh in two states" question is settled by
+     `[0]=11387 … [3]=9` and `[0]=8297 …` coexisting in one session as distinct weapons.
+   - **The `RelatchWrongRoles` backstop never fired**, so the `bigger` misfire I flagged as possible did
+     not occur across 161k lines and four weapons. It also cannot pre-empt a swap: the normal drop needs
+     240 frames and the backstop 600, so the normal drop always wins that race. Confirmed — 21 swaps,
+     zero backstop firings.
+   - ⚠️ **The ~2 s of hidden gun after a swap is still neither confirmed nor refuted.** The mechanism is
+     unchanged and still there in the code (the new weapon is outside the old baseline, so
+     `HideStrayArms` hides it until the 240-frame drop), but the drop line marks the *end* of that
+     window so the log cannot size it, and the user did not report seeing it across 21 swaps. Open.
+   - ⚠️ **NEW, and latent rather than visible: the ARMS role can be misassigned.** Line 156769 latched
+     `gun=11389, arms=97` from `[0]=11389 [1]=97 [2]=3314 [3]=390` — slot [1] was a 97-vertex sub-mesh,
+     not the real 3314 arms. **No visible defect, by luck**: with `HideExtraArms=1` the real arms are
+     hidden anyway as "a baseline mesh that is neither gun nor arms". With `HideExtraArms=0` they would
+     be visible. The role assignment "slot [1] is the arms" is the weak part — `3314` is invariant
+     across every weapon in every log and is the better identifier. Not fixed; recorded.
 
 11. **✅ The arms reappear for the health injector animation (run 198–199).** `HealArmsMs=2150`,
    `HealArmsDelayMs=100`.
