@@ -391,6 +391,10 @@ volatile LONG g_setStateCalls = 0;   // rumble path activity, counted per second
 // The right trigger straight from OpenXR, 0-255, independent of whether the pad is currently
 // plugged in. The script census splits on this so an unplugged pad cannot silently empty it.
 volatile LONG g_rawTrigger = 0;
+// Run 213: the LEFT trigger, same scale and same source. It was already packed into g_padBtns bits
+// 16-23 for the pad, but nothing published it on its own - and it is the alt-fire, which is what
+// raises the sniper scope. The scope census keys on this edge.
+volatile LONG g_rawAltTrigger = 0;
 
 // ---- ⚠️ run 155: reported STUCK TRIGGERS on a set-down controller ----
 //
@@ -1457,6 +1461,7 @@ static bool IsLive(uintptr_t obj) {
 // is the "a weapon really exists" gate the suppression uses - and the gate that keeps every GObjects
 // walk out of the splash screens.
 extern volatile LONG g_gunVerts;
+extern volatile LONG g_armsVerts;     // run 213: the scope census reports both roles, and is defined earlier
 // Defined with the camera-position probe. Non-zero means there is a live player camera, i.e. GAMEPLAY -
 // which is the gate that keeps the offset resolver's object walks out of the menus (run 210).
 extern volatile LONG g_camPosValid;
@@ -6734,6 +6739,7 @@ void SyncXRInput(XrTime displayTime) {
     if (lt < 0.10f) lt = 0.0f;
     if (rt < 0.10f) rt = 0.0f;
     InterlockedExchange(&g_rawTrigger, (LONG)(rt * 255.0f));
+    InterlockedExchange(&g_rawAltTrigger, (LONG)(lt * 255.0f));   // run 213 - see the scope census
     g_msActionStates += msStates;
     if (msStates > g_pkActionStates) g_pkActionStates = msStates;
     const LONG packedBtns = (LONG)btns
@@ -8520,6 +8526,7 @@ static bool FgHidden(UINT verts);
 static bool FgRidesGun(UINT verts);
 static bool FgHideWholePass();
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+void LogFgList(const char* why);      // run 213: the scope census dumps the mesh list alongside itself
 
 // ================================================================ the video-quad probe (run 160)
 //
@@ -8591,7 +8598,9 @@ const char* VidSrcName(uint8_t s) {
 //
 // If that is what is happening, the fix is the one this codebase already has for the Bink video quad
 // (run 160): draw it once per eye with `x' = x/2 + eyeOffset`. Same defect, same shape, same remedy.
-const int kFireSigMax = 20;
+// Run 213: 20 -> 32. The scope window records far more frames than a fire window (the overlay does not
+// arrive on the first frame of the press), so more distinct signatures accumulate before the dump.
+const int kFireSigMax = 32;
 struct FireSig {
     uint8_t  src, wasQuad;
     uint32_t primType, primCount, stride;
@@ -8607,6 +8616,41 @@ int  g_fireSplitSeen = 0, g_fireQuadSeen = 0;
 int  g_fireBySrc[4] = {};            // draws per hook, so "not on a user-pointer path" is visible
 bool g_fireIsBaseline = false;       // this window was taken with the trigger UP
 bool g_fireBaselineDone = false;
+
+// ---- ⭐ run 213: the SCOPE census - the same instrument, armed on the ALT trigger ----
+//
+// Reported: the sniper scope "isn't being shown in each eye". It comes up on the left trigger, which is
+// alt-fire.
+//
+// This is the same shape as the Bink quad (run 160) and the muzzle flash (run 192): a draw that covers
+// the whole frame is passed through undivided, so it lands across the ALREADY side-by-side buffer and
+// each eye gets half of it. But it is NOT the only candidate, and this project has lost sessions to
+// picking one and building on it:
+//
+//   A  the overlay is an NDC quad      <3 prims and in clip space, so UserPtrQuad passes it through
+//   B  the overlay is a Canvas element in PIXEL coordinates, which fails the NDC test and goes to
+//      HudStereoPair - in which case it is already remapped and something else is wrong
+//   C  the scope is GEOMETRY on the weapon. Run 212 latched `gun=11389, arms=97` for the sniper, so
+//      the 97-vertex mesh is being HIDDEN as if it were the arms. If that mesh is the lens, the mod is
+//      hiding part of the scope outright
+//   D  none of the above - a render-target or FOV effect on no draw path this census can see
+//
+// So this measures and classifies nothing. `FireCensusDump` already prints the bounding box and already
+// calls out "PASSED THROUGH BUT DOES NOT SPAN NDC", which settles A. The foreground mesh list is dumped
+// alongside it, which settles C. B and D show up as an absence - the diff against the baseline names no
+// new user-pointer signature - and that absence is a real answer, not a failed run.
+//
+// ⚠️ The signature table only holds the USER-POINTER paths, because they are the ones carrying vertex
+// data. If the scope is on an indexed path the table will not name it, but `draws by hook` will still
+// differ between the baseline and the window. Read that line before concluding "nothing changed".
+int  g_scopeCensusBudget = 0;        // ini [Render] ScopeDrawCensus: how many scope-ups to record
+bool g_scopeTrigWasDown = false;
+bool g_scopeBaselineDone = false;
+bool g_censusIsScope = false;        // labels the dump, and adds the mesh list to it
+// The overlay is not on the first frame of the press - there is a zoom animation between the two - so
+// the scope window is much longer than a fire window. Aggregated by signature, so the extra frames cost
+// counts rather than table entries.
+const int kScopeCensusFrames = 60;   // ~0.5 s at 120 fps
 
 // ---- run 193: the flash's register, found by what was written just before its draw ----
 //
@@ -8941,7 +8985,10 @@ void FireCensusRecord(uint8_t src, D3DPRIMITIVETYPE t, UINT primCount, UINT stri
 // Printed from Present, never from a draw hook - run 24/25's startup hang was file I/O inside one.
 void FireCensusDump() {
     Log("---- %s draw census: %d user-pointer signature(s); %d draw(s) split per eye, %d passed through"
-        " as fullscreen quads ----", g_fireIsBaseline ? "BASELINE (trigger UP)" : "FIRE-WINDOW",
+        " as fullscreen quads ----",
+        g_censusIsScope ? (g_fireIsBaseline ? "SCOPE BASELINE (alt trigger UP)"
+                                            : "SCOPE-WINDOW (alt trigger DOWN)")
+                        : (g_fireIsBaseline ? "BASELINE (trigger UP)" : "FIRE-WINDOW"),
         g_fireSigN, g_fireSplitSeen, g_fireQuadSeen);
     Log("    draws by hook: DrawPrim %d, DrawIdxPrim %d, DrawPrimUP %d, DrawIdxPrimUP %d"
         " (only the UP paths are listed below - they are the ones with vertex data)",
@@ -8970,9 +9017,26 @@ void FireCensusDump() {
     if (!g_fireSigN)
         Log("    (no user-pointer draws at all in this window - if the flash was visible, it is on an"
             " indexed path and the quad classifier is not involved)");
-    if (!g_fireIsBaseline)
+    if (!g_fireIsBaseline && !g_censusIsScope)
         Log("    Compare against the BASELINE block: a signature present HERE and absent there is the"
             " shot's own geometry. That is the muzzle flash, and its box says whether it spans NDC.");
+    if (g_censusIsScope) {
+        // Hypothesis C, settled in the same dump: run 212 latched `gun=11389, arms=97` for the sniper,
+        // so a 97-vertex mesh is being hidden as if it were the arms. If the scope lens is that mesh,
+        // the mod is hiding part of the scope and no quad classifier is involved at all.
+        Log("    latched roles: gun=%ld arms=%ld (anything in the baseline set that is NEITHER is hidden"
+            " by HideExtraArms; the arms count itself is hidden outright)",
+            InterlockedCompareExchange(&g_gunVerts, 0, 0),
+            InterlockedCompareExchange(&g_armsVerts, 0, 0));
+        LogFgList(g_fireIsBaseline ? "scope census BASELINE - first-person meshes, alt trigger up"
+                                   : "scope census WINDOW - first-person meshes, alt trigger down");
+        if (!g_fireIsBaseline)
+            Log("    Read this against the SCOPE BASELINE block. A new user-pointer signature here that"
+                " is PASSED THROUGH and does not span NDC is the overlay (hypothesis A). No new"
+                " signature but a changed 'draws by hook' line means it is on an indexed path (B/D)."
+                " A new mesh in the list above, or one equal to the latched arms count, is geometry the"
+                " mod may be hiding (C).");
+    }
     g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
     for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
 }
@@ -16433,6 +16497,39 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (InterlockedCompareExchange(&g_rawTrigger, 0, 0) < 20) g_fireTrigWasDown = false;
     }
 
+    // ---- ⭐ run 213: the scope census, on the ALT trigger ----
+    //
+    // Deliberately AFTER the fire block and sharing its recording buffer: the two cannot both be armed
+    // (each checks `left > 0` first), and one buffer means one dump format to read. The label says which.
+    {
+        const LONG left = InterlockedCompareExchange(&g_fireCensusFrames, 0, 0);
+        const LONG alt  = InterlockedCompareExchange(&g_rawAltTrigger, 0, 0);
+        if (left <= 0 && g_scopeCensusBudget > 0) {
+            if (!g_scopeBaselineDone && alt < 20 && InterlockedCompareExchange(&g_gunVerts, 0, 0)) {
+                // Baseline first, gated on a weapon being latched - the same reasoning as the fire
+                // baseline. A baseline taken at the menu shares nothing with the scope window and the
+                // diff would name every draw in the level.
+                g_scopeBaselineDone = true;
+                g_fireIsBaseline = true; g_censusIsScope = true;
+                g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
+                for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
+                InterlockedExchange(&g_fireCensusFrames, 8);
+                Log("scope census: BASELINE, alt trigger UP, recording 8 frames - do not scope yet");
+            } else if (g_scopeBaselineDone && alt > 40 && !g_scopeTrigWasDown) {
+                --g_scopeCensusBudget;
+                g_scopeTrigWasDown = true;
+                g_fireIsBaseline = false; g_censusIsScope = true;
+                g_fireSigN = 0; g_fireSplitSeen = 0; g_fireQuadSeen = 0;
+                for (int i = 0; i < 4; ++i) g_fireBySrc[i] = 0;
+                InterlockedExchange(&g_fireCensusFrames, kScopeCensusFrames);
+                Log("scope census: SCOPE window, alt trigger DOWN, recording %d frames - HOLD the left"
+                    " trigger through this (%d scope-up(s) left)", kScopeCensusFrames,
+                    g_scopeCensusBudget);
+            }
+        }
+        if (alt < 20) g_scopeTrigWasDown = false;
+    }
+
     UpdateFromHeadset(s);
     ApplyPadTestOverrides();   // must follow SyncXRInput - see the note on the function
     UpdateAutoPad();           // and after that, so a test override is never what keeps it awake
@@ -17012,6 +17109,19 @@ void LoadIniSettings() {
         g_fireCensusBudget ? "record how each small draw during a shot is classified - looking for a"
                              " draw PASSED THROUGH as a fullscreen quad that does not span NDC"
                            : "off");
+
+    // Run 213: the same census, armed on the ALT trigger, for the sniper scope. Default 0 - it is a
+    // measuring tool and recording costs per-draw work while a window is open, so it should not charge
+    // rent on every future launch (the lesson TimeOurWork's default flip recorded). Set it to 2-4 for a
+    // scope run. Costs nothing at all once the budget is spent.
+    g_scopeCensusBudget = GetPrivateProfileIntA("Render", "ScopeDrawCensus", 0, path);
+    if (g_scopeCensusBudget < 0)  g_scopeCensusBudget = 0;
+    if (g_scopeCensusBudget > 10) g_scopeCensusBudget = 10;
+    Log("ini: ScopeDrawCensus=%d (%s)", g_scopeCensusBudget,
+        g_scopeCensusBudget ? "record how each draw is classified while the ALT trigger is held, against"
+                              " a baseline taken with it up - for the sniper scope. Dumps the"
+                              " first-person mesh list too, so weapon geometry is covered as well"
+                            : "off");
 
     // Run 191's register probe. Turned OFF by default now: it came back negative - no plausible
     // view-projection register is unique to a fire frame - so paying an expensive scan per shot on
