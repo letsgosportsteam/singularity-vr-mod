@@ -8732,6 +8732,11 @@ const UINT kFlashStride = 72;
 // Kept in the code rather than left as a note, because the next session should be able to ask the
 // question with one ini key instead of rebuilding the instrument.
 int g_dropStride = 0;                // ini [Render] MuzzleFxDropStride, 0 = off
+// Run 213d. The same idea for DrawPrimitive, which has no stride to key on. `DropPrimCount=0` is off;
+// `DropPrimType=-1` matches any primitive type. See the drop site in Hook_DrawPrim.
+int g_dropPrimCount = 0;             // ini [Render] DropPrimCount
+int g_dropPrimType  = -1;            // ini [Render] DropPrimType
+volatile LONG g_dropPrimDraws = 0;
 
 // Reads and clears the mask. Called at the top of every draw hook, so the value returned describes the
 // draw that is about to be issued rather than an accumulation over the whole frame.
@@ -9234,6 +9239,24 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
     // turns out to be here rather than on a user-pointer path, the quad classifier is not involved at
     // all and the whole hypothesis changes.
     FireCensusRecord(0, t, count, 0, nullptr, false, 0);
+    // ---- ⭐ run 213d: the validation, on the path that had none ----
+    //
+    // `MuzzleFxDropStride` only reaches the user-pointer hooks, because a stride is the only handle
+    // those draws offer. THIS path has no vertex pointer and no stride, so it had no drop mechanism at
+    // all - and that is exactly why the run-213c census could finally see a candidate here that three
+    // earlier censuses were structurally blind to.
+    //
+    // Run 213a's whole lesson was that a candidate identified by correlation must be DROPPED before
+    // anything is built on it. Building the drop for this path first, rather than a second per-eye
+    // transform on a second guess.
+    //
+    // Returning S_OK without drawing is how every other drop in this file works: device state
+    // untouched, so the next draw behaves normally.
+    if (g_dropPrimCount && (UINT)g_dropPrimCount == count &&
+        (g_dropPrimType < 0 || (UINT)g_dropPrimType == (UINT)t)) {
+        InterlockedIncrement(&g_dropPrimDraws);
+        return D3D_OK;
+    }
     // Cleared here so the mask stays scoped to a single draw - see TakeDrawWriteMask.
     if (g_flashProbeLeft > 0) { LONG lo, hi; TakeDrawWriteMask(&lo, &hi); }
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
@@ -16179,6 +16202,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (const LONG sq = InterlockedExchange(&g_scopeQuadDraws, 0))
                 Log("    scope overlay quads drawn per eye: %ld this second", sq);
 
+            // Run 213d. Proves the drop test actually engaged. "I saw no change" means nothing if the
+            // filter never matched a draw - that ambiguity is what made run 213a expensive.
+            if (const LONG dp = InterlockedExchange(&g_dropPrimDraws, 0))
+                Log("    DrawPrimitive draws SKIPPED by DropPrimCount: %ld this second", dp);
+
             // Directly under the correlation table, because it answers the next question that table
             // raises: the row above says the frame is 5 ms slower, this one says whether those 5 ms
             // were spent or waited for.
@@ -17357,6 +17385,18 @@ void LoadIniSettings() {
         g_fireCensusBudget ? "record how each small draw during a shot is classified - looking for a"
                              " draw PASSED THROUGH as a fullscreen quad that does not span NDC"
                            : "off");
+
+    // Run 213d: the drop test for the DrawPrimitive path - the validation MuzzleFxDropStride cannot do,
+    // because that path has no stride. Set DropPrimCount=2 DropPrimType=5 and scope: if the scope
+    // circle disappears, that draw IS the overlay. If it survives, it is not, and nothing gets built.
+    g_dropPrimCount = GetPrivateProfileIntA("Render", "DropPrimCount", 0, path);
+    g_dropPrimType  = GetPrivateProfileIntA("Render", "DropPrimType", -1, path);
+    if (g_dropPrimCount < 0) g_dropPrimCount = 0;
+    if (g_dropPrimCount)
+        Log("ini: DropPrimCount=%d DropPrimType=%d - DIAGNOSTIC: every DrawPrimitive with that"
+            " primitive count%s is SKIPPED. This is an identification test, not a fix - set"
+            " DropPrimCount=0 when finished.", g_dropPrimCount, g_dropPrimType,
+            g_dropPrimType < 0 ? " (any type)" : " and type");
 
     // ---- run 213: the sniper scope overlay, drawn once per eye. See IsScopeQuad. ----
     g_scopeQuadPerEye = GetPrivateProfileIntA("Render", "ScopeQuadPerEye", 0, path) ? 1 : 0;
