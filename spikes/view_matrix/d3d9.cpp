@@ -8527,6 +8527,10 @@ static bool FgRidesGun(UINT verts);
 static bool FgHideWholePass();
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 void LogFgList(const char* why);      // run 213: the scope census dumps the mesh list alongside itself
+// run 213e: the scope overlay fix lives at the drop site in Hook_DrawPrim, which is defined before the
+// globals it reads. Declared here rather than moved, so the fix stays next to the note explaining it.
+extern int g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount;
+extern volatile LONG g_scopeQuadDraws;
 
 // ================================================================ the video-quad probe (run 160)
 //
@@ -9265,6 +9269,57 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
         // WEAPON FX = HIDE PASS. This path learns no signatures, so there is nothing to order it
         // against - but it must be inside the pass check, not outside it.
         if (FgHideWholePass()) return D3D_OK;
+    }
+    // ---- ⭐ run 213e: the SNIPER SCOPE overlay, and why StereoPair cannot fix it ----
+    //
+    // Identified by census and then VALIDATED by dropping it: DropPrimCount=2 DropPrimType=5 skipped
+    // exactly 120 draws a second while scoped - one per frame - and the scope circle disappeared,
+    // leaving the magnified scene correct in both eyes. So this draw IS the overlay, and everything
+    // beneath it is already right.
+    //
+    // StereoPair duplicates it and scissors each copy to one half, then remaps the CAMERA REGISTERS.
+    // This quad is already in clip space and reads no camera register, so the remap is a no-op on it:
+    // both copies land at identical full-frame coordinates and each gets clipped to its own half. One
+    // circle across the seam, each eye seeing half - exactly the reported symptom.
+    //
+    // It comes from a bound vertex buffer, so there is no vertex pointer to rewrite the way the Bink
+    // quad's is. The right tool for a clip-space fullscreen quad is the VIEWPORT: NDC maps onto the
+    // viewport rect, so pointing the viewport at one half puts the WHOLE quad inside that half. No
+    // vertex access, no shader constant, and it cannot disturb any draw but this one.
+    if (g_scopeQuadPerEye && VrModeOn() && (UINT)t == (UINT)g_scopeQuadPrimType &&
+        count == (UINT)g_scopeQuadPrimCount &&
+        InterlockedCompareExchange(&g_dupDraws, 0, 0) &&
+        InterlockedCompareExchange(&g_rtIsScene, 0, 0)) {
+        D3DVIEWPORT9 full{};
+        if (SUCCEEDED(dev->GetViewport(&full)) && full.Width >= 4) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                Log("scope: overlay quad (DrawPrimitive, type %u, %u prims) is being drawn once into"
+                    " EACH eye by moving the viewport. (run 213e; ini ScopeQuadPerEye)",
+                    (UINT)t, count);
+            }
+            // A scissor left enabled by an earlier draw would clip us; the viewport already confines
+            // rasterisation to the half, so the scissor has nothing to add here.
+            DWORD oldScissor = FALSE;
+            dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
+            dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+            const DWORD halfWidth = full.Width / 2;
+            HRESULT shr = S_OK;
+            for (int eye = 0; eye < 2; ++eye) {
+                D3DVIEWPORT9 vp = full;
+                vp.X = full.X + (eye ? halfWidth : 0);
+                vp.Width = halfWidth;
+                dev->SetViewport(&vp);
+                const HRESULT r = g_origDrawPrim(dev, t, start, count);
+                if (FAILED(r)) shr = r;
+            }
+            dev->SetViewport(&full);
+            dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
+            InterlockedIncrement(&g_scopeQuadDraws);
+            return shr;
+        }
+        // Viewport unreadable: fall through and draw it as before. An uncorrected scope beats none.
     }
     // Run 181: this path could not move anything at all before - g_thisDrawMoved was only ever set
     // in the indexed hook. Zero for the vertex count because a non-indexed draw does not report one;
@@ -11342,103 +11397,37 @@ bool DrawVideoQuadPerEye(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT primCou
     return SUCCEEDED(hr);
 }
 
-// ================= ⭐ run 213: the SNIPER SCOPE, drawn once per eye =========================
+// ================= ⭐ run 213e: the SNIPER SCOPE overlay ==================================
 //
-// Measured, not guessed. Three scope windows in one run, each against a baseline taken seconds earlier
-// with the same weapon and the alt trigger up:
+// The overlay is `DrawPrimitive, triangle strip, 2 primitives` - a fullscreen quad from a bound vertex
+// buffer. Identified by the run-213c census (drawn every frame the scope was up, absent with the
+// trigger up, reproducible across windows) and then VALIDATED by dropping it: DropPrimCount=2
+// DropPrimType=5 skipped exactly 120 draws a second while scoped, and the scope circle disappeared
+// while the magnified scene stayed correct in both eyes.
 //
-//   DrawIdxPrUP type 4 prims 2 stride 16 PASSED THROUGH box x[-0.998 +0.995]   x30 / x32 / x37
+// The transform lives at the drop site in Hook_DrawPrim, because the fix is a VIEWPORT change and needs
+// no vertex data. See the note there.
 //
-// Present in all three scope windows, absent from the baseline. ~30 of 60 frames, which is right - the
-// window opens on the trigger edge and the zoom animation takes about half of it.
+// ⛔ THREE earlier candidates were wrong, and the wreckage is worth keeping in one place:
 //
-// **It is passed through because it genuinely spans NDC**, and that is the part the run-192 heuristic
-// gets wrong here. Spanning NDC is CORRECT for a post-process quad, whose source already holds the
-// side-by-side frame. It is wrong for an overlay that is meant to be one image per eye: covering the
-// whole buffer once puts a single scope circle across the seam, so each eye sees half of it.
+//   stride 16, 2 prims, spans NDC (run 213a)   Appeared in every scope window and no baseline, so it
+//       was picked on correlation alone. Drawing it per eye fired 120 times a second - one per frame,
+//       the gate was right - and the picture did not change. **A per-frame draw that only happens
+//       while scoped is not necessarily the thing you can see.**
+//   two stride-12 rows with degenerate boxes   Flagged by `PASSED THROUGH BUT DOES NOT SPAN NDC`,
+//       which was written for the muzzle flash - a small centred sprite - and does not generalise to a
+//       full-frame overlay. A verdict line is only as good as the case it was written for.
+//   "new since the baseline" generally (213b)  Produced 32 rows, every one a count of ONE, none of
+//       them the scope; and its baseline was taken with a DIFFERENT WEAPON. Novelty was the wrong
+//       filter - PERSISTENCE is what defines an overlay.
 //
-// ⚠️ So `PASSED THROUGH BUT DOES NOT SPAN NDC` pointed at the WRONG rows in this census - two stride-12
-// entries with degenerate boxes. The verdict line was written for the muzzle flash, a small centred
-// sprite, and it does not generalise to a full-frame overlay. Left in place because it is right for
-// what it was built for; do not read its silence on a row as absolution.
-//
-// The screenshot and the log agree independently: the buffer is 4224x2304, so a circle sized to the
-// frame HEIGHT is 2304/4224 = 0.545 of the width, NDC x[-0.545 +0.545]. Measured off the screenshot:
-// x[-0.52 +0.53].
-//
-// ---- the transform, and the part that is NOT settled ----
-//
-// Same remedy as the Bink quad (run 160): draw it twice, once into each half. Position only - the UVs
-// sit past offset 8 and are left alone, so each eye gets the whole texture.
-//
-// `p[1] *= 0.5` is inherited from DrawVideoQuadPerEye and it is what keeps the circle CIRCULAR: halving
-// x alone turns a screen-circle into a tall ellipse, because each eye's half is 2112x2304 rather than
-// 4224x2304. The cost is that the quad then covers only the centre of each half, so whatever the
-// overlay draws OUTSIDE the circle - the darkened vignette - may not reach the edges any more.
-//
-// **That trade is unmeasured**, which is why the Y scale is an ini percentage rather than a constant:
-// 50 keeps it circular, 100 fills the half and stretches it. One ini edit tries the other, no rebuild.
-int g_scopeQuadStride = 16;      // ini [Render] ScopeQuadStride  - 0 disables by stride
-// ⛔ run 213b: DEFAULT FLIPPED 1 -> 0. This fired 120 times a second, exactly one draw per frame while
-// scoped, and the picture did not change - so stride 16 is something that merely co-occurs with the
-// scope, not what paints it. The mechanism below is kept because it is the right remedy once the right
-// draw is identified, but it must not ship enabled on a draw that has been shown to do nothing.
-int g_scopeQuadPerEye = 0;       // ini [Render] ScopeQuadPerEye
-int g_scopeQuadYPct   = 50;      // ini [Render] ScopeQuadYPct
+// The lesson that actually paid: `MuzzleFxDropStride` could not reach this path, because it keys on a
+// vertex stride and DrawPrimitive has none. Building the drop for the path FIRST, and only then the
+// fix, is what turned a fourth guess into an answer.
+int g_scopeQuadPerEye   = 1;     // ini [Render] ScopeQuadPerEye
+int g_scopeQuadPrimType = 5;     // ini [Render] ScopeQuadPrimType  - 5 = D3DPT_TRIANGLESTRIP
+int g_scopeQuadPrimCount= 2;     // ini [Render] ScopeQuadPrimCount
 volatile LONG g_scopeQuadDraws = 0;
-
-// Narrow on every column that was actually measured, and reject anything whose vertices do not read as
-// clean NDC - several rows in that census had garbage boxes from over-reading, and a transform applied
-// to one of those would corrupt a draw nobody has identified.
-bool IsScopeQuad(D3DPRIMITIVETYPE t, UINT primCount, const void* vtxData, UINT vtxStride,
-                 UINT numVertices) {
-    if (!g_scopeQuadPerEye || !g_scopeQuadStride) return false;
-    if (t != D3DPT_TRIANGLELIST || primCount != 2) return false;
-    if (vtxStride != (UINT)g_scopeQuadStride) return false;
-    if (!vtxData || numVertices < 3 || numVertices > 8) return false;
-    if (!Readable(vtxData, (size_t)numVertices * vtxStride)) return false;
-    float minX = 1e30f, maxX = -1e30f;
-    for (UINT i = 0; i < numVertices; ++i) {
-        const float* p = reinterpret_cast<const float*>(
-            static_cast<const uint8_t*>(vtxData) + (size_t)i * vtxStride);
-        // Anything outside clip space means this is not the quad that was measured.
-        if (!(p[0] > -1.5f && p[0] < 1.5f && p[1] > -1.5f && p[1] < 1.5f)) return false;
-        if (p[0] < minX) minX = p[0];
-        if (p[0] > maxX) maxX = p[0];
-    }
-    return minX <= -0.9f && maxX >= 0.9f;          // it must really span the frame
-}
-
-// Returns false when it cannot do the job safely, and the caller then draws the quad exactly as before.
-// A scope that is merely uncorrected beats a scope replaced by nothing.
-bool DrawScopeQuadPerEye(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT minVtxIndex, UINT numVertices,
-                         UINT primCount, const void* idxData, D3DFORMAT idxFormat,
-                         const void* vtxData, UINT vtxStride) {
-    static uint8_t scratch[8 * 64];
-    if (vtxStride > 64 || numVertices > 8) return false;
-
-    DWORD oldScissor = FALSE;
-    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
-    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-
-    const float ys = (float)g_scopeQuadYPct * 0.01f;
-    HRESULT hr = D3D_OK;
-    for (int eye = 0; eye < 2; ++eye) {
-        memcpy(scratch, vtxData, (size_t)numVertices * vtxStride);
-        const float xOff = (eye == 0) ? -0.5f : +0.5f;
-        for (UINT i = 0; i < numVertices; ++i) {
-            float* p = reinterpret_cast<float*>(scratch + (size_t)i * vtxStride);
-            p[0] = p[0] * 0.5f + xOff;
-            p[1] = p[1] * ys;
-        }
-        const HRESULT r = g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
-                                                  idxData, idxFormat, scratch, vtxStride);
-        if (FAILED(r)) hr = r;
-    }
-
-    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
-    return SUCCEEDED(hr);
-}
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
@@ -11532,24 +11521,6 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
             return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                            idxData, idxFormat, vtxData, vtxStride); });
     if (quad) {
-        // ⭐ run 213: the sniper scope overlay. Gated on VR mode - flat, the quad already covers the
-        // whole frame correctly and there is nothing to split. See IsScopeQuad for what was measured.
-        if (VrModeOn() && IsScopeQuad(t, primCount, vtxData, vtxStride, numVertices)) {
-            static bool said = false;
-            if (!said) {
-                said = true;
-                Log("scope: overlay quad detected (2 prims, stride %u, spans NDC, passed through) -"
-                    " drawing it once per eye from here. Y scale %d%%. (run 213; ini ScopeQuadPerEye)",
-                    vtxStride, g_scopeQuadYPct);
-            }
-            if (DrawScopeQuadPerEye(dev, t, minVtxIndex, numVertices, primCount,
-                                    idxData, idxFormat, vtxData, vtxStride)) {
-                InterlockedIncrement(&g_scopeQuadDraws);
-                return D3D_OK;
-            }
-            // Fell through: the vertex layout was not one this can rewrite. Draw it as before rather
-            // than not at all.
-        }
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     }
@@ -17398,19 +17369,20 @@ void LoadIniSettings() {
             " DropPrimCount=0 when finished.", g_dropPrimCount, g_dropPrimType,
             g_dropPrimType < 0 ? " (any type)" : " and type");
 
-    // ---- run 213: the sniper scope overlay, drawn once per eye. See IsScopeQuad. ----
-    g_scopeQuadPerEye = GetPrivateProfileIntA("Render", "ScopeQuadPerEye", 0, path) ? 1 : 0;
-    g_scopeQuadStride = GetPrivateProfileIntA("Render", "ScopeQuadStride", 16, path);
-    if (g_scopeQuadStride < 0)  g_scopeQuadStride = 0;
-    if (g_scopeQuadStride > 64) g_scopeQuadStride = 64;
-    g_scopeQuadYPct = GetPrivateProfileIntA("Render", "ScopeQuadYPct", 50, path);
-    if (g_scopeQuadYPct < 10)  g_scopeQuadYPct = 10;
-    if (g_scopeQuadYPct > 100) g_scopeQuadYPct = 100;
-    Log("ini: ScopeQuadPerEye=%d ScopeQuadStride=%d ScopeQuadYPct=%d (%s)",
-        g_scopeQuadPerEye, g_scopeQuadStride, g_scopeQuadYPct,
-        g_scopeQuadPerEye ? "the sniper scope overlay is drawn once into EACH eye instead of once"
-                            " across the whole side-by-side frame. YPct 50 keeps the scope circular;"
-                            " 100 fills each eye's half and stretches it"
+    // ---- run 213e: the sniper scope overlay, drawn once per eye. See the note in Hook_DrawPrim. ----
+    //
+    // Default ON, because unlike run 213a's version this draw was VALIDATED before the fix was written:
+    // dropping it removed the scope and nothing else. The primitive type and count stay ini-settable so
+    // a weapon whose overlay differs can be retargeted without a rebuild.
+    g_scopeQuadPerEye = GetPrivateProfileIntA("Render", "ScopeQuadPerEye", 1, path) ? 1 : 0;
+    g_scopeQuadPrimType = GetPrivateProfileIntA("Render", "ScopeQuadPrimType", 5, path);
+    g_scopeQuadPrimCount = GetPrivateProfileIntA("Render", "ScopeQuadPrimCount", 2, path);
+    if (g_scopeQuadPrimType < 1 || g_scopeQuadPrimType > 6) g_scopeQuadPrimType = 5;
+    if (g_scopeQuadPrimCount < 1) g_scopeQuadPrimCount = 1;
+    Log("ini: ScopeQuadPerEye=%d ScopeQuadPrimType=%d ScopeQuadPrimCount=%d (%s)",
+        g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount,
+        g_scopeQuadPerEye ? "the sniper scope overlay is drawn once into EACH eye by moving the"
+                            " viewport, instead of once across the whole side-by-side frame"
                           : "off - the overlay spans the seam, i.e. each eye sees half a scope");
 
     // Run 213: the same census, armed on the ALT trigger, for the sniper scope. Default 0 - it is a
