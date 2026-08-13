@@ -24,6 +24,47 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## Run 214: the melee swing was invisible for the same reason the heal was
+
+**Reported and fixed, confirmed in play.** `MeleeArmsMs=700`, `MeleeArmsDelayMs=0`.
+
+The animation is performed by the arms this mod hides, so hiding them left the player watching
+nothing happen — run 198's finding, arriving on a second animation.
+
+Deliberately the **same mechanism**, not a variation: the window shows the arms **and returns the gun
+to the engine's position** for its duration. Run 198 established that moving the gun onto the
+controller while the arms animate at the engine position tears one animation in half, and a swing has
+exactly that problem too.
+
+The three sites that gated on `HealWindowActive()` now ask `ArmsAnimActive()`, so a third animation is
+one function to extend rather than three sites to remember. Both windows keep the run-203 cheap-gate
+shape — two plain aligned 32-bit reads in the common case, no 64-bit interlocked value on the hot
+path, which run 203 measured as a two-thread fight over one cache line.
+
+Armed on the **rising edge** of the button the mod injects itself, as the heal is: no inference to get
+wrong, and a held button cannot re-arm every frame. The button row is resolved **by name** once at ini
+load rather than matched by mask per frame, because the mask is rebindable from that same loop.
+
+Verified in the log rather than by eye: **12 windows, one per press**, none double-armed.
+
+### ⚠️ The impulse weapon shares this button, and that is deliberately not guessed at
+
+Once that weapon exists the same press fires a weapon rather than swinging a fist, and the window
+becomes a misfire. Rather than invent a discriminator for a weapon nobody has seen — the failure mode
+that cost run 213 four fixes — **every window logs the latched weapon with it**:
+
+```
+melee window: arms shown from +0 ms to +700 ms after the press (gun=11387)
+```
+
+So when the impulse weapon does exist, one ordinary run says whether the two cases can be told apart
+at all, instead of that being its own diagnostic run. `MeleeArmsMs=0` disables it without a rebuild.
+
+⚠️ **700 ms is a guess**, and an ini value for the same reason `HealArmsMs` is one — that one took a
+round of tuning after its first flight.
+
+---
+
 ## ⭐ Run 213: the sniper scope — four wrong fixes, and the shader had the answer all along
 
 **Reported:** the sniper scope is not shown in each eye. It comes up on the left trigger (alt-fire).

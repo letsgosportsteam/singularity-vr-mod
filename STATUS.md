@@ -509,6 +509,19 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      alt trigger, which means something different on every other weapon.
      ⚠️ **NOT confirmed in play** — it rode along with the visual fix and only the visuals were reported.
 
+11b. **✅ FIXED and VERIFIED (run 214) — the melee swing was invisible.** `MeleeArmsMs=700`,
+   `MeleeArmsDelayMs=0`.
+   - Same cause and same remedy as the heal: the animation is performed by the arms the mod hides. The
+     window shows the arms **and returns the gun to the engine's position**, because moving the gun onto
+     the controller mid-animation tears it in half (run 198).
+   - The heal and melee sites now share `ArmsAnimActive()` — a third animation extends one function
+     rather than three call sites. Both keep the run-203 cheap-gate shape on the hot path.
+   - Verified in the log: **12 windows, one per press**, none double-armed.
+   - ⚠️ **700 ms is a guess.** `HealArmsMs` needed tuning after its first flight; expect the same.
+   - ⚠️ **The impulse weapon shares this button** and that case is unmeasured. Every window logs the
+     latched weapon (`gun=…`) so one ordinary run settles it once the weapon exists. `MeleeArmsMs=0`
+     disables it without a rebuild.
+
 11. **✅ The arms reappear for the health injector animation (run 198–199).** `HealArmsMs=2150`,
    `HealArmsDelayMs=100`.
    - The arms are shown **and the gun is returned to the engine's position** for the window — moving the
