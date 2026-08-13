@@ -8531,6 +8531,7 @@ void LogFgList(const char* why);      // run 213: the scope census dumps the mes
 // globals it reads. Declared here rather than moved, so the fix stays next to the note explaining it.
 extern int g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount;
 extern volatile LONG g_scopeQuadDraws;
+extern int g_scopeScenePsReg, g_scopeAspectPsReg;      // run 213g
 void ScopeQuadDump(IDirect3DDevice9* dev, UINT primCount);   // run 213f
 
 // ================================================================ the video-quad probe (run 160)
@@ -9407,6 +9408,38 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
             DWORD oldScissor = FALSE;
             dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
             dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+
+            // ---- ⭐ run 213g: the two constants the dump named ----
+            //
+            // The viewport alone moved the GEOMETRY into each half and left the shader reading the
+            // whole frame, so each eye showed the world twice. The dump says why, and says it exactly:
+            //
+            //   ps c1  +0.50000 -0.50000 +0.50035 +0.50020   <== ScreenPositionScaleBias
+            //   tex stage 1: 2560x1440                       <== scene-sized: the read spanning both eyes
+            //
+            // UE3 derives the scene-colour UV from CLIP POSITION through c1, not from the vertex
+            // texcoords - and clip x spans -1..+1 whatever the viewport is, so the read covers the whole
+            // target regardless of where the quad landed. Scaling c1 into a half is the entire fix for
+            // the doubled world, and it leaves the OVERLAY ART alone: that is sampled with TEXCOORD0
+            // (offset 24, FLOAT2, measured (0,0)-(1,1) in the dump), so the reticle stays complete.
+            //
+            // Rewriting the vertex UVs would NOT have worked, and the dump is what shows it: TEXCOORD0-3
+            // are all aliased to the same 8 bytes at offset 24, so the art and any UV-driven sampling
+            // share one value and cannot be moved independently.
+            //
+            //   ps c0  +1.77778   = 16/9, and the frame is 2560x1440
+            //
+            // That is the aspect the shader uses to keep the circle ROUND. Each eye's half is 1280x1440,
+            // so the correction has to halve with it - which is the tall ellipse in the last screenshot,
+            // and it is a separate knob because "c0 is the aspect" is an inference from one number
+            // matching, where "c1 is ScreenPositionScaleBias" is a documented UE3 constant this file
+            // already identified in run 41/42.
+            float oldScene[4]{}, oldAspect[4]{};
+            const bool haveScene = g_scopeScenePsReg >= 0 &&
+                SUCCEEDED(dev->GetPixelShaderConstantF(g_scopeScenePsReg, oldScene, 1));
+            const bool haveAspect = g_scopeAspectPsReg >= 0 &&
+                SUCCEEDED(dev->GetPixelShaderConstantF(g_scopeAspectPsReg, oldAspect, 1));
+
             const DWORD halfWidth = full.Width / 2;
             HRESULT shr = S_OK;
             for (int eye = 0; eye < 2; ++eye) {
@@ -9414,9 +9447,25 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
                 vp.X = full.X + (eye ? halfWidth : 0);
                 vp.Width = halfWidth;
                 dev->SetViewport(&vp);
+                if (haveScene) {
+                    // Map the old UV range linearly into this eye's half: u' = u*0.5 (+0.5 for the
+                    // right eye). Correct to within half a texel, and it carries the existing
+                    // half-texel offset along rather than discarding it.
+                    float c[4] = { oldScene[0] * 0.5f, oldScene[1],
+                                   oldScene[2] * 0.5f + (eye ? 0.5f : 0.0f), oldScene[3] };
+                    dev->SetPixelShaderConstantF(g_scopeScenePsReg, c, 1);
+                }
+                if (haveAspect) {
+                    float c[4] = { oldAspect[0] * 0.5f, oldAspect[1], oldAspect[2], oldAspect[3] };
+                    dev->SetPixelShaderConstantF(g_scopeAspectPsReg, c, 1);
+                }
                 const HRESULT r = g_origDrawPrim(dev, t, start, count);
                 if (FAILED(r)) shr = r;
             }
+            // Put back exactly what the engine had set, for every register disturbed - the same
+            // discipline StereoPair applies to the vertex registers it remaps.
+            if (haveScene)  dev->SetPixelShaderConstantF(g_scopeScenePsReg, oldScene, 1);
+            if (haveAspect) dev->SetPixelShaderConstantF(g_scopeAspectPsReg, oldAspect, 1);
             dev->SetViewport(&full);
             dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
             InterlockedIncrement(&g_scopeQuadDraws);
@@ -11530,6 +11579,13 @@ bool DrawVideoQuadPerEye(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT primCou
 int g_scopeQuadPerEye   = 1;     // ini [Render] ScopeQuadPerEye
 int g_scopeQuadPrimType = 5;     // ini [Render] ScopeQuadPrimType  - 5 = D3DPT_TRIANGLESTRIP
 int g_scopeQuadPrimCount= 2;     // ini [Render] ScopeQuadPrimCount
+// Run 213g, both measured in the run-213f dump. -1 disables either independently.
+//   scene  ps c1 = (0.5, -0.5, 0.50035, 0.50020) - UE3's ScreenPositionScaleBias, the scene-colour
+//          UV. Scaling it into a half is what stops the world being drawn twice per eye.
+//   aspect ps c0 = 1.77778 = 16/9 against a 2560x1440 frame - the circle's roundness correction.
+//          A weaker claim than the scene register: one number matching, not a documented constant.
+int g_scopeScenePsReg  = 1;      // ini [Render] ScopeScenePsReg
+int g_scopeAspectPsReg = 0;      // ini [Render] ScopeAspectPsReg
 volatile LONG g_scopeQuadDraws = 0;
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
@@ -17493,6 +17549,13 @@ void LoadIniSettings() {
     g_scopeQuadPrimCount = GetPrivateProfileIntA("Render", "ScopeQuadPrimCount", 2, path);
     if (g_scopeQuadPrimType < 1 || g_scopeQuadPrimType > 6) g_scopeQuadPrimType = 5;
     if (g_scopeQuadPrimCount < 1) g_scopeQuadPrimCount = 1;
+    g_scopeScenePsReg  = GetPrivateProfileIntA("Render", "ScopeScenePsReg", 1, path);
+    g_scopeAspectPsReg = GetPrivateProfileIntA("Render", "ScopeAspectPsReg", 0, path);
+    if (g_scopeScenePsReg  < -1 || g_scopeScenePsReg  > 63) g_scopeScenePsReg  = 1;
+    if (g_scopeAspectPsReg < -1 || g_scopeAspectPsReg > 63) g_scopeAspectPsReg = 0;
+    Log("ini: ScopeScenePsReg=%d ScopeAspectPsReg=%d (the pixel-shader registers remapped per eye for"
+        " the scope: the scene-colour UV, and the aspect that keeps the circle round. -1 disables"
+        " either on its own)", g_scopeScenePsReg, g_scopeAspectPsReg);
     Log("ini: ScopeQuadPerEye=%d ScopeQuadPrimType=%d ScopeQuadPrimCount=%d (%s)",
         g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount,
         g_scopeQuadPerEye ? "the sniper scope overlay is drawn once into EACH eye by moving the"
