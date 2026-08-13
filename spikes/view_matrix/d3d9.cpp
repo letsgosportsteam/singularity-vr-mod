@@ -10646,7 +10646,14 @@ static void GunAimDir(float d[3]) {
 }
 
 // ⭐ run 219: how far ADS pulls the weapon back along that axis, in engine units. 0 disables.
-volatile LONG g_adsPullbackUU = 10;   // ini [Input] AdsPullbackUU
+// ⛔ run 219b: DEFAULT 0. The pull-back is the right SHAPE for VR ADS, but it cannot ship until the
+// game's own aim animation is suppressed - layering ours under one that already slides the weapon to
+// screen centre gives two wrong offsets instead of one. User's call, and correct: this is not something
+// to A/B in a headset, it is something that needs the animation gone first.
+//
+// Kept, not deleted: it is what ADS should do once the game's version is out of the way, and the run
+// that settles suppression is the run that turns this back on.
+volatile LONG g_adsPullbackUU = 0;    // ini [Input] AdsPullbackUU
 
 // ⭐ run 218: where the gun's rotation point ACTUALLY ends up in the world.
 //
@@ -18611,14 +18618,15 @@ void LoadIniSettings() {
 
     // ⭐ run 219: how far ADS pulls the weapon back along the aiming line. The game's own ADS animation
     // slides it toward screen CENTRE, which is right in head mode and meaningless on a hand-held gun.
-    LONG apull = GetPrivateProfileIntA("Input", "AdsPullbackUU", 10, path);
+    LONG apull = GetPrivateProfileIntA("Input", "AdsPullbackUU", 0, path);
     if (apull < 0)   apull = 0;
     if (apull > 100) apull = 100;
     InterlockedExchange(&g_adsPullbackUU, apull);
     Log("ini: AdsPullbackUU=%ld (%s)", apull,
         apull ? "aiming pulls the weapon back along the line it is pointing, so the sight picture does"
-                " not move - the sniper is excluded, it has its own scope"
-              : "off - the game's own aim animation is left alone");
+                " not move - the sniper is excluded, it has its own scope. ⚠ only useful once the"
+                " game's own aim animation is suppressed, or you get BOTH offsets"
+              : "off (default) - the game's own aim animation is untouched");
 
     // ⭐ run 217: OFF by default. It is a gameplay change as much as an instrument, and the panel is
     // where it gets turned on - LaserSight in the ini is what the panel writes back on close, exactly
