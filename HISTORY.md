@@ -1679,7 +1679,8 @@ bad setting, it is an experience the player cannot stop by letting go.
 
 ### The VR settings panel
 
-**Hold Y for 1.3 s** — anywhere: main menu, pause menu, or mid-game. Left stick navigates, values
+**Hold Y for 1.3 s** — *(shortened to 1 s in run 219; the rest of this entry stands)* — anywhere:
+main menu, pause menu, or mid-game. Left stick navigates, values
 apply live, the ini is written on close (so a value you corrected never reaches the file).
 `WritePrivateProfileString` edits in place and preserves comments.
 
@@ -1727,7 +1728,8 @@ trustworthy state.
 
 **It is not used for the panel.** The main menu reports `PAUSED NO` — correctly, there is no game
 running to pause — and the main menu is exactly where someone sets comfort options before playing.
-Gating on pause would have locked them out of it. The 1.3 s hold needs no state at all.
+Gating on pause would have locked them out of it. The hold (1.3 s then, 1 s since run 219) needs no
+state at all.
 
 Kept anyway: it is cheap, and it tells us whether the world is running.
 

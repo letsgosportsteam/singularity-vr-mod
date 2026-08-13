@@ -58,7 +58,7 @@ dropped beside the game exe. No game files modified.
 | **Cutscene head tracking** | ✅ **working, automatic** — run 138. `SetCinematicMode` drives it; look around freely during a cutscene, normal turning restored on exit |
 | **`D3D9ExMode=1` texture corruption** | ✅ **fixed** — run 139. Zero-copy is usable again; visuals match `D3D9ExMode=0` |
 | **Smooth turning** | ✅ run 140 — `TurnMode=2`, degrees per second, works during cutscenes |
-| **VR settings panel** | ✅ run 142 — hold Y 1.3s anywhere; live changes, saved to the ini on close |
+| **VR settings panel** | ✅ run 142 — hold Y **1 s** anywhere (1.3 s until run 219); live changes, saved to the ini on close |
 | **The game's HUD and menus in both eyes** | ✅ run 151 — health, ammo, crosshair, prompts, pause menu. `HudStereo=1` |
 | **The sniper scope in both eyes** | ✅ run 213 — whole scope per eye, world once, circle round. `ScopeQuadPerEye=1` |
 | **Shipping defaults = the tested configuration** | ✅ 2026-08-08 — a fresh install with no ini now behaves like the tuned dev machine. See below |

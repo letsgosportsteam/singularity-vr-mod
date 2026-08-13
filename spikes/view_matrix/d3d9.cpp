@@ -5781,6 +5781,9 @@ const int kPadButtonCount = (int)(sizeof(g_padButtons) / sizeof(g_padButtons[0])
 // Run 214: which row is the melee/impulse button. Resolved once at ini load; -1 until then, and the
 // melee window simply never arms in that case rather than guessing at a row.
 int g_impulseBtnIdx = -1;
+// ⭐ run 219: the laser toggle rides the JUMP button's long press. See the note at the poll loop.
+int g_jumpBtnIdx = -1;
+volatile LONG g_laserHoldMs = 1000;    // ini [Input] LaserHoldMs, 0 = no button toggle
 
 // Turn. Snap steps the yaw base directly rather than driving the look stick, because the engine's
 // own turn ramp is exactly what snap must not have: instant and exact is the whole point. Smooth
@@ -6046,6 +6049,7 @@ bool InitXRInput() {
                 // user-rebindable from this very loop, so keying on it would break the moment
                 // somebody moved the button.
                 if (!strcmp(g_padButtons[i].name, "impulse")) g_impulseBtnIdx = i;
+                if (!strcmp(g_padButtons[i].name, "jump"))    g_jumpBtnIdx    = i;
             }
         }
     }
@@ -6651,6 +6655,40 @@ void SyncXRInput(XrTime displayTime) {
             }
             wasDown = down;
         }
+        // ---- ⭐ run 219: HOLD A FOR A SECOND: toggle the laser sight ----
+        //
+        // Every button on both controllers is spoken for, which the recentre note has said since run
+        // 142 - so this is a long press, the same answer MENU and Y already use.
+        //
+        // WARNING: unlike those two, the tap is NOT deferred to release. Jump has to be instant, and
+        // making it fire on release to keep the hold clean would trade a laser toggle for laggy
+        // movement. So the press goes through immediately and a one-second hold ALSO toggles the
+        // laser: you will jump once on the way to toggling it. That is the deliberate trade, and it is
+        // why the threshold is an ini value - if holding A turns out to mean something in play, this
+        // moves without a rebuild.
+        if (i == g_jumpBtnIdx && Rd(g_laserHoldMs) > 0) {
+            static LARGE_INTEGER since{};
+            static bool consumed = false;
+            if (down) {
+                if (!since.QuadPart) QueryPerformanceCounter(&since);
+                if (!consumed && MsSince(since) >= (double)Rd(g_laserHoldMs)) {
+                    consumed = true;
+                    const LONG now = InterlockedCompareExchange(&g_laserOn, 0, 0) ? 0 : 1;
+                    InterlockedExchange(&g_laserOn, now);
+                    // Written through immediately, because there is no panel close to ride on. The
+                    // panel row reads the same global, so the menu already shows the new value - this
+                    // is only about the value surviving a relaunch. PanelSaveRow is reused rather than
+                    // duplicated so the key and section cannot drift from the panel's own write.
+                    char path[MAX_PATH]{};
+                    if (IniPath(path)) PanelSaveRow(PR_LASER, path);
+                    Log("laser sight %s (held A for %ld ms) - saved to the ini",
+                        now ? "ON" : "OFF", Rd(g_laserHoldMs));
+                }
+            } else {
+                since.QuadPart = 0;
+                consumed = false;
+            }
+        }
         if (down) btns |= g_padButtons[i].mask;
     }
 
@@ -6666,7 +6704,8 @@ void SyncXRInput(XrTime displayTime) {
         static LARGE_INTEGER heldSince{};
         static bool consumed = false;
         static int  tapPulse = 0;
-        const double kHoldSeconds = 1.3;    // 2.0 was tried first and felt like waiting
+        // ⭐ run 219: 1.3 -> 1.0 on request. 2.0 was tried first and felt like waiting.
+        const double kHoldSeconds = 1.0;
         if (panelHeld) {
             if (!heldSince.QuadPart) QueryPerformanceCounter(&heldSince);
             if (!consumed && MsSince(heldSince) >= kHoldSeconds * 1000.0) {
@@ -8810,7 +8849,15 @@ extern int g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount;
 extern volatile LONG g_scopeQuadDraws;
 extern int g_scopeScenePsReg, g_scopeAspectPsReg;      // run 213g
 extern int g_scopeHeadAim;                            // run 213h
-extern volatile LONG g_scopeUpMs;
+// ⭐ run 219: defined HERE rather than with the scope code, because three separate things now ask "is the
+// scope up": the aim path, the laser, and the ADS pull-back. One definition, one answer - the run-218
+// lesson about two expressions for one fact, applied before it can bite twice.
+volatile LONG g_scopeUpMs = 0;
+inline bool ScopeActive() {
+    const DWORD last = (DWORD)Rd(g_scopeUpMs);
+    if (!last) return false;
+    return (DWORD)(GetTickCount() - last) < 150;   // ~18 frames at 120 fps
+}
 void ScopeQuadDump(IDirect3DDevice9* dev, UINT primCount);   // run 213f
 
 // ================================================================ the video-quad probe (run 160)
@@ -10582,6 +10629,25 @@ static void GunAnchorWorld(float G[3]) {
     for (int i = 0; i < 3; ++i) G[i] = af * F[i] + ar * R[i] + au * U[i];
 }
 
+// ⭐ run 219: the direction the SHOT goes, which is also the axis ADS pulls back along and the line the
+// laser draws. RotateTrace adds the hand deviation to the engine's aim in spherical terms, and in
+// ENGINE rot mode that aim is the view - so the same add, from the same signs, reproduces the shot.
+// Shared for the reason run 218 had to learn the hard way: a second copy of "where is the gun pointing"
+// is a second thing to keep in step.
+extern LONG g_traceSignYaw, g_traceSignPitch;
+static void GunAimDir(float d[3]) {
+    const float kU2R = 6.2831853f / 65536.0f;
+    const float yaw   = ((float)g_wantYaw   + (float)g_traceSignYaw *
+                         (float)InterlockedCompareExchange(&g_handDevYawUU, 0, 0)) * kU2R;
+    const float pitch = ((float)g_wantPitch + (float)g_traceSignPitch *
+                         (float)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)) * kU2R;
+    const float cp = cosf(pitch);
+    d[0] = cp * cosf(yaw); d[1] = cp * sinf(yaw); d[2] = sinf(pitch);
+}
+
+// ⭐ run 219: how far ADS pulls the weapon back along that axis, in engine units. 0 disables.
+volatile LONG g_adsPullbackUU = 10;   // ini [Input] AdsPullbackUU
+
 // ⭐ run 218: where the gun's rotation point ACTUALLY ends up in the world.
 //
 // GunAnchorWorld returns the anchor relative to the VIEW. The gun does not stay there: BuildGunC
@@ -10603,6 +10669,31 @@ static void GunPivotWorld(float H[3]) {
         H[1] = (float)InterlockedCompareExchange(&g_handOffY, 0, 0) / kHandFixed;
         H[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_handOffZ, 0, 0)) / kHandFixed;
     }
+    // ---- ⭐ run 219: AIM DOWN SIGHTS: back along the aiming line, and nothing else ----
+    //
+    // Reported: the zoom animation is wonky on the pistol, rifle and shotgun. It is the GAME's ADS
+    // animation, which slides the weapon toward the centre of the screen - correct in head mode, where
+    // the centre of the screen IS where you aim, and meaningless in MOTION CONTROLLER, where the gun
+    // lives on your hand and the aim line is wherever you point it.
+    //
+    // What ADS should mean here is what it means physically: the weapon comes closer to your eye along
+    // the line it is already pointing. The sight picture does not move - the line is unchanged - the
+    // gun is simply nearer. So: translate back along the aim axis and change nothing else.
+    //
+    // WARNING: the SNIPER is excluded, and by the scope overlay being drawn rather than by weapon
+    // identity - it has its own zoom reticle and its own optics, and pulling it back as well would
+    // fight them. That is also the signal the laser uses to switch itself off.
+    //
+    // The game's own animation still plays underneath this. Whether that is enough to look right is
+    // exactly what the run tests; if it is not, the next question is suppressing the game's version,
+    // not tuning this number.
+    if (Rd(g_adsPullbackUU) > 0 && InterlockedCompareExchange(&g_rawAltTrigger, 0, 0) > 40 &&
+        !ScopeActive()) {
+        float d[3]; GunAimDir(d);
+        const float back = (float)Rd(g_adsPullbackUU);
+        H[0] -= d[0] * back; H[1] -= d[1] * back; H[2] -= d[2] * back;
+    }
+
     // ---- 💥 run 201: the gun was anchored to the ENGINE's eye, not to YOURS ----
     //
     // Reported: *"when I recentered, the gun came closer to me."* A real defect, not a recentring
@@ -12043,13 +12134,7 @@ int g_scopeQuadPrimCount= 2;     // ini [Render] ScopeQuadPrimCount
 //
 // Wall-clock rather than a frame count because the two live on different threads: the quad is drawn on
 // the render thread and the trace is rotated on the game thread. DWORD subtraction wraps correctly.
-volatile LONG g_scopeUpMs = 0;
 int g_scopeHeadAim = 1;          // ini [Render] ScopeHeadAim
-inline bool ScopeActive() {
-    const DWORD last = (DWORD)Rd(g_scopeUpMs);
-    if (!last) return false;
-    return (DWORD)(GetTickCount() - last) < 150;   // ~18 frames at 120 fps
-}
 // ⭐ run 213j: back ON, with the components corrected from the shader's own bytecode. The CTAB names
 // them outright - c0 is ScreenAspectRatio, c1 is ScreenPositionScaleBias, s1 is SceneColorTexture -
 // so these are no longer inferences. Run 213i turned them off because scaling them was a regression;
@@ -15716,17 +15801,11 @@ void DrawLaserSight(IDirect3DDevice9* dev) {
     D3DVIEWPORT9 vp{};
     if (FAILED(dev->GetViewport(&vp)) || vp.Width < 4) return;
 
-    // ---- where the shot actually goes ----
-    //
-    // RotateTrace adds the hand deviation to the ENGINE aim in spherical terms, and in ENGINE rot
-    // mode that aim is the view. So the same add, from the same signs, reproduces the shot line.
-    const float kU2R = 6.2831853f / 65536.0f;
-    const float yaw   = ((float)g_wantYaw   + (float)g_traceSignYaw *
-                         (float)InterlockedCompareExchange(&g_handDevYawUU, 0, 0)) * kU2R;
-    const float pitch = ((float)g_wantPitch + (float)g_traceSignPitch *
-                         (float)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)) * kU2R;
-    const float cp = cosf(pitch);
-    const float dir[3] = { cp * cosf(yaw), cp * sinf(yaw), sinf(pitch) };
+    // ⭐ run 219: the sniper scope has its own reticle, and a beam across it is noise on top of an aiming
+    // aid that already works. Off while it is up.
+    if (ScopeActive()) return;
+
+    float dir[3]; GunAimDir(dir);      // ⭐ run 219: shared with the ADS pull-back - see GunAimDir
 
     // ⭐ run 218: the gun's real pivot, not the view anchor. See GunPivotWorld for what run 217 got wrong.
     float A[3]; GunPivotWorld(A);
@@ -18518,6 +18597,28 @@ void LoadIniSettings() {
                   " to the engine's position for that span, so the swing reads as one piece. ⚠ the"
                   " impulse weapon shares this button - see the melee window note"
                 : "off - the melee swing stays invisible");
+
+    // ⭐ run 219: how long A must be held to toggle the laser. 0 disables the button entirely and leaves
+    // the panel as the only route.
+    LONG lhold = GetPrivateProfileIntA("Input", "LaserHoldMs", 1000, path);
+    if (lhold < 0)    lhold = 0;
+    if (lhold > 5000) lhold = 5000;
+    InterlockedExchange(&g_laserHoldMs, lhold);
+    Log("ini: LaserHoldMs=%ld (%s)", lhold,
+        lhold ? "hold A for this long to toggle the laser sight - it writes straight to the ini,"
+                " because there is no panel close to save on"
+              : "off - the laser is panel-only");
+
+    // ⭐ run 219: how far ADS pulls the weapon back along the aiming line. The game's own ADS animation
+    // slides it toward screen CENTRE, which is right in head mode and meaningless on a hand-held gun.
+    LONG apull = GetPrivateProfileIntA("Input", "AdsPullbackUU", 10, path);
+    if (apull < 0)   apull = 0;
+    if (apull > 100) apull = 100;
+    InterlockedExchange(&g_adsPullbackUU, apull);
+    Log("ini: AdsPullbackUU=%ld (%s)", apull,
+        apull ? "aiming pulls the weapon back along the line it is pointing, so the sight picture does"
+                " not move - the sniper is excluded, it has its own scope"
+              : "off - the game's own aim animation is left alone");
 
     // ⭐ run 217: OFF by default. It is a gameplay change as much as an instrument, and the panel is
     // where it gets turned on - LaserSight in the ini is what the panel writes back on close, exactly
