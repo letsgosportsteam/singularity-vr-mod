@@ -8532,6 +8532,8 @@ void LogFgList(const char* why);      // run 213: the scope census dumps the mes
 extern int g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount;
 extern volatile LONG g_scopeQuadDraws;
 extern int g_scopeScenePsReg, g_scopeAspectPsReg;      // run 213g
+extern int g_scopeHeadAim;                            // run 213h
+extern volatile LONG g_scopeUpMs;
 void ScopeQuadDump(IDirect3DDevice9* dev, UINT primCount);   // run 213f
 
 // ================================================================ the video-quad probe (run 160)
@@ -8888,8 +8890,31 @@ static void DumpShaderConstUsage(IDirect3DVertexShader9* vs) {
 int g_scopeDumpLeft = 0;             // ini [Render] ScopeQuadDump
 void ScopeQuadDump(IDirect3DDevice9* dev, UINT primCount) {
     if (g_scopeDumpLeft <= 0) return;
+    // ⭐ run 213h: RATE-LIMITED, because the budget used to be spent inside a twentieth of a second.
+    // The overlay draws 120 times a second, so four dumps all described the same instant - and the one
+    // state that matters is a SECOND one: the user found the scope renders CORRECTLY in slow motion.
+    // One dump a second lets a single run sample normal and slow-motion without any keypress.
+    static DWORD lastMs = 0;
+    const DWORD now = GetTickCount();
+    if (lastMs && (DWORD)(now - lastMs) < 1000) return;
+    lastMs = now;
     --g_scopeDumpLeft;
     Log("---- scope quad dump (%d left) ----", g_scopeDumpLeft);
+
+    // The shader identity is the whole question this time. If slow motion swaps the shader, the two
+    // states sample the scene by different means and one fix cannot serve both.
+    IDirect3DPixelShader9* psh = nullptr;
+    if (SUCCEEDED(dev->GetPixelShader(&psh)) && psh) {
+        Log("    pixel shader  %p", (void*)psh);
+        psh->Release();
+    } else {
+        Log("    NO pixel shader - fixed function, which would change the fix entirely");
+    }
+    IDirect3DVertexShader9* vsh = nullptr;
+    if (SUCCEEDED(dev->GetVertexShader(&vsh)) && vsh) {
+        Log("    vertex shader %p", (void*)vsh);
+        vsh->Release();
+    }
 
     // The declaration says where TEXCOORD0 is, which is the whole question for the vertex-buffer case.
     if (IDirect3DVertexDeclaration9* decl = nullptr;
@@ -9469,6 +9494,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
             dev->SetViewport(&full);
             dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
             InterlockedIncrement(&g_scopeQuadDraws);
+            InterlockedExchange(&g_scopeUpMs, (LONG)GetTickCount());   // run 213h
             return shr;
         }
         // Viewport unreadable: fall through and draw it as before. An uncorrected scope beats none.
@@ -11584,6 +11610,27 @@ int g_scopeQuadPrimCount= 2;     // ini [Render] ScopeQuadPrimCount
 //          UV. Scaling it into a half is what stops the world being drawn twice per eye.
 //   aspect ps c0 = 1.77778 = 16/9 against a 2560x1440 frame - the circle's roundness correction.
 //          A weaker claim than the scene register: one number matching, not a documented constant.
+// ---- ⭐ run 213h: while you are looking THROUGH the scope, the shot belongs to the head ----
+//
+// Reported: scoped in, the bullet still follows the controller. It should not - a scope is aimed by
+// putting your eye behind it, and the reticle you are looking at is drawn to the VIEW, not the hand.
+// Aim mode 11 rotates the fire trace by the hand-minus-head deviation, which is exactly right when you
+// are pointing a gun with your hand and exactly wrong here.
+//
+// Gated on the SCOPE OVERLAY ACTUALLY BEING DRAWN rather than on the alt trigger. The trigger is
+// alt-fire generally - it means something different on every other weapon - whereas the overlay quad is
+// the scope by measurement (run 213d dropped it and the scope vanished). The signal is therefore exact
+// and costs one 32-bit store per frame from the draw that already runs.
+//
+// Wall-clock rather than a frame count because the two live on different threads: the quad is drawn on
+// the render thread and the trace is rotated on the game thread. DWORD subtraction wraps correctly.
+volatile LONG g_scopeUpMs = 0;
+int g_scopeHeadAim = 1;          // ini [Render] ScopeHeadAim
+inline bool ScopeActive() {
+    const DWORD last = (DWORD)Rd(g_scopeUpMs);
+    if (!last) return false;
+    return (DWORD)(GetTickCount() - last) < 150;   // ~18 frames at 120 fps
+}
 int g_scopeScenePsReg  = 1;      // ini [Render] ScopeScenePsReg
 int g_scopeAspectPsReg = 0;      // ini [Render] ScopeAspectPsReg
 volatile LONG g_scopeQuadDraws = 0;
@@ -13495,9 +13542,12 @@ void* __cdecl Hook_LineCheck(void* params) {
         //                               and the OTHER line check is the one that matters.
         const LONG am = InterlockedCompareExchange(&g_aimMode, 0, 0);
         const int32_t kTestYaw = (int32_t)(25.0f * (65536.0f / 360.0f));
-        const int32_t dYaw   = (am == 12) ? kTestYaw
+        // ⭐ run 213h: through a scope, the shot follows the HEAD. Zeroing the deviation is exactly
+        // aim mode 0's behaviour for the duration, and it leaves everything else about mode 11 alone.
+        const bool scoped = g_scopeHeadAim && ScopeActive();
+        const int32_t dYaw   = scoped ? 0 : (am == 12) ? kTestYaw
                              : InterlockedCompareExchange(&g_aimYawForXi, 0, 0)   - g_wantYaw;
-        const int32_t dPitch = (am == 12) ? 0
+        const int32_t dPitch = scoped ? 0 : (am == 12) ? 0
                              : InterlockedCompareExchange(&g_aimPitchForXi, 0, 0) - g_wantPitch;
         const LONG n = InterlockedIncrement(&g_traceRotated);
         if (s >= 0) {
@@ -13570,9 +13620,12 @@ int __fastcall Hook_SingleLineCheck(void* self, void* edx, void* hit, void* src,
             const float ex = Start[0] - g_camPos[0], ey = Start[1] - g_camPos[1], ez = Start[2] - g_camPos[2];
             if (ex*ex + ey*ey + ez*ez < 520.0f * 520.0f) {
                 const int32_t kTestYaw = (int32_t)(25.0f * (65536.0f / 360.0f));
-                const int32_t dYaw   = (am == 12) ? kTestYaw
+                // run 213h - see the note at g_scopeUpMs. Both trace sites, or the shot would follow
+                // the head on one path and the hand on the other depending on which one decides it.
+                const bool scoped = g_scopeHeadAim && ScopeActive();
+                const int32_t dYaw   = scoped ? 0 : (am == 12) ? kTestYaw
                                      : (int32_t)InterlockedCompareExchange(&g_handDevYawUU, 0, 0);
-                const int32_t dPitch = (am == 12) ? 0
+                const int32_t dPitch = scoped ? 0 : (am == 12) ? 0
                                      : (int32_t)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0);
                 const float bx = End[0], by = End[1], bz = End[2];
                 RotateTrace(Start, End, dYaw, dPitch);
@@ -17533,7 +17586,7 @@ void LoadIniSettings() {
     // need opposite fixes. Bounded hard, because this logs from inside a draw hook.
     g_scopeDumpLeft = GetPrivateProfileIntA("Render", "ScopeQuadDump", 0, path);
     if (g_scopeDumpLeft < 0) g_scopeDumpLeft = 0;
-    if (g_scopeDumpLeft > 4) g_scopeDumpLeft = 4;
+    if (g_scopeDumpLeft > 12) g_scopeDumpLeft = 12;
     if (g_scopeDumpLeft)
         Log("ini: ScopeQuadDump=%d - dump the scope overlay quad's vertex declaration, vertices, pixel"
             " shader constants and bound textures, %d time(s). Diagnostic only.",
@@ -17553,6 +17606,11 @@ void LoadIniSettings() {
     g_scopeAspectPsReg = GetPrivateProfileIntA("Render", "ScopeAspectPsReg", 0, path);
     if (g_scopeScenePsReg  < -1 || g_scopeScenePsReg  > 63) g_scopeScenePsReg  = 1;
     if (g_scopeAspectPsReg < -1 || g_scopeAspectPsReg > 63) g_scopeAspectPsReg = 0;
+    g_scopeHeadAim = GetPrivateProfileIntA("Render", "ScopeHeadAim", 1, path) ? 1 : 0;
+    Log("ini: ScopeHeadAim=%d (%s)", g_scopeHeadAim,
+        g_scopeHeadAim ? "while the scope overlay is on screen the shot follows the HEAD, not the"
+                         " controller - you are aiming through a reticle drawn to the view"
+                       : "off - the shot follows the controller even while scoped");
     Log("ini: ScopeScenePsReg=%d ScopeAspectPsReg=%d (the pixel-shader registers remapped per eye for"
         " the scope: the scene-colour UV, and the aspect that keeps the circle round. -1 disables"
         " either on its own)", g_scopeScenePsReg, g_scopeAspectPsReg);
