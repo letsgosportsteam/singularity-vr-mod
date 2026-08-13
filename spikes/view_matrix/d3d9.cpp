@@ -9507,11 +9507,25 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
                 vp.Width = halfWidth;
                 dev->SetViewport(&vp);
                 if (haveScene) {
-                    // Map the old UV range linearly into this eye's half: u' = u*0.5 (+0.5 for the
-                    // right eye). Correct to within half a texel, and it carries the existing
-                    // half-texel offset along rather than discarding it.
-                    float c[4] = { oldScene[0] * 0.5f, oldScene[1],
-                                   oldScene[2] * 0.5f + (eye ? 0.5f : 0.0f), oldScene[3] };
+                    // ---- ⭐ run 213j: the components, read off the shader instead of assumed ----
+                    //
+                    //   mad r1.xy, r1.yzzw, c1, c1.wzzw
+                    //
+                    // The bias swizzle is .wzzw, so X takes its bias from c1.W and Y from c1.Z:
+                    //
+                    //   u = (v1.x/w) * c1.x + c1.w
+                    //   v = (v1.y/w) * c1.y + c1.z
+                    //
+                    // Run 213g scaled c1.x (right) and biased c1.z (WRONG - that is the Y bias). The
+                    // result did both visible things at once: X kept the untouched 0.5002 bias against
+                    // a halved 0.25 scale, so it sampled [0.2502, 0.7502] - the MIDDLE band, still
+                    // straddling the seam, which is why the doubling never went away - while the
+                    // mangled Y bias smeared the image VERTICALLY, which is the streaking that
+                    // appeared at the same time.
+                    //
+                    // So: scale X, bias X, leave Y entirely alone.
+                    float c[4] = { oldScene[0] * 0.5f, oldScene[1], oldScene[2],
+                                   oldScene[3] * 0.5f + (eye ? 0.5f : 0.0f) };
                     dev->SetPixelShaderConstantF(g_scopeScenePsReg, c, 1);
                 }
                 if (haveAspect) {
@@ -11665,13 +11679,14 @@ inline bool ScopeActive() {
     if (!last) return false;
     return (DWORD)(GetTickCount() - last) < 150;   // ~18 frames at 120 fps
 }
-// ⛔ run 213i: BOTH DEFAULTED TO -1 (off). Scaling them per eye did NOT fix the doubled world, and it
-// ADDED vertical streaking that was not there before - a regression, reported and visible in the
-// screenshots. A change that fails to fix its target and breaks something else does not stay on by
-// default while the question is still open. Kept as knobs because the registers are correctly
-// identified even if scaling them is the wrong operation.
-int g_scopeScenePsReg  = -1;     // ini [Render] ScopeScenePsReg
-int g_scopeAspectPsReg = -1;     // ini [Render] ScopeAspectPsReg
+// ⭐ run 213j: back ON, with the components corrected from the shader's own bytecode. The CTAB names
+// them outright - c0 is ScreenAspectRatio, c1 is ScreenPositionScaleBias, s1 is SceneColorTexture -
+// so these are no longer inferences. Run 213i turned them off because scaling them was a regression;
+// the registers were right and the COMPONENT was wrong. Still separate knobs: the scene fix decides
+// whether the world is doubled, the aspect fix decides whether the circle is round, and they fail
+// independently.
+int g_scopeScenePsReg  = 1;      // ini [Render] ScopeScenePsReg   - ScreenPositionScaleBias
+int g_scopeAspectPsReg = 0;      // ini [Render] ScopeAspectPsReg  - ScreenAspectRatio
 volatile LONG g_scopeQuadDraws = 0;
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
@@ -17641,10 +17656,10 @@ void LoadIniSettings() {
     g_scopeQuadPrimCount = GetPrivateProfileIntA("Render", "ScopeQuadPrimCount", 2, path);
     if (g_scopeQuadPrimType < 1 || g_scopeQuadPrimType > 6) g_scopeQuadPrimType = 5;
     if (g_scopeQuadPrimCount < 1) g_scopeQuadPrimCount = 1;
-    g_scopeScenePsReg  = GetPrivateProfileIntA("Render", "ScopeScenePsReg", -1, path);
-    g_scopeAspectPsReg = GetPrivateProfileIntA("Render", "ScopeAspectPsReg", -1, path);
-    if (g_scopeScenePsReg  < -1 || g_scopeScenePsReg  > 63) g_scopeScenePsReg  = -1;
-    if (g_scopeAspectPsReg < -1 || g_scopeAspectPsReg > 63) g_scopeAspectPsReg = -1;
+    g_scopeScenePsReg  = GetPrivateProfileIntA("Render", "ScopeScenePsReg", 1, path);
+    g_scopeAspectPsReg = GetPrivateProfileIntA("Render", "ScopeAspectPsReg", 0, path);
+    if (g_scopeScenePsReg  < -1 || g_scopeScenePsReg  > 63) g_scopeScenePsReg  = 1;
+    if (g_scopeAspectPsReg < -1 || g_scopeAspectPsReg > 63) g_scopeAspectPsReg = 0;
     g_scopeHeadAim = GetPrivateProfileIntA("Render", "ScopeHeadAim", 1, path) ? 1 : 0;
     Log("ini: ScopeHeadAim=%d (%s)", g_scopeHeadAim,
         g_scopeHeadAim ? "while the scope overlay is on screen the shot follows the HEAD, not the"
