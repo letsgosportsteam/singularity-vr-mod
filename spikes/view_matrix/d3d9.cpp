@@ -10781,24 +10781,32 @@ void UpdateFgLatch() {
         // position, against a session that otherwise stays broken. RelatchWrongRoles=0 if it ever bites.
         static int wrongRole = 0;
         if (g_relatchWrongRoles) {
-            LONG stray = 0;                       // largest non-baseline mesh in the pass this frame
+            // 💥 run 216: this used to require the larger mesh to be OUTSIDE the baseline, and that is
+            // exactly why it never fired on the scope case. A latch taken from a scoped pass captures a
+            // baseline containing the REAL gun, so the real gun was never a "stray" and the
+            // contradiction was invisible. The baseline test is dropped: the invariant that matters is
+            // simply that **the gun is the largest mesh in the pass**, which holds in every census on
+            // disk and cannot be true of a latch that put the arms in the gun role.
+            LONG biggest = 0;
             for (LONG i = 0; i < n && i < kFgSigMax; ++i) {
                 const LONG v = InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0);
-                if (v && v > stray && !FgIsBaseline((UINT)v)) stray = v;
+                if (v > biggest) biggest = v;
             }
             const bool quietGun = FgIsQuiet((UINT)gun);
-            if (!stray || !(quietGun || stray > gun)) wrongRole = 0;
+            const LONG stray = biggest;           // reported below; the name is kept for the log line
+            if (!(quietGun || biggest > gun)) wrongRole = 0;
             else if (++wrongRole >= kWrongRoleFrames) {
                 wrongRole = 0;
                 InterlockedExchange(&g_gunVerts, 0);
                 InterlockedExchange(&g_armsVerts, 0);
                 InterlockedExchange(&g_fgBaseCount, 0);
                 Log("*** mesh latch: THE ROLES ARE WRONG - dropping and re-taking. gun=%ld, and %ld has"
-                    " been drawn outside the baseline for %d frames (%s). That is a real weapon being"
-                    " HIDDEN by a latch that is not on a weapon. (run 212; ini RelatchWrongRoles) ***",
+                    " been drawn for %d frames (%s). That is a real weapon being HIDDEN by a latch that"
+                    " is not on a weapon. (run 212/216; ini RelatchWrongRoles) ***",
                     gun, stray, kWrongRoleFrames,
                     quietGun ? "and the gun role is held by a mesh drawn with NO weapon in hand"
-                             : "and it is LARGER than the latched gun, which the weapon never is");
+                             : "and it is LARGER than the latched gun - the weapon is the largest mesh"
+                               " in the pass in every census on disk");
                 LogFgList("at the WRONG-ROLE drop - this is what it will re-take from");
                 return;
             }
@@ -10823,11 +10831,43 @@ void UpdateFgLatch() {
     static LONG candGun = 0, candArms = 0;
     static int  steady = 0;
     if (n < 2) { steady = 0; return; }
-    const LONG a = InterlockedCompareExchange(&g_fgStableVerts[0], 0, 0);
-    const LONG b = InterlockedCompareExchange(&g_fgStableVerts[1], 0, 0);
+    // ---- 💥 run 216: the roles were POSITIONAL, and the scope changes the draw order ----
+    //
+    // Reported: after using the sniper scope, the arms are on the controller and the gun is invisible,
+    // and it survives a weapon switch. That is the run-207 role shift arriving by a new route.
+    //
+    // The scope census recorded both orders in the same run:
+    //
+    //   normal   [0]=11389 [1]=97   [2]=3314 [3]=390
+    //   scoped   [0]=3314  [1]=390  [2]=11389 [3]=97      <- the arms are drawn FIRST
+    //
+    // So a re-latch while scoped took slot[0]=3314 as the gun. Run 213 already recorded that "slot [1]
+    // is the arms" was the weak half of this rule, after it mis-assigned arms=97; it is the whole rule
+    // that is weak, and this is the same defect from the other end.
+    //
+    // **The gun is the LARGEST mesh in the first-person pass, and the arms are the second largest.**
+    // Checked against every census on disk - 5799/3314/390, 11387/3314/390/9, 8297/3314/390,
+    // 11389/97/3314/390, and the scoped order above. Size is invariant under draw order; position is
+    // not. It also fixes run 213's arms=97 misassignment for free, because sorted by size the second
+    // entry is 3314 rather than whatever happened to be drawn second.
+    LONG a = 0, b = 0;
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i) {
+        const LONG v = InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0);
+        if (v > a)                 { b = a; a = v; }
+        else if (v > b && v != a)  { b = v; }
+    }
     if (!a || !b) { steady = 0; return; }
     if (a != candGun || b != candArms) { candGun = a; candArms = b; steady = 0; return; }
     if (++steady < kLatchSteady) return;
+    // ⭐ run 216: and do not take a latch from a SCOPED pass at all. Sorting by size makes the roles
+    // survive the reordering, but the scoped pass is an abnormal state generally - the weapon can be
+    // swapped for a scope-specific mesh - and there is no reason to learn the roles from it when an
+    // ordinary frame is a second away. ScopeActive's own signal, reused. 500 ms rather than the aim
+    // path's 150: this only has to avoid a moment, not track one.
+    {
+        const DWORD lastScope = (DWORD)Rd(g_scopeUpMs);
+        if (lastScope && (DWORD)(GetTickCount() - lastScope) < 500) { steady = 0; return; }
+    }
     // ⭐ run 209: the roles are only meaningful if there IS a weapon, and the pass size says so at zero
     // cost - see the note at g_minFgMeshes. With no weapon the top two are the ARMS and the hand
     // fragment; latching those moves the arms onto the controller and hides the real gun once one is
