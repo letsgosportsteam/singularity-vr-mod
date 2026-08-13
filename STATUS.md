@@ -509,6 +509,21 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      alt trigger, which means something different on every other weapon.
      ⚠️ **NOT confirmed in play** — it rode along with the visual fix and only the visuals were reported.
 
+10d. **✅ FIXED and VERIFIED (run 215) — the mesh matchers hid WORLD geometry.** `FgPrimeWindowDraws=16`.
+   - Reported as a hole in the floor with water and a basement visible through it. Bisected on ini keys:
+     absent unmodded → it is us; HEAD mode fixes it → the mesh path; `HideExtraArms=0` fixes it →
+     `FgIsExtraArm`.
+   - **`fgDrawCount > kFgSanePass` never fires outside the first-person pass**, because the counter it
+     reads is 0 there — so `0 > 64` is false and the vertex-count match proceeded **frame-wide**. With
+     `9` in the baseline set, every 9-vertex draw in the frame was hidden.
+   - Fixed with a window: **inside the pass, OR within the first few draws of the frame**. Gating on the
+     pass alone would have restored run 120's black silhouette, since the depth prime is drawn at
+     draws 2–3. Applied to the MOVE path too.
+   - **Measured ~4 refusals per frame across a whole run** — this was pervasive, not room-specific. It
+     had been removing small world meshes all along and only became visible on a floor.
+   - ⚠️ If a hidden mesh ever leaves a **black silhouette**, the window is too narrow — raise
+     `FgPrimeWindowDraws`. That is run 120's failure mode and needs no rebuild.
+
 11b. **✅ FIXED and VERIFIED (run 214) — the melee swing was invisible.** `MeleeArmsMs=700`,
    `MeleeArmsDelayMs=0`.
    - Same cause and same remedy as the heal: the animation is performed by the arms the mod hides. The

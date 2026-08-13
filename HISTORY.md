@@ -24,6 +24,62 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 215: the mesh matchers were frame-wide, and a floor plane collided with them
+
+**Reported:** a hole in the floor — water and the basement under the next room visible through it,
+including a chest down there. **Fixed and confirmed:** floor intact, fragment still hidden.
+
+### Bisected on ini keys alone — no rebuild until the cause was named
+
+| test | result | rules out |
+|---|---|---|
+| `d3d9.dll.off` | floor fine | **it IS us** |
+| AIM METHOD → HEAD | floor fine | **the MESH path** (`hideMeshIdx = 0`) |
+| `OcclusionQueryMode=0` | no effect | culling |
+| `D3D9ExMode=0` | no effect | the run-139 texture wrapper |
+| `HideStrayArms=0` | no effect | the stray rule |
+| `HideExtraArms=0` | **fixed it** | → `FgIsExtraArm` |
+
+### The bug
+
+The matchers key on vertex count with **no positional gate that actually bites**. `fgDrawCount >
+kFgSanePass` looks like one — but outside the first-person pass `g_fgDrawCount` is **0**, so the test
+reads `0 > 64`, false, and the match proceeds. They matched **anywhere in the frame**.
+
+The weapon's baseline set was `[11387, 3314, 390, 9]`, and `FgIsExtraArm` hides any baseline count that
+is neither gun nor arms — so **every 390-vertex and every 9-vertex draw in the whole frame** was
+hidden. A large flat floor plane has very few vertices.
+
+**Measured after the fix: ~4 refusals per frame, across the whole run.** This was not a rare
+coincidence in one room; it was removing small world meshes constantly, and only became *visible*
+where the collided mesh was a floor you could fall through.
+
+### ⚠️ Gating on the foreground pass alone would have been wrong
+
+The obvious fix, and it trades this bug for run 120's. The depth-prime copy of the arms is drawn at
+**draws 2–3 at the top of the frame**, and hiding only inside the pass left the prime alive to write a
+black silhouette. So the window is *"inside the first-person pass, **or** within the first few draws of
+the frame"* — both needs met.
+
+Applied to the **move** path too: a world mesh colliding with the gun's count is transformed onto the
+controller, which removes it from where it belongs just as surely as hiding it does.
+
+Checked only on an actual match, so a world draw matching nothing costs exactly what it did before.
+
+### Method notes
+
+- **The cheap control settled it in one step and should have been first.** `CLAUDE.md` says so
+  explicitly. Two ini theories were tried ahead of it and both were wrong — `OcclusionQueryMode` and
+  `D3D9ExMode` cost a run each. "Is this us at all" is one minute and it collapses the search space.
+- **A guard that reads correctly can still never fire.** `fgDrawCount > kFgSanePass` was written as a
+  sanity bound and reviewed as one; it is inert precisely where it was needed, because the counter it
+  reads is zero outside the pass. **Check what a guard evaluates to in the case you are not thinking
+  about**, not only in the one that motivated it.
+- **A symptom noticed late is usually a condition met late.** The collision was pervasive from the
+  start; the room only made it visible.
+
+---
+
 ## Run 214: the melee swing was invisible for the same reason the heal was
 
 **Reported and fixed, confirmed in play.** `MeleeArmsMs=700`, `MeleeArmsDelayMs=0`.
