@@ -894,6 +894,9 @@ WORD g_stickDownMask = XI_DPAD_UP;   // ini StickDown - Health
 // path only arms it. See the note at g_healArmsMs.
 extern volatile LONG   g_healArmsMs, g_healDelayMs, g_healPending;
 extern volatile LONG64 g_healUntilMs, g_healFromMs;
+// Run 214: the melee window. Same shape, same reason the input path only ARMS it - see g_meleeArmsMs.
+extern volatile LONG   g_meleeArmsMs, g_meleeDelayMs, g_meleePending;
+extern volatile LONG64 g_meleeUntilMs, g_meleeFromMs;
 
 // The NUMPAD4/NUMPAD5 test inputs, laid OVER whatever the controllers just published.
 //
@@ -5556,6 +5559,9 @@ PadButtonAction g_padButtons[] = {
     { "menu",       "Menu",           "/user/hand/left/input/menu/click",        "Menu",       XI_START,     XR_NULL_HANDLE, true,  false },
 };
 const int kPadButtonCount = (int)(sizeof(g_padButtons) / sizeof(g_padButtons[0]));
+// Run 214: which row is the melee/impulse button. Resolved once at ini load; -1 until then, and the
+// melee window simply never arms in that case rather than guessing at a row.
+int g_impulseBtnIdx = -1;
 
 // Turn. Snap steps the yaw base directly rather than driving the look stick, because the engine's
 // own turn ramp is exactly what snap must not have: instant and exact is the whole point. Smooth
@@ -5789,9 +5795,14 @@ bool InitXRInput() {
                 Log("input: LEFT-HANDED - gun and buttons mirrored. Sticks are NOT swapped (that is"
                     " SwapSticks). MENU stays on the LEFT controller: the Touch profile has no"
                     " right-hand menu/click and system/click is reserved by the runtime.");
-            for (int i = 0; i < kPadButtonCount; ++i)
+            for (int i = 0; i < kPadButtonCount; ++i) {
                 g_padButtons[i].mask = (WORD)GetPrivateProfileIntA(
                     "Input", g_padButtons[i].iniKey, g_padButtons[i].mask, path);
+                // Run 214: resolved by NAME once, not matched by mask per frame - the mask is
+                // user-rebindable from this very loop, so keying on it would break the moment
+                // somebody moved the button.
+                if (!strcmp(g_padButtons[i].name, "impulse")) g_impulseBtnIdx = i;
+            }
         }
     }
 
@@ -6374,6 +6385,28 @@ void SyncXRInput(XrTime displayTime) {
         const bool down = getBool(g_padButtons[i].action);
         if (g_padButtons[i].isMenu)  { menuHeld  = down; menuMask  = g_padButtons[i].mask; continue; }
         if (g_padButtons[i].isPanel) { panelHeld = down; panelMask = g_padButtons[i].mask; continue; }
+        // ---- ⭐ run 214: the melee swing is invisible, for the run-198 reason ----
+        //
+        // Armed from the button WE inject, on the RISING edge, exactly as the heal window is: there is
+        // no inference to get wrong, because we are the ones asking for the swing. Holding the button
+        // must not re-arm every frame, hence the edge.
+        if (i == g_impulseBtnIdx) {
+            static bool wasDown = false;
+            if (down && !wasDown && InterlockedCompareExchange(&g_meleeArmsMs, 0, 0) > 0) {
+                const LONG64 now = (LONG64)GetTickCount64();
+                const LONG dly = InterlockedCompareExchange(&g_meleeDelayMs, 0, 0);
+                const LONG end = InterlockedCompareExchange(&g_meleeArmsMs, 0, 0);
+                InterlockedExchange64(&g_meleeFromMs,  now + dly);
+                InterlockedExchange64(&g_meleeUntilMs, now + (end > dly ? end : dly + 1));
+                InterlockedExchange(&g_meleePending, 1);   // the cheap gate LAST, after the deadlines
+                // The latched weapon is logged with every window on purpose. The impulse weapon shares
+                // this button, and when it finally exists this line is what says whether the two cases
+                // can be told apart at all - without it, that question needs its own run.
+                Log("melee window: arms shown from +%ld ms to +%ld ms after the press (gun=%ld)",
+                    dly, end, InterlockedCompareExchange(&g_gunVerts, 0, 0));
+            }
+            wasDown = down;
+        }
         if (down) btns |= g_padButtons[i].mask;
     }
 
@@ -9882,6 +9915,43 @@ inline bool HealWindowActive() {
     return now >= InterlockedCompareExchange64(&g_healFromMs, 0, 0);
 }
 
+// ---- ⭐ run 214: the MELEE window, the heal's shape applied to a shorter animation ----
+//
+// Reported: the melee swing is invisible. Same cause as the heal was - the animation is performed by
+// the arms this mod hides, so hiding them leaves the player watching nothing happen.
+//
+// Deliberately the SAME mechanism rather than a variation on it: show the arms AND return the gun to
+// the engine's position for the window. Run 198 established why both halves are needed - moving the gun
+// onto the controller while the arms animate at the engine position tears one animation in half.
+//
+// ⚠ The duration is a GUESS and therefore an ini value, exactly as HealArmsMs is. A swing is much
+// shorter than the injector animation; 700 ms is a starting point, not a measurement, and the first
+// person to watch it should expect to move it.
+//
+// ⚠⚠ **The impulse weapon shares this button.** Once that weapon is acquired the same press fires a
+// weapon rather than swinging a fist, and showing the arms then is a misfire. That is unmeasured and
+// deliberately not guessed at - see the log line at the arming site, which records the latched weapon
+// with every window so the two cases can be told apart from one run once the weapon exists.
+// `MeleeArmsMs=0` disables the whole thing without a rebuild.
+volatile LONG g_meleeArmsMs = 700;     // ini [Render] MeleeArmsMs      - end, from the press
+volatile LONG g_meleeDelayMs = 0;      // ini [Render] MeleeArmsDelayMs - start, from the press
+volatile LONG64 g_meleeUntilMs = 0, g_meleeFromMs = 0;
+volatile LONG g_meleePending = 0;      // the cheap 32-bit gate - see HealWindowActive for why
+
+inline bool MeleeWindowActive() {
+    if (!Rd(g_meleePending)) return false;         // the common case, and it costs nothing
+    const LONG64 until = InterlockedCompareExchange64(&g_meleeUntilMs, 0, 0);
+    if (!until) return false;
+    const LONG64 now = (LONG64)GetTickCount64();
+    if (now >= until) { InterlockedExchange(&g_meleePending, 0); return false; }   // expired: latch off
+    return now >= InterlockedCompareExchange64(&g_meleeFromMs, 0, 0);
+}
+
+// True while ANY first-person animation window is open. Both windows want the same two things - the
+// arms visible, and the gun back where the animation expects it - so the call sites ask one question
+// rather than growing a list that a third animation would have to be added to in three places.
+inline bool ArmsAnimActive() { return HealWindowActive() || MeleeWindowActive(); }
+
 // Was this mesh on screen when the latch was taken?
 static bool FgIsBaseline(UINT verts) {
     const LONG n = Rd(g_fgBaseCount);
@@ -10393,8 +10463,9 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     // ⭐ run 203: a "pass" this large is not the first-person pass, so there is nothing here worth
     // matching - and matching anyway is what cost 120 fps at the dock. See kFgSanePass.
     if (Rd(g_fgDrawCount) > kFgSanePass) return false;
-    // The heal animation is the arms' one legitimate appearance - see the note at g_healArmsMs.
-    if (HealWindowActive()) return false;
+    // The heal and melee animations are the arms' legitimate appearances - see g_healArmsMs and
+    // g_meleeArmsMs.
+    if (ArmsAnimActive()) return false;
     const LONG a = Rd(g_armsVerts);
     if (a && (UINT)a == verts) return true;
     // ⭐ run 199: the leftover hand/arm fragment - the 390-vertex mesh. Checked before the stray rule
@@ -10419,7 +10490,7 @@ static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
     if (m != 1 && m != 3) return false;
     const LONG g = Rd(g_gunVerts);
     if (!g || (UINT)g != verts) return false;
-    return !HealWindowActive();                        // leave the gun where the animation expects it
+    return !ArmsAnimActive();                          // leave the gun where the animation expects it
 }
 
 // Everything else the first-person pass draws - the muzzle flash, the barrel smoke, ejected shells,
@@ -10447,10 +10518,11 @@ static bool FgRidesGun(UINT verts) {
     // == 1 exactly. Mode 2 is the hide-the-pass test and must not also transform what it keeps.
     if (Rd(g_fgRideAll) != 1) return false;
     if (!Rd(g_inForeground)) return false;
-    // Nothing rides during the heal - the gun itself is not being moved, so an attachment that followed
-    // the controller would be the only thing off the animation. Moved BELOW the cheap gates in run 203:
-    // it was the second test in the function, so every draw paid for a 64-bit interlocked read.
-    if (HealWindowActive()) return false;
+    // Nothing rides during an animation window - the gun itself is not being moved, so an attachment
+    // that followed the controller would be the only thing off the animation. Moved BELOW the cheap
+    // gates in run 203: it was the second test in the function, so every draw paid for a 64-bit
+    // interlocked read.
+    if (ArmsAnimActive()) return false;
     // ---- ⚠️ the boundary is LOOSE, and widening what rides it raises the stakes ----
     //
     // Run 115 set g_inForeground on "a depth-only Clear once some draws have happened" and wrote
@@ -17961,6 +18033,24 @@ void LoadIniSettings() {
         healMs ? "the arms are visible from DelayMs to Ms after the health button, and the gun returns to"
                  " the engine's position for that span, so the injector animation reads as one piece"
                : "off - the arms stay hidden through the heal animation");
+
+    // Run 214: how long the arms stay visible after the melee button. A swing is much shorter than the
+    // injector animation, so this is not HealArmsMs with a different name - but it IS the same kind of
+    // guess, and the same kind of knob. MeleeArmsMs=0 turns the window off entirely, which is also the
+    // escape hatch for when the impulse weapon turns out to share the button badly.
+    LONG meleeMs = GetPrivateProfileIntA("Render", "MeleeArmsMs", 700, path);
+    if (meleeMs < 0)    meleeMs = 0;
+    if (meleeMs > 5000) meleeMs = 5000;
+    InterlockedExchange(&g_meleeArmsMs, meleeMs);
+    LONG meleeDelay = GetPrivateProfileIntA("Render", "MeleeArmsDelayMs", 0, path);
+    if (meleeDelay < 0)    meleeDelay = 0;
+    if (meleeDelay > 2000) meleeDelay = 2000;
+    InterlockedExchange(&g_meleeDelayMs, meleeDelay);
+    Log("ini: MeleeArmsMs=%ld MeleeArmsDelayMs=%ld (%s)", meleeMs, meleeDelay,
+        meleeMs ? "the arms are visible from DelayMs to Ms after the melee button, and the gun returns"
+                  " to the engine's position for that span, so the swing reads as one piece. ⚠ the"
+                  " impulse weapon shares this button - see the melee window note"
+                : "off - the melee swing stays invisible");
 
     LONG fxHide = GetPrivateProfileIntA("Render", "HideMuzzleFx", 1, path) ? 1 : 0;
     InterlockedExchange(&g_hideMuzzleFx, fxHide);
