@@ -3815,7 +3815,13 @@ void StampCaptureState(CopySlot& cap) {
 // Returns the slot whose pixels now sit in g_uploadTex, or nullptr if there is nothing to submit.
 // In pipelined mode the very first frame returns nullptr because nothing has been captured yet -
 // that is normal startup, not a failure.
+void DrawLaserSight(IDirect3DDevice9* dev);   // ⭐ run 217: defined late, called from the copy
 const CopySlot* CopyBackbufferToD3D11(IDirect3DDevice9* dev) {
+    // ⭐ run 217: defined further down, next to the transforms it reuses - see DrawLaserSight.
+    // The last thing added to the frame before it is handed to XR. Here rather than at a draw
+    // hook because this is the one point that is provably AFTER the scene and BEFORE the copy, on both
+    // the zero-copy and CPU paths - the laser cannot end up in one and not the other.
+    DrawLaserSight(dev);
     IDirect3DSurface9* back = nullptr;
     if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) return nullptr;
     D3DSURFACE_DESC sd{};
@@ -5039,6 +5045,126 @@ inline SHORT DebugKey(int vk) {
     return InterlockedCompareExchange(&g_debugOn, 0, 0) ? GetAsyncKeyState(vk) : (SHORT)0;
 }
 
+// The laser toggle, defined with the drawing code it controls. Declared here because the PANEL owns
+// it - a panel-backed setting has to be visible to the row text, the adjust and the save, all of which
+// live above the renderer.
+extern volatile LONG g_laserOn, g_laserLenUU;
+
+// The global anchor these slots override and seed from; defined with the gun transform.
+extern LONG g_gunAnchorFwd, g_gunAnchorRight, g_gunAnchorUp;
+
+// ---- ⭐ run 217: alignment is PER WEAPON, because the barrel is per weapon ----
+//
+// Reported: the pistol and shotgun feel right, but at mid/long range the assault rifle's bullets
+// clearly do not go where the barrel points - while still following the controller correctly.
+//
+// That is an ANGULAR error, and the distinction decides which knob can fix it. A positional error -
+// the gun sitting in the wrong place with its barrel parallel to the shot - misses by `d/R` and gets
+// SMALLER with range. An angular error misses by `R*theta` and gets larger. "Fine up close, clearly
+// off far away" is the second one, so the anchor alone was never going to fix it.
+//
+// It differs per weapon because we apply ONE rotation to every weapon mesh, and each mesh is modelled
+// with its barrel at its own angle relative to the mesh's local axes. The pistol feeling right just
+// means its art happens to sit near whatever the current transform assumes.
+//
+// ⚠️ The trim rotates the MESH ONLY. The bullet already goes where the controller points - the user
+// said so explicitly - so the thing that is wrong is where the gun is DRAWN, and touching the trace
+// would move a thing that is already correct. That is also why it can never cost accuracy: the worst a
+// bad trim can do is draw the gun crooked.
+//
+// Keyed on the latched vertex count, which is the identifier this mod already has for "which weapon" -
+// 5799, 8297, 11387, 11389 in the logs so far.
+const int kGunAlignMax = 8;
+struct GunAlignSlot {
+    LONG verts;              // latched vertex count; 0 = empty
+    LONG fwd, right, up;     // anchor, engine units from the eye
+    LONG yawTenths;          // barrel trim, tenths of a degree. 0.1 deg is ~8.7 cm at 50 m
+    LONG pitchTenths;
+};
+GunAlignSlot g_gunAlign[kGunAlignMax]{};
+
+// The slot for the weapon in hand, or nullptr when there is none. Never allocates - see GunAlignFor.
+GunAlignSlot* GunAlignFind(LONG verts) {
+    if (!verts) return nullptr;
+    for (int i = 0; i < kGunAlignMax; ++i)
+        if (g_gunAlign[i].verts == verts) return &g_gunAlign[i];
+    return nullptr;
+}
+
+// Find or create. Creating seeds from the GLOBAL anchor, so a weapon you have never tuned starts
+// exactly where it is today and tuning is always a change FROM the current look, never a jump.
+GunAlignSlot* GunAlignFor(LONG verts) {
+    if (!verts) return nullptr;
+    if (GunAlignSlot* g = GunAlignFind(verts)) return g;
+    for (int i = 0; i < kGunAlignMax; ++i) {
+        if (g_gunAlign[i].verts) continue;
+        g_gunAlign[i].verts = verts;
+        g_gunAlign[i].fwd   = g_gunAnchorFwd;
+        g_gunAlign[i].right = g_gunAnchorRight;
+        g_gunAlign[i].up    = g_gunAnchorUp;
+        g_gunAlign[i].yawTenths = g_gunAlign[i].pitchTenths = 0;
+        return &g_gunAlign[i];
+    }
+    return nullptr;                      // table full: fall back to the globals rather than evict
+}
+
+// The anchor actually in force this frame. Falls back to the globals for an untuned weapon, so
+// nothing changes for anyone who never opens the page.
+void GunAnchorInForce(LONG* fwd, LONG* right, LONG* up) {
+    const GunAlignSlot* g = GunAlignFind(InterlockedCompareExchange(&g_gunVerts, 0, 0));
+    *fwd   = g ? g->fwd   : g_gunAnchorFwd;
+    *right = g ? g->right : g_gunAnchorRight;
+    *up    = g ? g->up    : g_gunAnchorUp;
+}
+
+// ---- 🛑 run 174: the sideways anchor does NOT mirror. Two attempts, both wrong, both removed ----
+//
+// First I multiplied it by -1 in the transform. Then I split it into a second tunable value. Both
+// were built on the same unexamined premise: that the anchor is a property of the HAND.
+//
+// It is not. It was tuned with the gun attached to the ARMS, so it describes where the game's own
+// gun mesh sits relative to the eye - and the game has no left-handed arms. The mesh is on the same
+// side whichever controller is aiming it, so there is nothing to mirror.
+//
+// The evidence agreed once the right question was asked. With position frozen (TAB) the gun swung
+// through an ARC in left-handed mode, which is the documented symptom of a pivot in the wrong
+// place, and -8 against +8 is a pivot 16 units off the grip - exactly that.
+//
+// ⚠️ Worth keeping as a caution rather than just deleting: the sign flip also sat DOWNSTREAM of the
+// on-screen readout and the arrow-key tuning, so the panel showed one number while another was
+// applied and pressing "right" moved the gun LEFT. Any future per-handedness value must go through
+// the same accessor as its readout and its tuning, or calibrating it by feel is impossible.
+volatile LONG g_gunSignCombo = 0;
+volatile LONG g_readoutOn = 1;   // on-screen state squares - see DrawStateReadout
+
+// ---- run 128: which anchor axis the arrow keys adjust ----
+//
+// The anchor is the point the gun rotates about, and getting it onto the grip is pure eyeball -
+// exactly the kind of tuning that should never cost a restart per guess. LEFT/RIGHT pick the axis,
+// UP/DOWN change it, and all three values plus the selection are on screen.
+volatile LONG g_anchorAxis = 0;                // 0 forward, 1 right, 2 up
+
+static void Mul3(float out[3][3], const float a[3][3], const float b[3][3]) {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            out[i][j] = a[i][0]*b[0][j] + a[i][1]*b[1][j] + a[i][2]*b[2][j];
+}
+
+// The eight rotation-sign combinations, cycled by CAPS LOCK so the right one is found in ONE run
+// instead of one restart per guess. Three axes reported wrong in three separate runs is what this
+// is for - a sign is not worth a headset session each.
+// ---- ⚠️ run 126: bit 3 turns the view-frame conjugation OFF ----
+//
+// Run 125 changed the frame AND baked a new pitch sign in the same build, so the result could not
+// say which caused what - the one-factor-at-a-time rule, broken by me after this project had
+// already recorded it twice. It also renumbered the combos, so "combo 2 was best" stopped being
+// reproducible between the two runs.
+//
+// So the frame change joins the cycle as a fourth bit instead of being a decision already taken.
+// Sixteen states on one key, and the log names each one, so a single session settles both
+// questions - which signs, and whether the conjugation helps at all.
+static bool GunViewFrame() { return (InterlockedCompareExchange(&g_gunSignCombo, 0, 0) & 8) == 0; }
+
 // Only settings that are consulted EVERY FRAME from a global belong here. Anything read once at
 // device creation - D3D9ExMode, ZeroCopy, the resolution - would appear to change and silently do
 // nothing until a relaunch, which is worse than not offering it. Those stay ini-only.
@@ -5046,7 +5172,9 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TURNDIR, PR_HEADROLL, PR_CROSSHAIR, PR_OCCLUSION, PR_DEBUG,
        PR_CINESTICK, PR_CINECAM, PR_SWAPSTICKS, PR_LEFTHAND, PR_WEAPONFX, PR_MUZZLEFX, PR_WORLDSCALE,
        PR_AIMPARTS,
-       PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_BACK };
+       // ⭐ run 217: the laser and the per-weapon alignment rows.
+       PR_LASER, PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH,
+       PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
 //
@@ -5061,10 +5189,14 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // DISPLAY is its own page with a single row today. That is deliberate: HUD inset/safe-area tuning
 // is already queued (it is the beta item in STATUS), and the crosshair belongs with it rather than
 // with comfort. A page of one that is about to be a page of three beats moving it twice.
-const int kPanelPages    = 5;
+// ⭐ run 217: WEAPON is its own page because it is the only one whose rows are PER WEAPON - the values
+// on it change meaning when you switch guns, and mixing that with global settings on a shared page is
+// how someone tunes the rifle and wonders why the pistol moved.
+const int kPanelPages    = 6;
 const int kPanelRowsMax  = 8;
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
-    { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV },
+    { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
+      PR_GOTO_WEAPON },
     { PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_MOVEDIR, PR_SWAPSTICKS,
       PR_LEFTHAND, PR_BACK },
     { PR_CINESTICK, PR_CINECAM, PR_BACK },
@@ -5074,16 +5206,20 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // WORLD SCALE belongs here for the reason the DISPLAY page exists: it is judged by LOOKING, and a
     // setting judged by looking has to be adjustable while you are looking. A relaunch per guess is what
     // this project's own notes call out - "a sign is not worth a headset session each".
-    { PR_CROSSHAIR, PR_MUZZLEFX, PR_WORLDSCALE, PR_BACK },
+    // ⭐ run 217: LASER sits with CROSSHAIR deliberately: the crosshair is HIDDEN in MOTION CONTROLLER
+    // because a centre-screen reticle points where the shot is not going, and the laser is the thing
+    // that replaces it. Judged by looking, like everything else on this page.
+    { PR_CROSSHAIR, PR_LASER, PR_MUZZLEFX, PR_WORLDSCALE, PR_BACK },
     // ⭐ run 205: AIM PARTS is on the panel, not just the ini, because the ONLY sound way to compare
     // these is to toggle them IN PLACE - same spot, same view direction, seconds apart. Draw count in a
     // headset is dominated by where you are LOOKING, so two runs "in the same place" can differ by 3x
     // (1,400 vs 3,800 draws was measured) and a cross-run comparison is worthless. That mistake cost a
     // test run and it was mine.
     { PR_OCCLUSION, PR_WEAPONFX, PR_AIMPARTS, PR_DEBUG, PR_BACK },
+    { PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 6, 8, 3, 4, 5 };
+const int kPageCount[kPanelPages] = { 7, 8, 3, 5, 5, 7 };
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5091,9 +5227,9 @@ const int kPageCount[kPanelPages] = { 6, 8, 3, 4, 5 };
 // raiser, so forgetting to update one of these costs a resize rather than text spilling off the
 // plate. The widest strings are "AIM METHOD MOTION CONTROLLER" and "MOVE DIRECTION HAND (NO
 // TRACKING)", which is why those two pages are the broad ones.
-const int kPageCols[kPanelPages] = { 34, 35, 30, 28, 28 };
+const int kPageCols[kPanelPages] = { 34, 35, 30, 28, 28, 30 };
 const char* kPageName[kPanelPages] = { "VR SETTINGS", "CONTROLLER", "COMFORT", "DISPLAY",
-                                       "ADVANCED" };
+                                       "ADVANCED", "WEAPON ALIGN" };
 
 int g_panelPage = 0;
 inline int PanelRowCount() { return kPageCount[g_panelPage]; }
@@ -5180,6 +5316,36 @@ void PanelSaveRow(int rowId, const char* path) {
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
                         InterlockedCompareExchange(&g_aimMethod, 0, 0));
             WritePrivateProfileStringA("Input", "AimMethod", v, path); return;
+        case PR_LASER:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_laserOn, 0, 0));
+            WritePrivateProfileStringA("Render", "LaserSight", v, path); return;
+        // ⭐ run 217: every occupied slot is written on any weapon row, not just the one being edited.
+        // The rows share one table and PanelSave walks rows, so writing "the row I touched" would drop
+        // a weapon you tuned earlier in the same session. Nav rows return silently; these do not,
+        // because they DO persist - just all at once.
+        case PR_ALIGNGUN: case PR_ALIGNFWD: case PR_ALIGNRIGHT: case PR_ALIGNUP:
+        case PR_ALIGNYAW: case PR_ALIGNPITCH: {
+            static bool written = false;
+            if (written) { written = false; return; }   // one write per save, not six
+            written = true;
+            for (int i = 0; i < kGunAlignMax; ++i) {
+                char key[48];
+                const GunAlignSlot& g = g_gunAlign[i];
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dVerts", i);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", g.verts);
+                WritePrivateProfileStringA("Input", key, v, path);
+                if (!g.verts) continue;
+                const char* nm[5] = { "Fwd", "Right", "Up", "YawTenths", "PitchTenths" };
+                const LONG  vals[5] = { g.fwd, g.right, g.up, g.yawTenths, g.pitchTenths };
+                for (int k = 0; k < 5; ++k) {
+                    _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%d%s", i, nm[k]);
+                    _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", vals[k]);
+                    WritePrivateProfileStringA("Input", key, v, path);
+                }
+            }
+            return;
+        }
         case PR_MOVEDIR:
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_walkDirection);
             WritePrivateProfileStringA("Input", "WalkDirection", v, path); return;
@@ -5280,6 +5446,38 @@ void PanelRowText(int row, char* out, size_t cap) {
     switch (row) {
         case PR_ENABLEVR:
             _snprintf_s(out, cap, _TRUNCATE, "VR MODE        %s", VrModeOn() ? "ON" : "OFF");
+            break;
+        case PR_LASER:
+            _snprintf_s(out, cap, _TRUNCATE, "LASER SIGHT    %s",
+                        InterlockedCompareExchange(&g_laserOn, 0, 0) ? "ON" : "OFF");
+            break;
+        // The weapon rows report NO WEAPON rather than a stale number when nothing is latched, because
+        // adjusting a value that belongs to a gun you are not holding is the confusing case.
+        case PR_ALIGNGUN: {
+            const LONG gv = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+            if (!gv) _snprintf_s(out, cap, _TRUNCATE, "WEAPON         NO WEAPON");
+            else     _snprintf_s(out, cap, _TRUNCATE, "WEAPON         %ld%s", gv,
+                                 GunAlignFind(gv) ? " (TUNED)" : "");
+            break;
+        }
+        case PR_ALIGNFWD: case PR_ALIGNRIGHT: case PR_ALIGNUP: {
+            LONG f, r, u; GunAnchorInForce(&f, &r, &u);
+            const char* nm = row == PR_ALIGNFWD ? "ANCHOR FWD  " :
+                             row == PR_ALIGNRIGHT ? "ANCHOR RIGHT" : "ANCHOR UP   ";
+            const LONG val = row == PR_ALIGNFWD ? f : row == PR_ALIGNRIGHT ? r : u;
+            _snprintf_s(out, cap, _TRUNCATE, "%s   %ld", nm, val);
+            break;
+        }
+        case PR_ALIGNYAW: case PR_ALIGNPITCH: {
+            const GunAlignSlot* g = GunAlignFind(InterlockedCompareExchange(&g_gunVerts, 0, 0));
+            const LONG t = !g ? 0 : (row == PR_ALIGNYAW ? g->yawTenths : g->pitchTenths);
+            _snprintf_s(out, cap, _TRUNCATE, "%s  %+.1f", row == PR_ALIGNYAW ? "BARREL YAW  "
+                                                                            : "BARREL PITCH",
+                        (double)t / 10.0);
+            break;
+        }
+        case PR_GOTO_WEAPON:
+            _snprintf_s(out, cap, _TRUNCATE, "WEAPON ALIGN...");
             break;
         case PR_AIMMETHOD:
             _snprintf_s(out, cap, _TRUNCATE, "AIM METHOD     %s",
@@ -5532,6 +5730,27 @@ void PanelAdjust(int row, int dir) {
             break;
         case PR_GOTO_DISPLAY: g_panelPage = 3; g_panelRow = 0; return;
         case PR_GOTO_ADV:     g_panelPage = 4; g_panelRow = 0; return;
+        case PR_GOTO_WEAPON:  g_panelPage = 5; g_panelRow = 0; return;
+        case PR_LASER:
+            InterlockedExchange(&g_laserOn,
+                                InterlockedCompareExchange(&g_laserOn, 0, 0) ? 0 : 1);
+            break;
+        // ⭐ run 217: the weapon rows. GunAlignFor creates the slot on first adjustment, seeded from the
+        // global anchor - so tuning always starts from what you are already looking at, never a jump.
+        // With no weapon latched there is nothing to key on and the press does nothing, which the row
+        // text says in advance.
+        case PR_ALIGNGUN: return;                      // informational; nothing to adjust
+        case PR_ALIGNFWD: case PR_ALIGNRIGHT: case PR_ALIGNUP:
+        case PR_ALIGNYAW: case PR_ALIGNPITCH: {
+            GunAlignSlot* g = GunAlignFor(InterlockedCompareExchange(&g_gunVerts, 0, 0));
+            if (!g) return;
+            if      (row == PR_ALIGNFWD)   g->fwd   += dir;
+            else if (row == PR_ALIGNRIGHT) g->right += dir;
+            else if (row == PR_ALIGNUP)    g->up    += dir;
+            else if (row == PR_ALIGNYAW)   g->yawTenths   += dir;
+            else                           g->pitchTenths += dir;
+            break;
+        }
         case PR_BACK:         g_panelPage = 0; g_panelRow = 0; return;
         default:
             // Always recoverable, by two independent routes: the panel is opened by holding a
@@ -5758,6 +5977,31 @@ bool InitXRInput() {
             // A shipped build takes these unless the player overrides them, so the numbers that ship
             // must be the numbers that were tuned. Per-user trim is still expected - this is an
             // offset from YOUR eye - but it should start from the measured pose, not a placeholder.
+            // ⭐ run 217: the per-weapon slots, read before the global anchor so the log reads in the
+            // order the values are applied: a slot wins for its weapon, the global covers the rest.
+            for (int i = 0; i < kGunAlignMax; ++i) {
+                char key[48];
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dVerts", i);
+                const LONG gv = GetPrivateProfileIntA("Input", key, 0, path);
+                g_gunAlign[i] = GunAlignSlot{};
+                if (!gv) continue;
+                g_gunAlign[i].verts = gv;
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dFwd", i);
+                g_gunAlign[i].fwd = GetPrivateProfileIntA("Input", key, 30, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dRight", i);
+                g_gunAlign[i].right = GetPrivateProfileIntA("Input", key, 9, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dUp", i);
+                g_gunAlign[i].up = GetPrivateProfileIntA("Input", key, -13, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dYawTenths", i);
+                g_gunAlign[i].yawTenths = GetPrivateProfileIntA("Input", key, 0, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dPitchTenths", i);
+                g_gunAlign[i].pitchTenths = GetPrivateProfileIntA("Input", key, 0, path);
+                Log("ini: GunAlign%d - weapon %ld anchor F%ld R%ld U%ld, barrel trim yaw %+.1f"
+                    " pitch %+.1f deg", i, g_gunAlign[i].verts, g_gunAlign[i].fwd,
+                    g_gunAlign[i].right, g_gunAlign[i].up,
+                    (double)g_gunAlign[i].yawTenths / 10.0,
+                    (double)g_gunAlign[i].pitchTenths / 10.0);
+            }
             g_gunAnchorFwd   = GetPrivateProfileIntA("Input", "GunAnchorFwd",   30, path);
             g_gunAnchorRight   = GetPrivateProfileIntA("Input", "GunAnchorRight",    9, path);
             g_gunAnchorUp    = GetPrivateProfileIntA("Input", "GunAnchorUp",    -13, path);
@@ -10251,54 +10495,6 @@ LONG g_gunSignYaw = 1, g_gunSignPitch = -1, g_gunSignRoll = 1, g_gunFollowPos = 
 LONG g_gunSignPosZ = -1;                       // vertical translation came back flipped too
 LONG g_gunAnchorFwd = 25, g_gunAnchorRight = 8, g_gunAnchorUp = -8;   // engine units from the eye
 
-// ---- 🛑 run 174: the sideways anchor does NOT mirror. Two attempts, both wrong, both removed ----
-//
-// First I multiplied it by -1 in the transform. Then I split it into a second tunable value. Both
-// were built on the same unexamined premise: that the anchor is a property of the HAND.
-//
-// It is not. It was tuned with the gun attached to the ARMS, so it describes where the game's own
-// gun mesh sits relative to the eye - and the game has no left-handed arms. The mesh is on the same
-// side whichever controller is aiming it, so there is nothing to mirror.
-//
-// The evidence agreed once the right question was asked. With position frozen (TAB) the gun swung
-// through an ARC in left-handed mode, which is the documented symptom of a pivot in the wrong
-// place, and -8 against +8 is a pivot 16 units off the grip - exactly that.
-//
-// ⚠️ Worth keeping as a caution rather than just deleting: the sign flip also sat DOWNSTREAM of the
-// on-screen readout and the arrow-key tuning, so the panel showed one number while another was
-// applied and pressing "right" moved the gun LEFT. Any future per-handedness value must go through
-// the same accessor as its readout and its tuning, or calibrating it by feel is impossible.
-volatile LONG g_gunSignCombo = 0;
-volatile LONG g_readoutOn = 1;   // on-screen state squares - see DrawStateReadout
-
-// ---- run 128: which anchor axis the arrow keys adjust ----
-//
-// The anchor is the point the gun rotates about, and getting it onto the grip is pure eyeball -
-// exactly the kind of tuning that should never cost a restart per guess. LEFT/RIGHT pick the axis,
-// UP/DOWN change it, and all three values plus the selection are on screen.
-volatile LONG g_anchorAxis = 0;                // 0 forward, 1 right, 2 up
-
-static void Mul3(float out[3][3], const float a[3][3], const float b[3][3]) {
-    for (int i = 0; i < 3; ++i)
-        for (int j = 0; j < 3; ++j)
-            out[i][j] = a[i][0]*b[0][j] + a[i][1]*b[1][j] + a[i][2]*b[2][j];
-}
-
-// The eight rotation-sign combinations, cycled by CAPS LOCK so the right one is found in ONE run
-// instead of one restart per guess. Three axes reported wrong in three separate runs is what this
-// is for - a sign is not worth a headset session each.
-// ---- ⚠️ run 126: bit 3 turns the view-frame conjugation OFF ----
-//
-// Run 125 changed the frame AND baked a new pitch sign in the same build, so the result could not
-// say which caused what - the one-factor-at-a-time rule, broken by me after this project had
-// already recorded it twice. It also renumbered the combos, so "combo 2 was best" stopped being
-// reproducible between the two runs.
-//
-// So the frame change joins the cycle as a fourth bit instead of being a decision already taken.
-// Sixteen states on one key, and the log names each one, so a single session settles both
-// questions - which signs, and whether the conjugation helps at all.
-static bool GunViewFrame() { return (InterlockedCompareExchange(&g_gunSignCombo, 0, 0) & 8) == 0; }
-
 static void GunSigns(int& sy, int& sp, int& sr) {
     const LONG c = InterlockedCompareExchange(&g_gunSignCombo, 0, 0);
     sy = (c & 1) ? -(int)g_gunSignYaw   : (int)g_gunSignYaw;
@@ -10380,8 +10576,9 @@ static void GunAnchorWorld(float G[3]) {
     const float U[3] = { -sp * cy, -sp * sy, cp };
     // The sideways offset mirrors with the hand: the gun hangs off the right of your eye when it is
     // in your right hand and the left when it is not. Forward and up are unaffected.
-    const float af = (float)g_gunAnchorFwd, au = (float)g_gunAnchorUp;
-    const float ar = (float)g_gunAnchorRight;
+    LONG afL, arL, auL; GunAnchorInForce(&afL, &arL, &auL);   // run 217: per weapon
+    const float af = (float)afL, au = (float)auL;
+    const float ar = (float)arL;
     for (int i = 0; i < 3; ++i) G[i] = af * F[i] + ar * R[i] + au * U[i];
 }
 
@@ -10419,9 +10616,14 @@ static void BuildGunC(float C[4][4]) {
         H[2] += g_hmdOffset[2];
     }
     int sy, sp, sr; GunSigns(sy, sp, sr);
+    // ⭐ run 217: the per-weapon barrel trim, added to the MESH rotation and nowhere else. Tenths of a
+    // degree into UE3 units: 65536/360 = 182.044 per degree, so 18.2044 per tenth.
+    const GunAlignSlot* al = GunAlignFind(InterlockedCompareExchange(&g_gunVerts, 0, 0));
+    const int32_t trimYaw   = al ? (int32_t)(al->yawTenths   * 18.2044f) : 0;
+    const int32_t trimPitch = al ? (int32_t)(al->pitchTenths * 18.2044f) : 0;
     BuildGunTransform(C, G,
-        (int32_t)(sy * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)),
-        (int32_t)(sp * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)),
+        (int32_t)(sy * InterlockedCompareExchange(&g_handDevYawUU, 0, 0)) + trimYaw,
+        (int32_t)(sp * InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)) + trimPitch,
         (int32_t)(sr * InterlockedCompareExchange(&g_handDevRollUU, 0, 0)),
         // The gun faces along the view, so the view yaw is the frame its pitch and roll belong in -
         // unless the cycle has it switched off, which is what makes run 125 testable rather than
@@ -15441,6 +15643,152 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
 }
 
+// ================= ⭐ run 217: the LASER SIGHT, and the first geometry this mod draws ==========
+//
+// It exists as a feature and as the only INSTRUMENT that can settle the barrel-alignment question.
+// We cannot compute the divergence ourselves: the barrel direction lives inside art we cannot read,
+// so we know the transform we apply and not where the modelled barrel points inside the mesh. A line
+// along the shot real direction turns "it feels off" into "the barrel sits THIS far off it", which is
+// what makes the per-weapon trim tunable at all.
+//
+// WARNING: it is drawn along the BULLET direction, not the barrel. That is the whole point - you align
+// the gun to the laser, not the laser to the gun. Same spherical add that RotateTrace performs, from
+// the same signs, so if the two ever disagree the laser is wrong rather than reassuring.
+//
+// ---- the mechanics, and why they are unlike everything else in this file ----
+//
+// Every other draw here is the GAME own, intercepted. This one is ours, so it needs its own vertex
+// format and its own state, and it must leave the device exactly as it found it. XYZRHW + DIFFUSE with
+// both shaders unbound is the smallest thing that works: pre-transformed vertices skip the vertex
+// pipeline entirely, so no shader constant of the game is involved and nothing it set can distort us.
+//
+// The screen positions are computed HERE, on the CPU, from the same camera matrix the stereo path
+// remaps - once per eye, with the same ApplyEyeRemap the geometry gets. That keeps the laser in the
+// same space as the world it is drawn over without touching the game pipeline at all.
+volatile LONG g_laserOn = 0;          // ini [Render] LaserSight - OFF by default
+volatile LONG g_laserLenUU = 4000;    // ini [Render] LaserLengthUU
+
+// world (translated-world) -> clip, honouring the register convention the scan locked.
+static void WorldToClip(const float* m, int conv, const float pt[3], float out[4]) {
+    const Reg4* r = reinterpret_cast<const Reg4*>(m);
+    if (conv == CONV_ROW) {
+        out[0] = pt[0]*r[0].x + pt[1]*r[1].x + pt[2]*r[2].x + r[3].x;
+        out[1] = pt[0]*r[0].y + pt[1]*r[1].y + pt[2]*r[2].y + r[3].y;
+        out[2] = pt[0]*r[0].z + pt[1]*r[1].z + pt[2]*r[2].z + r[3].z;
+        out[3] = pt[0]*r[0].w + pt[1]*r[1].w + pt[2]*r[2].w + r[3].w;
+    } else {
+        out[0] = r[0].x*pt[0] + r[0].y*pt[1] + r[0].z*pt[2] + r[0].w;
+        out[1] = r[1].x*pt[0] + r[1].y*pt[1] + r[1].z*pt[2] + r[1].w;
+        out[2] = r[2].x*pt[0] + r[2].y*pt[1] + r[2].z*pt[2] + r[2].w;
+        out[3] = r[3].x*pt[0] + r[3].y*pt[1] + r[3].z*pt[2] + r[3].w;
+    }
+}
+
+struct LaserVtx { float x, y, z, rhw; DWORD c; };
+
+void DrawLaserSight(IDirect3DDevice9* dev) {
+    if (!InterlockedCompareExchange(&g_laserOn, 0, 0)) return;
+    if (!VrModeOn() || !g_origDrawPrimUP) return;
+    if (!InterlockedCompareExchange(&g_gunVerts, 0, 0)) return;    // no weapon in hand
+    if (!InterlockedCompareExchange(&g_dupDraws, 0, 0)) return;    // stereo off: nowhere to place it
+
+    // A camera matrix, or there is no way to put a world point on the screen.
+    int slot = -1;
+    for (int i = 0; i < g_camMatUsed; ++i) if (g_camMats[i].valid) { slot = i; break; }
+    if (slot < 0) return;
+
+    D3DVIEWPORT9 vp{};
+    if (FAILED(dev->GetViewport(&vp)) || vp.Width < 4) return;
+
+    // ---- where the shot actually goes ----
+    //
+    // RotateTrace adds the hand deviation to the ENGINE aim in spherical terms, and in ENGINE rot
+    // mode that aim is the view. So the same add, from the same signs, reproduces the shot line.
+    const float kU2R = 6.2831853f / 65536.0f;
+    const float yaw   = ((float)g_wantYaw   + (float)g_traceSignYaw *
+                         (float)InterlockedCompareExchange(&g_handDevYawUU, 0, 0)) * kU2R;
+    const float pitch = ((float)g_wantPitch + (float)g_traceSignPitch *
+                         (float)InterlockedCompareExchange(&g_handDevPitchUU, 0, 0)) * kU2R;
+    const float cp = cosf(pitch);
+    const float dir[3] = { cp * cosf(yaw), cp * sinf(yaw), sinf(pitch) };
+
+    float A[3]; GunAnchorWorld(A);                 // start at the rotation point, as asked
+    const float len = (float)InterlockedCompareExchange(&g_laserLenUU, 0, 0);
+    const float B[3] = { A[0] + dir[0]*len, A[1] + dir[1]*len, A[2] + dir[2]*len };
+
+    // Save every piece of state this touches. The game sets its own next frame, but leaving a device
+    // altered from a hook is how the run 24/25 class of bug happens.
+    IDirect3DVertexShader9* oldVS = nullptr; dev->GetVertexShader(&oldVS);
+    IDirect3DPixelShader9*  oldPS = nullptr; dev->GetPixelShader(&oldPS);
+    DWORD oldFVF = 0, oldZ = 0, oldAB = 0, oldCull = 0, oldLit = 0, oldSc = 0;
+    dev->GetFVF(&oldFVF);
+    dev->GetRenderState(D3DRS_ZENABLE, &oldZ);
+    dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldAB);
+    dev->GetRenderState(D3DRS_CULLMODE, &oldCull);
+    dev->GetRenderState(D3DRS_LIGHTING, &oldLit);
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldSc);
+
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetTexture(0, nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);  // v1: over everything. Depth is a later question
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+
+    const float halfW = (float)(vp.Width / 2);
+    for (int eye = 0; eye < 2; ++eye) {
+        float m[16];
+        memcpy(m, g_camMats[slot].m, sizeof(m));
+        const int conv = g_camMats[slot].conv;
+        // Exactly what StereoPairBody does, in the same order - the right eye is offset in WORLD space
+        // before clip space is rescaled, or the offset lands in the wrong frame.
+        if (eye) ApplyOffset(reinterpret_cast<Reg4*>(m), conv, g_eyeDeltaUU);
+        ApplyEyeRemap(reinterpret_cast<Reg4*>(m), conv, eye ? +0.5f : -0.5f);
+
+        float ca[4], cb[4];
+        WorldToClip(m, conv, A, ca);
+        WorldToClip(m, conv, B, cb);
+        if (ca[3] <= 0.001f || cb[3] <= 0.001f) continue;   // behind the eye: skip rather than fold
+
+        const float sx0 = (ca[0]/ca[3] * 0.5f + 0.5f) * (float)vp.Width  + (float)vp.X;
+        const float sy0 = (0.5f - ca[1]/ca[3] * 0.5f) * (float)vp.Height + (float)vp.Y;
+        const float sx1 = (cb[0]/cb[3] * 0.5f + 0.5f) * (float)vp.Width  + (float)vp.X;
+        const float sy1 = (0.5f - cb[1]/cb[3] * 0.5f) * (float)vp.Height + (float)vp.Y;
+
+        // A screen-space quad along the segment. Width scaled off the eye half so it looks the same
+        // at any resolution.
+        float dx = sx1 - sx0, dy = sy1 - sy0;
+        const float L = sqrtf(dx*dx + dy*dy);
+        if (L < 0.5f) continue;
+        dx /= L; dy /= L;
+        const float w = halfW * 0.0015f + 0.5f;      // about 2 px at 1280 per eye
+        const float px = -dy * w, py = dx * w;
+
+        const DWORD col = 0xFFFF2020;                 // red, opaque
+        LaserVtx v[4] = {
+            { sx0 + px, sy0 + py, 0.0f, 1.0f, col },
+            { sx1 + px, sy1 + py, 0.0f, 1.0f, col },
+            { sx0 - px, sy0 - py, 0.0f, 1.0f, col },
+            { sx1 - px, sy1 - py, 0.0f, 1.0f, col },
+        };
+        g_origDrawPrimUP(dev, D3DPT_TRIANGLESTRIP, 2, v, sizeof(LaserVtx));
+    }
+
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldSc);
+    dev->SetRenderState(D3DRS_LIGHTING, oldLit);
+    dev->SetRenderState(D3DRS_CULLMODE, oldCull);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, oldAB);
+    dev->SetRenderState(D3DRS_ZENABLE, oldZ);
+    dev->SetFVF(oldFVF);
+    dev->SetPixelShader(oldPS);
+    dev->SetVertexShader(oldVS);
+    if (oldPS) oldPS->Release();
+    if (oldVS) oldVS->Release();
+}
+
 HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
     // Whoever calls Present owns the device. Recorded so the user-pointer draw hooks can tell
     // render-thread calls from movie-playback-thread ones and stay completely inert on the latter.
@@ -18153,6 +18501,22 @@ void LoadIniSettings() {
                   " to the engine's position for that span, so the swing reads as one piece. ⚠ the"
                   " impulse weapon shares this button - see the melee window note"
                 : "off - the melee swing stays invisible");
+
+    // ⭐ run 217: OFF by default. It is a gameplay change as much as an instrument, and the panel is
+    // where it gets turned on - LaserSight in the ini is what the panel writes back on close, exactly
+    // like every other panel-backed setting.
+    InterlockedExchange(&g_laserOn,
+                        GetPrivateProfileIntA("Render", "LaserSight", 0, path) ? 1 : 0);
+    LONG llen = GetPrivateProfileIntA("Render", "LaserLengthUU", 4000, path);
+    if (llen < 100)    llen = 100;
+    if (llen > 100000) llen = 100000;
+    InterlockedExchange(&g_laserLenUU, llen);
+    Log("ini: LaserSight=%ld LaserLengthUU=%ld (%s)",
+        InterlockedCompareExchange(&g_laserOn, 0, 0), llen,
+        InterlockedCompareExchange(&g_laserOn, 0, 0)
+            ? "a line along the BULLET's real path, from the gun's rotation point - align the barrel"
+              " to it on the WEAPON ALIGN page"
+            : "off (default) - turn it on from the panel's DISPLAY page");
 
     LONG fxHide = GetPrivateProfileIntA("Render", "HideMuzzleFx", 1, path) ? 1 : 0;
     InterlockedExchange(&g_hideMuzzleFx, fxHide);
