@@ -532,7 +532,9 @@ recorded rather than filtered out, because a long enough transient reads as a vi
    - The heal and melee sites now share `ArmsAnimActive()` — a third animation extends one function
      rather than three call sites. Both keep the run-203 cheap-gate shape on the hot path.
    - Verified in the log: **12 windows, one per press**, none double-armed.
-   - ⚠️ **700 ms is a guess.** `HealArmsMs` needed tuning after its first flight; expect the same.
+   - ✅ **700 ms is CONFIRMED, first flight** — reported as "the timing was perfect", no tuning needed.
+     Unlike `HealArmsMs`, which took a round. Still an ini value in case another weapon's swing differs,
+     not because this one is unverified.
    - ⚠️ **The impulse weapon shares this button** and that case is unmeasured. Every window logs the
      latched weapon (`gun=…`) so one ordinary run settles it once the weapon exists. `MeleeArmsMs=0`
      disables it without a rebuild.

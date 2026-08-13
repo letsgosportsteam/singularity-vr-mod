@@ -116,8 +116,10 @@ melee window: arms shown from +0 ms to +700 ms after the press (gun=11387)
 So when the impulse weapon does exist, one ordinary run says whether the two cases can be told apart
 at all, instead of that being its own diagnostic run. `MeleeArmsMs=0` disables it without a rebuild.
 
-⚠️ **700 ms is a guess**, and an ini value for the same reason `HealArmsMs` is one — that one took a
-round of tuning after its first flight.
+✅ **700 ms is CONFIRMED — user-reported as "the timing was perfect", first flight, no tuning.** It was
+chosen as a guess and is recorded here as measured. `HealArmsMs` needed a round of tuning after its
+first flight and this did not, so the two are not the same kind of number any more. It stays an ini
+value because a different weapon's swing may not be 700 ms, not because this one is unverified.
 
 ---
 
