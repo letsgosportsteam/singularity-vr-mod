@@ -10582,10 +10582,21 @@ static void GunAnchorWorld(float G[3]) {
     for (int i = 0; i < 3; ++i) G[i] = af * F[i] + ar * R[i] + au * U[i];
 }
 
-static void BuildGunC(float C[4][4]) {
+// ⭐ run 218: where the gun's rotation point ACTUALLY ends up in the world.
+//
+// GunAnchorWorld returns the anchor relative to the VIEW. The gun does not stay there: BuildGunC
+// rotates about that anchor and then translates by (H - G), so the pivot lands at H - your hand -
+// and only coincides with the view anchor when your hand happens to be at rest.
+//
+// Run 217's laser started at G and so was glued to the view while the gun was glued to the hand. Level
+// hand, they agreed; move it, and the beam detached from the weapon. The DIRECTION was right the whole
+// time - the shots landed on it - which is exactly why the origin being wrong was worth a photo to see.
+//
+// Extracted rather than copied: two expressions for "where is the gun" is how they drift apart, and
+// this file has a run-192 note about exactly that class of duplication.
+static void GunPivotWorld(float H[3]) {
     float G[3]; GunAnchorWorld(G);
-
-    float H[3] = { G[0], G[1], G[2] };          // no position following -> translation cancels
+    H[0] = G[0]; H[1] = G[1]; H[2] = G[2];      // no position following -> translation cancels
     if (g_gunFollowPos) {
         // Milli-UU back to UU. This is the read side of the run-190 stepping fix.
         H[0] = (float)InterlockedCompareExchange(&g_handOffX, 0, 0) / kHandFixed;
@@ -10594,27 +10605,32 @@ static void BuildGunC(float C[4][4]) {
     }
     // ---- 💥 run 201: the gun was anchored to the ENGINE's eye, not to YOURS ----
     //
-    // Reported: *"when I recentered, the gun came closer to me."* That is this, and it is a real defect
-    // rather than a recentring artefact.
+    // Reported: *"when I recentered, the gun came closer to me."* A real defect, not a recentring
+    // artefact. 6-DOF displaces the VIEW - the camera matrix has g_hmdOffset folded in by the constant
+    // hook, so you look from `engine eye + g_hmdOffset`. But H is (hand - head) applied relative to the
+    // origin of translated-world space, which is the ENGINE's eye, and never received that
+    // displacement. So the gun sat at `engine eye + H` while you viewed from `engine eye + hmdOffset`,
+    // wrong by exactly however far you had drifted from the recentre point - and recentring zeroed the
+    // offset, so the gun jumped by the accumulated drift.
     //
-    // 6-DOF displaces the VIEW: the camera matrix has `g_hmdOffset` folded into it by the constant hook,
-    // so you are looking from `engine eye + g_hmdOffset`. But H is `(hand - head)` applied relative to the
-    // origin of translated-world space, which is the ENGINE's eye - it never received that displacement.
-    // So the gun sits at `engine eye + H` while you view from `engine eye + g_hmdOffset`, and its apparent
-    // position is wrong by exactly however far you have drifted from the recentre point.
-    //
-    // Recentring zeroes `g_hmdOffset`, so the gun jumps by the accumulated drift - toward you or away
-    // depending on which way you had moved, which is why the direction was not obviously diagnostic.
-    //
-    // Your hand's true position relative to the engine's eye is `g_hmdOffset + (hand - head)`, so this is
-    // the missing term. Added unconditionally, including the follow-off case: with position following off
-    // the gun should stay glued to the view exactly as the flat game's does, and without this it slides
-    // against the view as you lean.
+    // Applied unconditionally, including the follow-off case: with position following off the gun
+    // should stay glued to the view exactly as the flat game's does, and without this it slides against
+    // the view as you lean. Run 218: the laser starts here too, so it inherits the same correction.
     if (g_gunHeadOffset) {
         H[0] += g_hmdOffset[0];
         H[1] += g_hmdOffset[1];
         H[2] += g_hmdOffset[2];
     }
+}
+
+static void BuildGunC(float C[4][4]) {
+    float G[3]; GunAnchorWorld(G);
+
+    // ⭐ run 218: shared with the laser, so the two can never disagree about where the gun is.
+    // The run-201 note about anchoring to YOUR head rather than the engine's eye now lives there with
+    // the term it explains.
+    float H[3]; GunPivotWorld(H);
+
     int sy, sp, sr; GunSigns(sy, sp, sr);
     // ⭐ run 217: the per-weapon barrel trim, added to the MESH rotation and nowhere else. Tenths of a
     // degree into UE3 units: 65536/360 = 182.044 per degree, so 18.2044 per tenth.
@@ -15712,7 +15728,8 @@ void DrawLaserSight(IDirect3DDevice9* dev) {
     const float cp = cosf(pitch);
     const float dir[3] = { cp * cosf(yaw), cp * sinf(yaw), sinf(pitch) };
 
-    float A[3]; GunAnchorWorld(A);                 // start at the rotation point, as asked
+    // ⭐ run 218: the gun's real pivot, not the view anchor. See GunPivotWorld for what run 217 got wrong.
+    float A[3]; GunPivotWorld(A);
     const float len = (float)InterlockedCompareExchange(&g_laserLenUU, 0, 0);
     const float B[3] = { A[0] + dir[0]*len, A[1] + dir[1]*len, A[2] + dir[2]*len };
 
