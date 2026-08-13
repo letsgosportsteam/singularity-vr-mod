@@ -481,12 +481,27 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      unchanged and still there in the code (the new weapon is outside the old baseline, so
      `HideStrayArms` hides it until the 240-frame drop), but the drop line marks the *end* of that
      window so the log cannot size it, and the user did not report seeing it across 21 swaps. Open.
-   - ⚠️ **NEW, and latent rather than visible: the ARMS role can be misassigned.** Line 156769 latched
-     `gun=11389, arms=97` from `[0]=11389 [1]=97 [2]=3314 [3]=390` — slot [1] was a 97-vertex sub-mesh,
-     not the real 3314 arms. **No visible defect, by luck**: with `HideExtraArms=1` the real arms are
-     hidden anyway as "a baseline mesh that is neither gun nor arms". With `HideExtraArms=0` they would
-     be visible. The role assignment "slot [1] is the arms" is the weak part — `3314` is invariant
-     across every weapon in every log and is the better identifier. Not fixed; recorded.
+   - **✅ CLOSED by run 216.** This recorded `gun=11389, arms=97` as a latent misassignment and named
+     the cause correctly — "slot [1] is the arms" was the weak rule. It was left unfixed because it
+     changed nothing visible. It later bit hard: the same positional rule put the **arms** in the gun
+     role after scope use. Roles are assigned **by size** now, which fixes both. **A known-weak rule
+     left alone because its current symptom is invisible is a bug waiting for a louder symptom.**
+
+10e. **✅ FIXED and VERIFIED (run 216) — the scope reorders the pass, and the roles were positional.**
+   - Reported: after using the sniper scope, the arms are on the controller and the gun is invisible,
+     surviving a weapon switch. The run-207 role shift by a route neither run-212 defence covered.
+   - **The scope draws the arms FIRST** — `[3314, 390, 11389, 97]` against the normal
+     `[11389, 97, 3314, 390]` — so a re-latch while scoped took slot[0]=3314 as the gun.
+   - **Unrecoverable by design flaw:** a latch taken from a scoped pass captures a baseline containing
+     the real gun, so `FgIsExtraArm` hid it *and* run 212's recovery — which required a larger mesh
+     **outside** the baseline — never saw a contradiction.
+   - **Fixed by size:** the gun is the largest mesh in the pass, the arms the second largest. True of
+     every census on disk, and invariant under draw order. Plus: no latch from a scoped pass, and the
+     recovery's baseline requirement dropped.
+   - **Verified, and the case was genuinely exercised** — two takes from the arms-first list, both
+     correct: `[0]=3314 [1]=390 [2]=11387 [3]=9` gives `gun=11387 arms=3314`, and
+     `[0]=3314 [1]=390 [2]=11389 [3]=97` gives `gun=11389 arms=3314`. Under the old rule both would
+     have been the bug. No recovery firing was needed.
 
 10c. **✅ FIXED and VERIFIED (run 213) — the sniper scope was drawn once across the whole frame.**
    `ScopeQuadPerEye=1`, `ScopeScenePsReg=1`, `ScopeAspectPsReg=0`, `ScopeHeadAim=1`.

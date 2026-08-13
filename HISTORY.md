@@ -24,6 +24,64 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 216: the scope reorders the first-person pass, and the roles were positional
+
+**Reported:** after using the sniper scope, the arms are on the controller and the gun is invisible,
+and it survives a weapon switch. **Fixed and confirmed.**
+
+The run-207 role shift again, by a route neither run-212 defence covered.
+
+### The scope draws the arms FIRST
+
+Both orders were recorded in the same run-213 census, and read past at the time:
+
+```
+normal   [0]=11389 [1]=97   [2]=3314 [3]=390
+scoped   [0]=3314  [1]=390  [2]=11389 [3]=97
+```
+
+So a re-latch while scoped takes slot[0]=3314 — the arms — as the gun.
+
+### Why it could not recover, which is specific to this route
+
+A latch taken from a scoped pass captures a baseline containing the **real gun**. So `FgIsExtraArm`
+hides it — that is the invisible gun — and run 212's recovery, which required a larger mesh **outside
+the baseline**, never saw a contradiction. The drop rule meanwhile watches `3314`, which is always
+drawn. Permanently stuck, which is what "persisted across weapon switches" means.
+
+### The fix: size, not position
+
+**The gun is the largest mesh in the first-person pass; the arms are the second largest.** True of
+every census on disk — `5799/3314/390`, `11387/3314/390/9`, `8297/3314/390`, `11389/97/3314/390`, and
+the scoped order above. **Size is invariant under draw order; position is not.** It also closes run
+213's `arms=97` misassignment for free.
+
+Plus two supporting changes: no latch is taken from a scoped pass at all (`ScopeActive`'s own signal,
+at 500 ms), and the recovery's baseline-membership requirement is dropped — the invariant that matters
+is simply that the gun is the largest mesh, which cannot hold for a latch that put the arms in the gun
+role, and requiring "outside the baseline" is exactly why it stayed silent.
+
+### Verified, and the case was genuinely exercised
+
+Two takes from the **arms-first** list, both correct:
+
+```
+5391  fg census: [0]=3314 [1]=390 [2]=11387 [3]=9    -> gun=11387 arms=3314
+9613  fg census: [0]=3314 [1]=390 [2]=11389 [3]=97   -> gun=11389 arms=3314
+```
+
+Under the old positional rule both would have been the bug. No `ROLES ARE WRONG` firing was needed —
+prevention held. The named false-pass mode (a clean run that never re-latches while scoped) did not
+occur.
+
+### Method note
+
+Run 213 recorded the weak rule, named the right replacement, and left it because the symptom was
+invisible. Three runs later it produced a symptom that was not. **The census had both draw orders in
+it the whole time.**
+
+---
+
 ## ⭐ Run 215: the mesh matchers were frame-wide, and a floor plane collided with them
 
 **Reported:** a hole in the floor — water and the basement under the next room visible through it,
@@ -335,15 +393,13 @@ pairs**, every one re-taking the correct gun. So:
   the code — the new weapon is outside the old baseline, so `HideStrayArms` hides it until the
   240-frame drop — but the drop line marks the **end** of that window, so the log cannot size it, and
   it was not reported across 21 swaps. Do not record this as "fine"; it is unmeasured.
-- **⚠️ NEW: the ARMS role can be misassigned, latently.** Line 156769 latched `gun=11389, arms=97`
-  from `[0]=11389 [1]=97 [2]=3314 [3]=390`. Slot [1] was a 97-vertex sub-mesh, not the real 3314 arms.
-  **No visible defect, and only by luck:** with `HideExtraArms=1` the real arms are hidden anyway, as
-  "a baseline mesh that is neither gun nor arms". With `HideExtraArms=0` they would be visible.
-  - The weak part is the role rule itself — "slot [0] is the gun, slot [1] is the arms". Run 212 fixed
-    the *gun* half with evidence; the arms half is still positional. **`3314` is invariant across every
-    weapon in every log**, and is the identifier the arms role should use.
-  - Not fixed, deliberately: it changes nothing visible in the shipping configuration, and the run that
-    would test it is expensive.
+- **⛔ SUPERSEDED by run 216 — and the reason it was left alone is the lesson.** This recorded
+  `gun=11389, arms=97` as latent, named the cause correctly ("slot [1] is the arms" is the weak rule),
+  identified the right replacement (`3314` is invariant across every weapon in every log) — and then
+  declined to fix it, because it changed nothing visible in the shipping configuration.
+  It changed something visible three runs later: the same positional rule put the **arms** in the gun
+  role after scope use, and that one was neither latent nor recoverable. **A known-weak rule left alone
+  because its current symptom is invisible is a bug waiting for a louder symptom.**
 - The fix remains designed against **one** logged instance of the original failure, now confirmed by a
   second. Both knobs stay ini toggles.
 - The run-158d **menu** latch (`[4 251 745 …]`) is untouched and still open.
