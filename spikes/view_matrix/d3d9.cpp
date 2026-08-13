@@ -8906,6 +8906,40 @@ void ScopeQuadDump(IDirect3DDevice9* dev, UINT primCount) {
     IDirect3DPixelShader9* psh = nullptr;
     if (SUCCEEDED(dev->GetPixelShader(&psh)) && psh) {
         Log("    pixel shader  %p", (void*)psh);
+        // ---- ⭐ run 213i: READ THE SHADER, stop inferring what it does ----
+        //
+        // Every constant-level theory so far has been an inference about how this shader turns a
+        // position into a texture coordinate, and each one cost a run. The bytecode says it outright:
+        // the dcl instructions name which texcoord feeds which sampler, and whether the scene read is
+        // driven by an interpolator or computed from position.
+        //
+        // That single fact decides whether the two reads (scene, and the scope ART) CAN be separated at
+        // all. The run-213f declaration showed TEXCOORD0-3 aliased to one 8-byte field, so if both
+        // sample through the same interpolator no vertex or viewport trick can ever split them, and the
+        // fix has to be something else entirely. Better to know that than to keep discovering it.
+        //
+        // One-shot and bounded: a pixel shader of this kind is a few hundred DWORDs, eight to a line.
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            // Static, not heap: this runs inside a draw hook, and runs 24/25 are the standing
+            // reminder that a draw hook is the wrong place to do anything that can block.
+            static DWORD code[4096];
+            UINT sz = 0;
+            if (SUCCEEDED(psh->GetFunction(nullptr, &sz)) && sz && sz <= sizeof(code)) {
+                if (SUCCEEDED(psh->GetFunction(code, &sz))) {
+                    const UINT n = sz / 4;
+                    Log("    ---- pixel shader bytecode, %u DWORDs ----", n);
+                    for (UINT i = 0; i < n; i += 8) {
+                        char line[160]; int m = 0;
+                        for (UINT k = i; k < i + 8 && k < n; ++k)
+                            m += _snprintf_s(line + m, sizeof(line) - m, _TRUNCATE, " %08X", code[k]);
+                        Log("    [%03u]%s", i, line);
+                    }
+                    Log("    ---- end bytecode ----");
+                }
+            }
+        }
         psh->Release();
     } else {
         Log("    NO pixel shader - fixed function, which would change the fix entirely");
@@ -11631,8 +11665,13 @@ inline bool ScopeActive() {
     if (!last) return false;
     return (DWORD)(GetTickCount() - last) < 150;   // ~18 frames at 120 fps
 }
-int g_scopeScenePsReg  = 1;      // ini [Render] ScopeScenePsReg
-int g_scopeAspectPsReg = 0;      // ini [Render] ScopeAspectPsReg
+// ⛔ run 213i: BOTH DEFAULTED TO -1 (off). Scaling them per eye did NOT fix the doubled world, and it
+// ADDED vertical streaking that was not there before - a regression, reported and visible in the
+// screenshots. A change that fails to fix its target and breaks something else does not stay on by
+// default while the question is still open. Kept as knobs because the registers are correctly
+// identified even if scaling them is the wrong operation.
+int g_scopeScenePsReg  = -1;     // ini [Render] ScopeScenePsReg
+int g_scopeAspectPsReg = -1;     // ini [Render] ScopeAspectPsReg
 volatile LONG g_scopeQuadDraws = 0;
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
@@ -17602,10 +17641,10 @@ void LoadIniSettings() {
     g_scopeQuadPrimCount = GetPrivateProfileIntA("Render", "ScopeQuadPrimCount", 2, path);
     if (g_scopeQuadPrimType < 1 || g_scopeQuadPrimType > 6) g_scopeQuadPrimType = 5;
     if (g_scopeQuadPrimCount < 1) g_scopeQuadPrimCount = 1;
-    g_scopeScenePsReg  = GetPrivateProfileIntA("Render", "ScopeScenePsReg", 1, path);
-    g_scopeAspectPsReg = GetPrivateProfileIntA("Render", "ScopeAspectPsReg", 0, path);
-    if (g_scopeScenePsReg  < -1 || g_scopeScenePsReg  > 63) g_scopeScenePsReg  = 1;
-    if (g_scopeAspectPsReg < -1 || g_scopeAspectPsReg > 63) g_scopeAspectPsReg = 0;
+    g_scopeScenePsReg  = GetPrivateProfileIntA("Render", "ScopeScenePsReg", -1, path);
+    g_scopeAspectPsReg = GetPrivateProfileIntA("Render", "ScopeAspectPsReg", -1, path);
+    if (g_scopeScenePsReg  < -1 || g_scopeScenePsReg  > 63) g_scopeScenePsReg  = -1;
+    if (g_scopeAspectPsReg < -1 || g_scopeAspectPsReg > 63) g_scopeAspectPsReg = -1;
     g_scopeHeadAim = GetPrivateProfileIntA("Render", "ScopeHeadAim", 1, path) ? 1 : 0;
     Log("ini: ScopeHeadAim=%d (%s)", g_scopeHeadAim,
         g_scopeHeadAim ? "while the scope overlay is on screen the shot follows the HEAD, not the"
