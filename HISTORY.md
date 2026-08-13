@@ -24,6 +24,99 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 213: the sniper scope — four wrong fixes, and the shader had the answer all along
+
+**Reported:** the sniper scope is not shown in each eye. It comes up on the left trigger (alt-fire).
+**Fixed and confirmed in play.** Whole scope in each eye, world once, circle round, no streaking.
+
+### What it was
+
+The overlay is `DrawPrimitive, triangle strip, 2 primitives` — a fullscreen quad from a bound vertex
+buffer. `StereoPair` duplicates it and scissors each copy to a half, then remaps the **camera
+registers** — and this quad is already in clip space and reads no camera register, so the remap is a
+no-op on it. Both copies landed at identical full-frame coordinates and each was clipped to its own
+half: one circle across the seam. It also explains why the HUD was always fine — `HudStereoPair`
+transforms `c5`–`c8`, which the HUD shader does read.
+
+**The fix is three parts, and all three were needed:**
+
+| part | what it does |
+|---|---|
+| per-eye **viewport** | NDC maps onto the viewport rect, so pointing it at one half puts the whole quad inside that half. No vertex data needed — which matters, because this draw has no vertex pointer to rewrite |
+| `c1` **ScreenPositionScaleBias**, X only | the scene read derives from the projected position, not the geometry, so it kept spanning both eyes until the UV was mapped into a half |
+| `c0` **ScreenAspectRatio**, halved | each eye's half is 1280×1440, not 2560×1440, so the roundness correction has to halve with it |
+
+### 💥 Four candidate fixes were written on inference. All four were wrong.
+
+1. **stride 16, 2 prims, spans NDC.** Appeared in every scope window and no baseline, so it was picked
+   on correlation alone. Drawing it per eye fired **120 times a second — one per frame, the gate was
+   right** — and the picture did not change. *A per-frame draw that only happens while scoped is not
+   necessarily the thing you can see.*
+2. **the `PASSED THROUGH BUT DOES NOT SPAN NDC` verdict.** Written for the muzzle flash, a small
+   centred sprite. It flagged two stride-12 rows with degenerate boxes and stayed silent on the real
+   overlay, which is passed through *because* it spans NDC. *A verdict line is only as good as the case
+   it was written for.*
+3. **"new since the baseline".** 32 rows, every one a count of **one**, none of them the scope — and
+   its baseline was taken with a **different weapon** (`11387` against `11389`). Novelty was the wrong
+   filter; **persistence** is what defines an overlay, and the count column was already in the table.
+4. **scaling `c1.x` and `c1.z`.** Right register, wrong component — see below.
+
+### ⭐ The one that actually paid: read the shader
+
+The pixel shader is 600 DWORDs and carries its own **CTAB symbol table**:
+
+```
+c0 ScreenAspectRatio   c1 ScreenPositionScaleBias   c3 ScreenResolution
+s0 BlurredSceneColorTexture   s1 SceneColorTexture   s2-s5 Texture2D_0..3
+dcl_texcoord0 v0    dcl_texcoord5 v1    (no vPos anywhere)
+20  mad   r1.xy, r1.yzzw, c1, c1.wzzw
+32  texld r3, v0, s3        <- the scope ART reads TEXCOORD0
+```
+
+Two facts, neither obtainable any other way. The scene reads derive from `v1` (projected position)
+while the art reads `v0`, so **they are separable** — the run-213f worry that the aliased
+`TEXCOORD0`–`3` made this unfixable was unfounded. And the bias swizzle is `.wzzw`:
+
+```
+u = (v1.x/w) * c1.x + c1.w      <- X bias is .w
+v = (v1.y/w) * c1.y + c1.z      <- Y bias is .z
+```
+
+Run 213g scaled `c1.x` (right) and biased `c1.z`, the **Y** bias. That one mistake produced **both**
+reported symptoms at once: X kept its untouched `0.5002` bias against a halved `0.25` scale and so
+sampled `[0.2502, 0.7502]` — the middle band, still straddling the seam, which is why the doubling
+never went away — while the mangled Y bias smeared the image **vertically**, which was the new
+streaking.
+
+### Method notes this run earned
+
+- **When a fix depends on how something computes a value, read the thing that computes it.** The
+  shader was one `GetFunction` call away for the whole investigation and it had a symbol table.
+- **The drop test is not optional.** `MuzzleFxDropStride` was proposed, then skipped as "a whole run
+  to confirm one bit" — and that bit was the one worth buying. It could not reach `DrawPrimitive`
+  anyway (it keys on a vertex stride and that path has none), which is *why* the candidate hid there.
+  Building `DropPrimCount`/`DropPrimType` first, and only then the fix, is what turned a fourth guess
+  into an answer.
+- **A census that lists only some draw paths will name the wrong candidate rather than none.** Three
+  censuses listed only the user-pointer hooks; of the handful of things they could see, stride 16 won
+  by default rather than on merit.
+- **A slow-motion lead closed negatively, and that was worth knowing.** Eight dumps spanning both
+  states were byte-identical — same shader, same constants, same textures — so whatever reads as
+  different in slow motion is not this draw, and no constant-level fix could be keyed to it.
+
+### Also shipped: the shot follows the head while scoped
+
+`ScopeHeadAim=1`. Aim mode 11 rotates the fire trace by the hand-minus-head deviation, which is right
+when you point a gun with your hand and wrong when you are looking through a reticle drawn to the
+view. Gated on **the scope overlay actually being drawn** rather than on the alt trigger — the trigger
+is alt-fire generally and means something different on every other weapon, whereas the overlay quad is
+the scope by measurement. Applied at **both** trace sites.
+
+⚠️ **Not confirmed in play yet** — it shipped in the same build as the visual fix and only the visuals
+were reported on.
+
+---
+
 ## ⭐ Run 212: the run-207 role shift came back, past the gate that was built to stop it
 
 **Reported, and the differentiator was the whole diagnosis:** playing **from the very beginning** to

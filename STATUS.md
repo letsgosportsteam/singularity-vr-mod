@@ -60,6 +60,7 @@ dropped beside the game exe. No game files modified.
 | **Smooth turning** | ✅ run 140 — `TurnMode=2`, degrees per second, works during cutscenes |
 | **VR settings panel** | ✅ run 142 — hold Y 1.3s anywhere; live changes, saved to the ini on close |
 | **The game's HUD and menus in both eyes** | ✅ run 151 — health, ammo, crosshair, prompts, pause menu. `HudStereo=1` |
+| **The sniper scope in both eyes** | ✅ run 213 — whole scope per eye, world once, circle round. `ScopeQuadPerEye=1` |
 | **Shipping defaults = the tested configuration** | ✅ 2026-08-08 — a fresh install with no ini now behaves like the tuned dev machine. See below |
 
 ### ⭐ The code defaults ARE the tested configuration (2026-08-08)
@@ -486,6 +487,27 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      hidden anyway as "a baseline mesh that is neither gun nor arms". With `HideExtraArms=0` they would
      be visible. The role assignment "slot [1] is the arms" is the weak part — `3314` is invariant
      across every weapon in every log and is the better identifier. Not fixed; recorded.
+
+10c. **✅ FIXED and VERIFIED (run 213) — the sniper scope was drawn once across the whole frame.**
+   `ScopeQuadPerEye=1`, `ScopeScenePsReg=1`, `ScopeAspectPsReg=0`, `ScopeHeadAim=1`.
+   - The overlay is `DrawPrimitive, triangle strip, 2 prims` — a fullscreen quad from a bound vertex
+     buffer. `StereoPair` remaps the **camera registers**, and a clip-space quad reads none, so both
+     copies landed at full-frame coordinates and each eye got half a circle. Same reason the HUD was
+     always fine: `HudStereoPair` transforms `c5`–`c8`, which the HUD shader does read.
+   - **Three parts, all required:** per-eye **viewport** (no vertex pointer exists to rewrite);
+     `c1 ScreenPositionScaleBias` **X only** (the scene read comes from the projected position, not the
+     geometry); `c0 ScreenAspectRatio` halved (each half is 1280×1440, not 2560×1440).
+   - Verified in the log, not just by eye: `scope overlay quads drawn per eye: 120` — one per frame
+     while scoped, absent otherwise. User-confirmed in play.
+   - ⚠️ **Four fixes were written on inference first, and all four were wrong.** The full autopsy is in
+     `HISTORY.md`; the short version is that the pixel shader carries a **CTAB symbol table** naming
+     every constant and sampler, and reading it settled in one look what three censuses could not.
+   - ⚠️ The counter reads **240** in a few windows — the overlay is drawn twice a frame in some state.
+     Harmless as observed, but it means "once per frame" is not universal.
+   - **`ScopeHeadAim=1` shipped alongside**: while the scope overlay is on screen the shot follows the
+     HEAD, not the controller, at both trace sites. Gated on the overlay being drawn rather than on the
+     alt trigger, which means something different on every other weapon.
+     ⚠️ **NOT confirmed in play** — it rode along with the visual fix and only the visuals were reported.
 
 11. **✅ The arms reappear for the health injector animation (run 198–199).** `HealArmsMs=2150`,
    `HealArmsDelayMs=100`.
