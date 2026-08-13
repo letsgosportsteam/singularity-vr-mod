@@ -211,8 +211,10 @@ view. Gated on **the scope overlay actually being drawn** rather than on the alt
 is alt-fire generally and means something different on every other weapon, whereas the overlay quad is
 the scope by measurement. Applied at **both** trace sites.
 
-⚠️ **Not confirmed in play yet** — it shipped in the same build as the visual fix and only the visuals
-were reported on.
+✅ **Confirmed in play:** *"the aiming is accurate with the scope on, based on reticle rather than
+controller pose."* Both trace sites agree, which is what the "apply it at both or neither" note was
+protecting — a shot decided by the other line check would have followed the hand and read as
+intermittent inaccuracy rather than a clean miss.
 
 ---
 

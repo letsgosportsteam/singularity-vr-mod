@@ -507,7 +507,7 @@ recorded rather than filtered out, because a long enough transient reads as a vi
    - **`ScopeHeadAim=1` shipped alongside**: while the scope overlay is on screen the shot follows the
      HEAD, not the controller, at both trace sites. Gated on the overlay being drawn rather than on the
      alt trigger, which means something different on every other weapon.
-     ⚠️ **NOT confirmed in play** — it rode along with the visual fix and only the visuals were reported.
+     ✅ **Confirmed in play (run 216)** — the shot follows the reticle, not the controller pose.
 
 10d. **✅ FIXED and VERIFIED (run 215) — the mesh matchers hid WORLD geometry.** `FgPrimeWindowDraws=16`.
    - Reported as a hole in the floor with water and a basement visible through it. Bisected on ini keys:
