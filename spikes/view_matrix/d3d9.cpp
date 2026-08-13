@@ -10457,6 +10457,41 @@ static bool FgIsMesh(UINT verts, int idx1) {          // idx1 is 1-based into th
     return (UINT)InterlockedCompareExchange(&g_fgStableVerts[idx1 - 1], 0, 0) == verts;
 }
 
+// ---- 💥 run 215: the mesh matchers were FRAME-WIDE, and a world mesh collided ----
+//
+// Reported: a hole in the floor - water and the basement below visible through it. Confirmed as ours
+// (it is absent unmodded), and confirmed as the mesh path (HEAD mode fixes it, and HEAD sets
+// hideMeshIdx = 0). `HideStrayArms=0` did NOT fix it and `HideExtraArms=0` DID, which names the rule.
+//
+// The matchers key on vertex count with no positional gate that actually bites. `fgDrawCount >
+// kFgSanePass` looks like one, but OUTSIDE the first-person pass `g_fgDrawCount` is 0 - so the test
+// reads `0 > 64`, false, and the match proceeds. They therefore matched **anywhere in the frame**.
+//
+// The weapon's baseline set was `[11387, 3314, 390, 9]`, and FgIsExtraArm hides any baseline count that
+// is neither gun nor arms - so **every 390-vertex and every 9-vertex draw in the entire frame** was
+// hidden. A large flat floor plane has very few vertices. That is the hole.
+//
+// ---- why NOT simply "only inside the foreground pass" ----
+//
+// Because run 120 needs the frame-wide behaviour and says so: the depth-prime copy of the arms is drawn
+// at **draws 2-3, at the very start of the frame**, and hiding only inside the foreground pass left the
+// prime alive to write a black silhouette. Gating on `g_inForeground` alone would trade this bug for
+// that one.
+//
+// So the window is "the first-person pass, OR the handful of draws at the top of the frame where the
+// depth prime lives". Both needs are met and a mid-frame world draw can no longer be eaten by a count
+// collision. 16 against a measured 2-3 is deliberate margin, and an ini value because the 2-3 came from
+// one measurement and the failure mode - a black silhouette - is recognisable but needs no rebuild.
+int g_fgPrimeWindow = 16;             // ini [Render] FgPrimeWindowDraws
+volatile LONG g_fgWindowRejects = 0;  // matches refused BY this rule - see the per-second report
+
+inline bool FgMatchWindow() {
+    if (Rd(g_inForeground)) return true;                       // the real first-person pass
+    if (Rd(g_frameDrawIdx) <= (LONG)g_fgPrimeWindow) return true;   // run 120's depth-prime copy
+    InterlockedIncrement(&g_fgWindowRejects);
+    return false;
+}
+
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     const LONG m = Rd(g_hideMeshIdx);
     if (m != 2 && m != 3) return false;
@@ -10466,11 +10501,13 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     // The heal and melee animations are the arms' legitimate appearances - see g_healArmsMs and
     // g_meleeArmsMs.
     if (ArmsAnimActive()) return false;
+    // ⭐ run 215: the window is checked ONLY on a match, so the common case - a world draw whose count
+    // matches nothing - still costs exactly what it did before.
     const LONG a = Rd(g_armsVerts);
-    if (a && (UINT)a == verts) return true;
+    if (a && (UINT)a == verts) return FgMatchWindow();
     // ⭐ run 199: the leftover hand/arm fragment - the 390-vertex mesh. Checked before the stray rule
     // below because it IS in the baseline and that rule would never reach it.
-    if (FgIsExtraArm(verts)) return true;
+    if (FgIsExtraArm(verts)) return FgMatchWindow();
     // ---- run 198: stray animation geometry, hidden by NOT being in the baseline ----
     //
     // Gated on the latch being taken: with no baseline set, "not in the baseline" is true of everything
@@ -10479,7 +10516,7 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     if (!g_hideStrayArms) return false;
     if (!Rd(g_fgBaseCount)) return false;
     if (!Rd(g_gunVerts)) return false;
-    return !FgIsBaseline(verts);
+    return !FgIsBaseline(verts) && FgMatchWindow();
 }
 
 static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
@@ -10490,6 +10527,10 @@ static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
     if (m != 1 && m != 3) return false;
     const LONG g = Rd(g_gunVerts);
     if (!g || (UINT)g != verts) return false;
+    // ⭐ run 215: same guard as FgHidden. A world mesh that collides with the GUN's count would be
+    // transformed onto the controller - which removes it from where it belongs just as surely as
+    // hiding it does, and would read as the same hole.
+    if (!FgMatchWindow()) return false;
     return !ArmsAnimActive();                          // leave the gun where the animation expects it
 }
 
@@ -16516,6 +16557,16 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (const LONG dp = InterlockedExchange(&g_dropPrimDraws, 0))
                 Log("    DrawPrimitive draws SKIPPED by DropPrimCount: %ld this second", dp);
 
+            // Run 215. Nonzero means the frame-wide match was refused - i.e. a world draw collided
+            // with a first-person vertex count and would have been hidden or moved. Zero everywhere
+            // except the rooms where the collision actually happens is the expected shape; a large
+            // steady count would mean the window is too NARROW and real first-person draws are being
+            // refused, which shows up visually as a black silhouette.
+            if (const LONG fr = InterlockedExchange(&g_fgWindowRejects, 0))
+                Log("    mesh matches refused outside the first-person window: %ld this second"
+                    " (run 215 - these are world draws that collided with a first-person vertex"
+                    " count)", fr);
+
             // Directly under the correlation table, because it answers the next question that table
             // raises: the row above says the frame is 5 ms slower, this one says whether those 5 ms
             // were spent or waited for.
@@ -18012,6 +18063,17 @@ void LoadIniSettings() {
                               " drop and re-take once a real weapon has been hidden for a while -"
                               " recovers a bad latch instead of carrying it for the session"
                             : "off - a bad latch is kept until the gun mesh stops being drawn");
+
+    // Run 215: how many draws at the TOP of a frame still count as the first-person depth prime. Run
+    // 120 measured that copy at draws 2-3; 16 is margin. Outside this window and outside the
+    // first-person pass, a vertex-count match is a COLLISION with world geometry, not the arms.
+    g_fgPrimeWindow = GetPrivateProfileIntA("Render", "FgPrimeWindowDraws", 16, path);
+    if (g_fgPrimeWindow < 0)    g_fgPrimeWindow = 0;
+    if (g_fgPrimeWindow > 2000) g_fgPrimeWindow = 2000;
+    Log("ini: FgPrimeWindowDraws=%d (a mesh may be hidden or moved by vertex count only inside the"
+        " first-person pass, or within this many draws of the start of the frame where the depth prime"
+        " is drawn. Raise it if a hidden mesh leaves a black silhouette; lower it if world geometry"
+        " disappears)", g_fgPrimeWindow);
 
     g_hideExtraArms = GetPrivateProfileIntA("Render", "HideExtraArms", 1, path) ? 1 : 0;
     Log("ini: HideExtraArms=%d (%s)", g_hideExtraArms,
