@@ -339,7 +339,7 @@ HeadRoll=1
 ; because with no hook the engine's own culling is what is actually running and
 ; the panel must not display a mode that cannot happen.
 ; ---------------------------------------------------------------------------
-OcclusionQueryMode=0
+OcclusionQueryMode=2
 
 ; ---------------------------------------------------------------------------
 ; Debug   -- the developer scaffolding, on/off (run 157)
@@ -1143,3 +1143,48 @@ SwapSticks=0
 ; moving onto the gun would mean this setting is reaching further than the pass.
 ; ---------------------------------------------------------------------------
 WeaponFxRideGun=1
+
+; ---------------------------------------------------------------------------
+; WEAPON ALIGNMENT and the LASER SIGHT  (runs 217-225)
+;
+; Every key below is COMMENTED OUT on purpose. The tuned values ship in the DLL
+; - assault rifle, shotgun and pistol were measured in the headset against the
+; laser - so a fresh install is already aligned and needs none of this.
+;
+; Uncomment only to override a weapon on YOUR copy. An ini slot wins over the
+; built-in one for the same weapon, matched by vertex count rather than by slot
+; number, so you can use any free slot.
+;
+; The panel writes these for you: hold Y, WEAPON ALIGN, adjust with the stick,
+; close the panel. Hand-editing is for people who prefer a text editor.
+;
+;   GunAlign0Verts=11387        which weapon: its first-person vertex count
+;   GunAlign0Fwd=26             anchor, engine units from the eye
+;   GunAlign0Right=8
+;   GunAlign0Up=-13
+;   GunAlign0YawTenths=30       barrel trim, TENTHS of a degree (30 = +3.0)
+;   GunAlign0PitchTenths=-28
+;
+; The laser sight. OFF by default: it is a gameplay change as much as an aiming
+; aid. Turn it on from the panel's DISPLAY page, or hold A for a second in game -
+; either route writes it back here.
+;
+;   LaserSight=0
+;   LaserLengthUU=4000
+;   LaserHoldMs=1000            hold A this long to toggle it. 0 = panel only
+;
+; Aiming. The game's own aim animation slides the weapon toward screen CENTRE,
+; which is right in head mode and meaningless on a hand-held gun. AdsMaskAnim
+; holds it still and AdsPullbackUU replaces it with a pull back along the line
+; the gun is already pointing.
+;
+; NOTE the mask suppresses recoil and reload motion WHILE AIMING - that is the
+; trade, not a bug. AdsMaskAnim=0 restores the game's behaviour.
+;
+;   AdsMaskAnim=1
+;   AdsMaskLo=5                 measured on the ASSAULT RIFLE only
+;   AdsMaskHi=22
+;   AdsMaskTailMs=400           holds through the animation's return, or the gun
+;                               jumps on release
+;   AdsPullbackUU=10
+; ---------------------------------------------------------------------------

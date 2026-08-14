@@ -5093,13 +5093,22 @@ GunAlignSlot g_gunAlign[kGunAlignMax]{};
 // The vertex count identifies the weapon across every install, because it is the shipped mesh - the
 // same number on every copy of the game. That is what makes a built-in table possible at all.
 //
-// Measured in play, run 220, against the laser: assault rifle 11387.
-//   anchor F26 R8 U-13, barrel trim yaw +3.0 deg pitch -2.8 deg
+// Measured in play against the laser, all three tuned in the headset on the WEAPON ALIGN page:
+//
+//   11387  assault rifle   F26 R8  U-13   yaw +3.0  pitch -2.8   (run 220)
+//   8297   shotgun         F30 R10 U-13   yaw +3.0  pitch  0.0   (run 225)
+//   5799   pistol          F30 R9  U-13   yaw +1.0  pitch  0.0   (run 225)
+//
+// The sniper (11389) is deliberately absent: it aims through its own scope, so the laser it would be
+// aligned against is switched off and there is nothing to tune it with. It stays on the global anchor
+// until there is a way to judge it.
 //
 // An ini slot for the same weapon OVERRIDES this - see the loader. So tuning your own copy still wins,
 // and these are a starting point rather than a ceiling.
 const GunAlignSlot kGunAlignDefaults[] = {
-    { 11387, 26, 8, -13,  30, -28 },   // assault rifle
+    { 11387, 26,  8, -13,  30, -28 },   // assault rifle
+    {  8297, 30, 10, -13,  30,   0 },   // shotgun
+    {  5799, 30,  9, -13,  10,   0 },   // pistol
 };
 const int kGunAlignDefaultCount = (int)(sizeof(kGunAlignDefaults) / sizeof(kGunAlignDefaults[0]));
 

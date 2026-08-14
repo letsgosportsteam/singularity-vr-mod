@@ -77,10 +77,13 @@ overriding whatever the code said — was corrected to match:
 `GunAnchorFwd/Right/Up` 30/9/−13 · `GunSignPitch` 1 · `GunSignCombo` 2 · `D3D9ExMode` 1 ·
 `Debug` 0 · `PoseLeadFrames` 1 · `AimMethod` 1 · `AimFieldSet` 1 · `TurnMode` 2
 
-**`OcclusionQueryMode` is the one deliberate non-match** — default 2 against the dev ini's 0. Mode 0
-forces every query visible and costs roughly twice the draws (1500–1693 vs 737–943 per frame); mode 2
-has never been played on for a full session. Its risk is **geometry winking out** at distance or
-screen edges, not frame rate. If that appears, `OcclusionQueryMode=0` is the first suspect.
+**`OcclusionQueryMode=2` is now the tested value, and `SingularityVR.ini.example` was still shipping
+`0`.** Mode 0 forces every query visible and costs roughly twice the draws (1500–1693 vs 737–943 per
+frame). Mode 2 was carried for a long time as "never played on for a full session" — it since has
+been, across many, and run 215 cleared it of the vanishing-floor report outright (that was the mesh
+matchers, not culling). The example ini has been corrected to match the code.
+⚠ Its residual risk is still **geometry winking out** at distance or screen edges rather than frame
+rate, so `OcclusionQueryMode=0` remains the first suspect if that ever appears.
 
 ⚠️ **`AutoResX`/`AutoResY` must never be shipped or hand-edited.** They are the mod's own cache of
 *this* headset's size. A shipped value injects one machine's resolution into everyone's first launch.
