@@ -5103,6 +5103,12 @@ GunAlignSlot* GunAlignFor(LONG verts) {
         g_gunAlign[i].right = g_gunAnchorRight;
         g_gunAlign[i].up    = g_gunAnchorUp;
         g_gunAlign[i].yawTenths = g_gunAlign[i].pitchTenths = 0;
+        // ⭐ run 220: says WHICH weapon just became independently tuned. The panel shows "(TUNED)"
+        // in the headset, but only the log answers it afterwards - and "did I tune the gun I meant
+        // to" is exactly the question a tuning session leaves behind.
+        Log("weapon align: slot %d created for weapon %ld, seeded from the global anchor"
+            " F%ld R%ld U%ld - this weapon no longer follows the global anchor",
+            i, verts, g_gunAnchorFwd, g_gunAnchorRight, g_gunAnchorUp);
         return &g_gunAlign[i];
     }
     return nullptr;                      // table full: fall back to the globals rather than evict
