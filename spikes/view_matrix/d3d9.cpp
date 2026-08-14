@@ -10700,14 +10700,11 @@ static void GunAimDir(float d[3]) {
 }
 
 // ⭐ run 219: how far ADS pulls the weapon back along that axis, in engine units. 0 disables.
-// ⛔ run 219b: DEFAULT 0. The pull-back is the right SHAPE for VR ADS, but it cannot ship until the
-// game's own aim animation is suppressed - layering ours under one that already slides the weapon to
-// screen centre gives two wrong offsets instead of one. User's call, and correct: this is not something
-// to A/B in a headset, it is something that needs the animation gone first.
-//
-// Kept, not deleted: it is what ADS should do once the game's version is out of the way, and the run
-// that settles suppression is the run that turns this back on.
-volatile LONG g_adsPullbackUU = 0;    // ini [Input] AdsPullbackUU
+// ⭐ run 224: BACK ON. Run 219b turned this off because layering it under the game's own aim animation
+// gave two wrong offsets; run 223 measured that the animation is a rigid transform of one bone block,
+// and AdsMask now holds that block still. With the game's version masked, this is the only motion left
+// - and it is the motion that was asked for: back along the line the gun is already pointing.
+volatile LONG g_adsPullbackUU = 10;   // ini [Input] AdsPullbackUU
 
 // ⭐ run 218: where the gun's rotation point ACTUALLY ends up in the world.
 //
@@ -10950,6 +10947,39 @@ int g_adsFreezeLo = -1;                   // ini [Render] AdsFreezeLo, -1 = off
 int g_adsFreezeHi = -1;                   // ini [Render] AdsFreezeHi
 volatile LONG g_adsFrozenDraws = 0;       // reported per second - "no change" vs "never fired"
 
+// ---- ⭐ run 224: MASK the aim animation, which the freeze test proved is possible ----
+//
+// Measured, both configurations run:
+//
+//   freeze c5-c22    the WHOLE gun stopped moving  -> this block carries the entire visible weapon
+//   freeze c23-c127  the gun moved as usual        -> those bones carry nothing you can see
+//
+// So the aim motion is a rigid transform of the whole weapon, applied through one matrix that six
+// bones share, and holding that block at its pre-aim pose removes the animation completely. The
+// c5-c127 control was not needed: freezing 5-22 stopping ALL motion already proves the motion lives in
+// these constants, which is what the control existed to ask.
+//
+// ---- why the mask outlasts the press ----
+//
+// Reported from the test: on release the gun jumped to wherever the animation had got to and then
+// travelled back to rest. That is the game's animation still running underneath - we mask it, we do not
+// stop it - so the mask has to cover the RETURN as well or that jump happens on every release. The tail
+// holds the pose until the game's own animation has finished coming home.
+//
+// ⚠ A masked bone stops doing everything, so while aiming, RECOIL and reload motion are suppressed
+// too. That is the real cost of this approach and it is not hypothetical - it is the same property that
+// made the test work. Judged worth it because the weapon is on your hand in this mode and its own
+// idle animation was never what sold the shot, but AdsMaskAnim=0 is there for the other opinion.
+//
+// ⚠ The range 5-22 was measured on the ASSAULT RIFLE (11387) and nothing else. Another weapon may
+// lay its bones out differently; if one looks wrong while aiming, re-run the freeze test on it rather
+// than assuming this range transfers.
+int g_adsMaskOn   = 1;                    // ini [Render] AdsMaskAnim
+int g_adsMaskLo   = 5;                    // ini [Render] AdsMaskLo
+int g_adsMaskHi   = 22;                   // ini [Render] AdsMaskHi
+volatile LONG g_adsMaskTailMs = 400;      // ini [Render] AdsMaskTailMs
+volatile LONG g_adsMaskUntilMs = 0;       // wall clock; the tail after release
+
 // Called from the gun's own draw, and only on the two frames a capture is armed - so the readback
 // costs nothing on every other frame and on every other draw.
 static void AdsCapture(IDirect3DDevice9* dev) {
@@ -10961,8 +10991,39 @@ static void AdsCapture(IDirect3DDevice9* dev) {
     InterlockedExchange(&g_adsCapture, 0);
 }
 
+// ⭐ run 224: the shipping version: hold the gun's bones at their pre-aim pose for as long as the aim
+// animation would otherwise be moving them - the press, the hold, and the return afterwards.
+//
+// The SNIPER is excluded by the scope overlay being drawn, the same signal the laser and the pull-back
+// use. It has its own optics and its own zoom; masking its animation would fight them.
+static void AdsMask(IDirect3DDevice9* dev) {
+    if (!g_adsMaskOn || g_adsMaskLo < 0 || g_adsMaskHi < g_adsMaskLo) return;
+    if (ScopeActive()) return;
+    const DWORD now = GetTickCount();
+    const bool aiming = InterlockedCompareExchange(&g_rawAltTrigger, 0, 0) > 40;
+    if (aiming) {
+        InterlockedExchange(&g_adsMaskUntilMs, (LONG)(now + (DWORD)Rd(g_adsMaskTailMs)));
+    } else {
+        const DWORD until = (DWORD)Rd(g_adsMaskUntilMs);
+        // The tail. Without it, releasing shows the gun wherever the animation had reached and then
+        // walking home - which is the jump the freeze test surfaced.
+        if (!until || (LONG)(now - until) >= 0) {
+            // Not aiming and the tail has expired: this is the resting pose, so keep it fresh.
+            if (SUCCEEDED(dev->GetVertexShaderConstantF(0, g_adsBase, kAdsRegs))) g_adsHaveBase = true;
+            return;
+        }
+    }
+    if (!g_adsHaveBase || !g_origSetVSConstF) return;
+    const int hi = (g_adsMaskHi < kAdsRegs - 1) ? g_adsMaskHi : kAdsRegs - 1;
+    g_origSetVSConstF(dev, (UINT)g_adsMaskLo, g_adsBase + g_adsMaskLo * 4,
+                      (UINT)(hi - g_adsMaskLo + 1));
+    InterlockedIncrement(&g_adsFrozenDraws);
+}
+
 // ⭐ run 223: at the gun's draw: keep the resting pose fresh while the trigger is up, and write it back
 // over the chosen range while it is held. Entirely inert unless a freeze range is configured.
+// Kept as the DIAGNOSTIC it was - AdsMask above is the shipping path, and this is how another weapon's
+// bone layout gets measured if 5-22 turns out not to transfer.
 static void AdsFreeze(IDirect3DDevice9* dev) {
     if (g_adsFreezeLo < 0 || g_adsFreezeHi < g_adsFreezeLo) return;
     const bool aiming = InterlockedCompareExchange(&g_rawAltTrigger, 0, 0) > 40;
@@ -11526,7 +11587,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // ⭐ run 222: the gun's own draw is the only place these constants mean the gun. Guarded by the
     // capture state, so this is two GetVertexShaderConstantF calls in a whole session.
     const bool isGun = FgMoved(numVertices);
-    if (isGun) { AdsCapture(dev); AdsFreeze(dev); }   // ⭐ run 223: freeze before StereoPair: it only
+    if (isGun) { AdsCapture(dev); AdsFreeze(dev); AdsMask(dev); }   // ⭐ run 223: freeze before StereoPair: it only
                                                      // rewrites the camera slots, so the bones persist
                                                      // across both eye draws
     g_thisDrawMoved = isGun || FgRidesGun(numVertices);
@@ -18832,6 +18893,23 @@ void LoadIniSettings() {
                   " impulse weapon shares this button - see the melee window note"
                 : "off - the melee swing stays invisible");
 
+    // ⭐ run 224: the aim-animation mask. On by default: run 223 measured that holding c5-c22 removes the
+    // animation completely on the assault rifle, and the pull-back is only correct with it masked.
+    g_adsMaskOn = GetPrivateProfileIntA("Render", "AdsMaskAnim", 1, path) ? 1 : 0;
+    g_adsMaskLo = GetPrivateProfileIntA("Render", "AdsMaskLo", 5, path);
+    g_adsMaskHi = GetPrivateProfileIntA("Render", "AdsMaskHi", 22, path);
+    if (g_adsMaskLo < 0 || g_adsMaskHi < g_adsMaskLo) { g_adsMaskLo = 5; g_adsMaskHi = 22; }
+    if (g_adsMaskHi > 127) g_adsMaskHi = 127;
+    LONG tail = GetPrivateProfileIntA("Render", "AdsMaskTailMs", 400, path);
+    if (tail < 0)    tail = 0;
+    if (tail > 3000) tail = 3000;
+    InterlockedExchange(&g_adsMaskTailMs, tail);
+    Log("ini: AdsMaskAnim=%d (c%d-c%d, tail %ld ms) (%s)", g_adsMaskOn, g_adsMaskLo, g_adsMaskHi, tail,
+        g_adsMaskOn ? "the game's aim animation is held at the pre-aim pose, so AdsPullbackUU is the"
+                      " only motion left. WARNING: recoil and reload are suppressed while aiming, and"
+                      " the range was measured on the ASSAULT RIFLE only"
+                    : "off - the game's aim animation plays as shipped");
+
     // ⭐ run 223: the freeze range. -1 disables. See AdsFreeze for the three configurations worth running.
     g_adsFreezeLo = GetPrivateProfileIntA("Render", "AdsFreezeLo", -1, path);
     g_adsFreezeHi = GetPrivateProfileIntA("Render", "AdsFreezeHi", -1, path);
@@ -18865,7 +18943,7 @@ void LoadIniSettings() {
 
     // ⭐ run 219: how far ADS pulls the weapon back along the aiming line. The game's own ADS animation
     // slides it toward screen CENTRE, which is right in head mode and meaningless on a hand-held gun.
-    LONG apull = GetPrivateProfileIntA("Input", "AdsPullbackUU", 0, path);
+    LONG apull = GetPrivateProfileIntA("Input", "AdsPullbackUU", 10, path);
     if (apull < 0)   apull = 0;
     if (apull > 100) apull = 100;
     InterlockedExchange(&g_adsPullbackUU, apull);
