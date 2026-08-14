@@ -612,6 +612,24 @@ structural change in the build and the first thing to suspect if tracking ever m
 | Engine FOV | horizontal at 16:9, dips to its 65° default ~7% of samples |
 | Scene targets | 2× scene-sized (A8R8G8B8 + A16B16G16R16F), shadow map 512×512 R32F |
 
+## ⚠ The ini takes the FIRST key of a duplicated name, silently
+
+Hand-editing `SingularityVR.ini` can leave two lines with the same key. `GetPrivateProfileInt` returns
+the **first** and reports nothing about the second, so the file reads as if the change was made and the
+mod behaves as if it was not. This cost a run at 219b: `ScopeDrawCensus` appeared twice, the first was
+`0`, and a census that was believed armed recorded nothing.
+
+`PanelSave` is not affected — `WritePrivateProfileString` edits in place — so this only bites
+hand-edits. Check before trusting one:
+
+```bash
+awk -F= '/^[A-Za-z]/ {print $1}' SingularityVR.ini | sort | uniq -d
+```
+
+Anything printed is a key whose later copies are dead. And the log settles it either way: every setting
+prints its **effective** value at startup, so `ini: ScopeDrawCensus=0` next to a file saying `3` is the
+duplicate announcing itself.
+
 ## Quick start
 
 **The live build is `spikes/view_matrix/`** (spike 9). **`spikes/vr_render/`** (spike 8) is the
