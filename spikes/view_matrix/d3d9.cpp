@@ -10919,6 +10919,37 @@ volatile LONG g_adsCapture = 0;           // 0 idle, 1 want baseline, 2 want aim
 bool  g_adsHaveBase = false, g_adsHaveAimed = false;
 int   g_adsDumpLeft = 0;                  // ini [Render] AdsConstDump
 
+// ---- ⭐ run 223: FREEZE a range of the gun's bones, to find out what each block actually moves ----
+//
+// The run-222 diff says the aim offset is not one rigid delta - `c5`-`c22` are six bones sharing one
+// matrix that all moved together, `c23`+ moved differently, and `c0`-`c3` are the camera changing
+// because aiming also zooms. What it does NOT say is which of those blocks carries the part of the
+// weapon you can see, and no amount of staring at the numbers will answer that.
+//
+// So block one and not the other, then swap. Three configurations, all ini edits:
+//
+//   AdsFreezeLo=5  Hi=22    how much of the gun the rigid block carries
+//   AdsFreezeLo=23 Hi=127   how much the independently animated bones carry
+//   AdsFreezeLo=5  Hi=127   THE CONTROL - if the gun still slides with every bone frozen, the motion
+//                           is not in these constants at all and both proposed fixes are dead before
+//                           they are written
+//
+// That third one is the row worth having. It is the same shape as renaming d3d9.dll to settle "is this
+// us at all" in one minute, and it is the one I would not have thought to run.
+//
+// ---- the reference pose, and why it is captured continuously ----
+//
+// Freezing means writing back what the bones held BEFORE you aimed, so the reference has to be the
+// resting pose of THIS weapon. Captured every frame the aim trigger is up, so at the instant of the
+// press it is whatever the gun was doing a frame earlier - which is exactly the pose the aim animation
+// departs from. A stale or wrong-weapon reference would show motion that is not ADS at all.
+//
+// WARNING: a frozen bone stops doing EVERYTHING, not just the aim move. Firing or reloading while
+// frozen will look wrong for reasons that have nothing to do with this test. That is not a result.
+int g_adsFreezeLo = -1;                   // ini [Render] AdsFreezeLo, -1 = off
+int g_adsFreezeHi = -1;                   // ini [Render] AdsFreezeHi
+volatile LONG g_adsFrozenDraws = 0;       // reported per second - "no change" vs "never fired"
+
 // Called from the gun's own draw, and only on the two frames a capture is armed - so the readback
 // costs nothing on every other frame and on every other draw.
 static void AdsCapture(IDirect3DDevice9* dev) {
@@ -10928,6 +10959,32 @@ static void AdsCapture(IDirect3DDevice9* dev) {
     if (FAILED(dev->GetVertexShaderConstantF(0, dst, kAdsRegs))) return;
     if (want == 1) g_adsHaveBase = true; else g_adsHaveAimed = true;
     InterlockedExchange(&g_adsCapture, 0);
+}
+
+// ⭐ run 223: at the gun's draw: keep the resting pose fresh while the trigger is up, and write it back
+// over the chosen range while it is held. Entirely inert unless a freeze range is configured.
+static void AdsFreeze(IDirect3DDevice9* dev) {
+    if (g_adsFreezeLo < 0 || g_adsFreezeHi < g_adsFreezeLo) return;
+    const bool aiming = InterlockedCompareExchange(&g_rawAltTrigger, 0, 0) > 40;
+    if (!aiming) {
+        // The resting pose, refreshed. One readback a frame, and only while a freeze is configured.
+        if (SUCCEEDED(dev->GetVertexShaderConstantF(0, g_adsBase, kAdsRegs))) g_adsHaveBase = true;
+        return;
+    }
+    if (!g_adsHaveBase || !g_origSetVSConstF) return;
+    const int lo = g_adsFreezeLo;
+    const int hi = (g_adsFreezeHi < kAdsRegs - 1) ? g_adsFreezeHi : kAdsRegs - 1;
+    // g_origSetVSConstF, NOT the hooked entry: our own constant hook remaps the camera register per
+    // eye, and a write that re-entered it would be reinterpreted as a camera upload.
+    g_origSetVSConstF(dev, (UINT)lo, g_adsBase + lo * 4, (UINT)(hi - lo + 1));
+    InterlockedIncrement(&g_adsFrozenDraws);
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Log("*** ADS FREEZE ACTIVE: holding c%d-c%d at the pose they had before you aimed. This is a"
+            " TEST, not a fix - a frozen bone stops doing everything, so firing or reloading while"
+            " aimed will look wrong for unrelated reasons. (run 223; ini AdsFreezeLo/Hi) ***", lo, hi);
+    }
 }
 
 static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
@@ -11469,7 +11526,9 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // ⭐ run 222: the gun's own draw is the only place these constants mean the gun. Guarded by the
     // capture state, so this is two GetVertexShaderConstantF calls in a whole session.
     const bool isGun = FgMoved(numVertices);
-    if (isGun) AdsCapture(dev);
+    if (isGun) { AdsCapture(dev); AdsFreeze(dev); }   // ⭐ run 223: freeze before StereoPair: it only
+                                                     // rewrites the camera slots, so the bones persist
+                                                     // across both eye draws
     g_thisDrawMoved = isGun || FgRidesGun(numVertices);
     if (g_timeOurWork) {
         const double dm = MsSince(tMatch);
@@ -17147,6 +17206,11 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (const LONG dp = InterlockedExchange(&g_dropPrimDraws, 0))
                 Log("    DrawPrimitive draws SKIPPED by DropPrimCount: %ld this second", dp);
 
+            // ⭐ run 223: separates "I froze it and nothing changed" from "the freeze never fired",
+            // which look identical in a headset and mean opposite things.
+            if (const LONG fz = InterlockedExchange(&g_adsFrozenDraws, 0))
+                Log("    gun draws with frozen bones: %ld this second (run 223)", fz);
+
             // Run 215. Nonzero means the frame-wide match was refused - i.e. a world draw collided
             // with a first-person vertex count and would have been hidden or moved. Zero everywhere
             // except the rooms where the collision actually happens is the expected shape; a large
@@ -18767,6 +18831,17 @@ void LoadIniSettings() {
                   " to the engine's position for that span, so the swing reads as one piece. ⚠ the"
                   " impulse weapon shares this button - see the melee window note"
                 : "off - the melee swing stays invisible");
+
+    // ⭐ run 223: the freeze range. -1 disables. See AdsFreeze for the three configurations worth running.
+    g_adsFreezeLo = GetPrivateProfileIntA("Render", "AdsFreezeLo", -1, path);
+    g_adsFreezeHi = GetPrivateProfileIntA("Render", "AdsFreezeHi", -1, path);
+    if (g_adsFreezeLo < 0 || g_adsFreezeHi < g_adsFreezeLo) { g_adsFreezeLo = g_adsFreezeHi = -1; }
+    if (g_adsFreezeHi > 127) g_adsFreezeHi = 127;
+    if (g_adsFreezeLo >= 0)
+        Log("ini: AdsFreezeLo=%d AdsFreezeHi=%d - DIAGNOSTIC. While aiming, the gun's bones in that"
+            " register range are held at the pose they had before the press, so you can see which"
+            " block moves which part of the weapon. Freeze c5-c22, then c23-c127, then c5-c127 as the"
+            " control. Set both to -1 when finished.", g_adsFreezeLo, g_adsFreezeHi);
 
     // ⭐ run 222: how many aim-presses to capture the gun's shader constants for. Diagnostic only.
     g_adsDumpLeft = GetPrivateProfileIntA("Render", "AdsConstDump", 0, path);
