@@ -5324,11 +5324,14 @@ void PanelSaveRow(int rowId, const char* path) {
         // The rows share one table and PanelSave walks rows, so writing "the row I touched" would drop
         // a weapon you tuned earlier in the same session. Nav rows return silently; these do not,
         // because they DO persist - just all at once.
-        case PR_ALIGNGUN: case PR_ALIGNFWD: case PR_ALIGNRIGHT: case PR_ALIGNUP:
-        case PR_ALIGNYAW: case PR_ALIGNPITCH: {
-            static bool written = false;
-            if (written) { written = false; return; }   // one write per save, not six
-            written = true;
+        // The five adjustable rows have a case so run 171's "adjustable but persists nowhere" warning
+        // stays satisfied, but only PR_ALIGNGUN actually writes - it owns the table conceptually, and
+        // keying on a row rather than on call ORDER means a future reshuffle of the page cannot change
+        // how many times this runs.
+        case PR_ALIGNFWD: case PR_ALIGNRIGHT: case PR_ALIGNUP:
+        case PR_ALIGNYAW: case PR_ALIGNPITCH:
+            return;
+        case PR_ALIGNGUN: {
             for (int i = 0; i < kGunAlignMax; ++i) {
                 char key[48];
                 const GunAlignSlot& g = g_gunAlign[i];
