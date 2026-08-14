@@ -5083,6 +5083,36 @@ struct GunAlignSlot {
 };
 GunAlignSlot g_gunAlign[kGunAlignMax]{};
 
+// ---- ⭐ run 221: the TUNED values ship in the CODE, not in someone's ini ----
+//
+// An ini is the user's file. A fresh install has none, so anything that lives only there is a setting
+// the next person does not get - and "it looks right on the dev machine" is exactly the gap the
+// 2026-08-08 defaults audit was written about. Weapon alignment is not a preference like turn speed;
+// a mis-aligned barrel is wrong for everyone, so the measured value belongs in the binary.
+//
+// The vertex count identifies the weapon across every install, because it is the shipped mesh - the
+// same number on every copy of the game. That is what makes a built-in table possible at all.
+//
+// Measured in play, run 220, against the laser: assault rifle 11387.
+//   anchor F26 R8 U-13, barrel trim yaw +3.0 deg pitch -2.8 deg
+//
+// An ini slot for the same weapon OVERRIDES this - see the loader. So tuning your own copy still wins,
+// and these are a starting point rather than a ceiling.
+const GunAlignSlot kGunAlignDefaults[] = {
+    { 11387, 26, 8, -13,  30, -28 },   // assault rifle
+};
+const int kGunAlignDefaultCount = (int)(sizeof(kGunAlignDefaults) / sizeof(kGunAlignDefaults[0]));
+
+// Find-or-create WITHOUT the slot-creation log - used by the loader, where "created" is not news.
+GunAlignSlot* GunAlignSlotFor(LONG verts) {
+    if (!verts) return nullptr;
+    for (int i = 0; i < kGunAlignMax; ++i)
+        if (g_gunAlign[i].verts == verts) return &g_gunAlign[i];
+    for (int i = 0; i < kGunAlignMax; ++i)
+        if (!g_gunAlign[i].verts) { g_gunAlign[i].verts = verts; return &g_gunAlign[i]; }
+    return nullptr;
+}
+
 // The slot for the weapon in hand, or nullptr when there is none. Never allocates - see GunAlignFor.
 GunAlignSlot* GunAlignFind(LONG verts) {
     if (!verts) return nullptr;
@@ -5989,27 +6019,42 @@ bool InitXRInput() {
             // A shipped build takes these unless the player overrides them, so the numbers that ship
             // must be the numbers that were tuned. Per-user trim is still expected - this is an
             // offset from YOUR eye - but it should start from the measured pose, not a placeholder.
-            // ⭐ run 217: the per-weapon slots, read before the global anchor so the log reads in the
-            // order the values are applied: a slot wins for its weapon, the global covers the rest.
+            // ⭐ run 221: the SHIPPED table first, then the ini on top. Two things follow from that
+            // order, and both are the point:
+            //
+            //   a fresh install gets the tuned weapons, because they are in the binary
+            //   your own ini still wins, because it is applied second
+            //
+            // The ini is matched BY WEAPON, not by slot index. Slot 3 of the file has no reason to be
+            // slot 3 of the table once a default occupies slot 0, and matching on identity means a
+            // hand-edited file cannot silently overwrite a different weapon's alignment.
+            for (int i = 0; i < kGunAlignMax; ++i) g_gunAlign[i] = GunAlignSlot{};
+            for (int i = 0; i < kGunAlignDefaultCount && i < kGunAlignMax; ++i)
+                g_gunAlign[i] = kGunAlignDefaults[i];
             for (int i = 0; i < kGunAlignMax; ++i) {
                 char key[48];
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dVerts", i);
                 const LONG gv = GetPrivateProfileIntA("Input", key, 0, path);
-                g_gunAlign[i] = GunAlignSlot{};
                 if (!gv) continue;
-                g_gunAlign[i].verts = gv;
+                GunAlignSlot* sl = GunAlignSlotFor(gv);
+                if (!sl) continue;                      // table full: keep what is already there
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dFwd", i);
-                g_gunAlign[i].fwd = GetPrivateProfileIntA("Input", key, 30, path);
+                sl->fwd = (LONG)GetPrivateProfileIntA("Input", key, sl->fwd, path);
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dRight", i);
-                g_gunAlign[i].right = GetPrivateProfileIntA("Input", key, 9, path);
+                sl->right = (LONG)GetPrivateProfileIntA("Input", key, sl->right, path);
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dUp", i);
-                g_gunAlign[i].up = GetPrivateProfileIntA("Input", key, -13, path);
+                sl->up = (LONG)GetPrivateProfileIntA("Input", key, sl->up, path);
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dYawTenths", i);
-                g_gunAlign[i].yawTenths = GetPrivateProfileIntA("Input", key, 0, path);
+                sl->yawTenths = (LONG)GetPrivateProfileIntA("Input", key, sl->yawTenths, path);
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "GunAlign%dPitchTenths", i);
-                g_gunAlign[i].pitchTenths = GetPrivateProfileIntA("Input", key, 0, path);
-                Log("ini: GunAlign%d - weapon %ld anchor F%ld R%ld U%ld, barrel trim yaw %+.1f"
-                    " pitch %+.1f deg", i, g_gunAlign[i].verts, g_gunAlign[i].fwd,
+                sl->pitchTenths = (LONG)GetPrivateProfileIntA("Input", key, sl->pitchTenths, path);
+            }
+            // Reported AFTER the merge, so the line says what is in FORCE rather than what either
+            // source asked for. A default that an ini quietly overrode would otherwise read as applied.
+            for (int i = 0; i < kGunAlignMax; ++i) {
+                if (!g_gunAlign[i].verts) continue;
+                Log("weapon align in force: weapon %ld anchor F%ld R%ld U%ld, barrel trim yaw %+.1f"
+                    " pitch %+.1f deg", g_gunAlign[i].verts, g_gunAlign[i].fwd,
                     g_gunAlign[i].right, g_gunAlign[i].up,
                     (double)g_gunAlign[i].yawTenths / 10.0,
                     (double)g_gunAlign[i].pitchTenths / 10.0);
