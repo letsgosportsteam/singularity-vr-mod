@@ -10889,6 +10889,47 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     return !FgIsBaseline(verts) && FgMatchWindow();
 }
 
+// ================= ⭐ run 222: what does AIMING actually change about the gun's draw? ============
+//
+// The question this settles: the game's aim animation moves the weapon, and we need to know WHERE it
+// applies that move before anything can cancel it.
+//
+// Established already, from the run-219b census: the first-person mesh list is IDENTICAL aimed and not
+// - `[11387, 3314, 390, 9]` both ways - so aiming does not swap the mesh or pose it into different
+// geometry. Same meshes, moved. That rules out a mesh swap and rules out nothing else: a skeletal
+// animation preserves vertex counts too.
+//
+// So capture the vertex-shader constants for THE GUN'S OWN DRAW, once with the aim trigger up and once
+// with it down, and diff them. For a skeletal mesh those registers are the bone matrices, and the
+// shape of the difference answers it outright:
+//
+//   every changed register shifted by the SAME delta   a rigid component offset. Subtractable, or
+//                                                      freezable - that is "stop the animation"
+//   changed registers shifted DIFFERENTLY              a real skeletal animation. Freezing it would
+//                                                      freeze reload and fire too; not stoppable here
+//   nothing changed                                    the offset is not in the constants at all and
+//                                                      I am looking in the wrong place
+//
+// The third outcome is a real possibility, not a formality. This is where the offset is MOST LIKELY to
+// live, not where it is known to live.
+const int kAdsRegs = 128;                 // c0..c127 covers UE3's bone palette on a weapon
+float g_adsBase[kAdsRegs * 4]{};
+float g_adsAimed[kAdsRegs * 4]{};
+volatile LONG g_adsCapture = 0;           // 0 idle, 1 want baseline, 2 want aimed
+bool  g_adsHaveBase = false, g_adsHaveAimed = false;
+int   g_adsDumpLeft = 0;                  // ini [Render] AdsConstDump
+
+// Called from the gun's own draw, and only on the two frames a capture is armed - so the readback
+// costs nothing on every other frame and on every other draw.
+static void AdsCapture(IDirect3DDevice9* dev) {
+    const LONG want = InterlockedCompareExchange(&g_adsCapture, 0, 0);
+    if (!want) return;
+    float* dst = (want == 1) ? g_adsBase : g_adsAimed;
+    if (FAILED(dev->GetVertexShaderConstantF(0, dst, kAdsRegs))) return;
+    if (want == 1) g_adsHaveBase = true; else g_adsHaveAimed = true;
+    InterlockedExchange(&g_adsCapture, 0);
+}
+
 static bool FgMoved(UINT verts) {                     // gun, in modes 1 and 3
     // ⚠️ Mode FIRST. This used to read the mode, then call HealWindowActive(), then read g_gunVerts,
     // and only THEN check the mode - so every indexed draw in the frame paid for all three even with
@@ -11425,7 +11466,11 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // Run 181: the latched gun mesh, OR anything else the first-person pass draws - the muzzle
     // flash and the barrel smoke are the reported cases. FgRidesGun excludes the gun and the arms,
     // so the two matchers cannot both claim a draw.
-    g_thisDrawMoved = FgMoved(numVertices) || FgRidesGun(numVertices);
+    // ⭐ run 222: the gun's own draw is the only place these constants mean the gun. Guarded by the
+    // capture state, so this is two GetVertexShaderConstantF calls in a whole session.
+    const bool isGun = FgMoved(numVertices);
+    if (isGun) AdsCapture(dev);
+    g_thisDrawMoved = isGun || FgRidesGun(numVertices);
     if (g_timeOurWork) {
         const double dm = MsSince(tMatch);
         g_msMeshMatch += dm;
@@ -17667,6 +17712,70 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         if (InterlockedCompareExchange(&g_rawTrigger, 0, 0) < 20) g_fireTrigWasDown = false;
     }
 
+    // ---- ⭐ run 222: the ADS constant capture, on the same ALT trigger ----
+    //
+    // Armed from Present and captured at the draw, because Present is where the trigger state is known
+    // and the draw is where the constants mean anything. Reported from here too - never from the draw
+    // hook, which is the run 24/25 rule.
+    if (g_adsDumpLeft > 0) {
+        const LONG alt = InterlockedCompareExchange(&g_rawAltTrigger, 0, 0);
+        const LONG gun = InterlockedCompareExchange(&g_gunVerts, 0, 0);
+        if (gun && !g_adsHaveBase && alt < 20 &&
+            !InterlockedCompareExchange(&g_adsCapture, 0, 0)) {
+            InterlockedExchange(&g_adsCapture, 1);
+        } else if (gun && g_adsHaveBase && !g_adsHaveAimed && alt > 40 &&
+                   !InterlockedCompareExchange(&g_adsCapture, 0, 0)) {
+            // A short wait so the animation has SETTLED. Capturing on the first aimed frame would
+            // sample the middle of a lerp and read as "a bit of everything".
+            static int settle = 0;
+            if (++settle >= 45) { settle = 0; InterlockedExchange(&g_adsCapture, 2); }
+        } else if (alt < 20 && g_adsHaveBase && !g_adsHaveAimed) {
+            // released before it settled - keep the baseline, wait for a longer press
+        }
+        if (g_adsHaveBase && g_adsHaveAimed) {
+            --g_adsDumpLeft;
+            g_adsHaveBase = g_adsHaveAimed = false;
+            Log("---- ⭐ run 222: ADS constant diff for gun=%ld (%d dump(s) left) ----", gun, g_adsDumpLeft);
+            int changed = 0;
+            float dmin[4] = { 1e30f, 1e30f, 1e30f, 1e30f };
+            float dmax[4] = { -1e30f, -1e30f, -1e30f, -1e30f };
+            for (int r = 0; r < kAdsRegs; ++r) {
+                // `up`/`aim`/`dlt`, not a/b/d - those three are Hook_Present's own parameters and are
+                // live right here. The file already carries this convention at two other sites.
+                const float* up  = g_adsBase + r * 4;
+                const float* aim = g_adsAimed + r * 4;
+                float dlt[4] = { aim[0]-up[0], aim[1]-up[1], aim[2]-up[2], aim[3]-up[3] };
+                if (fabsf(dlt[0]) < 1e-4f && fabsf(dlt[1]) < 1e-4f &&
+                    fabsf(dlt[2]) < 1e-4f && fabsf(dlt[3]) < 1e-4f) continue;
+                ++changed;
+                for (int k = 0; k < 4; ++k) {
+                    if (dlt[k] < dmin[k]) dmin[k] = dlt[k];
+                    if (dlt[k] > dmax[k]) dmax[k] = dlt[k];
+                }
+                if (changed <= 24)
+                    Log("    c%-3d  %+.4f %+.4f %+.4f %+.4f  ->  %+.4f %+.4f %+.4f %+.4f"
+                        "   delta %+.4f %+.4f %+.4f %+.4f",
+                        r, up[0], up[1], up[2], up[3], aim[0], aim[1], aim[2], aim[3],
+                        dlt[0], dlt[1], dlt[2], dlt[3]);
+            }
+            if (!changed) {
+                Log("    NOTHING in c0-c%d changed. The aim offset is not in the vertex constants -"
+                    " it is applied somewhere none of these hooks can see, and the tunable per-weapon"
+                    " ADS offset is the honest remaining option.", kAdsRegs - 1);
+            } else {
+                if (changed > 24) Log("    ... %d more changed registers not listed", changed - 24);
+                Log("    %d of %d registers changed. Delta spread per component:", changed, kAdsRegs);
+                for (int k = 0; k < 4; ++k)
+                    Log("      [%d] min %+.4f  max %+.4f  spread %.4f", k, dmin[k], dmax[k],
+                        dmax[k] - dmin[k]);
+                Log("    READ IT LIKE THIS: a spread near ZERO on every component means every changed"
+                    " register moved by the SAME amount - a rigid offset, which can be subtracted or"
+                    " frozen. A large spread means the bones moved differently, which is a real"
+                    " animation and cannot be frozen without freezing reload and fire too.");
+            }
+        }
+    }
+
     // ---- ⭐ run 213: the scope census, on the ALT trigger ----
     //
     // Deliberately AFTER the fire block and sharing its recording buffer: the two cannot both be armed
@@ -18658,6 +18767,15 @@ void LoadIniSettings() {
                   " to the engine's position for that span, so the swing reads as one piece. ⚠ the"
                   " impulse weapon shares this button - see the melee window note"
                 : "off - the melee swing stays invisible");
+
+    // ⭐ run 222: how many aim-presses to capture the gun's shader constants for. Diagnostic only.
+    g_adsDumpLeft = GetPrivateProfileIntA("Render", "AdsConstDump", 0, path);
+    if (g_adsDumpLeft < 0) g_adsDumpLeft = 0;
+    if (g_adsDumpLeft > 6) g_adsDumpLeft = 6;
+    if (g_adsDumpLeft)
+        Log("ini: AdsConstDump=%d - capture the GUN's vertex-shader constants with the aim trigger up"
+            " and again with it held, and diff them. Answers whether the aim animation is a rigid"
+            " offset (cancellable) or a skeletal animation (not).", g_adsDumpLeft);
 
     // ⭐ run 219: how long A must be held to toggle the laser. 0 disables the button entirely and leaves
     // the panel as the only route.
