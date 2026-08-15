@@ -1760,16 +1760,23 @@ inline ArmedState PlayerArmed() { return (ArmedState)Rd(g_armedState); }
 // Logged on CHANGE only, so switching guns and raising the TMD writes one line each and an idle minute
 // writes nothing. If the name never changes while the TMD comes and goes, the hypothesis is dead and
 // the property dump below is the fallback - that outcome is worth the same one run.
-// 💥 run 235b: the first version deduped on the CLASS pointer, and every weapon in this game is
-// the same class - `RvWeaponShared`. So the key could never change, the function logged exactly once,
-// and a run that deployed the TMD ten times produced no evidence either way. The discriminating field
-// was in the very first line it printed: the OBJECT name, `ARMachineGun`.
+// ⛔ run 235c: ANSWERED, and the answer is NO. `Pawn.Weapon` never points at the TMD. Measured over a
+// run that deployed and retracted it repeatedly with two different guns, while the same probe happily
+// logged a real weapon switch:
 //
-// **A dedupe key that cannot vary turns a diagnostic into a single line that looks like a result.**
-// Same family as run 228's "absence is invisible" - the log said nothing changed when the instrument
-// was incapable of noticing.
+//     ARMachineGun (RvWeaponShared)  ->  ARShotgun (RvWeaponShared_Shotgun)  ->  ARMachineGun
 //
-// Keyed on the object POINTER now, which is what actually changes when you swap what is in your hands.
+// So the TMD is NOT an inventory weapon, and "using the TMD unequips your weapon" is the weapon being
+// HIDDEN rather than swapped. The signal has to come from somewhere else - see PropDumpPawn.
+//
+// Kept because it is cheap, correct, and names what is in your hands, which the per-weapon alignment
+// work will want.
+//
+// ⚠ An earlier note here claimed every weapon shares the class `RvWeaponShared` and that keying on the
+// class therefore could not work. **That was wrong** - the shotgun is `RvWeaponShared_Shotgun`, so a
+// switch would have fired it. The first version logged once because that run contained no weapon
+// switch at all, not because the key was dead. The object pointer is still the better key, since two
+// weapons CAN share a class; the reasoning that got here was not.
 static void LogEquippedClass(uintptr_t w) {
     static uintptr_t lastObj = (uintptr_t)-1;
     if (w == lastObj) return;
