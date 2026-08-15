@@ -1535,6 +1535,16 @@ WantedName g_wantNames[] = {
     { "BaseEyeHeight", -1 }, { "EyeHeight", -1 },
     // ⭐ run 227: the one question every mesh-latch heuristic has been guessing at: is a weapon EQUIPPED.
     { "Weapon", -1 },
+    // 💥 run 236b: THESE HAVE TO BE HERE. `WantedIdx` searches THIS TABLE and nothing else - a name
+    // absent from it resolves to -1 and `PropOffsetUnder` bails before walking a single class. Run 236
+    // added the lookups and not the registrations, so both reported "+0xFFFFFFFF (depth 13) NOT FOUND"
+    // after a full-chain walk that never actually compared anything, and the failure message blamed the
+    // class chain. The run-235 dump had already listed both at `RvPlayerPawn` depth 1.
+    //
+    // ⚠ The dump and the lookup do NOT share this step: the dump reads names straight off each
+    // property with `NameOf`, so it can see names the lookup is structurally blind to. That is why they
+    // disagreed, and it is worth knowing before trusting a "not found" from this resolver again.
+    { "mPlayerHandsStatus", -1 }, { "mTMD", -1 },
 };
 const int kWantNameCount = (int)(sizeof(g_wantNames) / sizeof(g_wantNames[0]));
 
@@ -2248,8 +2258,8 @@ void ResolveGameplayOffsets() {
             g_offHandsStatus = PropOffsetInChain(pc, "mPlayerHandsStatus", &dp);
             Log("    RvPlayerPawn.mPlayerHandsStatus +0x%03X (depth %d)%s", g_offHandsStatus, dp,
                 g_offHandsStatus < 0
-                  ? "  - NOT FOUND. The run-235 dump listed it, so a miss here means the class chain"
-                    " or the name differs on this build, not that the property is absent."
+                  ? "  - NOT FOUND. FIRST check it is registered in g_wantNames: WantedIdx searches"
+                    " only that table, and an unregistered name fails before any class is walked."
                   : "  - candidate for 'is the TMD raised'. Read only.");
         }
         if (g_offTMD < 0) {
