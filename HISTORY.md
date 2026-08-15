@@ -24,6 +24,76 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Runs 227-228: the rope, and the end of guessing whether a weapon exists
+
+**Reported:** in a scripted scene with the player's hands tied, the **rope is missing** - and pressing
+the heal button makes it appear. **Fixed and confirmed.**
+
+That second half was the diagnosis. The heal window is the one thing that short-circuits `FgHidden`,
+so whatever hid the rope was `FgHidden`.
+
+### The cause
+
+With no weapon the pass is `[3314 arms, 390 fragment, 537 rope]`, and run 216's size rule did exactly
+what it was told: **the largest mesh is the gun**. With no weapon in hand the largest mesh is your
+arms. The roles shifted by one, the rope inherited the arms role, and `FgHidden` hid it.
+
+### ⛔ Four proxies for "is a weapon equipped", all defeated by one scene
+
+| rule | how it was beaten |
+|---|---|
+| `MinFgMeshes` | a third mesh with no weapon satisfies the count (run 212, a stray prop) |
+| `VetoQuietGun` | needs a **2-mesh** weaponless pass to settle; the rope holds it at three forever |
+| `RelatchWrongRoles` | fires on "something bigger than the gun" - impossible when the arms *are* the biggest |
+| `FgRememberArms` | needs a good latch first. Load into the bad scene and the first latch **is** the bad one - it learned the ROPE as the arms |
+
+**Every one waits to be TOLD what normal looks like, and a save can start you somewhere that never
+tells it.** A fifth proxy would have been more of the same.
+
+### The engine already knew
+
+`Pawn.Weapon +0x3D4 (depth 10)` - a pointer, resolved by the same name-based property solver that
+already finds `Health`. Non-null means equipped. No history, no prior frame, no particular scene.
+
+Not run 209's mistake repeated: that removed a **GObjects walk** costing a ~2 s stutter. This resolves
+once and reads a cached pointer.
+
+### 💥 Then three separate things stopped it running at all
+
+Three consecutive builds changed nothing, and each failure had the same shape - the mechanism was fine
+and something upstream stopped it reaching the decision:
+
+1. **A "done" list that omitted the new offset.** `if (health && healthMax && packs) return;` -
+   `g_offWeapon` was added to the function and not to this test, so it returned before reaching it.
+2. **A guard nested under an unrelated condition.** The lookup sat inside `if (health < 0 || ...)`, so
+   it could only run on a save where a *health* offset was missing. Those share a pawn and nothing else.
+3. **Two throttles multiplying.** `ResolveGameplayOffsets` runs once per 2 s (15 s after misses);
+   `FindPlayerPawn`'s miss path walks on 1 call in 30. Stacked, a walk happened once a **minute** at
+   best and once every **seven** after backoff - so a 40-second session never found the pawn at all.
+
+### Then two fixes that were too broad, each caught by a precise report
+
+- **"a black mesh around the arms"** - the unarmed exemption disabled the *whole* of `FgHidden`, which
+  also un-hid the 390 fragment that run 199 hides on purpose. Narrowed to the arms-role rule alone.
+- **"an all-black rope following my head, while the real one follows my controller"** - run 120's
+  silhouette. First-person meshes are drawn **twice**; `FgMoved` covers both via `FgMatchWindow`, but
+  `FgRidesGun` still asked for `g_inForeground`, so the prime copy stayed at the engine position.
+
+### Method notes
+
+- **A proxy that must be told what normal looks like will eventually meet a save that never tells it.**
+  Ask the engine instead. Four rules and six runs went into learning that once.
+- **Absence in a log is invisible.** Three builds were indistinguishable from "not implemented" because
+  the state only logged on *change* and never changed from `UNKNOWN`. Making it report unconditionally
+  is what turned guesswork into three quick fixes.
+- **A "done" test that does not name everything its function resolves stops the function before it
+  finishes.**
+- **Two throttles multiply.** A caller that has paid for its own does not need the callee's as well.
+- **"Black, and head-locked rather than controller-locked"** identified the escaping draw in minutes.
+  A mesh at the engine position is a mesh the transform never reached.
+
+---
+
 ## ⭐ Run 216: the scope reorders the first-person pass, and the roles were positional
 
 **Reported:** after using the sniper scope, the arms are on the controller and the gun is invisible,

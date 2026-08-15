@@ -490,6 +490,23 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      role after scope use. Roles are assigned **by size** now, which fixes both. **A known-weak rule
      left alone because its current symptom is invisible is a bug waiting for a louder symptom.**
 
+10f. **✅ FIXED and VERIFIED (runs 227-228) - the mesh latch now ASKS whether a weapon is equipped.**
+   - Reported as a missing rope in a hands-tied scene. With no weapon the largest mesh in the pass is
+     the ARMS, so run 216's size rule gave them the gun role, the rope inherited the arms role, and it
+     was hidden. Pressing the heal button revealed it, which named `FgHidden` as the culprit outright.
+   - **Four proxies for "is there a weapon" were each defeated by that one scene** - `MinFgMeshes`,
+     `VetoQuietGun`, `RelatchWrongRoles`, `FgRememberArms`. Every one waits to be told what normal
+     looks like, and a save can start you somewhere that never tells it. **`Pawn.Weapon +0x3D4`
+     answers it directly**, resolved once by the existing property solver and read from a cached
+     pointer once a frame.
+   - ⚠ **Resolve it ONCE A FRAME, never per draw.** `FindPlayerPawn` walks `GObjects` on a miss, and
+     the first version called it from `FgHidden`, which runs per draw. That is run 209's defect.
+   - With no weapon: the arms-role mesh is not hidden (it is whatever is on your hands), it rides the
+     gun transform, and its **depth-prime copy rides too** - without that it writes run 120's black
+     silhouette at the engine position. The 390 fragment stays hidden either way.
+   - 📝 **`VetoQuietGun`, `RelatchWrongRoles` and `FgRememberArms` are now redundant weight** -
+     they exist to guess at exactly what the engine now answers. Left in place, not yet retired.
+
 10e. **✅ FIXED and VERIFIED (run 216) — the scope reorders the pass, and the roles were positional.**
    - Reported: after using the sniper scope, the arms are on the controller and the gun is invisible,
      surviving a weapon switch. The run-207 role shift by a route neither run-212 defence covered.
