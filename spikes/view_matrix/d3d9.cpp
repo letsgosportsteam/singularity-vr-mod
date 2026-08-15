@@ -10372,6 +10372,61 @@ static bool FgIsQuiet(UINT verts) {
     return false;
 }
 
+// ---- ⭐ run 226: the ARMS count, learned from every latch that worked ----
+//
+// Reported: in a scripted scene where the player's hands are tied, the ROPE is missing - and pressing
+// the heal button makes it appear, which points straight at FgHidden, because the heal window is the
+// one thing that short-circuits it.
+//
+// The log names it. With no weapon in hand the pass is `[537, 3314, 390]` - arms, rope, fragment - and
+// the run-216 size rule did exactly what it was told: the largest mesh is the gun. With no weapon, the
+// largest mesh is your ARMS. So `gun=3314, arms=537`, the rope inherits the arms role, and FgHidden
+// hides it.
+//
+// Both run-212 defences were inert, and for the same root reason:
+//
+//   VetoQuietGun       needs a 2-mesh weaponless pass to have settled, so the quiet set has something
+//                      in it. The rope keeps the count at THREE for the whole scene, so no weaponless
+//                      pass is ever recorded - the log shows zero WEAPONLESS lines - and the veto has
+//                      nothing to compare against.
+//   RelatchWrongRoles  fires on `biggest > gun`, and here the arms ARE the biggest. Never true.
+//
+// So the precondition is the bug: both rules wait to be TOLD what a weaponless pass looks like, and a
+// scene can deny them that indefinitely.
+//
+// The fix removes the wait. **The arms count is learned from every latch that succeeded** - it is the
+// second-largest mesh in a good pass, invariant at 3314 across every weapon in every log - and a count
+// known to be the arms can never afterwards take the GUN role. That needs no weaponless pass, no stray
+// prop, and no particular scene; one ordinary latch anywhere in the session arms it.
+//
+// In this run the very first latch was good (`gun=11387 arms=3314`, line 804), so 3314 would have been
+// known 28,000 lines before the scene that broke.
+//
+// ⚠ If a weapon ever genuinely had the same vertex count as the arms, this refuses to latch it. That
+// fails SAFE - no latch means the gun is left where the engine put it and nothing is hidden - and it is
+// visible in the log rather than silent.
+const int kKnownArmsMax = 4;
+volatile LONG g_knownArms[kKnownArmsMax] = {};
+volatile LONG g_knownArmsCount = 0;
+
+static bool FgIsKnownArms(UINT verts) {
+    if (!verts) return false;
+    const LONG n = Rd(g_knownArmsCount);
+    for (LONG i = 0; i < n && i < kKnownArmsMax; ++i)
+        if ((UINT)Rd(g_knownArms[i]) == verts) return true;
+    return false;
+}
+
+static void FgRememberArms(LONG verts) {
+    if (!verts || FgIsKnownArms((UINT)verts)) return;
+    const LONG n = Rd(g_knownArmsCount);
+    if (n >= kKnownArmsMax) return;               // full: keep the ones already proven
+    InterlockedExchange(&g_knownArms[n], verts);
+    InterlockedExchange(&g_knownArmsCount, n + 1);
+    Log("mesh latch: learned that %ld verts is the ARMS - from now on it can never take the gun role,"
+        " whatever else is or is not on screen (run 226)", verts);
+}
+
 // ---- ⭐ run 158: the latch, extracted so it is not owned by one keypress ----
 //
 // This used to live inline in the APPS handler and ran only when the cycle passed through mode 1.
@@ -11330,7 +11385,9 @@ void UpdateFgLatch() {
                 const LONG v = InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0);
                 if (v > biggest) biggest = v;
             }
-            const bool quietGun = FgIsQuiet((UINT)gun);
+            // ⭐ run 226: `biggest > gun` cannot fire when the ARMS are the biggest, which is exactly
+            // the weaponless case. Knowing the arms count catches it directly.
+            const bool quietGun = FgIsQuiet((UINT)gun) || FgIsKnownArms((UINT)gun);
             const LONG stray = biggest;           // reported below; the name is kept for the log line
             if (!(quietGun || biggest > gun)) wrongRole = 0;
             else if (++wrongRole >= kWrongRoleFrames) {
@@ -11439,15 +11496,19 @@ void UpdateFgLatch() {
     // A stray third mesh in a weaponless pass satisfies MinFgMeshes, and then the top two are the arms
     // and the hand fragment. The gun role cannot belong to a mesh that is drawn when there is no gun.
     // This is the whole fix for the reported "arms visible, pistol invisible" - see FgIsQuiet.
-    if (g_vetoQuietGun && FgIsQuiet((UINT)a)) {
+    // ⭐ run 226: two reasons to refuse, and the second does not wait to be told what a weaponless pass
+    // looks like: a count already proven to be the arms cannot become the gun.
+    if (g_vetoQuietGun && (FgIsQuiet((UINT)a) || FgIsKnownArms((UINT)a))) {
         static LONG saidFor = -1;
         if (saidFor != a) {
             saidFor = a;
             Log("*** mesh latch: REFUSING this latch. The list settled on %ld/%ld across %ld mesh(es),"
-                " but %ld was drawn in the weaponless pass - so it is the ARMS, not a gun, and latching"
-                " it would put the arms on your controller and HIDE the real weapon. This is the run-207"
-                " role shift arriving past MinFgMeshes on a stray mesh. (run 212; ini VetoQuietGun) ***",
-                a, b, n, a);
+                " but %ld is %s - so it is the ARMS, not a gun, and latching it would put the arms on"
+                " your controller and hide whatever else is in the pass. (run 212/226;"
+                " ini VetoQuietGun) ***",
+                a, b, n, a,
+                FgIsKnownArms((UINT)a) ? "the ARMS COUNT this session already latched successfully"
+                                       : "a mesh drawn in the weaponless pass");
             LogFgList("at the REFUSED take");
         }
         steady = 0;
@@ -11456,6 +11517,7 @@ void UpdateFgLatch() {
     steady = 0;
     InterlockedExchange(&g_gunVerts,  a);
     InterlockedExchange(&g_armsVerts, b);
+    FgRememberArms(b);            // ⭐ run 226: one good latch anywhere arms the veto for the session
     // ---- ⭐ run 198: capture the whole BASELINE set, not just the top two ----
     //
     // The reload artefact is arm and hand geometry that exists only in the reload animation, so it is
