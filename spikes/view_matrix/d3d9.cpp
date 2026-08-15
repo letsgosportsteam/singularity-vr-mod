@@ -1533,6 +1533,8 @@ WantedName g_wantNames[] = {
     { "mHealthPackCount", -1 },
     // Run 201: READ ONLY - what does the game think the player's eye height is? See ReportEyeHeight.
     { "BaseEyeHeight", -1 }, { "EyeHeight", -1 },
+    // ⭐ run 227: the one question every mesh-latch heuristic has been guessing at: is a weapon EQUIPPED.
+    { "Weapon", -1 },
 };
 const int kWantNameCount = (int)(sizeof(g_wantNames) / sizeof(g_wantNames[0]));
 
@@ -1649,6 +1651,46 @@ uintptr_t g_weaponFxClass = 0;
 // on past the animation it was supposed to cover. Asking "could this heal do anything" BEFORE the press
 // has no timing dependency at all.
 int g_offHealth = -1, g_offHealthMax = -1;
+
+// ---- ⭐ run 227: ask the ENGINE whether a weapon is in hand, instead of inferring it from meshes ----
+//
+// Four rules have now tried to answer "is there a weapon" from the shape of the first-person pass, and
+// a save has defeated every one of them:
+//
+//   MinFgMeshes        a third mesh with no weapon satisfies the count      (run 212, a stray prop)
+//   VetoQuietGun       needs a 2-mesh weaponless pass to have SETTLED - a scene that always draws
+//                      three never provides one                            (run 226, the rope)
+//   RelatchWrongRoles  fires on "something bigger than the gun", which cannot be true when the ARMS
+//                      are the biggest, i.e. exactly when unarmed          (run 226)
+//   FgRememberArms     needs a GOOD latch first. Load straight into the bad scene and the first latch
+//                      of the session is the bad one - it then learned the ROPE as the arms
+//
+// Every one of them is a proxy that has to be TOLD what normal looks like, and a save can always start
+// you somewhere that never tells it. The engine already knows. `Pawn.Weapon` is a pointer: non-null
+// means something is equipped, and it needs no history, no prior frame and no particular scene.
+//
+// Run 209 removed a GObjects WALK for this and was right to - it cost a ~2 s stutter every time there
+// was no weapon, which is the exact case it existed to detect. This is not that: the offset is resolved
+// once by the same name-based property solver that already finds Health, and the per-frame cost is one
+// pointer read from a cached pawn.
+//
+// ⚠ FAILS SAFE and fails LOUD. Until the offset resolves this returns UNKNOWN and every existing
+// heuristic behaves exactly as it does today - the run-199 pattern, where the heal window opens on the
+// button alone when health cannot be read, rather than silently doing nothing.
+int g_offWeapon = -1;
+
+static uintptr_t FindPlayerPawn();    // defined just below; cached, not a walk
+
+enum ArmedState { ARMED_UNKNOWN = 0, ARMED_YES, ARMED_NO };
+
+static ArmedState PlayerArmed() {
+    if (g_offWeapon < 0) return ARMED_UNKNOWN;
+    const uintptr_t pawn = FindPlayerPawn();
+    if (!pawn) return ARMED_UNKNOWN;
+    if (!Readable((void*)(pawn + g_offWeapon), sizeof(uintptr_t))) return ARMED_UNKNOWN;
+    const uintptr_t w = *reinterpret_cast<const uintptr_t*>(pawn + g_offWeapon);
+    return w ? ARMED_YES : ARMED_NO;
+}
 uintptr_t g_playerPawn = 0, g_playerPawnClass = 0;
 void ResolveGameplayOffsets();          // retryable; see its definition below SolvePropertyLayout
 // Consecutive failed resolve attempts, for the backoff. Cleared the moment everything resolves.
@@ -2009,6 +2051,16 @@ void ResolveGameplayOffsets() {
         int dh = 0, dm = 0;
         g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
         g_offHealthMax = PropOffsetInChain(pc, "HealthMax", &dm);
+        // ⭐ run 227: same super-chain walk. Engine.Pawn declares Weapon, well above RvPlayerPawnSP.
+        {
+            int dw = 0;
+            g_offWeapon = PropOffsetInChain(pc, "Weapon", &dw);
+            Log("    Pawn.Weapon +0x%03X (depth %d)%s", g_offWeapon, dw,
+                g_offWeapon < 0 ? "  - NOT FOUND: the mesh latch keeps using its heuristics, which is"
+                                  " what it did before this existed"
+                                : "  - the mesh latch can now ASK whether a weapon is equipped instead"
+                                  " of inferring it from the pass");
+        }
         // Run 201, read only. Same super-chain walk - both are declared on Engine.Pawn.
         {
             int db = 0, de = 0;
@@ -11334,6 +11386,24 @@ void UpdateFgLatch() {
     const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
     const LONG gun  = InterlockedCompareExchange(&g_gunVerts, 0, 0);
     const LONG arms = InterlockedCompareExchange(&g_armsVerts, 0, 0);
+
+    // ---- ⭐ run 227: the engine's answer outranks every heuristic below ----
+    //
+    // UNKNOWN leaves everything exactly as it was; only a definite NO acts. Dropping rather than merely
+    // refusing matters because the bad latch may already be held - which is what happens when a save
+    // loads straight into a scene with no weapon.
+    const ArmedState armed = PlayerArmed();
+    if (armed == ARMED_NO) {
+        if (gun || arms) {
+            InterlockedExchange(&g_gunVerts, 0);
+            InterlockedExchange(&g_armsVerts, 0);
+            InterlockedExchange(&g_fgBaseCount, 0);
+            Log("mesh latch: the pawn has NO WEAPON equipped - dropping the latch. Nothing in the"
+                " first-person pass is a gun right now, so nothing is moved and nothing is hidden."
+                " (run 227)");
+        }
+        return;                                   // and take no new latch while unarmed
+    }
 
     if (gun && arms) {
         if (n == 0) return;                       // nothing being drawn: no evidence either way
