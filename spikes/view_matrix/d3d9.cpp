@@ -10984,6 +10984,11 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     // The heal and melee animations are the arms' legitimate appearances - see g_healArmsMs and
     // g_meleeArmsMs.
     if (ArmsAnimActive()) return false;
+    // ⭐ run 228: and so is EVERYTHING, when the pawn has no weapon equipped. With nothing in the pass
+    // being a gun, every mesh in it is the player's own hands and whatever is on them - a rope, a
+    // device, a scripted prop - and hiding any of it is hiding the thing you are meant to look at.
+    // The engine is asked directly; UNKNOWN keeps the old behaviour. See PlayerArmed.
+    if (PlayerArmed() == ARMED_NO) return false;
     // ⭐ run 215: the window is checked ONLY on a match, so the common case - a world draw whose count
     // matches nothing - still costs exactly what it did before.
     const LONG a = Rd(g_armsVerts);
@@ -11230,7 +11235,11 @@ static bool FgRidesGun(UINT verts) {
     if (!g) return false;                            // not latched yet - see above
     if ((UINT)g == verts) return false;              // the gun itself, already moved by FgMoved
     const LONG a = Rd(g_armsVerts);
-    if (a && (UINT)a == verts) return false;         // the arms are hidden, not moved
+    // ⭐ run 228: normally the arms are hidden rather than moved, so they must not ride. With NO WEAPON
+    // equipped nothing is hidden, and the mesh in the arms role is something on the player's hands -
+    // the rope in the reported scene. It has to ride, or it stays at the engine's position while the
+    // hands it is tied to move to the controller.
+    if (a && (UINT)a == verts && PlayerArmed() != ARMED_NO) return false;
     InterlockedIncrement(&g_fgRodeDraws);
     RodeLearn(verts);
     return true;
@@ -11387,22 +11396,33 @@ void UpdateFgLatch() {
     const LONG gun  = InterlockedCompareExchange(&g_gunVerts, 0, 0);
     const LONG arms = InterlockedCompareExchange(&g_armsVerts, 0, 0);
 
-    // ---- ⭐ run 227: the engine's answer outranks every heuristic below ----
+    // ---- ⭐ run 228: the engine's answer, used to change what HIDING means rather than to drop ----
     //
-    // UNKNOWN leaves everything exactly as it was; only a definite NO acts. Dropping rather than merely
-    // refusing matters because the bad latch may already be held - which is what happens when a save
-    // loads straight into a scene with no weapon.
+    // Run 227 dropped the latch when the pawn had no weapon. That fixed the rope by leaving everything
+    // where the engine put it - and it also detached the player's hands from the controller, which is
+    // not what was wanted. Reported: the arms on the controller in that scene are FINE; the rope should
+    // simply come with them.
+    //
+    // So the latch stays. What changes is that with no weapon equipped, NOTHING IS HIDDEN - see
+    // FgHidden - and everything else in the pass rides the same transform, so the rope follows the
+    // hands it is tied to instead of being left behind at the engine's position.
+    //
+    // The transition is where the latch does need dropping: a latch taken while unarmed has the ARMS in
+    // the gun role, and the moment a real weapon appears that is the run-207 role shift. Dropping on
+    // the unarmed -> armed edge means each state gets a latch taken under its own conditions.
     const ArmedState armed = PlayerArmed();
-    if (armed == ARMED_NO) {
-        if (gun || arms) {
+    {
+        static ArmedState prev = ARMED_UNKNOWN;
+        if (prev == ARMED_NO && armed == ARMED_YES && (gun || arms)) {
             InterlockedExchange(&g_gunVerts, 0);
             InterlockedExchange(&g_armsVerts, 0);
             InterlockedExchange(&g_fgBaseCount, 0);
-            Log("mesh latch: the pawn has NO WEAPON equipped - dropping the latch. Nothing in the"
-                " first-person pass is a gun right now, so nothing is moved and nothing is hidden."
-                " (run 227)");
+            Log("mesh latch: a weapon has been equipped - dropping the unarmed latch so the roles are"
+                " taken again with a real gun in the pass (run 228)");
+            prev = armed;
+            return;
         }
-        return;                                   // and take no new latch while unarmed
+        if (armed != ARMED_UNKNOWN) prev = armed;
     }
 
     if (gun && arms) {
