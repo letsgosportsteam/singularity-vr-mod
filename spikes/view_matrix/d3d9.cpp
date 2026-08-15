@@ -1150,6 +1150,15 @@ volatile LONG g_handDevRollUU = 0;
 // far below both the controller's own noise floor and anything an eye can resolve.
 const float kHandFixed = 1000.0f;      // milli-UU per UU
 volatile LONG g_handOffX = 0, g_handOffY = 0, g_handOffZ = 0;   // hand minus head, world MILLI-UU
+
+// ---- ⭐ run 237: the OFF hand, for the TMD ----
+//
+// Identical quantities to the aim hand's, for the other controller. Computed by the same code with a
+// hand index rather than by a second copy of the maths - two derivations of one physical quantity is
+// how this file got the run-113 sign bug and the run-190 truncation, and neither was found by reading.
+volatile LONG g_offHandOffX = 0, g_offHandOffY = 0, g_offHandOffZ = 0;
+volatile LONG g_offHandDevYawUU = 0, g_offHandDevPitchUU = 0, g_offHandDevRollUU = 0;
+volatile LONG g_offHandValid = 0;
 volatile LONG g_fireDepth = 0;
 volatile LONG g_fireSeq = 0;
 
@@ -2637,6 +2646,14 @@ const float kMetresToUU = 52.5f;
 // 100 is not a guess: 16 units per foot is UE3's documented scale and 52.5 UU/m follows from it exactly.
 // The default should stay 100 unless the headset says otherwise.
 volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DISPLAY panel row
+
+// ⭐ run 237: the TMD's anchor on the OFF hand. Declared HERE, well above BuildTmdC which uses them,
+// because the panel and the ini loader read them and both are earlier in this single translation unit.
+// Placing a global next to the function that computes with it is the natural instinct and it does not
+// compile; this file has paid for that twice (the laser and the gun-align blocks, run 217).
+volatile LONG g_tmdFwd = 30, g_tmdRight = -9, g_tmdUp = -13;
+volatile LONG g_tmdYawTenths = 0, g_tmdPitchTenths = 0;
+volatile LONG g_tmdOnOffHand = 1;      // ini [Input] TmdOnOffHand - the whole feature's off switch
 
 // ---- ⭐ run 230: the note is a full-screen 2D panel, and a headset FOV is not a monitor ----
 //
@@ -5552,6 +5569,8 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        // ⭐ run 217: the laser and the per-weapon alignment rows.
        PR_LASER, PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH,
        PR_NOTESIZE,          // ⭐ run 230
+       PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
+       PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -5570,11 +5589,11 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // ⭐ run 217: WEAPON is its own page because it is the only one whose rows are PER WEAPON - the values
 // on it change meaning when you switch guns, and mixing that with global settings on a shared page is
 // how someone tunes the rifle and wonders why the pistol moved.
-const int kPanelPages    = 6;
+const int kPanelPages    = 7;      // ⭐ run 237: + TMD ALIGN
 const int kPanelRowsMax  = 8;
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
-      PR_GOTO_WEAPON },
+      PR_GOTO_WEAPON, PR_GOTO_TMD },
     { PR_TURNMODE, PR_TURNSPEED, PR_SNAPANGLE, PR_TURNDIR, PR_MOVEDIR, PR_SWAPSTICKS,
       PR_LEFTHAND, PR_BACK },
     { PR_CINESTICK, PR_CINECAM, PR_BACK },
@@ -5598,9 +5617,12 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // test run and it was mine.
     { PR_OCCLUSION, PR_WEAPONFX, PR_AIMPARTS, PR_DEBUG, PR_BACK },
     { PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH, PR_BACK },
+    // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
+    // change meaning when you switch guns; these are one object held one way, always the same.
+    { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 7, 8, 3, 6, 5, 7 };   // ⭐ run 230: DISPLAY 5 -> 6
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 7 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5608,9 +5630,9 @@ const int kPageCount[kPanelPages] = { 7, 8, 3, 6, 5, 7 };   // ⭐ run 230: DISP
 // raiser, so forgetting to update one of these costs a resize rather than text spilling off the
 // plate. The widest strings are "AIM METHOD MOTION CONTROLLER" and "MOVE DIRECTION HAND (NO
 // TRACKING)", which is why those two pages are the broad ones.
-const int kPageCols[kPanelPages] = { 34, 35, 30, 33, 28, 30 };   // ⭐ run 230: DISPLAY 28 -> 33 for "NOTE SIZE      100% (FULL SCREEN)"
+const int kPageCols[kPanelPages] = { 34, 35, 30, 33, 28, 30, 30 };   // ⭐ run 230: DISPLAY 28 -> 33 for "NOTE SIZE      100% (FULL SCREEN)"
 const char* kPageName[kPanelPages] = { "VR SETTINGS", "CONTROLLER", "COMFORT", "DISPLAY",
-                                       "ADVANCED", "WEAPON ALIGN" };
+                                       "ADVANCED", "WEAPON ALIGN", "TMD ALIGN" };
 
 int g_panelPage = 0;
 inline int PanelRowCount() { return kPageCount[g_panelPage]; }
@@ -5772,6 +5794,22 @@ void PanelSaveRow(int rowId, const char* path) {
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
                         InterlockedCompareExchange(&g_noteInsetPct, 0, 0));
             WritePrivateProfileStringA("Render", "NoteInsetPct", v, path); return;
+        // ⭐ run 237: ONE case writes the whole TMD block, so no row can be adjustable and persist
+        // nowhere - the defect PanelSaveRow was restructured to prevent.
+        case PR_TMDON: {
+            const struct { const char* k; volatile LONG* p; } tm[] = {
+                { "TmdOnOffHand", &g_tmdOnOffHand }, { "TmdFwd", &g_tmdFwd },
+                { "TmdRight", &g_tmdRight }, { "TmdUp", &g_tmdUp },
+                { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
+            };
+            for (int i = 0; i < 6; ++i) {
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
+                WritePrivateProfileStringA("Input", tm[i].k, v, path);
+            }
+            return;
+        }
+        case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
+        case PR_TMDYAW: case PR_TMDPITCH: return;   // written by PR_TMDON above
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
             // survives a relaunch is a state somebody meets tomorrow as a bug report - with the
@@ -5922,6 +5960,17 @@ void PanelRowText(int row, char* out, size_t cap) {
                         InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? "HIDDEN" : "SHOWN");
             break;
         }
+        case PR_TMDON:
+            _snprintf_s(out, cap, _TRUNCATE, "TMD ON OFF HAND  %s", Rd(g_tmdOnOffHand) ? "ON" : "OFF");
+            break;
+        case PR_TMDFWD:   _snprintf_s(out, cap, _TRUNCATE, "TMD FWD     %ld", Rd(g_tmdFwd));   break;
+        case PR_TMDRIGHT: _snprintf_s(out, cap, _TRUNCATE, "TMD RIGHT   %ld", Rd(g_tmdRight)); break;
+        case PR_TMDUP:    _snprintf_s(out, cap, _TRUNCATE, "TMD UP      %ld", Rd(g_tmdUp));    break;
+        case PR_TMDYAW:
+            _snprintf_s(out, cap, _TRUNCATE, "TMD YAW    %+.1f", Rd(g_tmdYawTenths) / 10.0f);   break;
+        case PR_TMDPITCH:
+            _snprintf_s(out, cap, _TRUNCATE, "TMD PITCH  %+.1f", Rd(g_tmdPitchTenths) / 10.0f); break;
+        case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
         case PR_NOTESIZE: {
             const LONG p = InterlockedCompareExchange(&g_noteInsetPct, 0, 0);
             if (p == 100) _snprintf_s(out, cap, _TRUNCATE, "NOTE SIZE      100%% (FULL SCREEN)");
@@ -6080,6 +6129,27 @@ void PanelAdjust(int row, int dir) {
             InterlockedExchange(&g_hideMuzzleFx,
                                 InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? 0 : 1);
             break;
+        case PR_TMDON:
+            InterlockedExchange(&g_tmdOnOffHand, Rd(g_tmdOnOffHand) ? 0 : 1);
+            break;
+        case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP: {
+            // 1 UU a press, like the gun anchor. 1 UU is about 1.9 cm - the finest step worth a press.
+            volatile LONG* t = row == PR_TMDFWD ? &g_tmdFwd
+                             : row == PR_TMDRIGHT ? &g_tmdRight : &g_tmdUp;
+            LONG v = Rd(*t) + dir;
+            if (v < -60) v = -60;
+            if (v >  60) v =  60;
+            InterlockedExchange(t, v);
+            break;
+        }
+        case PR_TMDYAW: case PR_TMDPITCH: {
+            volatile LONG* t = row == PR_TMDYAW ? &g_tmdYawTenths : &g_tmdPitchTenths;
+            LONG v = Rd(*t) + dir;
+            if (v < -900) v = -900;
+            if (v >  900) v =  900;
+            InterlockedExchange(t, v);
+            break;
+        }
         case PR_NOTESIZE: {
             // Same 5%-a-press step as WORLD SCALE. There is a floor rather than 0 because a note you
             // cannot read for being too small is the same bug reported from the other side.
@@ -6139,6 +6209,7 @@ void PanelAdjust(int row, int dir) {
         case PR_GOTO_DISPLAY: g_panelPage = 3; g_panelRow = 0; return;
         case PR_GOTO_ADV:     g_panelPage = 4; g_panelRow = 0; return;
         case PR_GOTO_WEAPON:  g_panelPage = 5; g_panelRow = 0; return;
+        case PR_GOTO_TMD:     g_panelPage = 6; g_panelRow = 0; return;   // ⭐ run 237
         case PR_LASER:
             InterlockedExchange(&g_laserOn,
                                 InterlockedCompareExchange(&g_laserOn, 0, 0) ? 0 : 1);
@@ -6455,6 +6526,18 @@ bool InitXRInput() {
                 GetPrivateProfileIntA("Input", "CutsceneStickTurn", 2, path) & 3);
             InterlockedExchange(&g_cutsceneLockCamera,
                 GetPrivateProfileIntA("Input", "CutsceneLockCamera", 0, path) ? 1 : 0);
+    // ⭐ run 237: the TMD's own anchor. Defaults mirror the gun's sideways offset; tune by looking.
+    InterlockedExchange(&g_tmdOnOffHand,  GetPrivateProfileIntA("Input", "TmdOnOffHand", 1, path) ? 1 : 0);
+    InterlockedExchange(&g_tmdFwd,        GetPrivateProfileIntA("Input", "TmdFwd",   30, path));
+    InterlockedExchange(&g_tmdRight,      GetPrivateProfileIntA("Input", "TmdRight", -9, path));
+    InterlockedExchange(&g_tmdUp,         GetPrivateProfileIntA("Input", "TmdUp",   -13, path));
+    InterlockedExchange(&g_tmdYawTenths,  GetPrivateProfileIntA("Input", "TmdYawTenths",   0, path));
+    InterlockedExchange(&g_tmdPitchTenths,GetPrivateProfileIntA("Input", "TmdPitchTenths", 0, path));
+    Log("ini: TmdOnOffHand=%ld (the TMD and the hand holding it ride the OFF controller while"
+        " mPlayerHandsStatus says it is raised) anchor F%ld R%ld U%ld, trim yaw %+.1f pitch %+.1f."
+        " Panel: TMD ALIGN.",
+        Rd(g_tmdOnOffHand), Rd(g_tmdFwd), Rd(g_tmdRight), Rd(g_tmdUp),
+        Rd(g_tmdYawTenths) / 10.0f, Rd(g_tmdPitchTenths) / 10.0f);
             // Read BEFORE the binding table is built below - that is the whole reason this one is
             // not on the panel.
             g_leftHanded = g_leftHandedPending =
@@ -7958,7 +8041,42 @@ void UpdateFromHeadset(IDirect3DDevice9* gameDev) {
                 InterlockedExchange(&g_handOffZ, (LONG)lroundf(hy * MetresToUU() * kHandFixed));
             }
             InterlockedExchange(&g_handDevValid, 1);
+        }
+        // ---- ⭐ run 237: the same six quantities for the OFF hand, for the TMD ----
+        //
+        // Deliberately a repeat of the block above rather than a call into it: that block also writes
+        // the AIM state that the bullet path depends on, and threading a hand index through it would
+        // put the shot at risk to serve a cosmetic feature. The duplication is bounded and this comment
+        // is the pointer between them - if the sign convention above ever changes, it changes here too.
+        if (g_handPoseValid[OffHand()]) {
+            float ovy = g_handYawRad[OffHand()] - yawRad;
+            while (ovy >  3.14159265f) ovy -= 6.2831853f;
+            while (ovy < -3.14159265f) ovy += 6.2831853f;
+            const float ovp = g_handPitchRad[OffHand()] - pitchRad;
+            float ovr = g_handRollRad[OffHand()] - g_headRollRad;
+            while (ovr >  3.14159265f) ovr -= 6.2831853f;
+            while (ovr < -3.14159265f) ovr += 6.2831853f;
+            InterlockedExchange(&g_offHandDevYawUU,   (LONG)(g_yawSign   * ovy * kRadToUU));
+            InterlockedExchange(&g_offHandDevPitchUU, (LONG)(g_pitchSign * ovp * kRadToUU));
+            InterlockedExchange(&g_offHandDevRollUU,  (LONG)(ovr * kRadToUU));
+            const float ox = g_handLastPos[OffHand()].x - g_headPosXR[0];
+            const float oy = g_handLastPos[OffHand()].y - g_headPosXR[1];
+            const float oz = g_handLastPos[OffHand()].z - g_headPosXR[2];
+            const float osc = sinf(g_centreYaw), occ = cosf(g_centreYaw);
+            const float ofwd   = -(ox * osc) - (oz * occ);
+            const float oright =  (ox * occ) - (oz * osc);
+            const float obyr = g_baseYaw * (6.2831853f / 65536.0f);
+            const float obc = cosf(obyr), obs = sinf(obyr);
+            InterlockedExchange(&g_offHandOffX,
+                (LONG)lroundf((obc * ofwd - obs * oright) * MetresToUU() * kHandFixed));
+            InterlockedExchange(&g_offHandOffY,
+                (LONG)lroundf((obs * ofwd + obc * oright) * MetresToUU() * kHandFixed));
+            InterlockedExchange(&g_offHandOffZ, (LONG)lroundf(oy * MetresToUU() * kHandFixed));
+            InterlockedExchange(&g_offHandValid, 1);
         } else {
+            InterlockedExchange(&g_offHandValid, 0);
+        }
+        if (!g_handPoseValid[AimHand()]) {
             // No hand, no deviation. Falling back to zero means the shot goes where you look,
             // which is the pre-mod behaviour rather than a stale direction from wherever the
             // controller was last seen.
@@ -9210,7 +9328,8 @@ HRESULT StereoPairBody(IDirect3DDevice9* dev, DrawFn&& draw) {
                 // spaces. The moment a pivot was introduced the space started to matter, and this
                 // file has recorded which space it is since the matrix scan probed
                 // "origin(translated-world)" as a candidate point.
-                float C[4][4]; BuildGunC(C);
+                float C[4][4];
+                if (g_thisDrawMoved == 2) BuildTmdC(C); else BuildGunC(C);   // ⭐ run 237
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
             }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
@@ -9233,7 +9352,8 @@ HRESULT StereoPairBody(IDirect3DDevice9* dev, DrawFn&& draw) {
                 // Pivot on the camera: the gun hangs off the view, so turning it about the eye is
                 // what makes it point where the controller points. Pivoting on the world origin
                 // would fling it across the level.
-                float C[4][4]; BuildGunC(C);
+                float C[4][4];
+                if (g_thisDrawMoved == 2) BuildTmdC(C); else BuildGunC(C);   // ⭐ run 237
                 ApplyWorldMatrix(reinterpret_cast<Reg4*>(mat), cs.conv, C);
             }
             g_origSetVSConstF(dev, cs.reg, mat, 4);
@@ -9260,9 +9380,10 @@ extern volatile LONG g_frameDrawIdx;
 extern volatile LONG g_inForeground, g_hideMeshIdx, g_fgDrawCount;
 // Defined with the foreground-mesh code. StereoPair reads it; the non-indexed draw hook above sets
 // it as of run 181, and that hook comes before the definition.
-extern bool g_thisDrawMoved;
+extern int g_thisDrawMoved;   // ⭐ run 237: 0 none, 1 gun hand, 2 off hand
 static bool FgHidden(UINT verts);
 static bool FgRidesGun(UINT verts);
+static int  RideTargetFor(UINT verts);   // ⭐ run 237: 0 none, 1 gun hand, 2 off hand
 static bool FgHideWholePass();
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 void LogFgList(const char* why);      // run 213: the scope census dumps the mesh list alongside itself
@@ -10327,9 +10448,9 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
     // Run 181: this path could not move anything at all before - g_thisDrawMoved was only ever set
     // in the indexed hook. Zero for the vertex count because a non-indexed draw does not report one;
     // see FgRidesGun for why that is the right thing to pass rather than a gap.
-    g_thisDrawMoved = FgRidesGun(0);
+    g_thisDrawMoved = RideTargetFor(0);   // ⭐ run 237
     const HRESULT phr = StereoPair(dev, [&] { return g_origDrawPrim(dev, t, start, count); });
-    g_thisDrawMoved = false;
+    g_thisDrawMoved = 0;
     return phr;
 }
 // ================= ⭐ run 114: find the FOREGROUND pass =======================================
@@ -10396,7 +10517,8 @@ volatile LONG g_hideMeshIdx = 0;       // 0 none, 1..3 index into the learned si
 // (about 57 cm) so a success is unmistakable and no controller maths can be blamed for a failure.
 // The controller pose replaces the constant only once this is proven.
 volatile LONG g_fgMoveOn = 0;          // APPS selects a mesh; this says move it rather than hide it
-bool g_thisDrawMoved = false;          // set per draw on the render thread, read inside StereoPair
+// ⭐ run 237: 0 = not moved, 1 = the gun hand, 2 = the OFF hand (the TMD).
+int g_thisDrawMoved = 0;               // set per draw on the render thread, read inside StereoPair
 volatile LONG g_fgDrawCount = 0;       // how many draws landed in the pass this frame
 
 // ---- ⭐ run 181: the weapon EFFECTS were never moved, only the weapon MESH ----
@@ -11245,6 +11367,72 @@ static void GunPivotWorld(float H[3]) {
     }
 }
 
+// ---- ⭐ run 237: the TMD rides the OFF hand ----
+//
+// The whole feature, and it is small because everything it needs already exists. `mPlayerHandsStatus`
+// (run 236) says when the TMD is up; the gun transform already knows how to put a first-person mesh on
+// a controller; run 237's first half computes the same pose for the other hand. This just points one
+// at the other.
+//
+// Its own anchor rather than the gun's mirrored, because it is a different object held a different
+// way - a gauntlet strapped to a forearm, not a weapon gripped and aimed. Defaults mirror the gun's
+// sideways offset as a starting point and are meant to be tuned by looking, like every other anchor
+// here. Panel: TMD ALIGN.
+
+static void TmdAnchorWorld(float G[3]) {
+    const float kUUToRad = 6.2831853f / 65536.0f;
+    const float y = g_wantYaw   * kUUToRad;
+    const float p = g_wantPitch * kUUToRad;
+    const float cy = cosf(y), sy = sinf(y), cp = cosf(p), sp = sinf(p);
+    const float F[3] = {  cp * cy,  cp * sy, sp };
+    const float R[3] = { -sy,       cy,      0.0f };
+    const float U[3] = { -sp * cy, -sp * sy, cp };
+    const float af = (float)Rd(g_tmdFwd), ar = (float)Rd(g_tmdRight), au = (float)Rd(g_tmdUp);
+    for (int i = 0; i < 3; ++i) G[i] = af * F[i] + ar * R[i] + au * U[i];
+}
+
+// The off-hand twin of BuildGunC. Same shape, same sign conventions, off-hand inputs.
+// ⚠ The run-201 head-offset correction is applied here too. Without it the TMD would sit at
+// `engine eye + H` while you view from `engine eye + hmdOffset`, and would slide against the view as
+// you lean - the same defect, and it would read as "the TMD drifts" rather than as a missing term.
+static void BuildTmdC(float C[4][4]) {
+    float G[3]; TmdAnchorWorld(G);
+    float H[3] = { G[0], G[1], G[2] };
+    if (g_gunFollowPos) {
+        H[0] = (float)Rd(g_offHandOffX) / kHandFixed;
+        H[1] = (float)Rd(g_offHandOffY) / kHandFixed;
+        H[2] = (float)(g_gunSignPosZ * Rd(g_offHandOffZ)) / kHandFixed;
+    }
+    if (g_gunHeadOffset) {
+        H[0] += g_hmdOffset[0]; H[1] += g_hmdOffset[1]; H[2] += g_hmdOffset[2];
+    }
+    int sy, sp, sr; GunSigns(sy, sp, sr);
+    const int32_t trimYaw   = (int32_t)(Rd(g_tmdYawTenths)   * 18.2044f);
+    const int32_t trimPitch = (int32_t)(Rd(g_tmdPitchTenths) * 18.2044f);
+    BuildGunTransform(C, G,
+        (int32_t)(sy * Rd(g_offHandDevYawUU))   + trimYaw,
+        (int32_t)(sp * Rd(g_offHandDevPitchUU)) + trimPitch,
+        (int32_t)(sr * Rd(g_offHandDevRollUU)),
+        GunViewFrame() ? g_wantYaw : 0,
+        H[0] - G[0], H[1] - G[1], H[2] - G[2]);
+}
+
+// 0 = leave it where the engine put it, 1 = the gun hand, 2 = the OFF hand.
+// Split from FgRidesGun rather than folded into it: that function is the one every draw in the pass
+// runs through and it has been the site of three separate regressions, so the new behaviour rides on
+// top of its answer instead of editing its conditions.
+static int RideTargetFor(UINT verts);
+
+static int RideTargetFor(UINT verts) {
+    if (!FgRidesGun(verts)) return 0;
+    // ⚠ The OFF-HAND pose has to be VALID, not just "the TMD is up". With one controller lost to
+    // tracking the alternative is not "slightly wrong" - it is the whole TMD assembly pinned at a stale
+    // position while your hand is somewhere else. Falling back to the gun hand keeps it attached to a
+    // hand that is actually tracked, which is wrong but not broken.
+    if (Rd(g_tmdOnOffHand) && TmdRaised() && Rd(g_offHandValid)) return 2;
+    return 1;
+}
+
 static void BuildGunC(float C[4][4]) {
     float G[3]; GunAnchorWorld(G);
 
@@ -11512,6 +11700,12 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
         // that hides the thing you are meant to be looking at. The fragment below is a separate
         // question and keeps its own answer.
         if (PlayerArmed() == ARMED_NO) return false;
+        // ⭐ run 237: with the TMD raised the arms mesh is not "the arms holding a gun we are
+        // replacing with a controller" - it is the LEFT HAND holding the TMD, and it is the thing you
+        // are meant to be looking at. Same shape of exemption as the unarmed case above, same reason:
+        // hiding it hides the subject. Run 234 measured that the right arm is animated out of view in
+        // this state, so showing the mesh shows one hand, not two.
+        if (Rd(g_tmdOnOffHand) && TmdRaised()) return false;
         return FgMatchWindow();
     }
     // ⭐ run 199: the leftover hand/arm fragment - the 390-vertex mesh. Checked before the stray rule
@@ -11779,7 +11973,10 @@ static bool FgRidesGun(UINT verts) {
     // equipped nothing is hidden, and the mesh in the arms role is something on the player's hands -
     // the rope in the reported scene. It has to ride, or it stays at the engine's position while the
     // hands it is tied to move to the controller.
-    if (a && (UINT)a == verts && PlayerArmed() != ARMED_NO) return false;
+    // ⭐ run 237: ...and with the TMD raised they must RIDE, for the same reason they are no longer
+    // hidden. RideTargetFor sends them to the off hand rather than the gun hand.
+    if (a && (UINT)a == verts && PlayerArmed() != ARMED_NO &&
+        !(Rd(g_tmdOnOffHand) && TmdRaised())) return false;
     InterlockedIncrement(&g_fgRodeDraws);
     RodeLearn(verts);
     return true;
@@ -12296,7 +12493,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     if (isGun) { AdsCapture(dev); AdsFreeze(dev); AdsMask(dev); }   // ⭐ run 223: freeze before StereoPair: it only
                                                      // rewrites the camera slots, so the bones persist
                                                      // across both eye draws
-    g_thisDrawMoved = isGun || FgRidesGun(numVertices);
+    g_thisDrawMoved = isGun ? 1 : RideTargetFor(numVertices);   // ⭐ run 237
     if (g_timeOurWork) {
         const double dm = MsSince(tMatch);
         g_msMeshMatch += dm;
@@ -12305,7 +12502,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     const HRESULT dhr = StereoPair(dev, [&] {
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
     });
-    g_thisDrawMoved = false;
+    g_thisDrawMoved = 0;
     return dhr;
 }
 
