@@ -5238,9 +5238,14 @@ GunAlignSlot g_gunAlign[kGunAlignMax]{};
 //   8297   shotgun         F30 R10 U-13   yaw +3.0  pitch  0.0   (run 225)
 //   5799   pistol          F30 R9  U-13   yaw +1.0  pitch  0.0   (run 225)
 //
-// The sniper (11389) is deliberately absent: it aims through its own scope, so the laser it would be
-// aligned against is switched off and there is nothing to tune it with. It stays on the global anchor
-// until there is a way to judge it.
+// ⛔ SUPERSEDED: "the sniper cannot be tuned because the laser is off behind its scope" was wrong,
+// and it was wrong about the INSTRUMENT rather than the weapon. The laser is not the only thing you
+// can align a barrel against - the scope has a reticle of its own, and run 214 had already measured
+// that scoped aim tracks that reticle. Aligning against it is the same judgement by eye, through a
+// different lens. The value below was tuned in a headset that way.
+//
+// The reasoning error is the one this project keeps making: a premise about a tool was carried
+// forward as a fact about the problem. Nothing about the sniper made it untunable.
 //
 // An ini slot for the same weapon OVERRIDES this - see the loader. So tuning your own copy still wins,
 // and these are a starting point rather than a ceiling.
@@ -5248,6 +5253,7 @@ const GunAlignSlot kGunAlignDefaults[] = {
     { 11387, 26,  8, -13,  30, -28 },   // assault rifle
     {  8297, 30, 10, -13,  30,   0 },   // shotgun
     {  5799, 30,  9, -13,  10,   0 },   // pistol
+    { 11389, 30, 13, -13,  43,   0 },   // sniper - tuned against its own scope reticle
 };
 const int kGunAlignDefaultCount = (int)(sizeof(kGunAlignDefaults) / sizeof(kGunAlignDefaults[0]));
 

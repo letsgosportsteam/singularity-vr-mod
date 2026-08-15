@@ -24,6 +24,30 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 230b: the sniper was tunable all along, against the wrong instrument
+
+All four weapons now ship aligned. The sniper (11389) sat untuned behind a note in the code claiming
+it *could not* be tuned - "it aims through its own scope, so the laser is off and there is nothing to
+align it against."
+
+That was wrong about the **instrument**, not the weapon. The laser is not the only reference a barrel
+can be aligned against: the scope has a reticle, and **run 214 had already measured that scoped aim
+tracks that reticle**. Aligning against it is the same judgement by eye through a different lens. The
+shipped values were tuned in a headset exactly that way.
+
+`{ 11389, 30, 13, -13, 43, 0 }`, promoted from a working ini where it had been sitting untracked.
+
+### Method note
+
+- **A limitation of the tool was carried forward as a property of the problem.** "The laser is off
+  there" is true and says nothing about whether the sniper can be aligned - but written down beside
+  the defaults it read as a closed question for several runs, and it closed nothing.
+- **Tuning that lives only in a working ini is not shipped.** Three of the four slots matched the
+  built-in defaults exactly; the fourth was real work that no fresh install would ever have seen.
+  ⭐ When a value is tuned in a headset, promote it the same day or it is invisible.
+
+---
+
 ## ⭐ Runs 229-230: the notes, and a diagnostic that expired before the thing it measured
 
 **Reported:** an in-game note "spans across the whole screen so is very hard to read". **Fixed and
