@@ -11171,16 +11171,42 @@ static void FgSoloStep() {
     const LONG n = Rd(g_fgStableCount);
     if (n <= 0) return;                          // an empty pass: hold the current target
     static DWORD nextAt = 0;
-    static LONG  idx = -1;
     const DWORD now = GetTickCount();
     if (nextAt && now < nextAt) return;
     nextAt = now + (DWORD)ms;
-    idx = (idx + 1) % n;
-    const LONG v = Rd(g_fgStableVerts[idx]);
-    InterlockedExchange(&g_fgSoloVerts, v);
-    Log("fg solo: showing ONLY %ld verts (entry %ld of %ld) - everything else in the first-person"
-        " pass is hidden. Say WHAT YOU SEE and in what order; this log supplies the counts. (run 233)",
-        v, idx + 1, n);
+
+    // ---- 💥 run 233b: step by SIZE, never by array position ----
+    //
+    // The first version advanced an index into g_fgStableVerts. That list is rebuilt in DRAW ORDER
+    // every frame and draw order shuffles - run 231's censuses show the same meshes in four different
+    // orders - so the index walked a moving list: meshes repeated, meshes were skipped, and "entry 3
+    // of 10" named a different mesh each time it printed. The wearer's report was fine; the log
+    // underneath it was not, which is the worse of the two failures because it looks authoritative.
+    //
+    // Sorting descending makes the walk depend only on the SET, not on the order it arrived in, so a
+    // steady pass gives the same cycle every time round.
+    LONG v[kFgSigMax]; LONG m2 = 0;
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i) v[m2++] = Rd(g_fgStableVerts[i]);
+    for (LONG i = 1; i < m2; ++i)
+        for (LONG j = i; j > 0 && v[j - 1] < v[j]; --j) {
+            const LONG t2 = v[j]; v[j] = v[j - 1]; v[j - 1] = t2;
+        }
+    const LONG cur = Rd(g_fgSoloVerts);
+    LONG pick = v[0], at = 1;
+    for (LONG i = 0; i < m2; ++i)
+        if (v[i] == cur) { pick = v[(i + 1) % m2]; at = ((i + 1) % m2) + 1; break; }
+    InterlockedExchange(&g_fgSoloVerts, pick);
+
+    char b3[640]; int o3 = 0;
+    for (LONG i = 0; i < m2; ++i) {
+        const int w = sprintf_s(b3 + o3, sizeof(b3) - o3, "%s%s%ld%s",
+                                i ? " " : "", v[i] == pick ? ">" : "", v[i], v[i] == pick ? "<" : "");
+        if (w <= 0) break;
+        o3 += w;
+    }
+    Log("fg solo: showing ONLY %ld verts (%ld of %ld by size) - everything else in the first-person"
+        " pass is hidden. Set: %s   Say WHAT YOU SEE and in what order. (run 233b)",
+        pick, at, m2, b3);
 }
 
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
