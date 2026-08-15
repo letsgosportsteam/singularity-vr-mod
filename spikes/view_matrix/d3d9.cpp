@@ -11145,7 +11145,51 @@ inline bool FgMatchWindow() {
     return false;
 }
 
+// ---- ⭐ run 233: SOLO CYCLING, to put a name to each mesh in the pass ----
+//
+// Run 232 widened the census and it named the sets, but a vertex count is not an identity. After the
+// TMD the constant core beside every weapon is 7444, 4818 and 37, and nothing in a list of numbers
+// says which of 7444 and 4818 is the LEFT arm - or whether either is a single arm at all rather than
+// both of them in one mesh. That distinction decides whether a two-handed mode is reachable, so it is
+// worth one run and no guessing.
+//
+// So: hide every first-person mesh except ONE, and step which one every FgSoloCycleMs. Each switch is
+// logged, so the wearer only has to describe what they saw and in what ORDER - the log supplies the
+// vertex counts and the two line up. One run names every mesh in the pass, not just the two in
+// question.
+//
+// ⚠ DIAGNOSTIC. Off unless FgSoloCycleMs > 0, and it deliberately hides things - it is not a mode to
+// leave switched on. It only ever touches the first-person pass; world geometry never reaches here.
+volatile LONG g_fgSoloCycleMs = 0;    // ini [Render] FgSoloCycleMs, 0 = off
+volatile LONG g_fgSoloVerts   = 0;    // the mesh currently shown alone, 0 = none chosen yet
+
+// Steps the solo target on a timer. Called once a frame from Present, never from a draw hook - the
+// list it walks is rebuilt there and stepping from a draw would pick a different entry per draw.
+static void FgSoloStep() {
+    const LONG ms = Rd(g_fgSoloCycleMs);
+    if (ms <= 0) { InterlockedExchange(&g_fgSoloVerts, 0); return; }
+    const LONG n = Rd(g_fgStableCount);
+    if (n <= 0) return;                          // an empty pass: hold the current target
+    static DWORD nextAt = 0;
+    static LONG  idx = -1;
+    const DWORD now = GetTickCount();
+    if (nextAt && now < nextAt) return;
+    nextAt = now + (DWORD)ms;
+    idx = (idx + 1) % n;
+    const LONG v = Rd(g_fgStableVerts[idx]);
+    InterlockedExchange(&g_fgSoloVerts, v);
+    Log("fg solo: showing ONLY %ld verts (entry %ld of %ld) - everything else in the first-person"
+        " pass is hidden. Say WHAT YOU SEE and in what order; this log supplies the counts. (run 233)",
+        v, idx + 1, n);
+}
+
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
+    // ⭐ run 233: solo overrides every rule below it, including the exemptions. That is the point -
+    // an exemption that let a second mesh through would make two meshes visible and the answer
+    // ambiguous, which is the one thing this measurement cannot afford.
+    if (const LONG solo = Rd(g_fgSoloVerts))
+        return (UINT)solo != verts && FgMatchWindow();
+
     const LONG m = Rd(g_hideMeshIdx);
     if (m != 2 && m != 3) return false;
     // ⭐ run 203: a "pass" this large is not the first-person pass, so there is nothing here worth
@@ -18740,6 +18784,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_uiPersp,  0);
             ReportXhairCensus();
             ReportFgRide();
+            FgSoloStep();      // ⭐ run 233: once a frame, never from a draw hook
             // Promote this frame's learned list to the stable one the matchers use, THEN clear the
             // learning list. The stable copy is therefore populated when the depth-prime draws
             // arrive at the start of the next frame - which is what makes hiding remove a mesh
@@ -19216,6 +19261,19 @@ void LoadIniSettings() {
                         " follows the controller then and a centre-screen reticle points somewhere"
                         " the shot is not going"
                       : "always hidden");
+
+    // ⭐ run 233. Solo-cycle the first-person pass: show one mesh at a time, this many ms each.
+    // DIAGNOSTIC - it hides things. 0 is off and is the shipping value.
+    {
+        LONG solo = GetPrivateProfileIntA("Render", "FgSoloCycleMs", 0, path);
+        if (solo && solo < 500)   solo = 500;      // below this you cannot name what you saw
+        if (solo > 20000)         solo = 20000;
+        InterlockedExchange(&g_fgSoloCycleMs, solo);
+        Log("ini: FgSoloCycleMs=%ld (%s)", solo,
+            solo ? "DIAGNOSTIC - every first-person mesh but one is HIDDEN, stepping to the next"
+                   " every interval. Describe what you see and in what order. Set to 0 when done."
+                 : "off - the pass is drawn normally");
+    }
 
     // ⭐ run 232. How many first-person pass changes to report before going quiet. 0 disables.
     g_fgCensusBudget = GetPrivateProfileIntA("Render", "FgCensusBudget", 400, path);
