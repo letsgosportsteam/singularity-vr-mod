@@ -11170,6 +11170,12 @@ static void FgSoloStep() {
     if (ms <= 0) { InterlockedExchange(&g_fgSoloVerts, 0); return; }
     const LONG n = Rd(g_fgStableCount);
     if (n <= 0) return;                          // an empty pass: hold the current target
+    // ⭐ run 233c: hold through CUTSCENES. Those passes carry whole character bodies - measured at
+    // 18 to 32 meshes, saturating even the widened census - against at most 12 for gameplay with a
+    // weapon and the TMD both up. Stepping through them would spend two minutes naming meshes nobody
+    // asked about and hand back a cycle position unrelated to the gameplay set. The threshold sits in
+    // the gap between the two measured populations rather than at either edge of it.
+    if (n > 14) return;
     static DWORD nextAt = 0;
     const DWORD now = GetTickCount();
     if (nextAt && now < nextAt) return;
@@ -11213,8 +11219,16 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     // ⭐ run 233: solo overrides every rule below it, including the exemptions. That is the point -
     // an exemption that let a second mesh through would make two meshes visible and the answer
     // ambiguous, which is the one thing this measurement cannot afford.
-    if (const LONG solo = Rd(g_fgSoloVerts))
+    //
+    // ⚠ run 233c: but NOT run 203's large-pass guard. The first version tested solo before it, so on
+    // a pass too big to be the first-person pass this did per-draw work on every one of thousands of
+    // draws - which is the exact case run 203 added that guard for after it cost 120 fps at the dock.
+    // A diagnostic is allowed to hide things; it is not allowed to reintroduce a fixed performance
+    // defect, and it would have fired on the very cutscene this run has to sit through.
+    if (const LONG solo = Rd(g_fgSoloVerts)) {
+        if (Rd(g_fgDrawCount) > kFgSanePass) return false;
         return (UINT)solo != verts && FgMatchWindow();
+    }
 
     const LONG m = Rd(g_hideMeshIdx);
     if (m != 2 && m != 3) return false;
