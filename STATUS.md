@@ -233,6 +233,15 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      registers rather than a new system.
    - Wants to be a panel setting (HUD inset / safe area), not a constant — how far in is
      comfortable depends on the headset's optics and the player's IPD.
+   - ⭐ **Run 230 built and shipped that mechanism for NOTES** (`NoteInsetPct`, DISPLAY page,
+     `NOTE SIZE`). Extending it to health and ammo is now a matter of choosing what to match, not
+     of writing anything: the scale-about-centre and its per-eye composition are done and proven.
+     ⚠️ **The inset must be applied BEFORE `ApplyEyeRemap`, never after** — the eye remap shifts x
+     by ±0.5, and scaling about zero after that shift drags the eye centre, throwing the two eyes
+     off in opposite directions.
+   - ⚠️ Whatever gets inset needs the same **corner exemption** notes use: an element anchored at
+     `|clip.x| >= 1` is a full-screen backdrop, and shrinking one leaves the world showing in a
+     ring around it.
 3. **⭐ The muzzle flash and barrel smoke draw on the STEREO SEAM — and it is OUR bug, not the
    engine's.** Suppressed for now: `MUZZLE FX` on the panel's DISPLAY page, `HideMuzzleFx=1`, default
    hidden. The real fix is queued and should retire that setting entirely.

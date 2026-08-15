@@ -24,6 +24,81 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Runs 229-230: the notes, and a diagnostic that expired before the thing it measured
+
+**Reported:** an in-game note "spans across the whole screen so is very hard to read". **Fixed** -
+`NoteInsetPct`, default 65, DISPLAY page as `NOTE SIZE`.
+
+### ⛔ Run 229 measured nothing, and the reason was timing
+
+The `UI element:` dump had existed since run 153 armed on the `[` key, and `Debug=0` makes keyboard
+input inert - so **it had never once been usable in a headset**. Run 229 made it ini-armable as a
+countdown: thirty batches, one a second.
+
+It expired at log line **3321**. The notes were opened around line **10000**. The instrument was
+switched off for the entire period it was built to observe, and no fixed countdown would have
+worked - launching, loading and walking to a note takes as long as it takes.
+
+**A diagnostic on a clock has to outlive the walk to the thing it measures.** The fix was to stop
+using a clock: a batch now fires when the NUMBER of HUD elements changes. Ammo and health digits do
+not change the count, so it is a trigger and not a firehose, and a slow heartbeat underneath leaves
+a baseline for a run where nothing changes at all.
+
+### The second half of the fix was making an ABSENCE readable
+
+The census sits behind **four early returns** in `HudStereoPair`. "The note is not in the list" could
+therefore mean the note is not on the HUD path, or that it went to an offscreen target, or that it is
+world-space, or that the stereo path was off - and a bare list distinguishes none of them. Each exit
+is now counted and all of them print in the batch header. Same lesson as run 228, applied deliberately
+rather than after losing a run to it.
+
+### What the note actually is
+
+Five ordinary HUD elements, **byte-identical across three consecutive batches spanning ~25 seconds** -
+the signature of a modal held open:
+
+| prims | stride | anchor | what |
+|---|---|---|---|
+| 10 | 8 | (-1.031, +1.000) | full-screen backing |
+| 10 | 12 | (-0.563, +1.000) | the panel |
+| 10 | 8 | (-0.563, +1.033) | panel border |
+| **344** | 20 | (-0.407, +0.806) | **the text** - ~172 glyph quads |
+| 28 | 20 | (-0.075, -0.755) | close prompt |
+
+All orthographic, all reaching the census, so `c5`-`c8` reaches them. The crosshair is absent from all
+three batches, which is what makes scaling *everything* while a note is up safe.
+
+⚠ **The 344 must never be used to recognise a note** - it is a glyph count, and a shorter note has
+fewer. The two panel corners at `y = +1.0` do not depend on the text, so those are the marker. It was
+validated before being built on: **3/3 note batches matched, 0 false positives across 888 elements**.
+
+### The fix
+
+A scale-about-centre on `c5`-`c8`. Under the row convention `out.x` is the sum of every register's
+`.x`, so multiplying all four by `k` scales the output by `k` about clip `(0,0)` - the centre of the
+eye - with no translation, so a centred layout stays centred.
+
+- ⚠ **Applied BEFORE `ApplyEyeRemap`, never after.** The eye remap shifts x by ±0.5 to put each copy
+  in its half. Scaling about zero after that shift would drag the eye centre toward the middle of the
+  frame and throw the two eyes off in **opposite** directions.
+- **The full-screen backing is exempt**, keyed on `|clip.x| >= 1`. Shrinking a dimming layer would
+  leave the world showing in a ring around it; insetting the panel and text while the backing stays
+  full-screen is what makes it read as a floating page.
+- Latched one frame late, because the marker can be drawn *after* the text it gates. A one-frame lag
+  on a panel that stays up for seconds is invisible; gating on draw order would inset half a note.
+
+### Method notes
+
+- **A diagnostic armed on a clock must outlive the walk to the thing it measures** - or better, not
+  use a clock. Trigger on the state changing and the timing question disappears.
+- **Count every exit, not just the hits.** A guard that only tallies its own matches cannot report a
+  miss, and "not in the list" is not a finding until the alternatives are counted too.
+- **Validate a signature against the whole capture before building on it.** Three lines of scripting
+  separated the two stable markers from the one that only looked stable.
+- **Never key on a count that is really a length.** 344 primitives is 172 glyphs, not "a note".
+
+---
+
 ## ⭐ Runs 227-228: the rope, and the end of guessing whether a weapon exists
 
 **Reported:** in a scripted scene with the player's hands tied, the **rope is missing** - and pressing

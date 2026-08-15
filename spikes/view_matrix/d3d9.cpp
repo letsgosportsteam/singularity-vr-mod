@@ -2451,6 +2451,44 @@ const float kMetresToUU = 52.5f;
 // The default should stay 100 unless the headset says otherwise.
 volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DISPLAY panel row
 
+// ---- ⭐ run 230: the note is a full-screen 2D panel, and a headset FOV is not a monitor ----
+//
+// Reported as "it spans across the whole screen so is very hard to read". On a monitor a full-width
+// page of text is fine because the whole monitor is inside your central vision. In a headset the same
+// page spans ~100 degrees, so its edges sit in the periphery and behind the soft part of the lens -
+// you have to move your HEAD along a line of text to read it.
+//
+// The census in run 230 measured the note as five ordinary UI elements on the HUD path, all of them
+// orthographic and all reaching HudStereoPair, so the existing c5-c8 rewrite can reach them:
+//
+//     prims=10  stride=8   anchor (-1.031, +1.000)   full-screen backing
+//     prims=10  stride=12  anchor (-0.563, +1.000)   the panel
+//     prims=10  stride=8   anchor (-0.563, +1.033)   the panel border
+//     prims=344 stride=20  anchor (-0.407, +0.806)   THE TEXT - ~172 glyph quads
+//     prims=28  stride=20  anchor (-0.075, -0.755)   the close prompt
+//
+// Byte-identical across three consecutive census batches spanning ~25 seconds, which is what a modal
+// held open looks like. The crosshair is absent from all three, so the note replaces the HUD rather
+// than overlaying it - which is why scaling EVERY element while it is up is safe.
+//
+// ⚠ The 344 is a GLYPH COUNT and must never be used to recognise a note: a shorter note has fewer.
+// The two anchors at y=+1.0 are panel corners and do not depend on the text, so those are the marker.
+volatile LONG g_noteInsetPct   = 65;   // ini [Render] NoteInsetPct, and a DISPLAY panel row
+volatile LONG g_noteSeenFrame  = 0;    // a note marker was drawn THIS frame
+volatile LONG g_noteOpen       = 0;    // ...was drawn LAST frame - what the inset actually reads
+volatile LONG g_noteInsetDraws = 0;    // elements actually scaled, reported per second
+
+// Validated against every element the run-230 census captured: 3 note batches matched, 0 of the
+// other 34 did, over 888 elements. Tolerances are wide enough to survive small layout drift and
+// narrow enough to exclude the stride-12 element at (-1.022, +1.061) that sits near it early in a
+// level. Requiring the exact stride is what separates those two.
+static inline bool NoteMarker(UINT stride, UINT prims, float x, float y) {
+    if (prims != 10 || y < 0.95f || y > 1.09f) return false;
+    if (stride == 8  && x > -1.08f && x < -0.98f) return true;   // full-screen backing
+    if (stride == 12 && x > -0.61f && x < -0.51f) return true;   // the panel
+    return false;
+}
+
 // Run 201: does the gun follow the 6-DOF head displacement? It must - see the note in BuildGunC. Kept as
 // an escape hatch rather than hardcoded, because the SIGN of a position fix is the kind of thing this
 // project has had to flip more than once, and reverting should not need a rebuild.
@@ -5320,6 +5358,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_AIMPARTS,
        // ⭐ run 217: the laser and the per-weapon alignment rows.
        PR_LASER, PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH,
+       PR_NOTESIZE,          // ⭐ run 230
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -5355,7 +5394,10 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // ⭐ run 217: LASER sits with CROSSHAIR deliberately: the crosshair is HIDDEN in MOTION CONTROLLER
     // because a centre-screen reticle points where the shot is not going, and the laser is the thing
     // that replaces it. Judged by looking, like everything else on this page.
-    { PR_CROSSHAIR, PR_LASER, PR_MUZZLEFX, PR_WORLDSCALE, PR_BACK },
+    // ⭐ run 230: NOTE SIZE is the HUD-inset row this page was created expecting. It belongs here
+    // for the reason the page exists - it is judged by READING, and a setting judged by reading has
+    // to be adjustable while you are reading. A relaunch per guess costs a headset run each.
+    { PR_CROSSHAIR, PR_LASER, PR_MUZZLEFX, PR_WORLDSCALE, PR_NOTESIZE, PR_BACK },
     // ⭐ run 205: AIM PARTS is on the panel, not just the ini, because the ONLY sound way to compare
     // these is to toggle them IN PLACE - same spot, same view direction, seconds apart. Draw count in a
     // headset is dominated by where you are LOOKING, so two runs "in the same place" can differ by 3x
@@ -5365,7 +5407,7 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 7, 8, 3, 5, 5, 7 };
+const int kPageCount[kPanelPages] = { 7, 8, 3, 6, 5, 7 };   // ⭐ run 230: DISPLAY 5 -> 6
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5373,7 +5415,7 @@ const int kPageCount[kPanelPages] = { 7, 8, 3, 5, 5, 7 };
 // raiser, so forgetting to update one of these costs a resize rather than text spilling off the
 // plate. The widest strings are "AIM METHOD MOTION CONTROLLER" and "MOVE DIRECTION HAND (NO
 // TRACKING)", which is why those two pages are the broad ones.
-const int kPageCols[kPanelPages] = { 34, 35, 30, 28, 28, 30 };
+const int kPageCols[kPanelPages] = { 34, 35, 30, 33, 28, 30 };   // ⭐ run 230: DISPLAY 28 -> 33 for "NOTE SIZE      100% (FULL SCREEN)"
 const char* kPageName[kPanelPages] = { "VR SETTINGS", "CONTROLLER", "COMFORT", "DISPLAY",
                                        "ADVANCED", "WEAPON ALIGN" };
 
@@ -5533,6 +5575,10 @@ void PanelSaveRow(int rowId, const char* path) {
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
                         InterlockedCompareExchange(&g_worldScalePct, 0, 0));
             WritePrivateProfileStringA("Render", "WorldScalePct", v, path); return;
+        case PR_NOTESIZE:
+            _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld",
+                        InterlockedCompareExchange(&g_noteInsetPct, 0, 0));
+            WritePrivateProfileStringA("Render", "NoteInsetPct", v, path); return;
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
             // survives a relaunch is a state somebody meets tomorrow as a bug report - with the
@@ -5681,6 +5727,12 @@ void PanelRowText(int row, char* out, size_t cap) {
             // muzzle-flash particle system, so a row named "smoke" would be describing half of one asset.
             _snprintf_s(out, cap, _TRUNCATE, "MUZZLE FX      %s",
                         InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? "HIDDEN" : "SHOWN");
+            break;
+        }
+        case PR_NOTESIZE: {
+            const LONG p = InterlockedCompareExchange(&g_noteInsetPct, 0, 0);
+            if (p == 100) _snprintf_s(out, cap, _TRUNCATE, "NOTE SIZE      100%% (FULL SCREEN)");
+            else          _snprintf_s(out, cap, _TRUNCATE, "NOTE SIZE      %ld%%", p);
             break;
         }
         case PR_WORLDSCALE: {
@@ -5835,6 +5887,15 @@ void PanelAdjust(int row, int dir) {
             InterlockedExchange(&g_hideMuzzleFx,
                                 InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? 0 : 1);
             break;
+        case PR_NOTESIZE: {
+            // Same 5%-a-press step as WORLD SCALE. The floor is 40 rather than 0 because a note you
+            // cannot read for being too small is the same bug reported from the other side.
+            LONG p = InterlockedCompareExchange(&g_noteInsetPct, 0, 0) + dir * 5;
+            if (p < 40)  p = 40;
+            if (p > 100) p = 100;
+            InterlockedExchange(&g_noteInsetPct, p);
+            break;
+        }
         case PR_WORLDSCALE: {
             // 5% a press: coarse enough to feel a difference in one press, fine enough that the useful
             // range is a few presses wide rather than a dozen. Clamped, like every numeric row.
@@ -12022,7 +12083,7 @@ volatile LONG g_hudDraws = 0, g_hudDrawsLast = 0;
 // Budget for the per-element position dump, refilled by the '[' re-arm.
 int g_uiDumpLeft = 0;
 
-// ---- |RUN229| the UI census, reachable from a headset ----
+// ---- ⭐ run 229: the UI census, reachable from a headset ----
 //
 // Reported: the in-game NOTES span the whole screen and are unreadable in VR. The diagnostic that
 // describes UI elements has existed since run 153 - position, scale, primitive count, stride - and has
@@ -12037,7 +12098,25 @@ int g_uiDumpLeft = 0;
 // on the HUD path and can be inset by scaling c5-c8 about centre, which is the mechanism STATUS item 2
 // already describes. An element that NEVER appears is drawn some other way - a fullscreen quad like
 // the sniper scope was - and no amount of HUD insetting would touch it.
-int g_uiDumpBatches = 0;                  // ini [Render] UiElementDump - batches, one per second
+int g_uiDumpBatches = 0;                  // ini [Render] UiElementDump - batches remaining
+// ---- ⭐ run 230: a clock was the wrong trigger, and a bare list was the wrong report ----
+//
+// Run 229 armed one batch a second for thirty seconds and EXPIRED before the note was ever opened.
+// No fixed count would have worked: launching, loading and walking to a note takes as long as it
+// takes. The right moment is whenever the UI CHANGES, which needs no timing at all - so a batch now
+// fires when the number of HUD elements differs from the batch before it. Ammo and health digits do
+// not change the COUNT, which is what makes the count usable as a trigger rather than a firehose.
+// A slow heartbeat sits underneath so a quiet run still leaves a baseline to diff against.
+//
+// The second half matters as much. The census sits behind FOUR early returns in HudStereoPair, so
+// "the note is not in the list" has several possible meanings and by itself distinguishes none of
+// them. Each exit is counted and all of them are printed in the batch header, which is what turns an
+// ABSENCE into a reading instead of a silence (run 228's lesson, applied on purpose this time).
+volatile LONG g_uiSeen     = 0;   // reached HudStereoPair at all
+volatile LONG g_uiOffTgt   = 0;   // rejected: drawing into an OFFSCREEN target, not the scene
+volatile LONG g_uiPersp    = 0;   // rejected: transform is not orthographic - world-space UI
+volatile LONG g_uiElemsThisFrame = 0;   // reached the census - these are the insettable ones
+int g_uiLastDumpedCount = -1;
 
 // ---- ⭐ run 153: the crosshair, identified by measurement ----
 //
@@ -12281,6 +12360,7 @@ int g_hudRemap = 0;
 template <typename DrawFn>
 HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn&& draw) {
     if (!g_hudRemap || !InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
+    InterlockedIncrement(&g_uiSeen);          // ⭐ run 230
 
     float c[16];
     D3DVIEWPORT9 vp{};
@@ -12299,7 +12379,7 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
     // StereoPair has guarded this since the shadow-map work - `if (!g_rtIsScene) return draw()` -
     // and HudStereoPair simply did not inherit it. Same rule, same reason: a draw into a target
     // that is not the scene has no eye halves to be split between.
-    if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) return draw();
+    if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) { InterlockedIncrement(&g_uiOffTgt); return draw(); }  // ⭐ run 230
 
     // ---- run 150: only ORTHOGRAPHIC UI may be squashed in clip space ----
     //
@@ -12327,6 +12407,7 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
         const bool ortho = fabsf(r[0].w) < 1e-4f && fabsf(r[1].w) < 1e-4f &&
                            fabsf(r[2].w) < 1e-4f && fabsf(r[3].w - 1.0f) < 1e-3f;
         if (!ortho) {
+            InterlockedIncrement(&g_uiPersp);          // ⭐ run 230
             static int once = 0;
             if (once < 3) {
                 ++once;
@@ -12351,6 +12432,7 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
     // before this runs, so sharing it would print nothing.
     {
         const Reg4* r = reinterpret_cast<const Reg4*>(c);
+        InterlockedIncrement(&g_uiElemsThisFrame);   // ⭐ run 230: counted always - it is the trigger
         if (g_uiDumpLeft > 0) {
             --g_uiDumpLeft;
             Log("    UI element: prims=%-4u stride=%-3u  at clip (%+.3f, %+.3f)  scale (%.5f, %.5f)",
@@ -12391,6 +12473,12 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
                 InterlockedExchange(&g_xh8MaxR, rad);
         }
         if (dropIt) return S_OK;
+
+        // ⭐ run 230: latch the note for the NEXT frame rather than this one. The marker can be
+        // drawn after the text it is supposed to gate, and a one-frame lag on a panel that stays up
+        // for seconds is invisible - whereas gating on draw order would inset half a note.
+        if (NoteMarker(stride, primCount, r[3].x, r[3].y))
+            InterlockedExchange(&g_noteSeenFrame, 1);
     }
 
     g_inHudRemap = true;      // our own c5-c8 writes below must not re-arm the UI marker
@@ -12402,11 +12490,39 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
     dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldOn);
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
 
+    // ---- ⭐ run 230: inset the note about the centre of the screen ----
+    //
+    // Under the ROW convention out.x is the sum of every register's .x, so multiplying all four .x
+    // by k multiplies the OUTPUT x by k - a pure scale about clip (0,0), which is the centre of the
+    // eye. Nothing is translated, so a centred note stays centred and the layout keeps its shape.
+    //
+    // ⚠ This must happen BEFORE ApplyEyeRemap, never after. The eye remap shifts x by +-0.5 to put
+    // each copy in its half; scaling about zero after that shift would drag the eye centre toward
+    // the middle of the frame and the note would come out off-centre in both eyes, in opposite
+    // directions. Insetting first and letting the eye remap act on the inset matrix composes right.
+    //
+    // The full-screen backing is exempt on purpose. It is anchored AT the clip edge (|x| >= 1), and
+    // shrinking a dimming layer would leave the world showing in a ring around it. Insetting the
+    // panel and text while the backing stays full-screen is what makes it read as a floating page.
+    float cIn[16];
+    memcpy(cIn, c, sizeof(cIn));
+    {
+        const LONG pct = InterlockedCompareExchange(&g_noteInsetPct, 0, 0);
+        const Reg4* rr = reinterpret_cast<const Reg4*>(c);
+        if (pct != 100 && InterlockedCompareExchange(&g_noteOpen, 0, 0) &&
+            fabsf(rr[3].x) < 1.0f) {
+            const float k = (float)pct / 100.0f;
+            Reg4* q = reinterpret_cast<Reg4*>(cIn);
+            for (int i = 0; i < 4; ++i) { q[i].x *= k; q[i].y *= k; }
+            InterlockedIncrement(&g_noteInsetDraws);
+        }
+    }
+
     const LONG halfW = (LONG)vp.Width / 2;
     HRESULT hr = S_OK;
     for (int eye = 0; eye < 2; ++eye) {
         float m[16];
-        memcpy(m, c, sizeof(m));
+        memcpy(m, cIn, sizeof(m));
         ApplyEyeRemap(reinterpret_cast<Reg4*>(m), CONV_ROW, eye ? +0.5f : -0.5f);
         // The scissor is belt and braces: with the transform right the geometry already lands in
         // its own half, and with it wrong this stops the failure spilling across the whole frame.
@@ -17520,20 +17636,37 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (const LONG dp = InterlockedExchange(&g_dropPrimDraws, 0))
                 Log("    DrawPrimitive draws SKIPPED by DropPrimCount: %ld this second", dp);
 
+            // ⭐ run 230: the same shape as the two lines above, and for the same reason. "The note
+            // still looks wrong" and "the inset never matched a draw" are indistinguishable in a
+            // headset and mean opposite things - one is a wrong SIZE, the other a dead MARKER.
+            if (const LONG ni = InterlockedExchange(&g_noteInsetDraws, 0))
+                Log("    note elements inset to %ld%%: %ld draw(s) this second (run 230)",
+                    InterlockedCompareExchange(&g_noteInsetPct, 0, 0), ni);
+
             // ⭐ run 223: separates "I froze it and nothing changed" from "the freeze never fired",
             // which look identical in a headset and mean opposite things.
             if (const LONG fz = InterlockedExchange(&g_adsFrozenDraws, 0))
                 Log("    gun draws with frozen bones: %ld this second (run 223)", fz);
 
-            // |RUN229| one batch a second while armed, so a note that is open for a few seconds is
-            // certain to be caught by one of them. The batch header makes the diff readable: whatever
-            // is present in a note batch and absent from the others is the note.
+            // ⭐ run 230: fires on CHANGE, with a slow heartbeat underneath. See g_uiElemsThisFrame.
             if (g_uiDumpBatches > 0) {
-                --g_uiDumpBatches;
-                g_uiDumpLeft = 24;
-                Log("---- UI census batch (%d left): every element below is on the HUD path and could"
-                    " be inset. Anything on screen that does NOT appear here is drawn another way."
-                    " (run 229) ----", g_uiDumpBatches);
+                static int heartbeat = 0;
+                const LONG nowN = InterlockedCompareExchange(&g_uiElemsThisFrame, 0, 0);
+                const bool changed = (g_uiLastDumpedCount < 0) || (nowN != g_uiLastDumpedCount);
+                if (changed || ++heartbeat >= 10) {
+                    heartbeat = 0;
+                    --g_uiDumpBatches;
+                    g_uiLastDumpedCount = (int)nowN;
+                    g_uiDumpLeft = 24;
+                    Log("---- UI census: %ld insettable HUD elements, out of %ld UI draws (%ld went to"
+                        " an OFFSCREEN target, %ld were WORLD-SPACE/perspective)%s. %d batch(es)"
+                        " left. ONLY the elements listed below can be inset via c5-c8. (run 230) ----",
+                        nowN, InterlockedCompareExchange(&g_uiSeen, 0, 0),
+                        InterlockedCompareExchange(&g_uiOffTgt, 0, 0),
+                        InterlockedCompareExchange(&g_uiPersp, 0, 0),
+                        changed ? " - CHANGED from the last batch" : " - unchanged, heartbeat",
+                        g_uiDumpBatches);
+                }
             }
 
             // Run 215. Nonzero means the frame-wide match was refused - i.e. a world draw collided
@@ -18525,6 +18658,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_frameDrawIdx, 0);
             InterlockedExchange(&g_inForeground, 0);
             InterlockedExchange(&g_fgDrawCount, 0);
+            // ⭐ run 230: this frame's sighting becomes next frame's state, then clears.
+            InterlockedExchange(&g_noteOpen, InterlockedExchange(&g_noteSeenFrame, 0));
+            InterlockedExchange(&g_uiElemsThisFrame, 0);   // ⭐ run 230
+            InterlockedExchange(&g_uiSeen,   0);
+            InterlockedExchange(&g_uiOffTgt, 0);
+            InterlockedExchange(&g_uiPersp,  0);
             ReportXhairCensus();
             ReportFgRide();
             // Promote this frame's learned list to the stable one the matchers use, THEN clear the
@@ -18962,6 +19101,19 @@ void LoadIniSettings() {
                         " the shot is not going"
                       : "always hidden");
 
+    // ⭐ run 230. Percent of full size for an open note, scaled about the centre of the eye.
+    // Default 65 rather than 100: a full-screen page of text is the REPORTED DEFECT, so shipping the
+    // default at 100 would ship the bug and make the setting a thing you have to discover.
+    LONG noteIni = GetPrivateProfileIntA("Render", "NoteInsetPct", 65, path);
+    if (noteIni < 40)  noteIni = 40;
+    if (noteIni > 100) noteIni = 100;
+    InterlockedExchange(&g_noteInsetPct, noteIni);
+    Log("ini: NoteInsetPct=%ld (%s). DISPLAY page, NOTE SIZE.", noteIni,
+        noteIni == 100 ? "full screen - the game's own layout, unchanged"
+                       : "an open note is scaled about the centre of the eye so the whole page sits"
+                         " inside the readable part of the lens instead of running into the"
+                         " periphery");
+
     // Run 181. Default ON: the effects belonging to a weapon that is on your controller is the
     // correct behaviour, not an experiment. OFF is the A/B - see the note at g_fgRideAll for what
     // each answer means, since "no change either way" is a real and informative outcome here.
@@ -19174,7 +19326,7 @@ void LoadIniSettings() {
                       " the range was measured on the ASSAULT RIFLE only"
                     : "off - the game's aim animation plays as shipped");
 
-    // |RUN229| batches of UI element descriptions, one a second. Open a note while it counts down.
+    // ⭐ run 229: batches of UI element descriptions, one a second. Open a note while it counts down.
     g_uiDumpBatches = GetPrivateProfileIntA("Render", "UiElementDump", 0, path);
     if (g_uiDumpBatches < 0)  g_uiDumpBatches = 0;
     if (g_uiDumpBatches > 60) g_uiDumpBatches = 60;
