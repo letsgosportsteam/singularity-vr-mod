@@ -12022,6 +12022,23 @@ volatile LONG g_hudDraws = 0, g_hudDrawsLast = 0;
 // Budget for the per-element position dump, refilled by the '[' re-arm.
 int g_uiDumpLeft = 0;
 
+// ---- |RUN229| the UI census, reachable from a headset ----
+//
+// Reported: the in-game NOTES span the whole screen and are unreadable in VR. The diagnostic that
+// describes UI elements has existed since run 153 - position, scale, primitive count, stride - and has
+// never once been usable, because it arms on the '[' key and Debug=0 makes every keyboard key inert.
+// A tool you cannot reach while wearing the headset is a tool for a problem you do not have.
+//
+// So: arm it from the ini, and repeat it once a second rather than firing once. A note is open for a
+// few seconds and nobody can time a one-shot to land inside that window.
+//
+// ⚠ THE KEY THING THIS ANSWERS is not the numbers - it is whether the note appears here AT ALL.
+// This dump sits inside HudStereoPair, past the orthographic check, so an element that reaches it is
+// on the HUD path and can be inset by scaling c5-c8 about centre, which is the mechanism STATUS item 2
+// already describes. An element that NEVER appears is drawn some other way - a fullscreen quad like
+// the sniper scope was - and no amount of HUD insetting would touch it.
+int g_uiDumpBatches = 0;                  // ini [Render] UiElementDump - batches, one per second
+
 // ---- ⭐ run 153: the crosshair, identified by measurement ----
 //
 // With aim mode 11 the bullet follows the controller and the view never moves, so a crosshair
@@ -17508,6 +17525,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (const LONG fz = InterlockedExchange(&g_adsFrozenDraws, 0))
                 Log("    gun draws with frozen bones: %ld this second (run 223)", fz);
 
+            // |RUN229| one batch a second while armed, so a note that is open for a few seconds is
+            // certain to be caught by one of them. The batch header makes the diff readable: whatever
+            // is present in a note batch and absent from the others is the note.
+            if (g_uiDumpBatches > 0) {
+                --g_uiDumpBatches;
+                g_uiDumpLeft = 24;
+                Log("---- UI census batch (%d left): every element below is on the HUD path and could"
+                    " be inset. Anything on screen that does NOT appear here is drawn another way."
+                    " (run 229) ----", g_uiDumpBatches);
+            }
+
             // Run 215. Nonzero means the frame-wide match was refused - i.e. a world draw collided
             // with a first-person vertex count and would have been hidden or moved. Zero everywhere
             // except the rooms where the collision actually happens is the expected shape; a large
@@ -19145,6 +19173,15 @@ void LoadIniSettings() {
                       " only motion left. WARNING: recoil and reload are suppressed while aiming, and"
                       " the range was measured on the ASSAULT RIFLE only"
                     : "off - the game's aim animation plays as shipped");
+
+    // |RUN229| batches of UI element descriptions, one a second. Open a note while it counts down.
+    g_uiDumpBatches = GetPrivateProfileIntA("Render", "UiElementDump", 0, path);
+    if (g_uiDumpBatches < 0)  g_uiDumpBatches = 0;
+    if (g_uiDumpBatches > 60) g_uiDumpBatches = 60;
+    if (g_uiDumpBatches)
+        Log("ini: UiElementDump=%d - describing every HUD element once a second for %d seconds:"
+            " primitive count, stride, clip position and scale. Open a note while it runs.",
+            g_uiDumpBatches, g_uiDumpBatches);
 
     // ⭐ run 223: the freeze range. -1 disables. See AdsFreeze for the three configurations worth running.
     g_adsFreezeLo = GetPrivateProfileIntA("Render", "AdsFreezeLo", -1, path);
