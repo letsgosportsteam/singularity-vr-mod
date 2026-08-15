@@ -1710,8 +1710,10 @@ static void RefreshArmedState() {
             }
         }
     }
+    static bool saidOnce = false;
     const LONG was = Rd(g_armedState);
-    if ((LONG)st != was) {
+    if ((LONG)st != was || !saidOnce) {
+        saidOnce = true;
         InterlockedExchange(&g_armedState, (LONG)st);
         Log("weapon state: %s (run 228)",
             st == ARMED_YES ? "a weapon IS equipped" :
@@ -2060,7 +2062,13 @@ void SolvePropertyLayout() {
 //                   empty attempts, re-armed by anything that changes the situation.
 void ResolveGameplayOffsets() {
     if (!g_upChildren) return;                       // layout not solved - nothing can be looked up
-    if (g_offHealth >= 0 && g_offHealthMax >= 0 && g_offHealthPacks >= 0) return;   // done
+    // ⛔ run 228c: g_offWeapon BELONGS IN THIS LIST. It was added in run 227 and this check was
+    // not updated, so once the health offsets resolved the function returned here and the Weapon
+    // lookup below never ran once - no Pawn.Weapon line in any log, PlayerArmed pinned at UNKNOWN, and
+    // the whole run-227/228 mechanism silently inert while looking implemented.
+    // A "done" test that does not name everything the function resolves is a test that stops the
+    // function before it finishes.
+    if (g_offHealth >= 0 && g_offHealthMax >= 0 && g_offHealthPacks >= 0 && g_offWeapon >= 0) return;
     // ⭐ Not in gameplay: the pawn and HUD cannot exist, so asking costs a full object walk for nothing.
     if (!InterlockedCompareExchange(&g_camPosValid, 0, 0)) return;
     {
@@ -2074,12 +2082,15 @@ void ResolveGameplayOffsets() {
 
     // Run 199: Health and HealthMax live on Engine.Pawn, several classes above RvPlayerPawnSP, which is
     // exactly what PropOffsetInChain's super-chain walk is for.
-    if ((g_offHealth < 0 || g_offHealthMax < 0 || g_offBaseEyeHeight < 0))
+    // ⛔ run 228c: `|| g_offWeapon < 0` added. The Weapon lookup was nested inside a condition that
+    // only fires when a HEALTH offset is missing, so on any save where health resolved first it was
+    // unreachable. The two have nothing to do with each other beyond sharing a pawn.
+    if ((g_offHealth < 0 || g_offHealthMax < 0 || g_offBaseEyeHeight < 0 || g_offWeapon < 0))
     if (const uintptr_t pawn = FindPlayerPawn()) {
         const uintptr_t pc = *reinterpret_cast<uintptr_t*>(pawn + OBJ_CLASS);
         int dh = 0, dm = 0;
-        g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
-        g_offHealthMax = PropOffsetInChain(pc, "HealthMax", &dm);
+        if (g_offHealth    < 0) g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
+        if (g_offHealthMax < 0) g_offHealthMax = PropOffsetInChain(pc, "HealthMax", &dm);
         // ⭐ run 227: same super-chain walk. Engine.Pawn declares Weapon, well above RvPlayerPawnSP.
         {
             int dw = 0;
