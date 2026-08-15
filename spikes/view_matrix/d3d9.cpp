@@ -1679,7 +1679,7 @@ int g_offHealth = -1, g_offHealthMax = -1;
 // button alone when health cannot be read, rather than silently doing nothing.
 int g_offWeapon = -1;
 
-static uintptr_t FindPlayerPawn();    // defined just below; cached, not a walk
+static uintptr_t FindPlayerPawn(bool force = false);   // defined just below; cached, not a walk
 
 enum ArmedState { ARMED_UNKNOWN = 0, ARMED_YES, ARMED_NO };
 
@@ -1750,13 +1750,22 @@ float MetresToUU();
 
 // The live player pawn, cached and revalidated by class word like FindCamera. Rewalks at most once every
 // 30 misses - a pawn does not exist at the menu and asking every frame is the run-35 failure.
-static uintptr_t FindPlayerPawn() {
+// ⛔ run 228d: `force` exists because two throttles were MULTIPLYING.
+//
+// The 1-in-30 miss throttle below protects callers that ask every frame. ResolveGameplayOffsets is not
+// one of them - it is already limited to once per 2 s, and once per 15 s after three misses. Stacked,
+// a walk happened at best once a MINUTE and at worst once every seven, so on a short session the pawn
+// was simply never found: gameplay live, posValid 1, and not one `player pawn:` line in the log. That
+// is what kept Pawn.Weapon unresolved and the whole run-227 mechanism reporting UNKNOWN.
+//
+// A caller that has already paid for its own throttle should not pay for this one as well.
+static uintptr_t FindPlayerPawn(bool force) {
     if (g_playerPawn && g_playerPawnClass && Readable((void*)g_playerPawn, 0x40) &&
         *reinterpret_cast<uintptr_t*>(g_playerPawn + OBJ_CLASS) == g_playerPawnClass)
         return g_playerPawn;
     g_playerPawn = 0;
     static int missTick = 0;
-    if ((++missTick % 30) != 1) return 0;
+    if (!force && (++missTick % 30) != 1) return 0;
     if (!Readable((void*)kGObjectsTArray, 12)) return 0;
     uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
     int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
@@ -2086,7 +2095,7 @@ void ResolveGameplayOffsets() {
     // only fires when a HEALTH offset is missing, so on any save where health resolved first it was
     // unreachable. The two have nothing to do with each other beyond sharing a pawn.
     if ((g_offHealth < 0 || g_offHealthMax < 0 || g_offBaseEyeHeight < 0 || g_offWeapon < 0))
-    if (const uintptr_t pawn = FindPlayerPawn()) {
+    if (const uintptr_t pawn = FindPlayerPawn(true)) {   // ⭐ run 228d: this caller is already throttled
         const uintptr_t pc = *reinterpret_cast<uintptr_t*>(pawn + OBJ_CLASS);
         int dh = 0, dm = 0;
         if (g_offHealth    < 0) g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
