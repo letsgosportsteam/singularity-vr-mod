@@ -1760,18 +1760,30 @@ inline ArmedState PlayerArmed() { return (ArmedState)Rd(g_armedState); }
 // Logged on CHANGE only, so switching guns and raising the TMD writes one line each and an idle minute
 // writes nothing. If the name never changes while the TMD comes and goes, the hypothesis is dead and
 // the property dump below is the fallback - that outcome is worth the same one run.
+// 💥 run 235b: the first version deduped on the CLASS pointer, and every weapon in this game is
+// the same class - `RvWeaponShared`. So the key could never change, the function logged exactly once,
+// and a run that deployed the TMD ten times produced no evidence either way. The discriminating field
+// was in the very first line it printed: the OBJECT name, `ARMachineGun`.
+//
+// **A dedupe key that cannot vary turns a diagnostic into a single line that looks like a result.**
+// Same family as run 228's "absence is invisible" - the log said nothing changed when the instrument
+// was incapable of noticing.
+//
+// Keyed on the object POINTER now, which is what actually changes when you swap what is in your hands.
 static void LogEquippedClass(uintptr_t w) {
-    static uintptr_t lastCls = (uintptr_t)-1;
-    const uintptr_t cls = (w && Readable((void*)(w + OBJ_CLASS), sizeof(uintptr_t)))
-                        ? *reinterpret_cast<const uintptr_t*>(w + OBJ_CLASS) : 0;
-    if (cls == lastCls) return;
-    lastCls = cls;
-    char cn[80] = "(none)", on[80] = "";
-    if (cls) NameOf(cls, cn, sizeof(cn));
-    if (w)   NameOf(w, on, sizeof(on));
-    Log("equipped: Pawn.Weapon -> %s  (object '%s')   run 235: if this reads as the TMD while the"
-        " TMD is out, that is the 'is the TMD active' signal and it needs no new property.",
-        cn, on);
+    static uintptr_t lastObj = (uintptr_t)-1;
+    if (w == lastObj) return;
+    lastObj = w;
+    char cn[80] = "(none)", on[80] = "(none)";
+    if (w) {
+        NameOf(w, on, sizeof(on));
+        if (Readable((void*)(w + OBJ_CLASS), sizeof(uintptr_t)))
+            if (const uintptr_t cls = *reinterpret_cast<const uintptr_t*>(w + OBJ_CLASS))
+                NameOf(cls, cn, sizeof(cn));
+    }
+    Log("equipped: Pawn.Weapon -> object '%s'  (class %s)   run 235b: the OBJECT name is the"
+        " identity here - every weapon shares the class RvWeaponShared. If this names the TMD while"
+        " the TMD is out, that is the 'is the TMD active' signal.", on, cn);
 }
 
 static void RefreshArmedState() {
