@@ -11162,6 +11162,76 @@ inline bool FgMatchWindow() {
 // leave switched on. It only ever touches the first-person pass; world geometry never reaches here.
 volatile LONG g_fgSoloCycleMs = 0;    // ini [Render] FgSoloCycleMs, 0 = off
 volatile LONG g_fgSoloVerts   = 0;    // the mesh currently shown alone, 0 = none chosen yet
+
+// ---- ⭐ run 234: is 7444 ONE mesh posed differently, or TWO meshes sharing a vertex count? ----
+//
+// Reported after the solo run: 7444 shows TWO hands with a gun equipped and ONE hand, in a different
+// pose, with the TMD. The likely reading is one arms mesh whose animation puts the right arm out of
+// frame - but "likely" is exactly the kind of premise this project keeps discovering was wrong six
+// runs later, and it is load-bearing for whether a two-handed mode is reachable.
+//
+// ⚠ The census CANNOT answer it. FgLearnSignature dedupes by vertex count, so two distinct meshes
+// with 7444 vertices each collapse into one entry and look like one thing. The instrument that raised
+// the question is structurally incapable of settling it.
+//
+// The draw call is, though, and without the wearer having to see anything. A mesh is identified by
+// where its geometry comes from: the vertex buffer and its offset and stride, the index buffer, and
+// the range within them - baseVertex, startIndex, primCount. One mesh drawn in two poses is
+// byte-identical in every one of those; only the BONE CONSTANTS differ, and those are not part of
+// this tuple. Two meshes differ in at least the range, and almost certainly in the buffers.
+//
+// primCount alone is nearly decisive and costs nothing: a different mesh with the same vertex count
+// would have to have the same triangle count too. The buffers are captured as well because "nearly"
+// is what this note exists to avoid.
+//
+// ⚠ One false positive to watch for when reading the result: a mesh streamed from a buffer that gets
+// REALLOCATED would report a new VB pointer while being the same mesh. That is why the whole tuple is
+// logged rather than a verdict - identities differing ONLY in pointer, with identical range and
+// counts, are one mesh in a moved buffer. Differing ranges are two meshes.
+volatile LONG g_fgIdentityVerts = 0;   // ini [Render] FgIdentityVerts, 0 = off
+
+struct FgIdent {
+    void* vb; UINT vbOff; UINT vbStride; void* ib;
+    INT   base; UINT minIdx; UINT nVerts; UINT startIdx; UINT prims;
+    LONG  seen;
+};
+const int kFgIdentMax = 8;
+FgIdent g_fgIdent[kFgIdentMax]{};
+int     g_fgIdentCount = 0;
+
+static void FgIdentityProbe(IDirect3DDevice9* dev, INT base, UINT minIdx, UINT nVerts,
+                            UINT startIdx, UINT prims) {
+    IDirect3DVertexBuffer9* vb = nullptr;
+    IDirect3DIndexBuffer9*  ib = nullptr;
+    UINT off = 0, stride = 0;
+    if (FAILED(dev->GetStreamSource(0, &vb, &off, &stride))) return;
+    dev->GetIndices(&ib);                       // may legitimately be null
+
+    bool known = false;
+    for (int i = 0; i < g_fgIdentCount; ++i) {
+        FgIdent& e = g_fgIdent[i];
+        if (e.vb == vb && e.vbOff == off && e.vbStride == stride && e.ib == ib &&
+            e.base == base && e.minIdx == minIdx && e.nVerts == nVerts &&
+            e.startIdx == startIdx && e.prims == prims) { ++e.seen; known = true; break; }
+    }
+    if (!known && g_fgIdentCount < kFgIdentMax) {
+        FgIdent& e = g_fgIdent[g_fgIdentCount++];
+        e.vb = vb; e.vbOff = off; e.vbStride = stride; e.ib = ib;
+        e.base = base; e.minIdx = minIdx; e.nVerts = nVerts;
+        e.startIdx = startIdx; e.prims = prims; e.seen = 1;
+        Log("fg identity: verts=%u SOURCE #%d - VB %p off %u stride %u | IB %p | base %d minIdx %u"
+            " startIdx %u prims %u%s",
+            nVerts, g_fgIdentCount, vb, off, stride, ib, base, minIdx, startIdx, prims,
+            g_fgIdentCount == 1
+              ? "   (the first. If this stays the ONLY one across both states, it is ONE mesh posed"
+                " two ways and a two-handed split is not reachable by transform.)"
+              : "   <== A SECOND SOURCE. Compare the RANGE and PRIMS against #1: identical range with"
+                " only a different VB pointer is one mesh in a moved buffer; a different range or"
+                " prim count is genuinely TWO meshes.");
+    }
+    if (vb) vb->Release();                      // GetStreamSource/GetIndices both AddRef
+    if (ib) ib->Release();
+}
 volatile LONG g_fgSoloIdx     = 0;    // ⭐ run 233d: step position, for the on-screen readout
 volatile LONG g_fgSoloOf      = 0;
 
@@ -12012,6 +12082,11 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     if (InterlockedCompareExchange(&g_inForeground, 0, 0)) {
         const LONG k = InterlockedIncrement(&g_fgDrawCount);
         FgLearnSignature(numVertices);
+        // ⭐ run 234: only for the one vertex count under investigation, so the COM calls cost
+        // nothing on every other draw in the pass.
+        if (const LONG iv = Rd(g_fgIdentityVerts))
+            if ((UINT)iv == numVertices)
+                FgIdentityProbe(dev, baseVertex, minIndex, numVertices, startIndex, primCount);
         DpgRecord(2, 0.0f, 0.0f, (uint32_t)k, numVertices, primCount, (uint32_t)t);
         // WEAPON FX = HIDE PASS. Deliberately after the learn, per the note above and FgHideWholePass.
         if (FgHideWholePass()) return D3D_OK;
@@ -17793,6 +17868,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (const LONG sq = InterlockedExchange(&g_scopeQuadDraws, 0))
                 Log("    scope overlay quads drawn per eye: %ld this second", sq);
 
+            // ⭐ run 234: the verdict, once a second, so it does not have to be assembled by hand.
+            if (Rd(g_fgIdentityVerts) && g_fgIdentCount) {
+                char b4[512]; int o4 = 0;
+                for (int i = 0; i < g_fgIdentCount; ++i)
+                    o4 += _snprintf_s(b4 + o4, sizeof(b4) - o4, _TRUNCATE, " #%d seen %ld",
+                                      i + 1, g_fgIdent[i].seen);
+                Log("    verts %ld: %d distinct draw source(s) so far -%s   (1 = ONE mesh posed"
+                    " differently; 2+ with different ranges = TWO meshes)",
+                    Rd(g_fgIdentityVerts), g_fgIdentCount, b4);
+            }
+
             // ⭐ run 231: the over-match test. The real scope quad cannot be drawn with the aim
             // trigger released, so a nonzero IDLE count is a false positive outright - and every one
             // of them suppresses the mesh latch, the laser, the ADS pull-back and the ADS mask for
@@ -19318,6 +19404,17 @@ void LoadIniSettings() {
                         " follows the controller then and a centre-screen reticle points somewhere"
                         " the shot is not going"
                       : "always hidden");
+
+    // ⭐ run 234. Log where the geometry of ONE vertex count comes from, so "one mesh posed twice"
+    // and "two meshes sharing a count" can be told apart. 0 = off.
+    {
+        const LONG iv = GetPrivateProfileIntA("Render", "FgIdentityVerts", 0, path);
+        InterlockedExchange(&g_fgIdentityVerts, iv > 0 ? iv : 0);
+        if (iv > 0)
+            Log("ini: FgIdentityVerts=%ld - every first-person draw with this vertex count reports"
+                " its vertex/index buffers and its range. One source across both states = one mesh"
+                " posed two ways. Two sources with different ranges = two meshes.", iv);
+    }
 
     // ⭐ run 233. Solo-cycle the first-person pass: show one mesh at a time, this many ms each.
     // DIAGNOSTIC - it hides things. 0 is off and is the shipping value.
