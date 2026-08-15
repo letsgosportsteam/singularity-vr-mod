@@ -11033,15 +11033,21 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     // The heal and melee animations are the arms' legitimate appearances - see g_healArmsMs and
     // g_meleeArmsMs.
     if (ArmsAnimActive()) return false;
-    // ⭐ run 228: and so is EVERYTHING, when the pawn has no weapon equipped. With nothing in the pass
-    // being a gun, every mesh in it is the player's own hands and whatever is on them - a rope, a
-    // device, a scripted prop - and hiding any of it is hiding the thing you are meant to look at.
-    // The engine is asked directly; UNKNOWN keeps the old behaviour. See PlayerArmed.
-    if (PlayerArmed() == ARMED_NO) return false;
     // ⭐ run 215: the window is checked ONLY on a match, so the common case - a world draw whose count
     // matches nothing - still costs exactly what it did before.
     const LONG a = Rd(g_armsVerts);
-    if (a && (UINT)a == verts) return FgMatchWindow();
+    if (a && (UINT)a == verts) {
+        // ⛔ run 228e: NARROWED to this rule. Run 228 exempted the whole function when unarmed, which
+        // also stopped hiding the 390-vertex hand fragment - run 199's cosmetic defect - and it came
+        // back as "a black mesh around the arms". Only the ARMS ROLE needs the exemption.
+        //
+        // With no weapon equipped the roles have shifted by one, so the mesh in the arms role is not
+        // the arms: it is whatever is ON the player's hands, the rope in the reported scene. Hiding
+        // that hides the thing you are meant to be looking at. The fragment below is a separate
+        // question and keeps its own answer.
+        if (PlayerArmed() == ARMED_NO) return false;
+        return FgMatchWindow();
+    }
     // ⭐ run 199: the leftover hand/arm fragment - the 390-vertex mesh. Checked before the stray rule
     // below because it IS in the baseline and that rule would never reach it.
     if (FgIsExtraArm(verts)) return FgMatchWindow();
