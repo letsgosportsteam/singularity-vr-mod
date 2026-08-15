@@ -24,6 +24,83 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Runs 232-234: what is actually in the first-person pass, and the arms are ONE mesh
+
+Groundwork for a possible two-handed VR mode. Three instrument fixes and one settled fact.
+
+### ⛔ The census was SATURATED exactly where the interesting thing happens
+
+`kFgSigMax` was 8 and `FgLearnSignature` silently drops everything past the 8th distinct mesh. Before
+the TMD the pass holds 4, so 8 was never questioned - after it, **every census was exactly 8 entries**,
+which is the instrument hitting its stop rather than a count of 8 meshes. Raised to 32; cutscene passes
+carrying whole character bodies still saturate even that (18-32 meshes), gameplay reaches 12.
+
+⚠ Not pure instrumentation, and the code says so: the latch takes the top two BY SIZE from this list,
+so widening it lets a previously-truncated mesh win a role.
+
+### The pass, named
+
+| verts | what it is |
+|---|---|
+| 11387 / 8297 | assault rifle / shotgun |
+| **7444** | **both arms - ONE mesh** |
+| **4818** | **the TMD gauntlet, left forearm, its own mesh** |
+| 1368, 729, 251, 207, 118, 37 | TMD sub-parts, appearing in stages as it deploys |
+
+Identified by solo-cycling: hide every first-person mesh but one, step on a timer, and let the wearer
+say what they saw. The weapon and the whole deployed TMD set are drawn **at the same time**, so the
+meshes a simultaneous gun-and-TMD view needs are all present and we are hiding them.
+
+### 💥 Then the report that mattered: "7444 is one hand with the TMD and two with the gun"
+
+Two readings, and they need opposite conclusions: one arms mesh posed differently, or two meshes that
+happen to share a vertex count.
+
+**The census is structurally incapable of answering it** - `FgLearnSignature` dedupes by vertex count,
+so two distinct 7444-vertex meshes collapse into one entry and look exactly like one mesh. The
+instrument that raised the question could never settle it.
+
+The draw call settles it, and without the wearer looking at anything. A mesh is identified by where its
+geometry comes from; one mesh in two poses is byte-identical in all of it, since only the bone constants
+differ. Measured over **27,279 draws in both states**:
+
+```
+verts=7444  VB 228B22A0 off 0 stride 32 | IB 0B77AC80
+            base 0  minIdx 0  startIdx 0  prims 4402      ONE source, every draw
+```
+
+`base 0, startIdx 0` - it occupies its buffer entirely, so it is a whole standalone mesh, not a section
+of a shared one. **One mesh, 7444 verts, 4402 triangles, animated into different poses.**
+
+### What that decides
+
+- ⛔ **Two-handed gun holding is NOT reachable by transform.** Both arms arrive in one draw call, which
+  takes one world matrix. Not a tuning problem. It needs bone-level control - the mechanism exists
+  (`AdsFreeze` already writes the bone palette) but the bone map and bind pose do not, and D3D9 hands
+  you neither.
+- ✅ **The TMD on the left hand is cheap.** `4818` is its own correctly-posed mesh, and in the TMD state
+  the arms mesh's visible portion IS the left hand - so routing `7444` and `4818` to one left-hand
+  transform keeps gauntlet and arm attached with no right arm in view to be dragged along.
+- 📝 Open: gun-and-TMD simultaneously still collides with the single arms draw call, and "is the TMD
+  active" has no clean signal yet - the sub-parts appearing is the observable proxy, and run 228's
+  lesson says ask the engine instead of proxying.
+
+### Method notes
+
+- **An instrument that dedupes cannot count duplicates.** The census raised the 7444 question and was
+  incapable of answering it; noticing that is what made the run cheap instead of circular.
+- **"Probably one mesh" is exactly the kind of premise this project keeps finding was wrong.** It cost
+  one run to convert into a fact, and it was load-bearing for a whole feature direction.
+- ⚠ **A diagnostic must not bypass a guard that fixed something.** The solo test was placed ahead of
+  run 203's large-pass guard and did per-draw work on the pass that guard exists to protect - and would
+  have fired on the cutscene the save opens with.
+- **Log the tuple, not the verdict.** A reallocated buffer would show a new pointer for the same mesh;
+  only the full range makes "one mesh that moved" distinguishable from "two meshes".
+- **A diagnostic the wearer cannot read is not a diagnostic.** The solo cycle was logged and nothing
+  else - naming a mesh meant counting four-second intervals in a headset. It went on the readout.
+
+---
+
 ## ⭐ Run 230b: the sniper was tunable all along, against the wrong instrument
 
 All four weapons now ship aligned. The sniper (11389) sat untuned behind a note in the code claiming

@@ -517,6 +517,19 @@ recorded rather than filtered out, because a long enough transient reads as a vi
    - 📝 **`VetoQuietGun`, `RelatchWrongRoles` and `FgRememberArms` are now redundant weight** -
      they exist to guess at exactly what the engine now answers. Left in place, not yet retired.
 
+10g. **📏 MEASURED (run 234) - the arms are ONE mesh, so two-handed VR is not reachable by
+   transform.** 7444 verts, 4402 triangles, from a single vertex/index buffer at `base 0, startIdx 0`
+   - it owns its buffer outright. Identical across **27,279 draws** with a weapon and with the TMD, so
+   the one-hand/two-hand difference the wearer sees is POSE, not a second mesh.
+   - ⛔ Both arms arrive in **one draw call**, which takes one world matrix. Splitting them needs
+     bone-level control. `AdsFreeze` proves we can write the bone palette; the bone map and bind pose
+     are what we do not have, and D3D9 does not expose them.
+   - ⚠ **The mesh census cannot answer questions like this** - `FgLearnSignature` dedupes by vertex
+     count, so two distinct meshes sharing a count collapse into one entry. Use the draw-call identity
+     probe (`FgIdentityVerts`) instead: buffers plus range, which pose does not change.
+   - ✅ The TMD gauntlet (4818) IS its own mesh, correctly posed on the left forearm, and is drawn at
+     the same time as the weapon. Putting it on the left hand is cheap and does not need any of the above.
+
 10e. **✅ FIXED and VERIFIED (run 216) — the scope reorders the pass, and the roles were positional.**
    - Reported: after using the sniper scope, the arms are on the controller and the gun is invisible,
      surviving a weapon switch. The run-207 role shift by a route neither run-212 defence covered.
