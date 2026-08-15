@@ -1613,6 +1613,50 @@ static int PropOffsetInChain(uintptr_t cls, const char* name, int* depthOut = nu
     return -1;
 }
 
+// ---- ⭐ run 235: ENUMERATE the properties, instead of guessing their names ----
+//
+// PropOffsetInChain can only find a property whose name you already know, which is fine for `Health`
+// and `Weapon` and useless for "is there something on the pawn that says the TMD is active". Guessing
+// names against a game whose script package we cannot read is unbounded; listing them is one pass.
+//
+// Walks the same Children list and the same SuperField chain the lookup uses, so if this prints
+// nothing the LOOKUP is broken too and that is worth knowing on its own - a dump that agrees with the
+// resolver cannot flatter it.
+//
+// One-shot and ini-armed. A Pawn chain runs to several hundred properties; that is a lot of log, and
+// it is also the whole point.
+static void DumpClassProperties(uintptr_t cls, const char* what) {
+    if (!g_upChildren || !g_upNext || !g_upOffset) {
+        Log("property dump (%s): the UProperty layout is not solved, so there is nothing to walk."
+            " This is the same data PropOffsetInChain needs - if it is missing, no lookup works"
+            " either.", what);
+        return;
+    }
+    Log("---- property dump: %s ----", what);
+    uintptr_t c = cls;
+    int depth = 0, total = 0;
+    for (; c && depth < 64; ++depth) {
+        char cn[80];
+        if (!Readable((void*)c, 0x100) || !NameOf(c, cn, sizeof(cn))) break;
+        Log("  class depth %d: %s", depth, cn);
+        uintptr_t pr = Readable((void*)(c + g_upChildren), sizeof(uintptr_t))
+                     ? *reinterpret_cast<uintptr_t*>(c + g_upChildren) : 0;
+        for (int g = 0; g < 400 && pr; ++g) {
+            if (!Readable((void*)pr, 0x100)) break;
+            char pn[80];
+            const int off = *reinterpret_cast<const int32_t*>(pr + g_upOffset);
+            if (NameOf(pr, pn, sizeof(pn)) && off >= 0 && off <= 0x8000) {
+                Log("      +0x%04X  %s", off, pn);
+                ++total;
+            }
+            pr = *reinterpret_cast<uintptr_t*>(pr + g_upNext);
+        }
+        if (!Readable((void*)(c + g_upNext - 4), 4)) break;
+        c = *reinterpret_cast<uintptr_t*>(c + g_upNext - 4);       // SuperField
+    }
+    Log("---- end property dump: %s - %d properties over %d class(es) ----", what, total, depth);
+}
+
 // A UClass by name. Restricted to script packages as its outer so an instance sharing the name cannot
 // be mistaken for the class.
 static uintptr_t FindClassByName(const char* want) {
@@ -1678,6 +1722,7 @@ int g_offHealth = -1, g_offHealthMax = -1;
 // heuristic behaves exactly as it does today - the run-199 pattern, where the heal window opens on the
 // button alone when health cannot be read, rather than silently doing nothing.
 int g_offWeapon = -1;
+int g_propDumpPawn = 0;      // ⭐ run 235: ini [Render] PropDumpPawn, one-shot
 
 static uintptr_t FindPlayerPawn(bool force = false);   // defined just below; cached, not a walk
 
@@ -1700,6 +1745,35 @@ volatile LONG g_armedState = ARMED_UNKNOWN;
 inline ArmedState PlayerArmed() { return (ArmedState)Rd(g_armedState); }
 
 // The expensive half. Present only - never a draw hook.
+// ---- ⭐ run 235: WHAT is equipped, not just whether something is ----
+//
+// Looking for an engine-side signal for "the TMD is active", because the observable alternative - the
+// TMD's sub-part meshes appearing as it deploys - is exactly the shape of proxy run 228 spent six runs
+// learning not to trust. Four rules guessed "is a weapon equipped" from the first-person pass and one
+// scene defeated all four; `Pawn.Weapon` answered it outright.
+//
+// The cheapest hypothesis first, and it needs NO new archaeology. The reported behaviour is that using
+// the TMD **unequips your weapon** - which is what an inventory weapon does when you switch to it. If
+// the TMD is itself a weapon, then `Pawn.Weapon` already points AT it while it is out, and the signal
+// is just the class name of a pointer we have been reading since run 227.
+//
+// Logged on CHANGE only, so switching guns and raising the TMD writes one line each and an idle minute
+// writes nothing. If the name never changes while the TMD comes and goes, the hypothesis is dead and
+// the property dump below is the fallback - that outcome is worth the same one run.
+static void LogEquippedClass(uintptr_t w) {
+    static uintptr_t lastCls = (uintptr_t)-1;
+    const uintptr_t cls = (w && Readable((void*)(w + OBJ_CLASS), sizeof(uintptr_t)))
+                        ? *reinterpret_cast<const uintptr_t*>(w + OBJ_CLASS) : 0;
+    if (cls == lastCls) return;
+    lastCls = cls;
+    char cn[80] = "(none)", on[80] = "";
+    if (cls) NameOf(cls, cn, sizeof(cn));
+    if (w)   NameOf(w, on, sizeof(on));
+    Log("equipped: Pawn.Weapon -> %s  (object '%s')   run 235: if this reads as the TMD while the"
+        " TMD is out, that is the 'is the TMD active' signal and it needs no new property.",
+        cn, on);
+}
+
 static void RefreshArmedState() {
     ArmedState st = ARMED_UNKNOWN;
     if (g_offWeapon >= 0) {
@@ -1707,6 +1781,7 @@ static void RefreshArmedState() {
             if (Readable((void*)(pawn + g_offWeapon), sizeof(uintptr_t))) {
                 const uintptr_t w = *reinterpret_cast<const uintptr_t*>(pawn + g_offWeapon);
                 st = w ? ARMED_YES : ARMED_NO;
+                LogEquippedClass(w);            // ⭐ run 235
             }
         }
     }
@@ -2104,7 +2179,13 @@ void ResolveGameplayOffsets() {
         {
             int dw = 0;
             g_offWeapon = PropOffsetInChain(pc, "Weapon", &dw);
-            Log("    Pawn.Weapon +0x%03X (depth %d)%s", g_offWeapon, dw,
+            // ⭐ run 235: the fallback if the equipped-class name does not name the TMD. One-shot, at the
+    // moment the pawn is known good.
+    if (g_propDumpPawn) {
+        g_propDumpPawn = 0;
+        DumpClassProperties(pc, "the player pawn's class chain");
+    }
+    Log("    Pawn.Weapon +0x%03X (depth %d)%s", g_offWeapon, dw,
                 g_offWeapon < 0 ? "  - NOT FOUND: the mesh latch keeps using its heuristics, which is"
                                   " what it did before this existed"
                                 : "  - the mesh latch can now ASK whether a weapon is equipped instead"
@@ -19404,6 +19485,14 @@ void LoadIniSettings() {
                         " follows the controller then and a centre-screen reticle points somewhere"
                         " the shot is not going"
                       : "always hidden");
+
+    // ⭐ run 235. One-shot dump of every property name on the player pawn's class chain, so a signal
+    // can be LOOKED UP rather than guessed at. Only needed if the equipped-class name does not already
+    // name the TMD.
+    g_propDumpPawn = GetPrivateProfileIntA("Render", "PropDumpPawn", 0, path) ? 1 : 0;
+    if (g_propDumpPawn)
+        Log("ini: PropDumpPawn=1 - the pawn's whole property list will be dumped once, at the mesh"
+            " latch. Expect several hundred lines.");
 
     // ⭐ run 234. Log where the geometry of ONE vertex count comes from, so "one mesh posed twice"
     // and "two meshes sharing a count" can be told apart. 0 = off.
