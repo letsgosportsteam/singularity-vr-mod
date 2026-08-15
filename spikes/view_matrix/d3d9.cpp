@@ -11665,6 +11665,29 @@ static void FgSoloStep() {
 }
 
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
+    // ---- 💥 run 237b: with the TMD up, hide NOTHING in the first-person pass ----
+    //
+    // Reported: "left hand with tmd was not visible", and the cause is upstream of the TMD work. The
+    // latch took `gun=11387 arms=3314, baseline [11387 3314 390 9]` BEFORE the TMD existed. Once you
+    // have it, 3314 and 390 are never drawn again and the pass becomes 11387 7444 4818 1368 729 ...
+    // so the hand (7444) and the gauntlet (4818) are **not in the baseline** and HideStrayArms hides
+    // them as stray animation geometry. They are dropped before the ride path is even reached, which
+    // is why `weapon fx: 0 foreground draw(s) rode` held all run.
+    //
+    // ⭐ This is also the ORIGINAL report - "while the TMD is active, it's invisible" - and it was
+    // never a missing feature. It is a stale baseline from a latch taken in a level state that no
+    // longer exists. The TMD work did not cause it and would not have fixed it.
+    //
+    // The exemption is the whole pass rather than a list of counts, because in this state the pass IS
+    // the thing you are meant to see: your hand and the device on it. There is no reload animation to
+    // suppress and no leftover fragment worth hiding. Naming counts here would be a fourth hardcoded
+    // mesh list, and run 228 is a long note about what those cost.
+    //
+    // 📝 The stale baseline itself is NOT fixed here - the latch still describes a pass that stopped
+    // existing. That wants a re-take when the pass composition changes fundamentally, and it is a
+    // bigger change to the most-repaired function in this file than one report justifies today.
+    if (Rd(g_tmdOnOffHand) && TmdRaised()) return false;
+
     // ⭐ run 233: solo overrides every rule below it, including the exemptions. That is the point -
     // an exemption that let a second mesh through would make two meshes visible and the answer
     // ambiguous, which is the one thing this measurement cannot afford.
