@@ -10359,7 +10359,23 @@ static void RodeLearn(UINT verts) {
 // magnitude - past it, the identification is wrong and there is nothing worth matching against.
 const LONG kFgSanePass = 64;
 
-const int kFgSigMax = 8;
+// ---- 💥 run 232: the census was SATURATED exactly where the interesting thing happens ----
+//
+// This was 8, and `FgLearnSignature` silently drops everything past the 8th distinct mesh. Before the
+// TMD the first-person pass holds 4 meshes, so 8 was never questioned. After the TMD, EVERY census in
+// the run-231 log is exactly 8 entries - which is not a measurement of 8 meshes, it is the instrument
+// hitting its stop. The classic arms (3314) and the fragment (390) vanish from those lists, and that
+// is far more likely to be truncation than the engine ceasing to draw them.
+//
+// ⚠ This is NOT a pure instrumentation change, and it must not be described as one. The latch picks
+// the top two BY SIZE from this list, so the list was "the largest two of whatever got drawn first".
+// Widening it lets a mesh that used to be truncated away win a role. That is strictly more correct -
+// choosing from a complete set beats choosing from an arbitrary prefix - but it can change which mesh
+// is the gun in TMD scenes, so the log now says outright when the old build would have truncated.
+//
+// 32 rather than 16: the only observed saturation is a pass that at least doubled on one pickup, and
+// a cap that has to be raised twice is a cap that was guessed twice. Cost is 4 arrays of LONGs.
+const int kFgSigMax = 32;
 volatile LONG g_fgSigVerts[kFgSigMax] = {};
 volatile LONG g_fgSigCount = 0;
 
@@ -10377,6 +10393,9 @@ volatile LONG g_fgSigCount = 0;
 // gameplay frame because it is replaced wholesale every frame rather than accumulated.
 volatile LONG g_fgStableVerts[kFgSigMax] = {};
 volatile LONG g_fgStableCount = 0;
+// ⭐ run 232: budget for the change-triggered census. Bounded because firing adds muzzle-flash
+// geometry to the pass, so a busy fight is a legitimate source of many real changes.
+int g_fgCensusBudget = 400;      // ini [Render] FgCensusBudget
 
 // ---- 💥 run 122: latch the mesh by its VERTEX COUNT, not its position in the list ----
 //
@@ -11535,7 +11554,7 @@ const int kWrongRoleFrames = 600;
 // Costs nothing when nothing is happening: the census line only prints when the list changes.
 void LogFgList(const char* why) {
     const LONG n = InterlockedCompareExchange(&g_fgStableCount, 0, 0);
-    char buf[256]; int off = 0;
+    char buf[640]; int off = 0;      // ⭐ run 232: 32 entries at ~13 chars, was 256 for 8
     for (LONG i = 0; i < n && i < kFgSigMax; ++i) {
         const LONG v = InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0);
         const int w = sprintf_s(buf + off, sizeof(buf) - off, "%s[%ld]=%ld", i ? " " : "", i, v);
@@ -18732,6 +18751,48 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     InterlockedExchange(&g_fgStableVerts[i],
                         i < sc ? InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0) : 0);
                 InterlockedExchange(&g_fgStableCount, sc);
+
+                // ---- ⭐ run 232: report the pass whenever its CONTENTS change ----
+                //
+                // LogFgList only ever fired at a latch take or drop, so the pass could change
+                // completely - a TMD coming out, a weapon going away - and leave no trace at all.
+                // Identifying the TMD meshes is a set-difference problem, and a set difference needs
+                // the set recorded at both ends.
+                //
+                // Compared as a SET, sorted, not as a sequence: draw ORDER shuffles frame to frame
+                // (the run-231 lists show the same meshes in four different orders), and an
+                // order-sensitive test would print every frame and drown the thing it is looking for.
+                if (g_fgCensusBudget > 0) {
+                    LONG cur[kFgSigMax];
+                    for (LONG i = 0; i < kFgSigMax; ++i)
+                        cur[i] = i < sc ? InterlockedCompareExchange(&g_fgStableVerts[i], 0, 0) : 0;
+                    for (LONG i = 1; i < kFgSigMax; ++i)      // insertion sort, 32 entries
+                        for (LONG j = i; j > 0 && cur[j - 1] < cur[j]; --j) {
+                            const LONG t2 = cur[j]; cur[j] = cur[j - 1]; cur[j - 1] = t2;
+                        }
+                    static LONG prev[kFgSigMax] = {};
+                    static bool havePrev = false;
+                    bool changed = !havePrev;
+                    for (LONG i = 0; i < kFgSigMax && !changed; ++i)
+                        if (prev[i] != cur[i]) changed = true;
+                    if (changed) {
+                        for (LONG i = 0; i < kFgSigMax; ++i) prev[i] = cur[i];
+                        havePrev = true;
+                        --g_fgCensusBudget;
+                        char b2[640]; int o2 = 0;
+                        for (LONG i = 0; i < sc && i < kFgSigMax; ++i) {
+                            const int w = sprintf_s(b2 + o2, sizeof(b2) - o2, "%s%ld",
+                                                    i ? " " : "", cur[i]);
+                            if (w <= 0) break;
+                            o2 += w;
+                        }
+                        if (!sc) sprintf_s(b2, sizeof(b2), "(empty)");
+                        Log("fg pass CHANGED: %ld mesh(es), largest first: %s%s", sc, b2,
+                            sc > 8 ? "   <== MORE THAN 8. The build before run 232 recorded only the"
+                                     " first 8 in draw order and dropped the rest, so every earlier"
+                                     " census of this pass was truncated." : "");
+                    }
+                }
             }
             InterlockedExchange(&g_fgSigCount, 0);
 
@@ -19155,6 +19216,15 @@ void LoadIniSettings() {
                         " follows the controller then and a centre-screen reticle points somewhere"
                         " the shot is not going"
                       : "always hidden");
+
+    // ⭐ run 232. How many first-person pass changes to report before going quiet. 0 disables.
+    g_fgCensusBudget = GetPrivateProfileIntA("Render", "FgCensusBudget", 400, path);
+    if (g_fgCensusBudget < 0)    g_fgCensusBudget = 0;
+    if (g_fgCensusBudget > 5000) g_fgCensusBudget = 5000;
+    Log("ini: FgCensusBudget=%d (report the first-person mesh set each time it CHANGES, this many"
+        " times. The pass census now holds %d meshes - it held 8 before run 232 and was SATURATED"
+        " in every TMD scene, so earlier lists of 8 were truncated, not complete.)",
+        g_fgCensusBudget, kFgSigMax);
 
     // ⭐ run 230. Percent of full size for an open note, scaled about the centre of the eye.
     // Default 40 rather than 100: a full-screen page of text is the REPORTED DEFECT, so shipping the
