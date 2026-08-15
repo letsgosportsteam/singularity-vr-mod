@@ -1724,6 +1724,33 @@ int g_offHealth = -1, g_offHealthMax = -1;
 int g_offWeapon = -1;
 int g_propDumpPawn = 0;      // ⭐ run 235: ini [Render] PropDumpPawn, one-shot
 
+// ---- ⭐ run 236: the property dump named the signal, and it was sitting next to mTMD ----
+//
+// Run 235 dumped all 2228 properties on the pawn's 13-class chain rather than guessing names, and the
+// TMD block on `RvPlayerPawn` reads:
+//
+//     +0x1054  mTMDArchetype
+//     +0x1058  mTMD                 the TMD object - non-null once you HAVE one
+//     +0x105C  mPlayerHandsStatus   <== what is actually IN your hands
+//     ...
+//     +0x1098  mArmMeshComponent    the arms component
+//     +0x109C  mNoTMDArms           the arms used when there is no TMD
+//     +0x10A0  mInviewMesh
+//
+// `mPlayerHandsStatus` is adjacent to `mTMD` in the same class and named for exactly the question, so
+// it is the candidate. Read, never written - if it turns out not to mean what the name says, the cost
+// is one log line rather than a broken hand.
+//
+// ⚠ Resolved BY NAME, not by the offsets above. Those came from one build of one copy of the game;
+// the name-based solver is what makes every other offset in this file survive a different install.
+//
+// 📝 mArmMeshComponent / mInviewMesh are noted for later: they are the real mesh components, and
+// identifying the arms through them would retire the vertex-count matching this whole subsystem rests
+// on. Not this run.
+int g_offHandsStatus = -1, g_offTMD = -1;
+volatile LONG g_handsStatus = -1;
+volatile LONG g_haveTMD = -1;
+
 static uintptr_t FindPlayerPawn(bool force = false);   // defined just below; cached, not a walk
 
 enum ArmedState { ARMED_UNKNOWN = 0, ARMED_YES, ARMED_NO };
@@ -1804,6 +1831,26 @@ static void RefreshArmedState() {
             }
         }
     }
+    // ⭐ run 236: both read from the pawn we already have, on the same once-a-frame path - never per
+    // draw. Logged on CHANGE, so raising and lowering the TMD writes two lines and idling writes none.
+    if (const uintptr_t pawn = FindPlayerPawn()) {
+        if (g_offHandsStatus >= 0 && Readable((void*)(pawn + g_offHandsStatus), 4)) {
+            const LONG v = *reinterpret_cast<const int32_t*>(pawn + g_offHandsStatus);
+            if (v != Rd(g_handsStatus)) {
+                InterlockedExchange(&g_handsStatus, v);
+                Log("hands: mPlayerHandsStatus = %ld   run 236: note WHAT YOU WERE HOLDING when this"
+                    " changed. If one value means the TMD is raised, that is the signal.", v);
+            }
+        }
+        if (g_offTMD >= 0 && Readable((void*)(pawn + g_offTMD), sizeof(uintptr_t))) {
+            const LONG have = *reinterpret_cast<const uintptr_t*>(pawn + g_offTMD) ? 1 : 0;
+            if (have != Rd(g_haveTMD)) {
+                InterlockedExchange(&g_haveTMD, have);
+                Log("hands: mTMD is %s", have ? "NON-NULL - the TMD has been acquired" : "null");
+            }
+        }
+    }
+
     static bool saidOnce = false;
     const LONG was = Rd(g_armedState);
     if ((LONG)st != was || !saidOnce) {
@@ -2195,6 +2242,22 @@ void ResolveGameplayOffsets() {
         if (g_offHealth    < 0) g_offHealth    = PropOffsetInChain(pc, "Health", &dh);
         if (g_offHealthMax < 0) g_offHealthMax = PropOffsetInChain(pc, "HealthMax", &dm);
         // ⭐ run 227: same super-chain walk. Engine.Pawn declares Weapon, well above RvPlayerPawnSP.
+        // ⭐ run 236: named by the run-235 dump, resolved by name like everything else here.
+        if (g_offHandsStatus < 0) {
+            int dp = 0;
+            g_offHandsStatus = PropOffsetInChain(pc, "mPlayerHandsStatus", &dp);
+            Log("    RvPlayerPawn.mPlayerHandsStatus +0x%03X (depth %d)%s", g_offHandsStatus, dp,
+                g_offHandsStatus < 0
+                  ? "  - NOT FOUND. The run-235 dump listed it, so a miss here means the class chain"
+                    " or the name differs on this build, not that the property is absent."
+                  : "  - candidate for 'is the TMD raised'. Read only.");
+        }
+        if (g_offTMD < 0) {
+            int dt = 0;
+            g_offTMD = PropOffsetInChain(pc, "mTMD", &dt);
+            Log("    RvPlayerPawn.mTMD +0x%03X (depth %d) - non-null once the TMD has been acquired,"
+                " which is NOT the same as it being raised.", g_offTMD, dt);
+        }
         {
             int dw = 0;
             g_offWeapon = PropOffsetInChain(pc, "Weapon", &dw);
