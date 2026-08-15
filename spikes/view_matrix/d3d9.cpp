@@ -1761,6 +1761,18 @@ int g_offHandsStatus = -1, g_offTMD = -1;
 volatile LONG g_handsStatus = -1;
 volatile LONG g_haveTMD = -1;
 
+// ✅ run 236c: DECODED, by correlating every change against the mesh census rather than against
+// anybody's memory of what they were holding. Six deployments, no exceptions in either direction:
+// every HANDS_TMD is followed within a frame or two by the TMD's five sub-part meshes appearing, and
+// every HANDS_WEAPON precedes them going away. It stayed correct across a weapon switch mid-sequence.
+//
+// ⭐ It LEADS the render. The property changed at log line 7508 and the meshes arrived at 7509-7511,
+// so a draw-time decision made on this value is already right on the frame the geometry shows up -
+// no one-frame latch of the kind the note-detection needed.
+enum { HANDS_NONE = 0, HANDS_TMD = 1, HANDS_WEAPON = 2 };
+inline bool TmdRaised()      { return Rd(g_handsStatus) == HANDS_TMD; }
+inline bool WeaponInHands()  { return Rd(g_handsStatus) == HANDS_WEAPON; }
+
 static uintptr_t FindPlayerPawn(bool force = false);   // defined just below; cached, not a walk
 
 enum ArmedState { ARMED_UNKNOWN = 0, ARMED_YES, ARMED_NO };
@@ -1848,8 +1860,10 @@ static void RefreshArmedState() {
             const LONG v = *reinterpret_cast<const int32_t*>(pawn + g_offHandsStatus);
             if (v != Rd(g_handsStatus)) {
                 InterlockedExchange(&g_handsStatus, v);
-                Log("hands: mPlayerHandsStatus = %ld   run 236: note WHAT YOU WERE HOLDING when this"
-                    " changed. If one value means the TMD is raised, that is the signal.", v);
+                Log("hands: mPlayerHandsStatus = %ld (%s)", v,
+                    v == HANDS_TMD    ? "TMD RAISED" :
+                    v == HANDS_WEAPON ? "weapon in hands" :
+                    v == HANDS_NONE   ? "neither" : "UNKNOWN VALUE - run 236c only decoded 0/1/2");
             }
         }
         if (g_offTMD >= 0 && Readable((void*)(pawn + g_offTMD), sizeof(uintptr_t))) {

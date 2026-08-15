@@ -517,6 +517,20 @@ recorded rather than filtered out, because a long enough transient reads as a vi
    - 📝 **`VetoQuietGun`, `RelatchWrongRoles` and `FgRememberArms` are now redundant weight** -
      they exist to guess at exactly what the engine now answers. Left in place, not yet retired.
 
+10h. **✅ FOUND (run 236) - `RvPlayerPawn.mPlayerHandsStatus` says whether the TMD is raised.**
+   `+0x105C`, depth 1, right beside `mTMD` (`+0x1058`). **0 = neither, 1 = TMD RAISED, 2 = weapon.**
+   - Decoded by correlating every change against the MESH CENSUS, not against anyone's memory of what
+     they were holding: six deployments, no exceptions either way, correct across a weapon switch.
+   - ⭐ **It LEADS the render** - the value changes a frame or two before the TMD's meshes appear, so a
+     draw-time decision on it is right on the frame the geometry arrives.
+   - ⛔ Two dead ends on the way, both worth not repeating: the TMD is **not** an inventory weapon
+     (`Pawn.Weapon` never points at it - it stays on the gun, which is HIDDEN not swapped), and
+     `IsTMD_Equipped` in the dump is a FUNCTION, not a readable property.
+   - ⚠ **A new property needs registering in `g_wantNames`.** `WantedIdx` searches only that table, so
+     an unregistered name fails before a single class is walked and reports as "not found at depth 13".
+     The property DUMP does not share that step - it reads names off each property directly - so the
+     two are not independent, and a "not found" from the resolver often means "not in the table".
+
 10g. **📏 MEASURED (run 234) - the arms are ONE mesh, so two-handed VR is not reachable by
    transform.** 7444 verts, 4402 triangles, from a single vertex/index buffer at `base 0, startIdx 0`
    - it owns its buffer outright. Identical across **27,279 draws** with a weapon and with the TMD, so
