@@ -11162,6 +11162,8 @@ inline bool FgMatchWindow() {
 // leave switched on. It only ever touches the first-person pass; world geometry never reaches here.
 volatile LONG g_fgSoloCycleMs = 0;    // ini [Render] FgSoloCycleMs, 0 = off
 volatile LONG g_fgSoloVerts   = 0;    // the mesh currently shown alone, 0 = none chosen yet
+volatile LONG g_fgSoloIdx     = 0;    // ⭐ run 233d: step position, for the on-screen readout
+volatile LONG g_fgSoloOf      = 0;
 
 // Steps the solo target on a timer. Called once a frame from Present, never from a draw hook - the
 // list it walks is rebuilt there and stepping from a draw would pick a different entry per draw.
@@ -11202,6 +11204,8 @@ static void FgSoloStep() {
     for (LONG i = 0; i < m2; ++i)
         if (v[i] == cur) { pick = v[(i + 1) % m2]; at = ((i + 1) % m2) + 1; break; }
     InterlockedExchange(&g_fgSoloVerts, pick);
+    InterlockedExchange(&g_fgSoloIdx, at);        // ⭐ run 233d: for the on-screen readout
+    InterlockedExchange(&g_fgSoloOf,  m2);
 
     char b3[640]; int o3 = 0;
     for (LONG i = 0; i < m2; ++i) {
@@ -16295,7 +16299,17 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     const LONG aim   = InterlockedCompareExchange(&g_aimMode, 0, 0);
 
     int sy, sp, sr; GunSigns(sy, sp, sr);
-    char l1[32], l2[32], l3[32];
+    char l1[32], l2[32], l3[32], l11[40];
+    // ⭐ run 233d: "how am I supposed to know what step I'm on?" - a fair hit. The solo cycle was
+    // logged and nothing else, so naming a mesh meant counting four-second intervals in a headset
+    // and hoping the count survived a cutscene. It rides the existing readout rather than getting
+    // an overlay of its own: this one is already built, already per-eye, and already has a switch
+    // the wearer knows how to reach.
+    if (const LONG sv = Rd(g_fgSoloVerts))
+        _snprintf_s(l11, sizeof(l11), _TRUNCATE, "SOLO %ld  (%ld OF %ld)",
+                    sv, Rd(g_fgSoloIdx), Rd(g_fgSoloOf));
+    else
+        _snprintf_s(l11, sizeof(l11), _TRUNCATE, "SOLO OFF");
     _snprintf_s(l1, sizeof(l1), _TRUNCATE, "COMBO %d  FRAME %s",
                 (int)combo, GunViewFrame() ? "ON" : "OFF");
     _snprintf_s(l2, sizeof(l2), _TRUNCATE, "YAW %c PITCH %c ROLL %c",
@@ -16444,7 +16458,9 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     //
     // So size it so overrun is impossible rather than unlikely: a 5x7 glyph has at most three runs
     // of set pixels per row (10101), so 21 rectangles per character is the true worst case, and
-    // the line buffers bound the character count. 10 lines x 39 chars x 2 eyes x 21 = 16380.
+    // the line buffers bound the character count. ⭐ run 233d added an 11th line, so the bound is
+    // now 11 x 39 x 2 x 21 = 18018 - still inside this cap, but it is the reason to re-check the
+    // arithmetic rather than the constant every time a line is added.
     const int kCap = 20480;
     static D3DRECT r[kCap];
     int n = 0;
@@ -16463,6 +16479,7 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
         // readout gets ignored.
         n = TextRects(r, n, kCap, x0, y0 + 2 * lh, px, l5);
         n = TextRects(r, n, kCap, x0, y0 + 3 * lh, px, l6);
+        n = TextRects(r, n, kCap, x0, y0 + 10 * lh, px, l11);   // ⭐ run 233d
     }
     // Loud, not silent. If the bound above is ever wrong the readout must say so rather than
     // quietly truncate - that failure mode already cost one run.
