@@ -9083,6 +9083,7 @@ void LogFgList(const char* why);      // run 213: the scope census dumps the mes
 // globals it reads. Declared here rather than moved, so the fix stays next to the note explaining it.
 extern int g_scopeQuadPerEye, g_scopeQuadPrimType, g_scopeQuadPrimCount;
 extern volatile LONG g_scopeQuadDraws;
+extern volatile LONG g_scopeMatchAim, g_scopeMatchIdle;   // ⭐ run 231
 extern int g_scopeScenePsReg, g_scopeAspectPsReg;      // run 213g
 extern int g_scopeHeadAim;                            // run 213h
 // ⭐ run 219: defined HERE rather than with the scope code, because three separate things now ask "is the
@@ -10008,11 +10009,40 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
     // quad's is. The right tool for a clip-space fullscreen quad is the VIEWPORT: NDC maps onto the
     // viewport rect, so pointing the viewport at one half puts the WHOLE quad inside that half. No
     // vertex access, no shader constant, and it cannot disturb any draw but this one.
-    if (g_scopeQuadPerEye && VrModeOn() && (UINT)t == (UINT)g_scopeQuadPrimType &&
+    // ---- 💥 run 231: this matcher fires on 96% of SECONDS in some saves ----
+    //
+    // It is "any 2-primitive triangle strip drawn into the scene target", which is the shape of every
+    // UE3 fullscreen post-process quad - the file's own Bink classifier note warns about exactly this
+    // class of over-match and then this predicate was written without the guard.
+    //
+    // The cost is not cosmetic. `g_scopeUpMs` is set here, and ScopeActive() gates FOUR things:
+    // the mesh latch (a scoped pass may not be latched from), the laser sight, the ADS pull-back and
+    // the ADS animation mask. A stuck match therefore silently disables all four - and the reported
+    // symptom was the first of them: "I reloaded a save and my gun was not attached to the
+    // controller", because UpdateFgLatch returned at its scope gate every call and no role was ever
+    // assigned. No latch line of any kind appears in that run's log.
+    //
+    // Measured across recent runs: 13-18% of seconds normally, 96% in the failing save. So it is not
+    // uniformly broken - something in that area draws the matching shape every frame.
+    //
+    // ⚠ The shape test is SPLIT from the action deliberately. ScopeQuadPerEye=0 has to remain a
+    // usable unblock - it turns off the viewport move AND stops g_scopeUpMs being set - while still
+    // letting the dump and the correlation counters run, or turning the bug off would also turn off
+    // the only instrument that can identify it.
+    const bool scopeShape = VrModeOn() && (UINT)t == (UINT)g_scopeQuadPrimType &&
         count == (UINT)g_scopeQuadPrimCount &&
         InterlockedCompareExchange(&g_dupDraws, 0, 0) &&
-        InterlockedCompareExchange(&g_rtIsScene, 0, 0)) {
+        InterlockedCompareExchange(&g_rtIsScene, 0, 0);
+    if (scopeShape) {
         ScopeQuadDump(dev, count);
+        // The decisive datum, and it costs two counters: the real scope quad can only be drawn while
+        // you are AIMING. A match with the aim trigger released is a false positive with no other
+        // possible reading, and no knowledge of the shader is needed to say so.
+        if (InterlockedCompareExchange(&g_rawAltTrigger, 0, 0) > 40)
+             InterlockedIncrement(&g_scopeMatchAim);
+        else InterlockedIncrement(&g_scopeMatchIdle);
+    }
+    if (g_scopeQuadPerEye && scopeShape) {
         D3DVIEWPORT9 full{};
         if (SUCCEEDED(dev->GetViewport(&full)) && full.Width >= 4) {
             static bool said = false;
@@ -12749,6 +12779,7 @@ int g_scopeHeadAim = 1;          // ini [Render] ScopeHeadAim
 int g_scopeScenePsReg  = 1;      // ini [Render] ScopeScenePsReg   - ScreenPositionScaleBias
 int g_scopeAspectPsReg = 0;      // ini [Render] ScopeAspectPsReg  - ScreenAspectRatio
 volatile LONG g_scopeQuadDraws = 0;
+volatile LONG g_scopeMatchAim = 0, g_scopeMatchIdle = 0;   // ⭐ run 231
 
 HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
                                           UINT primCount, const void* vtxData, UINT vtxStride) {
@@ -17641,6 +17672,19 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // means the gate never matched - the fix is inert, not wrong.
             if (const LONG sq = InterlockedExchange(&g_scopeQuadDraws, 0))
                 Log("    scope overlay quads drawn per eye: %ld this second", sq);
+
+            // ⭐ run 231: the over-match test. The real scope quad cannot be drawn with the aim
+            // trigger released, so a nonzero IDLE count is a false positive outright - and every one
+            // of them suppresses the mesh latch, the laser, the ADS pull-back and the ADS mask for
+            // the next 500 ms.
+            {
+                const LONG ma = InterlockedExchange(&g_scopeMatchAim, 0);
+                const LONG mi = InterlockedExchange(&g_scopeMatchIdle, 0);
+                if (ma || mi)
+                    Log("    scope quad matches: %ld while AIMING, %ld while NOT aiming%s", ma, mi,
+                        mi ? "  <== FALSE POSITIVES. Every one blocks the mesh latch, the laser and"
+                             " the ADS fixes for 500 ms (run 231)" : "");
+            }
 
             // Run 213d. Proves the drop test actually engaged. "I saw no change" means nothing if the
             // filter never matched a draw - that ambiguity is what made run 213a expensive.
