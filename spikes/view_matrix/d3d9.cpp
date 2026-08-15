@@ -2473,7 +2473,7 @@ volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DIS
 //
 // ⚠ The 344 is a GLYPH COUNT and must never be used to recognise a note: a shorter note has fewer.
 // The two anchors at y=+1.0 are panel corners and do not depend on the text, so those are the marker.
-volatile LONG g_noteInsetPct   = 65;   // ini [Render] NoteInsetPct, and a DISPLAY panel row
+volatile LONG g_noteInsetPct   = 40;   // ini [Render] NoteInsetPct, and a DISPLAY panel row
 volatile LONG g_noteSeenFrame  = 0;    // a note marker was drawn THIS frame
 volatile LONG g_noteOpen       = 0;    // ...was drawn LAST frame - what the inset actually reads
 volatile LONG g_noteInsetDraws = 0;    // elements actually scaled, reported per second
@@ -5888,10 +5888,15 @@ void PanelAdjust(int row, int dir) {
                                 InterlockedCompareExchange(&g_hideMuzzleFx, 0, 0) ? 0 : 1);
             break;
         case PR_NOTESIZE: {
-            // Same 5%-a-press step as WORLD SCALE. The floor is 40 rather than 0 because a note you
+            // Same 5%-a-press step as WORLD SCALE. There is a floor rather than 0 because a note you
             // cannot read for being too small is the same bug reported from the other side.
+            //
+            // ⚠ It was 40, and run 230 settled on exactly 40 - AT the clamp. A value chosen at a
+            // boundary is not a preference, it is the boundary, and there is no way to tell the two
+            // apart from inside the clamp. Lowered to 25 so the comfortable setting is somewhere in
+            // the range rather than at its edge.
             LONG p = InterlockedCompareExchange(&g_noteInsetPct, 0, 0) + dir * 5;
-            if (p < 40)  p = 40;
+            if (p < 25)  p = 25;
             if (p > 100) p = 100;
             InterlockedExchange(&g_noteInsetPct, p);
             break;
@@ -19102,10 +19107,11 @@ void LoadIniSettings() {
                       : "always hidden");
 
     // ⭐ run 230. Percent of full size for an open note, scaled about the centre of the eye.
-    // Default 65 rather than 100: a full-screen page of text is the REPORTED DEFECT, so shipping the
-    // default at 100 would ship the bug and make the setting a thing you have to discover.
-    LONG noteIni = GetPrivateProfileIntA("Render", "NoteInsetPct", 65, path);
-    if (noteIni < 40)  noteIni = 40;
+    // Default 40 rather than 100: a full-screen page of text is the REPORTED DEFECT, so shipping the
+    // default at 100 would ship the bug and make the setting a thing you have to discover. 40 is the
+    // measured comfortable value in a headset, not a guess - 65 was the guess and it was too big.
+    LONG noteIni = GetPrivateProfileIntA("Render", "NoteInsetPct", 40, path);
+    if (noteIni < 25)  noteIni = 25;
     if (noteIni > 100) noteIni = 100;
     InterlockedExchange(&g_noteInsetPct, noteIni);
     Log("ini: NoteInsetPct=%ld (%s). DISPLAY page, NOTE SIZE.", noteIni,

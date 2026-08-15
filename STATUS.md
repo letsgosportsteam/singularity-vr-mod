@@ -233,8 +233,9 @@ recorded rather than filtered out, because a long enough transient reads as a vi
      registers rather than a new system.
    - Wants to be a panel setting (HUD inset / safe area), not a constant — how far in is
      comfortable depends on the headset's optics and the player's IPD.
-   - ⭐ **Run 230 built and shipped that mechanism for NOTES** (`NoteInsetPct`, DISPLAY page,
-     `NOTE SIZE`). Extending it to health and ammo is now a matter of choosing what to match, not
+   - ⭐ **Run 230 built and shipped that mechanism for NOTES** (`NoteInsetPct`, **default 40**,
+     DISPLAY page, `NOTE SIZE`). Confirmed in a headset: 480 draws/second = the 4 non-exempt
+     elements at 120 fps, with the backing correctly left alone. Extending it to health and ammo is now a matter of choosing what to match, not
      of writing anything: the scale-about-centre and its per-eye composition are done and proven.
      ⚠️ **The inset must be applied BEFORE `ApplyEyeRemap`, never after** — the eye remap shifts x
      by ±0.5, and scaling about zero after that shift drags the eye centre, throwing the two eyes

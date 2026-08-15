@@ -26,8 +26,16 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ## ⭐ Runs 229-230: the notes, and a diagnostic that expired before the thing it measured
 
-**Reported:** an in-game note "spans across the whole screen so is very hard to read". **Fixed** -
-`NoteInsetPct`, default 65, DISPLAY page as `NOTE SIZE`.
+**Reported:** an in-game note "spans across the whole screen so is very hard to read". **Fixed and
+confirmed** - `NoteInsetPct`, **default 40**, DISPLAY page as `NOTE SIZE`.
+
+The log settled it rather than an impression: `480 draw(s) this second` at 120 fps is exactly the four
+non-exempt elements, so the marker fired and the backing was correctly skipped.
+
+⚠ **The chosen value came out AT the clamp.** The floor was 40 and the comfortable setting was 40,
+and from inside a clamp those two are indistinguishable - one is a preference, the other is the
+boundary. Floor lowered to 25 so the answer sits somewhere in the range instead of on its edge. 65
+was my guess and it was far too big; the measured value is nearly half of it.
 
 ### ⛔ Run 229 measured nothing, and the reason was timing
 
