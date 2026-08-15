@@ -1683,13 +1683,42 @@ static uintptr_t FindPlayerPawn();    // defined just below; cached, not a walk
 
 enum ArmedState { ARMED_UNKNOWN = 0, ARMED_YES, ARMED_NO };
 
-static ArmedState PlayerArmed() {
-    if (g_offWeapon < 0) return ARMED_UNKNOWN;
-    const uintptr_t pawn = FindPlayerPawn();
-    if (!pawn) return ARMED_UNKNOWN;
-    if (!Readable((void*)(pawn + g_offWeapon), sizeof(uintptr_t))) return ARMED_UNKNOWN;
-    const uintptr_t w = *reinterpret_cast<const uintptr_t*>(pawn + g_offWeapon);
-    return w ? ARMED_YES : ARMED_NO;
+// ⛔ run 228b: RESOLVED ONCE A FRAME, READ AS A PLAIN WORD EVERYWHERE ELSE.
+//
+// The first version called FindPlayerPawn() straight from FgHidden and FgRidesGun. Those run PER DRAW.
+// FindPlayerPawn is cheap only on its cached path - on a MISS it walks GObjects with a NameOf per
+// object, throttled to one walk per 30 CALLS. Per draw, at thousands of draws a frame, that is a
+// hundred full object walks a frame for as long as the pawn cannot be found: menus, loading, level
+// transitions. Exactly run 209's defect, which this file describes as "the object graph is not a thing
+// to poll from a frame path" - a sentence added this same session, and then ignored.
+//
+// So the resolve happens once a frame from Present, beside UpdateFgLatch which already runs there, and
+// every hot-path consumer reads a plain aligned 32-bit word. Same shape as g_healPending, and for the
+// same reason run 203 gave: the hot path must not touch anything that can block.
+volatile LONG g_armedState = ARMED_UNKNOWN;
+
+inline ArmedState PlayerArmed() { return (ArmedState)Rd(g_armedState); }
+
+// The expensive half. Present only - never a draw hook.
+static void RefreshArmedState() {
+    ArmedState st = ARMED_UNKNOWN;
+    if (g_offWeapon >= 0) {
+        if (const uintptr_t pawn = FindPlayerPawn()) {
+            if (Readable((void*)(pawn + g_offWeapon), sizeof(uintptr_t))) {
+                const uintptr_t w = *reinterpret_cast<const uintptr_t*>(pawn + g_offWeapon);
+                st = w ? ARMED_YES : ARMED_NO;
+            }
+        }
+    }
+    const LONG was = Rd(g_armedState);
+    if ((LONG)st != was) {
+        InterlockedExchange(&g_armedState, (LONG)st);
+        Log("weapon state: %s (run 228)",
+            st == ARMED_YES ? "a weapon IS equipped" :
+            st == ARMED_NO  ? "NO weapon equipped - nothing in the first-person pass will be hidden"
+                            : "UNKNOWN - the pawn or the Weapon offset could not be read, so the mesh"
+                              " latch keeps using its heuristics");
+    }
 }
 uintptr_t g_playerPawn = 0, g_playerPawnClass = 0;
 void ResolveGameplayOffsets();          // retryable; see its definition below SolvePropertyLayout
@@ -17240,6 +17269,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // gate needs the property layout, and the layout used to be solved only by the latch itself - a
         // circular dependency that meant the latch never took at all. Self-throttling; a no-op once solved.
         SolvePropertyLayout();
+        RefreshArmedState();   // ⭐ run 228b: once a frame, BEFORE the latch consults it
         UpdateFgLatch();
         // Run 200: the heal gate's offsets, retried until resolved. Free once it has them, and the HUD
         // often does not exist at the mesh latch where the first attempt runs.
