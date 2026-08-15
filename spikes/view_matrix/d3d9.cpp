@@ -11263,7 +11263,26 @@ static bool FgRidesGun(UINT verts) {
     if (m != 1 && m != 3) return false;
     // == 1 exactly. Mode 2 is the hide-the-pass test and must not also transform what it keeps.
     if (Rd(g_fgRideAll) != 1) return false;
-    if (!Rd(g_inForeground)) return false;
+    // ---- ⭐ run 228f: the DEPTH-PRIME copy has to ride too, or it writes a black silhouette ----
+    //
+    // Reported: an all-black copy of the rope, following the HEAD, while the real rope correctly
+    // follows the controller. That is run 120's silhouette from the other side.
+    //
+    // The first-person meshes are drawn TWICE: a depth prime at the top of the frame, then the real
+    // draw inside the foreground pass. FgMoved already covers both - run 215 gave it FgMatchWindow for
+    // exactly this reason - but this function still asked for g_inForeground alone. So the rope's
+    // foreground copy rode to the controller and its prime copy stayed at the engine's position,
+    // which is what you can see.
+    //
+    // ⚠ Deliberately NOT widened to "anything in the prime window". This function's job is
+    // "everything ELSE the pass draws", so it matches draws that match nothing - and letting that
+    // loose on the first frames of a frame would move whatever the engine happens to draw there. The
+    // exemption is narrowed to the one count we positively know: the arms-role mesh, while unarmed.
+    // Same safety shape as FgMoved, which is only ever count-matched.
+    if (!Rd(g_inForeground)) {
+        const LONG ap = Rd(g_armsVerts);
+        if (!(PlayerArmed() == ARMED_NO && ap && (UINT)ap == verts && FgMatchWindow())) return false;
+    }
     // Nothing rides during an animation window - the gun itself is not being moved, so an attachment
     // that followed the controller would be the only thing off the animation. Moved BELOW the cheap
     // gates in run 203: it was the second test in the function, so every draw paid for a 64-bit
