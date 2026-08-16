@@ -5708,7 +5708,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_LASER, PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH,
        PR_NOTESIZE,          // ⭐ run 230
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
-       PR_TMDARMFROM, PR_TMDARMTO,   // ⭐ run 237c
+       PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,   // ⭐ run 237c, un-retired in 247b
        PR_TMDHIDE,                   // ⭐ run 237d
        PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH, PR_TMDBONESLOT,   // ⭐ run 239
        PR_TMDBONEMODE,               // ⭐ run 241
@@ -5733,7 +5733,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // on it change meaning when you switch guns, and mixing that with global settings on a shared page is
 // how someone tunes the rifle and wonders why the pistol moved.
 const int kPanelPages    = 7;      // ⭐ run 237: + TMD ALIGN
-const int kPanelRowsMax  = 14;     // ⭐ run 245: + TMD ROLL
+const int kPanelRowsMax  = 17;     // ⭐ run 247b: + the triangle window rows
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
       PR_GOTO_WEAPON, PR_GOTO_TMD },
@@ -5769,10 +5769,16 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
       // no way to reach it. Asked for directly as "make the whole mesh disappear so I can confirm
       // both arms share it", which is exactly what it is for: one press answers a question that
       // otherwise costs a bone sweep.
-      PR_TMDBONEMODE, PR_TMDHIDE, PR_BACK },
+      PR_TMDBONEMODE,
+      // ⭐ run 247b: the triangle window is UN-RETIRED. Run 237f took it off the panel as measured
+      // dead - and it was, for the HANDS, where the two interleave. The left arm is a different
+      // object: one limb, wrist to shoulder on a single bone set, so bones cannot separate it and a
+      // contiguous block of triangles is the only remaining lever. Dead for one mesh is not dead.
+      PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,
+      PR_TMDHIDE, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 14 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 17 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
