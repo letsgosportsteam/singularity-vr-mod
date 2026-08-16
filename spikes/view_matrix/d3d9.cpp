@@ -1062,12 +1062,43 @@ const int CTL_ROTATION_2 = 0x05D4;
 // ⚠️ Reads only. Anything that WRITES, or needs read-modify-write, must stay interlocked.
 inline LONG Rd(const volatile LONG& v) { return v; }
 
+// ---- 💥 run 256: this is a SYSCALL, and a GObjects walk makes hundreds of thousands of them ----
+//
+// Measured, after four builds of narrowing: the splash screen spends 1365 ms in ONE call to
+// RefreshArmedState. That is a `FindPlayerPawn` walk over the whole GObjects array, and the walk
+// calls Readable() per object plus several more inside NameOf. VirtualQuery is a kernel transition;
+// at ~100k objects that is the entire cost.
+//
+// UE3's object heap is a handful of large committed regions that live for the process, so
+// consecutive objects nearly always fall inside the region the previous query already returned.
+// Caching that one region turns the syscall into a range compare for the overwhelming majority of
+// calls, and it speeds up EVERY GObjects walk in this file, not just the pawn's.
+//
+// ⚠️ Only POSITIVE results are cached, and only the exact region VirtualQuery reported as committed
+// and accessible - protection and state are uniform across a returned region by definition, so the
+// range test answers exactly what the syscall would have.
+//
+// ⚠️ This function exists to prevent crashes, so staleness is the whole risk: a region freed or
+// re-protected between the query and the read would make a cached "yes" a lie. Bounded two ways -
+// thread_local, so no other thread's walk can seed it, and cleared at the start of every walk and
+// once per frame. That caps the window at one walk, which after this change is milliseconds rather
+// than the 1.4 seconds it used to be.
+struct ReadableRegion { uintptr_t base = 0, end = 0; bool valid = false; };
+static thread_local ReadableRegion g_readOk;
+
+void ReadableForget() { g_readOk.valid = false; }
+
 bool Readable(const void* p, size_t n) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    if (g_readOk.valid && a >= g_readOk.base && (a + n) <= g_readOk.end) return true;
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
     if (mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    return ((uintptr_t)p + n) <= ((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    if ((a + n) > base + mbi.RegionSize) return false;
+    g_readOk.base = base; g_readOk.end = base + mbi.RegionSize; g_readOk.valid = true;
+    return true;
 }
 
 // Split out of NameOf so a name index can be resolved on its own. The ProcessEvent census keeps
@@ -1963,12 +1994,35 @@ static uintptr_t FindPlayerPawn(bool force) {
         *reinterpret_cast<uintptr_t*>(g_playerPawn + OBJ_CLASS) == g_playerPawnClass)
         return g_playerPawn;
     g_playerPawn = 0;
-    static int missTick = 0;
-    if (!force && (++missTick % 30) != 1) return 0;
-    if (!Readable((void*)kGObjectsTArray, 12)) return 0;
+    // ---- 💥 run 256: the miss throttle counted FRAMES, which is backwards when the walk is the
+    // thing making frames slow ----
+    //
+    // `(++missTick % 30) != 1` fires every 30 frames whatever a frame costs. At the splash screen
+    // that is every ~3.7 s at 8 fps, and the walk itself measured 1365 ms - so better than a third
+    // of all wall-clock time went into a search that CANNOT succeed, and the slower it made things
+    // the larger its share became. A frame count is not a rate limit when frames are the casualty.
+    //
+    // Time-based with a backoff now, and deliberately the same shape as ResolveGameplayOffsets'
+    // own throttle a few hundred lines down: 2 s, then 15 s once it has missed three times running.
+    //
+    // ⚠️ This does NOT reintroduce run 228d's stacked-throttle bug. That was about the FORCED path -
+    // ResolveGameplayOffsets pays its own throttle and skips this one, and `force` still does. This
+    // only slows down callers that ask repeatedly while no pawn exists, which is exactly the splash
+    // screen and exactly nothing else: in gameplay the first walk succeeds and every later call
+    // returns from the cache above without reaching here.
+    static ULONGLONG lastWalk = 0;
+    static int consecutiveMisses = 0;
+    if (!force) {
+        const ULONGLONG nowMs = GetTickCount64();
+        const ULONGLONG waitMs = (consecutiveMisses >= 3) ? 15000 : 2000;
+        if (lastWalk && nowMs - lastWalk < waitMs) return 0;
+        lastWalk = nowMs;
+    }
+    ReadableForget();          // ⭐ run 256: never carry a region cache into a fresh walk
+    if (!Readable((void*)kGObjectsTArray, 12)) { ++consecutiveMisses; return 0; }
     uintptr_t data = *reinterpret_cast<uintptr_t*>(kGObjectsTArray);
     int32_t count = *reinterpret_cast<int32_t*>(kGObjectsTArray + 4);
-    if (!data || count <= 0) return 0;
+    if (!data || count <= 0) { ++consecutiveMisses; return 0; }
     uintptr_t* objs = reinterpret_cast<uintptr_t*>(data);
     for (int32_t i = 0; i < count; ++i) {
         uintptr_t o = objs[i];
@@ -1979,9 +2033,16 @@ static uintptr_t FindPlayerPawn(bool force) {
         if (!strstr(cn, "PlayerPawn")) continue;
         g_playerPawn = o;
         g_playerPawnClass = cls;
-        Log("player pawn: 0x%08X (%s)", (unsigned)o, cn);
+        consecutiveMisses = 0;              // ⭐ run 256: found - the backoff resets
+        Log("player pawn: 0x%08X (%s) after walking %d object(s)", (unsigned)o, cn, i + 1);
         return o;
     }
+    // ⚠️ A miss is the SPLASH-SCREEN case and it is normal there - the pawn does not exist yet. It is
+    // logged once per backoff step rather than per walk so the file cannot fill with it.
+    ++consecutiveMisses;
+    if (consecutiveMisses <= 3)
+        Log("player pawn: not found after walking %d object(s) - backing off to %s (run 256)",
+            count, consecutiveMisses >= 3 ? "15 s" : "2 s");
     return 0;
 }
 
@@ -19261,6 +19322,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // ⭐ run 208: solved HERE as well as at the latch take, and BEFORE UpdateFgLatch. The run-207 latch
         // gate needs the property layout, and the layout used to be solved only by the latch itself - a
         // circular dependency that meant the latch never took at all. Self-throttling; a no-op once solved.
+        // ⭐ run 256: the Readable region cache never survives a frame boundary. Belt and braces -
+        // every walk clears it on entry too - but this bounds the staleness window absolutely,
+        // which matters for a cache whose whole job is stopping us read freed memory.
+        ReadableForget();
         // ⭐ run 254: this whole block is TIMED now. It was never in any bucket, so all of it has
         // always landed in "our work" - see g_msGameplayHooks.
         const LARGE_INTEGER tGp = Now();
