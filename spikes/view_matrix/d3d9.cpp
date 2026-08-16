@@ -17339,7 +17339,21 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
     const int  boxH  = lh * (nRows + 3);
     const int  y0    = (int)(g_srcH / 2) - boxH / 2;
 
-    const int kCap = 8192;
+    // ---- 💥 run 248: 8192 was not enough for a 17-row page, and it FAILED SILENTLY ----
+    //
+    // Reported as "all settings in the TMD section are now invisible". TextRects stops emitting
+    // once the array is full, so rows past the budget simply do not draw - and the plate is drawn
+    // FIRST, so what survives is an empty box that looks like a page with nothing on it.
+    //
+    // ⚠ SECOND time in this file, and the first is documented in DrawStateReadout a few hundred
+    // lines away: "at 1200 it was neither... which is why the anchor readout appeared as
+    // 'ANCHOR (F27) R9 U-13' in the left eye and 'AN' in the right". I added five rows to this page
+    // across four runs and never re-checked the bound that note exists to warn about.
+    //
+    // A CORRECTNESS bound, derived rather than picked: a 5x7 glyph has at most three runs of set
+    // pixels per row, so 21 rectangles per character is the true worst case. Rows x columns x two
+    // eyes, plus the plate and the selection bar.
+    const int kCap = kPanelRowsMax * 44 * 21 * 2 + 64;
     static D3DRECT r[kCap];
 
     // The plate first, as one rectangle per eye.
@@ -17373,6 +17387,16 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
             n = TextRects(r, n, kCap, x0, y0 + lh * (2 + i), px, rows[i]);
         n = TextRects(r, n, kCap, x0, y0 + lh * (nRows + 2), px,
                       "LEFT STICK   HOLD Y TO CLOSE");
+    }
+    // ⭐ run 248: loud, not silent. A page that cannot fit must SAY so - the failure it replaces
+    // was indistinguishable from the feature being broken, and cost a headset run to report.
+    if (n >= kCap) {
+        static bool panelWarned = false;
+        if (!panelWarned) {
+            panelWarned = true;
+            Log("*** PANEL hit its %d-rect cap - rows are being DROPPED and the page will look"
+                " empty or half drawn. Raise kCap. ***", kCap);
+        }
     }
     if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
 
@@ -18935,6 +18959,21 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 // good, because the gun has been aligned with it for twenty runs. If both hands report
                 // the same sign the hand INDEX is wrong; if they differ the conversion is; if the raw
                 // XR values already disagree the fault is upstream of both.
+                // ⭐ run 248b: the SEPARATION, spelled out. The raw triples showed the two hands 8-9 cm
+                // apart and moving together while held apart, which is one controller read twice - but
+                // that took reading six numbers to see. One distance says it at a glance, and says it
+                // the same way whether the cause is the binding, the action space, or the test.
+                {
+                    const float sx = g_handLastPos[0].x - g_handLastPos[1].x;
+                    const float sy = g_handLastPos[0].y - g_handLastPos[1].y;
+                    const float sz = g_handLastPos[0].z - g_handLastPos[1].z;
+                    const float sep = sqrtf(sx * sx + sy * sy + sz * sz);
+                    Log("    HAND SEPARATION %.3f m  (valid L%d R%d)%s", sep,
+                        g_handPoseValid[0] ? 1 : 0, g_handPoseValid[1] ? 1 : 0,
+                        sep < 0.25f ? "   <== the two controllers are reporting nearly the SAME"
+                                      " place. Held apart, this should read close to a metre."
+                                    : "");
+                }
                 Log("    hands raw XR (metres, head-relative): AIM[%d] (%.3f %.3f %.3f)"
                     "  OFF[%d] (%.3f %.3f %.3f)  | derived UU: AIM (%.1f %.1f %.1f)"
                     "  OFF (%.1f %.1f %.1f)  | leftHanded %d (run 247)",
