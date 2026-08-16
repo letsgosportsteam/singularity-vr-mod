@@ -24,6 +24,52 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## 💥 Run 249: the TMD panel page was blank because ONE `Clear()` was too big, not because rows were dropped
+
+Reported twice, the second time as *"i see a big black screen. i can see what row i'm on, but the
+text is blank"*. That description is the whole diagnosis and it arrived before any instrument did:
+the plate and the selection bar are 2 and 1 rectangles and both drew; **the page title went missing
+along with the rows**, and the title is not a row. A cap that drops rows past a budget cannot
+remove the thing drawn *first*.
+
+Run 248 had read the same symptom as row-dropping, raised `kCap` from 8192 to ~31,000, and shipped
+a warning for the overrun. **The warning never fired once**, and the page stayed blank — so the fix
+was refuted by its own instrument, in the log, before this run touched anything.
+
+The panel draws text as a single `Clear()` with one rectangle per run of set pixels in a 5x7 glyph.
+A 17-row page asks for roughly 13,000; working pages sat at ~5,000. `Clear()` takes that list whole
+or refuses it whole, and **its HRESULT was never checked**, so the refusal had no way to be seen.
+
+- **`ClearRects()` batches at 1024** and logs the HRESULT, the failing batch and the total. The
+  limit is deliberately not hunted for: 1024 is an order of magnitude under the smallest count
+  observed to fail, and a wrong guess costs a few extra calls on a panel open for seconds.
+- **`kPanelRowsMax` 17 -> 10**, with TMD ALIGN split into `TMD ALIGN` / `TMD BONES` / `TMD MESH`.
+  The seven pose rows stay one press from the root because they are the ones worked through
+  repeatedly while aligning; the bone and triangle rows are hunting tools reached when a mesh is
+  wrong. `px` derives from that constant, so the glyph goes 3 -> 5 — it had been sitting on the
+  floor the code calls unreadable through a lens.
+- The panel logs its rect count per page change. That number is what the misdiagnosis lacked.
+
+⚠️ **The mechanism is not confirmed.** The page is now batched *and* short, and either alone could
+explain a working page. The per-page rect count and the absence of a `Clear() REFUSED` line are
+what would settle it.
+
+**Two defects found by reading the page rather than the symptom**, both from run 247b, both
+invisible because the page was blank: `ARM FROM` / `ARM TO` / `ARM STEP` had no `PanelRowText` case
+and fell through to the `default` arm, so all three rendered as *"DEBUGGING ON"*; `ARM STEP` had no
+`PanelAdjust` case either, so **adjusting it toggled the DEBUG setting**. `TmdArmStep` was
+adjustable and never saved, and the `PanelSaveRow` TMD block ran `for (i = 0; i < 11; ++i)` against
+an 11-entry table — a hardcoded count next to the comment explaining that this shape exists to stop
+exactly that. Now `_countof`.
+
+**Method notes.**
+- **A fix whose own warning never fires has been refuted, not confirmed.** Run 248 added the
+  instrument that disproved run 248, and it had been sitting in the log since.
+- **Which parts of the drawing survived is the discriminator**, and it was in the first report both
+  times. Title missing rules out row-dropping outright.
+- **An unchecked HRESULT on a call you rely on is an instrument you decided not to build.** This
+  one had been failing in plain sight through two headset runs.
+
 ## ⭐ Runs 232-234: what is actually in the first-person pass, and the arms are ONE mesh
 
 Groundwork for a possible two-handed VR mode. Three instrument fixes and one settled fact.

@@ -58,7 +58,7 @@ dropped beside the game exe. No game files modified.
 | **Cutscene head tracking** | ✅ **working, automatic** — run 138. `SetCinematicMode` drives it; look around freely during a cutscene, normal turning restored on exit |
 | **`D3D9ExMode=1` texture corruption** | ✅ **fixed** — run 139. Zero-copy is usable again; visuals match `D3D9ExMode=0` |
 | **Smooth turning** | ✅ run 140 — `TurnMode=2`, degrees per second, works during cutscenes |
-| **VR settings panel** | ✅ run 142 — hold Y **1 s** anywhere (1.3 s until run 219); live changes, saved to the ini on close |
+| **VR settings panel** | ✅ run 142 — hold Y **1 s** anywhere (1.3 s until run 219); live changes, saved to the ini on close. ⚠️ **No page may exceed `kPanelRowsMax` (10) rows** — run 249 |
 | **The game's HUD and menus in both eyes** | ✅ run 151 — health, ammo, crosshair, prompts, pause menu. `HudStereo=1` |
 | **The sniper scope in both eyes** | ✅ run 213 — whole scope per eye, world once, circle round. `ScopeQuadPerEye=1` |
 | **Shipping defaults = the tested configuration** | ✅ 2026-08-08 — a fresh install with no ini now behaves like the tuned dev machine. See below |
@@ -107,6 +107,43 @@ discount a perfect empirical correlation. **Matching a tested value costs nothin
    your own bug. `xrEndFrame` hid a **189 ms** stall in there for an entire day.
 3. **The cheap control first.** Rename `d3d9.dll` to `d3d9.dll.off` and run the game unmodded at the
    same resolution. One minute, and it settles "is this us at all" before any bisection starts.
+
+### ⚠️ SHIPPED, NOT YET FLOWN (run 249) — the TMD panel page drew no text at all
+
+Reported twice: the TMD page is a dark plate with the selection bar visible and **every glyph
+missing, the page title included**. Run 248 read that as rows being dropped past the rectangle cap
+and raised the cap; the page stayed blank and **the overrun warning that fix added never fired
+once**, which is how it was ruled out this time.
+
+The panel draws its text as a **single `Clear()` with one rectangle per run of set pixels**, and a
+17-row page asks for roughly 13,000 of them. That call fails as a **unit**, so nothing lands —
+which is exactly why the *title* went missing along with the rows, while the plate (2 rects) and
+the bar (1 rect) survived. Working pages sat at ~5,000 and drew, which is what made this look
+specific to the TMD page rather than to the panel. **The HRESULT had never been checked**, so the
+refusal was invisible.
+
+Three changes, and the mechanism is *not* yet confirmed — see the risk note below:
+
+- `ClearRects()` **batches at 1024**, so no single call can be large enough to be refused, and a
+  failure now **logs the HRESULT, the batch and the total**. This is the actual fix.
+- **`kPanelRowsMax` is back down to 10** and TMD ALIGN is split into three pages — `TMD ALIGN`
+  (the 7 pose rows, still one press from the root), `TMD BONES`, `TMD MESH`. `px` is derived from
+  that constant, so at 17 rows the glyph had hit its floor of 3, which the code's own comment calls
+  unreadable through a lens; at 10 it is 5.
+- The panel logs **`page N (NAME), R row(s), X text rect(s) in B batch(es), px P`** on every page
+  change. That number is what the whole misdiagnosis was missing.
+
+⚠️ **A working page will NOT by itself confirm the diagnosis.** The page is now both batched *and*
+short, so either change alone could account for it. The log settles it: the per-page rect count
+says how big the call would have been, and a `Clear() REFUSED` line says whether any batch was
+still turned away.
+
+**Also fixed on that page, and unrelated:** `ARM FROM`, `ARM TO` and `ARM STEP` had **no
+`PanelRowText` case**, so all three fell through to the `default` arm and rendered as *"DEBUGGING
+ON"*; `ARM STEP` had no `PanelAdjust` case either, so **adjusting it toggled the DEBUG setting**.
+Both shipped in run 247b and were invisible only because the page was blank. `TmdArmStep` was also
+adjustable-but-never-saved. ⚠️ **A `default` arm that quietly does something plausible is why a
+missing case reads as a row that works.**
 
 ### Next session, in order
 

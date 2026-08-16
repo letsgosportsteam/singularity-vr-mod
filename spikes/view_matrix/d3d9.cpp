@@ -5714,6 +5714,8 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TMDBONEMODE,               // ⭐ run 241
        PR_TMDROLL,                   // ⭐ run 245
        PR_GOTO_TMD,
+       // ⭐ run 249: the TMD page split into three. See kPageRows.
+       PR_GOTO_TMDBONE, PR_GOTO_TMDMESH, PR_BACK_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
 // ---- ⭐ run 165: pages, because eleven rows is a list you scroll rather than read ----
@@ -5732,8 +5734,25 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // ⭐ run 217: WEAPON is its own page because it is the only one whose rows are PER WEAPON - the values
 // on it change meaning when you switch guns, and mixing that with global settings on a shared page is
 // how someone tunes the rifle and wonders why the pistol moved.
-const int kPanelPages    = 7;      // ⭐ run 237: + TMD ALIGN
-const int kPanelRowsMax  = 17;     // ⭐ run 247b: + the triangle window rows
+// ---- 💥 run 249: kPanelRowsMax came back DOWN, and it is a rendering bound as well as a layout one ----
+//
+// A 17-row TMD page did not draw at all: the plate and the selection bar appeared and every glyph on
+// the page was missing, title included. Run 248 read that as rows being dropped past the rect cap and
+// raised the cap; the page stayed blank, and the overrun warning that fix added never fired once.
+//
+// It is the Clear() ITSELF. The text is drawn as one Clear with a rectangle per run of set pixels, and
+// a 17-row page asks for roughly 13,000 of them in a single call. That call fails as a UNIT - so
+// nothing lands, which is why the title went with the rows and why the plate (2 rects) and the bar
+// (1 rect) survived. Working pages sat at ~5,000 and drew, which is the whole reason this looked
+// specific to the TMD page rather than to the panel.
+//
+// Two independent guards, because either alone would leave the trap armed for the next person:
+//   - ClearRects() batches, so no single call can be large enough to refuse. That is the actual fix.
+//   - No page is longer than 10 rows, which keeps every page inside the range that was drawing
+//     before any of this. It also nearly DOUBLES the glyph - px is derived from this number, and at
+//     17 it had hit the floor of 3 that the comment below calls unreadable through a lens.
+const int kPanelPages    = 9;      // ⭐ run 237: + TMD ALIGN; ⭐ run 249: + TMD BONES, TMD MESH
+const int kPanelRowsMax  = 10;     // ⚠ a page longer than this cannot be declared - see kPageRows
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
       PR_GOTO_WEAPON, PR_GOTO_TMD },
@@ -5762,23 +5781,32 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH, PR_BACK },
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
+    // ---- ⭐ run 249: TMD ALIGN keeps the POSE, and hands the tools to two sub-pages ----
+    //
+    // Split on what you are doing, not on how many rows fit. The seven pose rows are the ones you
+    // sit and work through repeatedly while lining the device up on your forearm, so they stay one
+    // press from the root - burying them one deeper to make the count tidy would cost a press every
+    // adjustment, every session. The bone and triangle rows are hunting tools: reached when a mesh
+    // is wrong, not while aiming, and each is a self-contained job.
     { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH, PR_TMDROLL,
-      PR_TMDBONESLOT, PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI,
-      // 💥 run 242: HIDE MESH came BACK. It was dropped in run 239 to make room for BONE SLOT and
-      // that was never mentioned - so the capability still existed, in the ini and in FgHidden, with
-      // no way to reach it. Asked for directly as "make the whole mesh disappear so I can confirm
-      // both arms share it", which is exactly what it is for: one press answers a question that
-      // otherwise costs a bone sweep.
-      PR_TMDBONEMODE,
-      // ⭐ run 247b: the triangle window is UN-RETIRED. Run 237f took it off the panel as measured
-      // dead - and it was, for the HANDS, where the two interleave. The left arm is a different
-      // object: one limb, wrist to shoulder on a single bone set, so bones cannot separate it and a
-      // contiguous block of triangles is the only remaining lever. Dead for one mesh is not dead.
-      PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,
-      PR_TMDHIDE, PR_BACK },
+      PR_GOTO_TMDBONE, PR_GOTO_TMDMESH, PR_BACK },
+    // ⭐ run 239: the per-slot bone rows. BONE SLOT selects which of the four ranges the three rows
+    // below it are editing, so they belong together and nowhere else.
+    { PR_TMDBONESLOT, PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMODE, PR_BACK_TMD },
+    // ⭐ run 247b: the triangle window is UN-RETIRED. Run 237f took it off the panel as measured
+    // dead - and it was, for the HANDS, where the two interleave. The left arm is a different
+    // object: one limb, wrist to shoulder on a single bone set, so bones cannot separate it and a
+    // contiguous block of triangles is the only remaining lever. Dead for one mesh is not dead.
+    //
+    // 💥 run 242: HIDE MESH came BACK. It was dropped in run 239 to make room for BONE SLOT and that
+    // was never mentioned - so the capability still existed, in the ini and in FgHidden, with no way
+    // to reach it. Asked for directly as "make the whole mesh disappear so I can confirm both arms
+    // share it", which is exactly what it is for: one press answers a question that otherwise costs
+    // a bone sweep. It sits here because it is the same question the triangle window asks.
+    { PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP, PR_TMDHIDE, PR_BACK_TMD },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 17 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10, 6, 5 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page; ⭐ run 249: TMD 17 -> 10 + two sub-pages
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5786,9 +5814,11 @@ const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 17 };   // ⭐ run 230: 
 // raiser, so forgetting to update one of these costs a resize rather than text spilling off the
 // plate. The widest strings are "AIM METHOD MOTION CONTROLLER" and "MOVE DIRECTION HAND (NO
 // TRACKING)", which is why those two pages are the broad ones.
-const int kPageCols[kPanelPages] = { 34, 35, 30, 33, 28, 30, 30 };   // ⭐ run 230: DISPLAY 28 -> 33 for "NOTE SIZE      100% (FULL SCREEN)"
+// ⭐ run 249: TMD BONES is 30 for "BONE MODE      NUDGE (find it)", its longest reachable value.
+const int kPageCols[kPanelPages] = { 34, 35, 30, 33, 28, 30, 30, 30, 30 };   // ⭐ run 230: DISPLAY 28 -> 33 for "NOTE SIZE      100% (FULL SCREEN)"
 const char* kPageName[kPanelPages] = { "VR SETTINGS", "CONTROLLER", "COMFORT", "DISPLAY",
-                                       "ADVANCED", "WEAPON ALIGN", "TMD ALIGN" };
+                                       "ADVANCED", "WEAPON ALIGN", "TMD ALIGN",
+                                       "TMD BONES", "TMD MESH" };
 
 int g_panelPage = 0;
 inline int PanelRowCount() { return kPageCount[g_panelPage]; }
@@ -5959,9 +5989,16 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
                 { "TmdRollTenths", &g_tmdRollTenths },
                 { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
+                // ⭐ run 249: TmdArmStep was adjustable-but-never-saved, which is exactly the defect
+                // this one-case-writes-the-block shape exists to prevent. It is read back at startup
+                // (see the ini loader) so the omission silently reset it to 50 every launch.
+                { "TmdArmStep", &g_tmdArmStep },
                 { "TmdHideVerts", &g_tmdHideVerts }, { "TmdBoneMode", &g_tmdBoneMode },
             };
-            for (int i = 0; i < 11; ++i) {
+            // ⚠ Was a hardcoded 11 against an 11-entry table. Adding a key above without noticing
+            // this line writes the key and never saves it - the same class of silent omission the
+            // entry above was added to fix.
+            for (int i = 0; i < (int)_countof(tm); ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
             }
@@ -5983,7 +6020,7 @@ void PanelSaveRow(int rowId, const char* path) {
         }
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
         case PR_TMDYAW: case PR_TMDPITCH: case PR_TMDROLL:
-        case PR_TMDARMFROM: case PR_TMDARMTO:
+        case PR_TMDARMFROM: case PR_TMDARMTO: case PR_TMDARMSTEP:
         case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI:
         case PR_TMDBONEMESH: case PR_TMDBONESLOT: case PR_TMDBONEMODE:
             return;   // written by PR_TMDON above
@@ -6017,8 +6054,13 @@ void PanelSaveRow(int rowId, const char* path) {
             _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", g_leftHandedPending);
             WritePrivateProfileStringA("Input", "LeftHanded", v, path); return;
 
+        // ⭐ run 249: the navigation rows are listed in FULL now. PR_GOTO_WEAPON and PR_GOTO_TMD were
+        // missing, so every close logged two "row N has NO PanelSave entry" warnings about rows that
+        // correctly have nothing to save - and a warning that cries wolf is one nobody reads on the
+        // day it names a real one.
         case PR_GOTO_CTRL: case PR_GOTO_COMFORT: case PR_GOTO_DISPLAY: case PR_GOTO_ADV:
-        case PR_BACK:
+        case PR_GOTO_WEAPON: case PR_GOTO_TMD: case PR_GOTO_TMDBONE: case PR_GOTO_TMDMESH:
+        case PR_BACK: case PR_BACK_TMD:
             return;                                   // navigation, nothing to persist
 
         default:
@@ -6150,6 +6192,25 @@ void PanelRowText(int row, char* out, size_t cap) {
         case PR_TMDROLL:
             _snprintf_s(out, cap, _TRUNCATE, "TMD ROLL   %+.1f", Rd(g_tmdRollTenths) / 10.0f);  break;
         case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
+        // ---- 💥 run 249: these three rows had NO text case and fell through to `default` ----
+        //
+        // The default arm prints "DEBUGGING ON/OFF", so run 247b's un-retire put three rows on the
+        // page all reading DEBUGGING, and PR_TMDARMSTEP had no PanelAdjust case either - selecting
+        // it and pressing left or right toggled the DEBUG setting. Nobody saw it because the page
+        // was blank for other reasons the whole time it was shipping.
+        //
+        // ⚠ A `default` that quietly does something plausible is why: a missing case reads as a row
+        // that works. Fixed here rather than by removing the default, because the default is also
+        // the PR_DEBUG row's own text and rewiring that is a bigger change than this run wants.
+        case PR_TMDARMFROM:
+            _snprintf_s(out, cap, _TRUNCATE, "ARM FROM       %ld", Rd(g_tmdArmFrom)); break;
+        case PR_TMDARMTO:
+            _snprintf_s(out, cap, _TRUNCATE, "ARM TO         %ld", Rd(g_tmdArmTo));   break;
+        case PR_TMDARMSTEP:
+            _snprintf_s(out, cap, _TRUNCATE, "ARM STEP       %ld", Rd(g_tmdArmStep)); break;
+        case PR_GOTO_TMDBONE: _snprintf_s(out, cap, _TRUNCATE, "BONE RANGES        >"); break;
+        case PR_GOTO_TMDMESH: _snprintf_s(out, cap, _TRUNCATE, "TRIANGLE WINDOW    >"); break;
+        case PR_BACK_TMD:     _snprintf_s(out, cap, _TRUNCATE, "<  TMD ALIGN");         break;
         case PR_TMDBONEMODE: {
             const LONG bmo = Rd(g_tmdBoneMode);
             _snprintf_s(out, cap, _TRUNCATE, "BONE MODE      %s",
@@ -6415,6 +6476,21 @@ void PanelAdjust(int row, int dir) {
             }
             break;
         }
+        // 💥 run 249: this case did not exist. PR_TMDARMSTEP fell through to `default`, which
+        // toggles DEBUGGING - so the row that sets the sweep's stride was silently a debug switch.
+        // Stepped through a table rather than +-1: the point of the row is coarse-to-fine, and
+        // walking from 1 to 250 one press at a time is not a thing anyone would do in a headset.
+        case PR_TMDARMSTEP: {
+            static const LONG kSteps[] = { 1, 5, 10, 25, 50, 100, 250 };
+            const LONG cur = Rd(g_tmdArmStep);
+            int at = 0;
+            for (int i = 0; i < (int)_countof(kSteps); ++i) if (kSteps[i] == cur) { at = i; break; }
+            at += dir;
+            if (at < 0) at = 0;
+            if (at > (int)_countof(kSteps) - 1) at = (int)_countof(kSteps) - 1;
+            InterlockedExchange(&g_tmdArmStep, kSteps[at]);
+            break;
+        }
         case PR_TMDARMFROM: case PR_TMDARMTO: {
             // Kept ordered so the range can never invert into "draw nothing", which looks identical
             // to the mesh being hidden - and the two want opposite fixes.
@@ -6512,6 +6588,12 @@ void PanelAdjust(int row, int dir) {
         case PR_GOTO_ADV:     g_panelPage = 4; g_panelRow = 0; return;
         case PR_GOTO_WEAPON:  g_panelPage = 5; g_panelRow = 0; return;
         case PR_GOTO_TMD:     g_panelPage = 6; g_panelRow = 0; return;   // ⭐ run 237
+        // ⭐ run 249: the two TMD sub-pages, and a BACK that returns to TMD ALIGN rather than to the
+        // root. A sub-page whose BACK dumps you at the top costs two presses to get back to where
+        // you were working, which on a tuning page is the press you make most.
+        case PR_GOTO_TMDBONE: g_panelPage = 7; g_panelRow = 0; return;
+        case PR_GOTO_TMDMESH: g_panelPage = 8; g_panelRow = 0; return;
+        case PR_BACK_TMD:     g_panelPage = 6; g_panelRow = 0; return;
         case PR_LASER:
             InterlockedExchange(&g_laserOn,
                                 InterlockedCompareExchange(&g_laserOn, 0, 0) ? 0 : 1);
@@ -17259,6 +17341,39 @@ static int TmdMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
 // Drawn AFTER the game's own frame, including its menus, so it always sits on top. That is the
 // other half of why this cannot conflict with the pause menu: the game never sees the input, and
 // the panel is never drawn under anything.
+// ---- 💥 run 249: one Clear with 13,000 rectangles draws NOTHING, and fails silently ----
+//
+// This is the fix for "the TMD page is a big black box with no text in it". Clear() takes the whole
+// rectangle list in one call and either takes it or refuses it, so an over-large list does not come
+// back partly drawn - it comes back not drawn AT ALL. The plate and the selection bar are 2 and 1
+// rectangles and always survived; every glyph on the page, title included, went in the one big call
+// and vanished together. That is the signature: a page whose title is missing was never a page whose
+// ROWS were dropped, and run 248 spent a headset run on the row-dropping reading.
+//
+// Batching removes the failure mode without needing to know where the limit actually is - and we
+// deliberately do NOT go looking for it. 1024 is an order of magnitude under the smallest count
+// observed to fail and well over the smallest observed to work, and a wrong guess costs a few extra
+// calls on a panel that is open for seconds at a time.
+//
+// ⚠ VALIDATE THE INSTRUMENT: the HRESULT was never checked here. The call had been failing in plain
+// sight with nothing to say so, which is the whole reason this reached a wearer twice. It is checked
+// now, and a failure names the batch and the total so the next reading starts from a number.
+static void ClearRects(IDirect3DDevice9* dev, const D3DRECT* r, int n, D3DCOLOR colour) {
+    const int kBatch = 1024;
+    for (int i = 0; i < n; i += kBatch) {
+        const int cnt = (n - i < kBatch) ? (n - i) : kBatch;
+        const HRESULT hr = dev->Clear((DWORD)cnt, r + i, D3DCLEAR_TARGET, colour, 0.0f, 0);
+        if (FAILED(hr)) {
+            static bool clearWarned = false;
+            if (!clearWarned) {
+                clearWarned = true;
+                Log("*** Clear() REFUSED %d rect(s) at offset %d of %d (hr 0x%08lX) - that batch drew"
+                    " nothing. Lower kBatch. ***", cnt, i, n, (unsigned long)hr);
+            }
+        }
+    }
+}
+
 static void DrawVrPanel(IDirect3DDevice9* dev) {
     if (!dev || !g_srcW || !g_srcH) return;
 
@@ -17353,6 +17468,9 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
     // A CORRECTNESS bound, derived rather than picked: a 5x7 glyph has at most three runs of set
     // pixels per row, so 21 rectangles per character is the true worst case. Rows x columns x two
     // eyes, plus the plate and the selection bar.
+    //
+    // ⚠ run 249: raising this was NOT the fix and on its own it made no difference - see ClearRects.
+    // The cap governs how many rectangles we BUILD; it has never governed whether they draw.
     const int kCap = kPanelRowsMax * 44 * 21 * 2 + 64;
     static D3DRECT r[kCap];
 
@@ -17364,7 +17482,7 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
         r[n].x2 = cx + boxW / 2 + px * 4; r[n].y2 = y0 + boxH + px * 4;
         ++n;
     }
-    if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(8, 12, 16), 0.0f, 0);
+    ClearRects(dev, r, n, D3DCOLOR_XRGB(8, 12, 16));
 
     // The selected row's highlight bar, so the cursor is visible without a glyph for it.
     n = 0;
@@ -17375,7 +17493,7 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
         r[n].x2 = cx + boxW / 2 + px * 2; r[n].y2 = ry + (kGlyphH + 1) * px;
         ++n;
     }
-    if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 60, 40), 0.0f, 0);
+    ClearRects(dev, r, n, D3DCOLOR_XRGB(0, 60, 40));
 
     // Title, rows, and the key hint - the hint matters because nothing else on screen says how to
     // get out, and a panel you cannot close is worse than no panel.
@@ -17398,7 +17516,18 @@ static void DrawVrPanel(IDirect3DDevice9* dev) {
                 " empty or half drawn. Raise kCap. ***", kCap);
         }
     }
-    if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
+    // ⭐ run 249: the SIZE of the text pass, once per page. This is the number the whole run-248
+    // misdiagnosis was missing - "TMD ALIGN 13,204" next to "VR SETTINGS 4,800" says at a glance
+    // that the blank page is the big one, without anyone having to be wearing the headset.
+    {
+        static int lastLogged = -1;
+        if (g_panelPage != lastLogged) {
+            lastLogged = g_panelPage;
+            Log("VR panel: page %d (%s), %d row(s), %d text rect(s) in %d Clear batch(es), px %d",
+                g_panelPage, kPageName[g_panelPage], nRows, n, (n + 1023) / 1024, px);
+        }
+    }
+    ClearRects(dev, r, n, D3DCOLOR_XRGB(0, 255, 90));
 
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
 }
