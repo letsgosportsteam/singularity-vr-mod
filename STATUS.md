@@ -131,6 +131,26 @@ slot 0 inherits the old single `TmdArmFrom`/`TmdArmTo` so an existing ini keeps 
 with a comment explaining why two windows would need two draw calls, and the first sweep with it
 found the case that needs exactly that.
 
+### ⛔ REJECTED (run 259) — `HudArmSticky=1` breaks world geometry. Keep it 0.
+
+Reported as *"a lot of geometry being culled out — DRAW ALL was fine but ENGINE CULL had a lot
+missing, and this setting used to work fine."* **It was not the occlusion setting.** With sticky on,
+**1284–2538 draws per second** were taken onto the HUD path and `HUD remap SKIPPED` — the
+non-orthographic guard — fired **zero** times. Those draws have an orthographic-looking `c5`–`c8`,
+pass every guard, and get squashed in clip space as if they were UI.
+
+⚠️ **The measurement was right and the inference from it was wrong.** "1122–3019 UI draws/sec are
+missing the arm" is a real number; reading it as "that many *UI* draws are being lost" was the error
+— and the counter's own text warned that some are world draws. A frame-long arm captures every
+non-quad user-pointer draw following *any* `c5`–`c8` write, not the ones sharing the note's transform.
+
+⚠️ **Content-matching `c5`–`c8` will NOT fix it** — these draws never wrote those registers (that is
+why `hudFresh` was false), so the values still match. The discriminator has to be something the
+**draw** carries, not something the register does. The popup bug at run 253 is therefore still open.
+
+**The run-249 → 253 diagnosis stands**: the arm flag is consumed by the first user-pointer draw, and
+later draws sharing one UI transform miss the HUD path. Only the *remedy* was wrong.
+
 ### ✅ FIXED and VERIFIED (runs 252–257) — the splash regression was a failing `GObjects` walk
 
 **`RefreshArmedState` cost 1365 ms in a SINGLE call**, four times per window, on a frame with zero

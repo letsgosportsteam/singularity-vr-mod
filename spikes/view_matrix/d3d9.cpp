@@ -13937,10 +13937,28 @@ volatile LONG g_uiElemsThisFrame = 0;   // reached the census - these are the in
 // And the note inset lives INSIDE HudStereoPair, so a draw that misses the arm also misses the
 // scale-about-centre and stays full size. Not duplicated AND too big, from one flag.
 //
-// ⭐ HudArmSticky, DEFAULT 0 - measure first, then switch.
+// ⛔ HudArmSticky=1 WAS FLOWN AND IS REJECTED (run 259). Keep it 0.
+//
+// Reported immediately: "a lot of geometry being culled out - OcclusionQueryMode=DRAW ALL was fine
+// but ENGINE CULL had a lot missing, and this setting used to work fine." It was not the occlusion
+// setting. With sticky ON the log shows **1284-2538 draws per SECOND** taken onto the HUD path, and
+// `HUD remap SKIPPED` - the non-orthographic guard - fires **zero** times against them. So those
+// draws have an orthographic-looking c5-c8, pass every guard, and get squashed in clip space as if
+// they were UI. That is the missing geometry, and the warning was already written on the counter
+// itself: "some of these are world draws and belong where they went".
+//
+// ⚠️ The measurement was RIGHT and the inference from it was wrong. 1122-3019 draws/sec missing the
+// arm is a real number; reading it as "that many UI draws are being lost" was the error, and the
+// counter's own text says why. A frame-long arm is far too broad: it captures every non-quad
+// user-pointer draw that follows ANY c5-c8 write, not the ones sharing the note's transform.
+//
+// ⚠️ Content-matching c5-c8 would NOT fix it, so do not reach for that next. These draws never wrote
+// c5-c8 - that is precisely why `hudFresh` was false for them - so the registers still hold the UI
+// values and a content compare would match them too. The discriminator has to be something the DRAW
+// carries, not something the register does.
 //
 //   0  today's behaviour, plus g_uiUnarmed counting how many draws WOULD have been captured
-//   1  the transform stays armed until the end of the frame, so every draw sharing it is HUD
+//   1  ⛔ the transform stays armed until the end of the frame - BREAKS WORLD GEOMETRY, see above
 //
 // ⚠ Run 149 is the reason this is not simply switched on. Arming on a c5-c8 write once squashed the
 // scene's FULLSCREEN COMPOSITE quad and produced four panels. What makes sticky safer now than it
