@@ -12771,10 +12771,29 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
             boneRegN  = (int)(bh - bl + 1) * kBoneRegsPerBone;
             if (boneRegN > kMaxSaveRegs) boneRegN = kMaxSaveRegs;
             if (SUCCEEDED(dev->GetVertexShaderConstantF(boneRegLo, &savedBones[0][0], boneRegN))) {
+                // 💥 run 238c: ONE shared point, not each bone's own.
+                //
+                // The first version kept every bone's own translation, so each collapsed bone sent its
+                // vertices to ITS OWN joint - different points for different bones. Reported exactly:
+                // bones 13-29 left the right hand "flopped down and stretched", not gone. The hand
+                // collapsed onto its own skeleton and stayed perfectly visible.
+                //
+                // A triangle only vanishes when all THREE of its vertices land on the same place. So
+                // every bone in the range now gets the SAME translation - the first one's - and the
+                // whole affected region degenerates to a single point.
+                //
+                // ⚠ Taken from the first bone in the range rather than the origin. Zeroing the
+                // translation too would collapse everything onto the origin of the bone's space, which
+                // in translated-world is the CAMERA, and any partially weighted vertex would stretch a
+                // triangle through the viewer's face to reach it. A joint on the hand keeps the point
+                // local, so a stray sliver stays inside the arm.
                 float z[kMaxSaveRegs][4];
+                const float tx = savedBones[0][3];
+                const float ty = boneRegN > 1 ? savedBones[1][3] : 0.0f;
+                const float tz = boneRegN > 2 ? savedBones[2][3] : 0.0f;
                 for (int i = 0; i < boneRegN; ++i) {
                     z[i][0] = z[i][1] = z[i][2] = 0.0f;
-                    z[i][3] = savedBones[i][3];        // keep the translation
+                    z[i][3] = (i % 3) == 0 ? tx : (i % 3) == 1 ? ty : tz;
                 }
                 dev->SetVertexShaderConstantF(boneRegLo, &z[0][0], boneRegN);
             } else {
