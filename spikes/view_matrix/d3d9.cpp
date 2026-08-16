@@ -2722,19 +2722,25 @@ volatile LONG g_tmdArmStep = 50;
 // partially weighted vertices would stretch through your face to get there. Keeping the translation
 // collapses the arm to a point at its own joint instead, so a stray sliver is short and local rather
 // than a triangle across the screen.
-// ⭐ run 239: TWO slots. The hands (7444) and the arms (4818) are separate meshes with separate
-// bone palettes, so each needs its own range - a bone index measured on one means nothing on the
-// other. Two is what the job needs; a third would be a guess about a mesh nobody has looked at.
-const int kTmdBoneSlots = 2;
-volatile LONG g_tmdBoneLo[kTmdBoneSlots]   = { -1, -1 };   // bone INDEX range, -1 = off
-volatile LONG g_tmdBoneHi[kTmdBoneSlots]   = { -1, -1 };
+// 💥 run 240: FOUR slots, and several may name the SAME mesh.
+//
+// Two slots assumed one range per mesh, and the collapse stopped at the first slot that matched -
+// so 4818 could hold the right-arm range OR a left-arm range, never both. Reported as "none of the
+// from/to options removed that piece", which is what a one-range-per-mesh limit looks like from the
+// outside: the control appears to have no setting that works, when really it has no room.
+//
+// The ranges are now a UNION over every slot naming this mesh. Four because the job already needs
+// three - the hands, the right arm, the left upper arm - and a spare costs two integers.
+const int kTmdBoneSlots = 4;
+volatile LONG g_tmdBoneLo[kTmdBoneSlots]   = { -1, -1, -1, -1 };   // bone INDEX range, -1 = off
+volatile LONG g_tmdBoneHi[kTmdBoneSlots]   = { -1, -1, -1, -1 };
 volatile LONG g_tmdBoneSlot = 0;                           // which slot the panel rows edit
 // 💥 run 238d: WHICH MESH the range applies to. The first version applied it to everything riding
 // the off hand, and a bone palette is PER MESH - so "bones 13-29" meant the right hand in 7444 and
 // something unrelated in 4818, which came out as both sleeves spiking into points. A bone index is
 // only meaningful against the mesh it was measured on.
 // 0 = the arms mesh of the moment (largest non-weapon), which is where 13-29 was measured.
-volatile LONG g_tmdBoneMesh[kTmdBoneSlots] = { 0, 0 };
+volatile LONG g_tmdBoneMesh[kTmdBoneSlots] = { 0, 0, 0, 0 };
 // 💥 run 238e: a shared collapse POINT is not enough, and the reason is blending.
 //
 // A vertex weighted entirely to a collapsed bone does land on the point, and its triangles do
@@ -12847,15 +12853,19 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     float savedBones[kMaxSaveRegs][4];
     int   boneRegLo = 0, boneRegN = 0;
     if (g_thisDrawMoved == 2) {
-        // ⭐ run 239: whichever slot names THIS mesh. At most one can match, because a draw has one
-        // vertex count - so this is a lookup, not a merge, and two slots cannot fight over a mesh.
-        LONG bl = -1, bh = -1;
+        // ⭐ run 240: EVERY slot naming this mesh, unioned - not the first match. One mesh can need
+        // several disjoint ranges (the right arm and the left upper arm both live in 4818), and
+        // stopping at the first match made the second range unreachable.
+        LONG bl = -1, bh = -1;                    // the span to save: min lo, max hi across matches
+        bool covers[64] = { false };              // which bone indices any slot asks to collapse
         for (int sI = 0; sI < kTmdBoneSlots; ++sI) {
             const LONG m = Rd(g_tmdBoneMesh[sI]);
             const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
-            if (target == numVertices && Rd(g_tmdBoneLo[sI]) >= 0) {
-                bl = Rd(g_tmdBoneLo[sI]); bh = Rd(g_tmdBoneHi[sI]); break;
-            }
+            const LONG lo = Rd(g_tmdBoneLo[sI]), hi = Rd(g_tmdBoneHi[sI]);
+            if (target != numVertices || lo < 0 || hi < lo) continue;
+            if (bl < 0 || lo < bl) bl = lo;
+            if (hi > bh) bh = hi;
+            for (LONG b = lo; b <= hi && b < 64; ++b) covers[b] = true;
         }
         if (bl >= 0 && bh >= bl) {
             boneRegLo = kBoneReg0 + (int)bl * kBoneRegsPerBone;
@@ -12879,16 +12889,26 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                 // triangle through the viewer's face to reach it. A joint on the hand keeps the point
                 // local, so a stray sliver stays inside the arm.
                 float z[kMaxSaveRegs][4];
+                memcpy(z, savedBones, sizeof(float) * 4 * boneRegN);   // ⭐ run 240: gaps stay live
                 if (Rd(g_tmdBoneMode) == 0) {
                     const DWORD kQNaN = 0x7FC00000u;          // a quiet NaN, written as a bit pattern
                     float nan; memcpy(&nan, &kQNaN, sizeof(nan));
-                    for (int i = 0; i < boneRegN; ++i)
-                        z[i][0] = z[i][1] = z[i][2] = z[i][3] = nan;
+                    // ⭐ run 240: only the bones a slot actually asked for. The saved span runs from
+                    // the lowest lo to the highest hi across every matching slot, so with two disjoint
+                    // ranges it also covers the untouched bones BETWEEN them - and those must be left
+                    // exactly as the engine set them or the gap becomes a hole in the arm.
+                    for (int i = 0; i < boneRegN; ++i) {
+                        const LONG bone = bl + (i / kBoneRegsPerBone);
+                        if (bone >= 0 && bone < 64 && covers[bone])
+                            z[i][0] = z[i][1] = z[i][2] = z[i][3] = nan;
+                    }
                 } else {
                     const float tx = savedBones[0][3];
                     const float ty = boneRegN > 1 ? savedBones[1][3] : 0.0f;
                     const float tz = boneRegN > 2 ? savedBones[2][3] : 0.0f;
                     for (int i = 0; i < boneRegN; ++i) {
+                        const LONG bone = bl + (i / kBoneRegsPerBone);
+                        if (bone < 0 || bone >= 64 || !covers[bone]) continue;
                         z[i][0] = z[i][1] = z[i][2] = 0.0f;
                         z[i][3] = (i % 3) == 0 ? tx : (i % 3) == 1 ? ty : tz;
                     }
