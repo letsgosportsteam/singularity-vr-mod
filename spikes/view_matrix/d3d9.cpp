@@ -2651,6 +2651,22 @@ volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DIS
 // because the panel and the ini loader read them and both are earlier in this single translation unit.
 // Placing a global next to the function that computes with it is the natural instinct and it does not
 // compile; this file has paid for that twice (the laser and the gun-align blocks, run 217).
+// ⭐ run 237c: draw only part of the arms mesh, as a PERCENT of its triangles.
+//
+// Reported: "when I move my left hand up too high I can see the right hand" - correct, and expected:
+// run 234 measured that both arms are one mesh in one draw call, so moving it moves both.
+//
+// A draw call does not have to issue the WHOLE index buffer. DrawIndexedPrimitive takes a start and a
+// count, so if the two arms occupy contiguous ranges, drawing half of it draws one arm. Whether they
+// DO is unknown and is exactly what this sweeps: set FROM/TO and watch which arm survives.
+//
+// ⚠ If nothing clean ever appears - if every range cuts both arms - then the two are interleaved in
+// the buffer and this approach is dead, which is a real answer worth one run. Bone-level control would
+// be the remaining route, and a much longer one.
+//
+// Percent rather than raw primitives so the whole 4402-triangle mesh sweeps in 20 presses instead of
+// 4402. Defaults 0/100 draw everything, so the feature is inert until someone moves it.
+volatile LONG g_tmdArmFrom = 0, g_tmdArmTo = 100;
 volatile LONG g_tmdFwd = 30, g_tmdRight = -9, g_tmdUp = -13;
 volatile LONG g_tmdYawTenths = 0, g_tmdPitchTenths = 0;
 volatile LONG g_tmdOnOffHand = 1;      // ini [Input] TmdOnOffHand - the whole feature's off switch
@@ -5570,6 +5586,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_LASER, PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH,
        PR_NOTESIZE,          // ⭐ run 230
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
+       PR_TMDARMFROM, PR_TMDARMTO,   // ⭐ run 237c
        PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
@@ -5619,10 +5636,11 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH, PR_BACK },
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
-    { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH, PR_BACK },
+    { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
+      PR_TMDARMFROM, PR_TMDARMTO },      // ⭐ run 237c - no BACK row, the page is full at 8
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 7 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 8 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5801,15 +5819,17 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdOnOffHand", &g_tmdOnOffHand }, { "TmdFwd", &g_tmdFwd },
                 { "TmdRight", &g_tmdRight }, { "TmdUp", &g_tmdUp },
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
+                { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
             };
-            for (int i = 0; i < 6; ++i) {
+            for (int i = 0; i < 8; ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
             }
             return;
         }
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
-        case PR_TMDYAW: case PR_TMDPITCH: return;   // written by PR_TMDON above
+        case PR_TMDYAW: case PR_TMDPITCH:
+        case PR_TMDARMFROM: case PR_TMDARMTO: return;   // written by PR_TMDON above
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
             // survives a relaunch is a state somebody meets tomorrow as a bug report - with the
@@ -5971,6 +5991,10 @@ void PanelRowText(int row, char* out, size_t cap) {
         case PR_TMDPITCH:
             _snprintf_s(out, cap, _TRUNCATE, "TMD PITCH  %+.1f", Rd(g_tmdPitchTenths) / 10.0f); break;
         case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
+        case PR_TMDARMFROM:
+            _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS FROM  %ld%%", Rd(g_tmdArmFrom)); break;
+        case PR_TMDARMTO:
+            _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS TO    %ld%%", Rd(g_tmdArmTo));   break;
         case PR_NOTESIZE: {
             const LONG p = InterlockedCompareExchange(&g_noteInsetPct, 0, 0);
             if (p == 100) _snprintf_s(out, cap, _TRUNCATE, "NOTE SIZE      100%% (FULL SCREEN)");
@@ -6140,6 +6164,25 @@ void PanelAdjust(int row, int dir) {
             if (v < -60) v = -60;
             if (v >  60) v =  60;
             InterlockedExchange(t, v);
+            break;
+        }
+        case PR_TMDARMFROM: case PR_TMDARMTO: {
+            // 5% a press: the whole mesh sweeps in 20 presses. Kept ordered so the range can never
+            // invert into "draw nothing", which looks identical to the mesh being hidden.
+            volatile LONG* t = row == PR_TMDARMFROM ? &g_tmdArmFrom : &g_tmdArmTo;
+            LONG v = Rd(*t) + dir * 5;
+            if (v < 0)   v = 0;
+            if (v > 100) v = 100;
+            InterlockedExchange(t, v);
+            if (Rd(g_tmdArmFrom) >= Rd(g_tmdArmTo)) {
+                if (row == PR_TMDARMFROM) {
+                    LONG w = v + 5; if (w > 100) w = 100;
+                    InterlockedExchange(&g_tmdArmTo, w);
+                } else {
+                    LONG w = v - 5; if (w < 0) w = 0;
+                    InterlockedExchange(&g_tmdArmFrom, w);
+                }
+            }
             break;
         }
         case PR_TMDYAW: case PR_TMDPITCH: {
@@ -6533,6 +6576,8 @@ bool InitXRInput() {
     InterlockedExchange(&g_tmdUp,         GetPrivateProfileIntA("Input", "TmdUp",   -13, path));
     InterlockedExchange(&g_tmdYawTenths,  GetPrivateProfileIntA("Input", "TmdYawTenths",   0, path));
     InterlockedExchange(&g_tmdPitchTenths,GetPrivateProfileIntA("Input", "TmdPitchTenths", 0, path));
+    InterlockedExchange(&g_tmdArmFrom,    GetPrivateProfileIntA("Input", "TmdArmFrom",   0, path));
+    InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   100, path));
     Log("ini: TmdOnOffHand=%ld (the TMD and the hand holding it ride the OFF controller while"
         " mPlayerHandsStatus says it is raised) anchor F%ld R%ld U%ld, trim yaw %+.1f pitch %+.1f."
         " Panel: TMD ALIGN.",
@@ -9383,6 +9428,7 @@ extern volatile LONG g_inForeground, g_hideMeshIdx, g_fgDrawCount;
 extern int g_thisDrawMoved;   // ⭐ run 237: 0 none, 1 gun hand, 2 off hand
 static bool FgHidden(UINT verts);
 static bool FgRidesGun(UINT verts);
+static bool FgMatchesSignature(UINT verts);   // ⭐ run 237c: used by the depth-prime exemption
 static int  RideTargetFor(UINT verts);   // ⭐ run 237: 0 none, 1 gun hand, 2 off hand
 static bool FgHideWholePass();
 static void DpgRecord(uint8_t kind, float z0, float z1, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
@@ -11964,7 +12010,18 @@ static bool FgRidesGun(UINT verts) {
     // Same safety shape as FgMoved, which is only ever count-matched.
     if (!Rd(g_inForeground)) {
         const LONG ap = Rd(g_armsVerts);
-        if (!(PlayerArmed() == ARMED_NO && ap && (UINT)ap == verts && FgMatchWindow())) return false;
+        // 💥 run 237c: THIRD time. Reported as "the shadowed black version of the arm does not
+        // track" - run 120's silhouette again, after the rope in run 228f and the arms before that.
+        // First-person meshes are drawn TWICE, a depth prime then the real draw, and a rule that only
+        // covers the foreground copy leaves the prime one at the engine's position writing depth.
+        //
+        // Bounded by FgMatchesSignature rather than opened to the whole prime window: the note below
+        // is right that "anything drawn early" would fling world geometry onto a controller. A mesh
+        // already in the first-person signature list is not world geometry.
+        const bool tmdPrime = Rd(g_tmdOnOffHand) && TmdRaised() &&
+                              FgMatchesSignature(verts) && FgMatchWindow();
+        if (!tmdPrime &&
+            !(PlayerArmed() == ARMED_NO && ap && (UINT)ap == verts && FgMatchWindow())) return false;
     }
     // Nothing rides during an animation window - the gun itself is not being moved, so an attachment
     // that followed the controller would be the only thing off the animation. Moved BELOW the cheap
@@ -12057,6 +12114,21 @@ void ReportFgRide() {
 
 // Any first-person mesh, wherever it is drawn - used to catch the near-plane depth prime at
 // draws 2-3 so it is hidden or moved along with the foreground copy.
+// ⭐ run 237c: the arms mesh RIGHT NOW - the largest thing in the pass that is not the weapon.
+// Derived rather than hardcoded: the latched arms role is stale once the TMD is acquired (it still
+// names 3314, a mesh that stopped being drawn), and a literal 7444 would be a number measured on one
+// build of one save. Returns 0 when there is nothing to name.
+static UINT ArmsMeshNow() {
+    const LONG gun = Rd(g_gunVerts);
+    const LONG n = Rd(g_fgStableCount);
+    LONG best = 0;
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i) {
+        const LONG v = Rd(g_fgStableVerts[i]);
+        if (v != gun && v > best) best = v;
+    }
+    return (UINT)best;
+}
+
 static bool FgMatchesSignature(UINT verts) {
     if (!verts) return false;
     const LONG n = Rd(g_fgStableCount);
@@ -12522,8 +12594,19 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         g_msMeshMatch += dm;
         if (dm > g_msMeshMatchPeak) g_msMeshMatchPeak = dm;
     }
+    // ⭐ run 237c: clip the arms mesh to a range of its triangles. The lambda captures by reference,
+    // so adjusting these before the call is all it takes - no second draw path.
+    UINT dStart = startIndex, dPrims = primCount;
+    if (g_thisDrawMoved == 2 && primCount > 0) {
+        const LONG lo = Rd(g_tmdArmFrom), hi = Rd(g_tmdArmTo);
+        if ((lo > 0 || hi < 100) && hi > lo && ArmsMeshNow() == numVertices) {
+            const UINT a = (UINT)((primCount * (UINT64)lo) / 100);
+            const UINT b = (UINT)((primCount * (UINT64)hi) / 100);
+            if (b > a) { dStart = startIndex + a * 3; dPrims = b - a; }   // triangle LIST: 3 per prim
+        }
+    }
     const HRESULT dhr = StereoPair(dev, [&] {
-        return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, startIndex, primCount);
+        return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, dStart, dPrims);
     });
     g_thisDrawMoved = 0;
     return dhr;
