@@ -131,6 +131,48 @@ slot 0 inherits the old single `TmdArmFrom`/`TmdArmTo` so an existing ini keeps 
 with a comment explaining why two windows would need two draw calls, and the first sweep with it
 found the case that needs exactly that.
 
+### ✅ FIXED and VERIFIED (runs 252–257) — the splash regression was a failing `GObjects` walk
+
+**`RefreshArmedState` cost 1365 ms in a SINGLE call**, four times per window, on a frame with zero
+draws. One call is a `FindPlayerPawn` walk over **112,565 objects**, and the walk calls `Readable()`
+per object — plus more inside `NameOf` — where `Readable` is a **`VirtualQuery` syscall**. Hundreds
+of thousands of kernel transitions per walk.
+
+Two fixes, and **the log says which one worked**:
+
+| change | result |
+|---|---|
+| Miss throttle **frame-based → time-based** with backoff (2 s, then 15 s) | ✅ splash **8 → 17–28 fps** |
+| `Readable` region cache, **1 slot** | ❌ **no change** — 1365 → 1275 ms |
+| `Readable` region cache, **8 slots** | ✅ **1275 → 351 ms**, 3.8× |
+
+⚠️ **A frame count is not a rate limit when frames are the casualty.** `(++missTick % 30)` fired every
+30 frames whatever a frame cost — at 8 fps that is every 3.7 s with each walk costing 1.36 s, so over
+a third of all wall-clock went into a search that *cannot succeed* at a splash, and the slower it got
+the bigger its share grew.
+
+⚠️ **One cache slot hit approximately never, and the reasoning sounded right.** "Consecutive objects
+share a region" is true and irrelevant: per object the loop reads the object, its class, `GNames`,
+then the name data — three or four regions in rotation, so one slot is evicted by the next lookup.
+**It measured identical and was nearly kept on the strength of the argument.**
+
+**Why it was a staircase** (~27 → ~18 → ~13 → ~8 fps over Aug 5–15): every commit that added a
+property lookup or removed a throttle added another failing walk to the one screen where nothing it
+seeks can exist. Both recent steps land within minutes of such a commit.
+
+⚠️ **`ReadableCache=0` reverts the cache without a rebuild** — it is the one change here that can
+plausibly *crash* rather than slow down, since a region freed inside a frame makes a cached "yes" a
+lie. Bounded to positive results only, thread-local, cleared every walk and every frame.
+
+⚠️ **A lost pawn resets the backoff rather than advancing it.** Without that, a level transition
+inherited the splash's escalated backoff — up to **15 s of `PlayerArmed()` reading UNKNOWN**, which
+feeds the run-227/228 weapon check that decides the arms/gun roles. Caught before it shipped to play.
+
+**Residual:** the walk is still 351 ms every 15 s at a splash. User-reported as "okey dokey"; not
+pursued further. `player pawn: … after walking N object(s)` is the number any future attempt must beat.
+
+<details><summary>The original run-252 investigation, kept for the method</summary>
+
 ### 📉 MEASURED (run 252) — the splash screen has degraded in FOUR STEPS since Aug 5
 
 Reported as *"the game is lagging to all heck now, even in the splash screens"*. Taking the **first
@@ -176,6 +218,14 @@ elsewhere — which is the point of measuring it.
 
 ⚠️ Not gated on `TimeOurWork`: it only takes a timestamp on frames the scan is armed for, and a
 diagnostic nobody switches on cannot answer a question that shows up on someone else's machine.
+
+**Outcome: the scan measured `0.00 ms` and was innocent.** So were resolution (anti-correlated — the
+fastest splash ran the *largest* frame) and log volume. Three suspects killed by measurement, and the
+answer was in the block that had never been in any bucket at all. **The value of timing the wrong
+thing is that it stops you fixing the wrong thing** — a rate-limited rescan would have changed
+nothing and been called a fix.
+
+</details>
 
 ### ⚠️ SHIPPED, NOT YET FLOWN (run 251) — a slot is KEEP or CUT, and the mesh draws as SEGMENTS
 
