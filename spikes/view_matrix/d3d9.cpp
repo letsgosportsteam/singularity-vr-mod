@@ -2756,7 +2756,24 @@ volatile LONG g_tmdBoneMesh[kTmdBoneSlots] = { 0, 0, 0, 0 };
 //
 // 1 = the shared point, kept as an escape hatch: NaN handling is technically undefined and if some
 // driver rasterises it as garbage rather than discarding it, this switches back without a rebuild.
-volatile LONG g_tmdBoneMode = 0;   // ini [Input] TmdBoneMode - 0 = NaN, 1 = collapse to a point
+// ⭐ run 241: 0 = NaN (hide it), 1 = collapse to a point, 2 = NUDGE.
+//
+// NUDGE is the identification mode and it exists because sweeping for a DISAPPEARANCE is a bad
+// instrument: absence is hard to see, easy to miss at a glance, and indistinguishable from the tool
+// not working. A bone that visibly YANKS its geometry away names itself in one frame, and the
+// silhouette stays whole so you can still tell what you are looking at.
+volatile LONG g_tmdBoneMode = 0;   // ini [Input] TmdBoneMode
+
+// 💥 run 241: the 0-40 bound was a number I picked, and asked about - correctly - as "what if
+// there are more than 40 bones?". There was no measurement behind it.
+//
+// The real ceiling is the constant file: vs_3_0 has 256 float registers, bones start at c23 and take
+// three each, so at most (256-23)/3 = 77 can exist. That is a DERIVED bound rather than a guess.
+//
+// How many a given mesh actually uses is a different question, and the census below answers it by
+// reading the block and reporting the highest register that does not look like an unused slot.
+const int kTmdBoneMax = 77;
+volatile LONG g_tmdBoneCensus = 0;   // ini [Input] TmdBoneCensus - log the live bone count once a sec
 // ⭐ run 237d: one mesh to hide outright while the TMD is up. Reported: clipping the hand mesh never
 // touches the ARM, so the visible right arm is a DIFFERENT mesh - a range on one draw call cannot
 // reach it. Naming it is a solo-cycler job; dropping it once named is this.
@@ -5684,6 +5701,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TMDARMFROM, PR_TMDARMTO,   // ⭐ run 237c
        PR_TMDHIDE,                   // ⭐ run 237d
        PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH, PR_TMDBONESLOT,   // ⭐ run 239
+       PR_TMDBONEMODE,               // ⭐ run 241
        PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
@@ -5704,7 +5722,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // on it change meaning when you switch guns, and mixing that with global settings on a shared page is
 // how someone tunes the rifle and wonders why the pistol moved.
 const int kPanelPages    = 7;      // ⭐ run 237: + TMD ALIGN
-const int kPanelRowsMax  = 10;     // ⭐ run 237d: the TMD page needs 9
+const int kPanelRowsMax  = 12;     // ⭐ run 241: the TMD page needs 12 with MODE and BACK
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
       PR_GOTO_WEAPON, PR_GOTO_TMD },
@@ -5734,10 +5752,11 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
     { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
-      PR_TMDBONESLOT, PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI },   // ⭐ run 239
+      PR_TMDBONESLOT, PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI,
+      PR_TMDBONEMODE, PR_BACK },        // 💥 run 241: BACK went missing when the page filled up
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 12 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5917,9 +5936,9 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdRight", &g_tmdRight }, { "TmdUp", &g_tmdUp },
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
                 { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
-                { "TmdHideVerts", &g_tmdHideVerts },
+                { "TmdHideVerts", &g_tmdHideVerts }, { "TmdBoneMode", &g_tmdBoneMode },
             };
-            for (int i = 0; i < 9; ++i) {
+            for (int i = 0; i < 10; ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
             }
@@ -5943,7 +5962,7 @@ void PanelSaveRow(int rowId, const char* path) {
         case PR_TMDYAW: case PR_TMDPITCH:
         case PR_TMDARMFROM: case PR_TMDARMTO:
         case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI:
-        case PR_TMDBONEMESH: case PR_TMDBONESLOT:
+        case PR_TMDBONEMESH: case PR_TMDBONESLOT: case PR_TMDBONEMODE:
             return;   // written by PR_TMDON above
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
@@ -6106,6 +6125,12 @@ void PanelRowText(int row, char* out, size_t cap) {
         case PR_TMDPITCH:
             _snprintf_s(out, cap, _TRUNCATE, "TMD PITCH  %+.1f", Rd(g_tmdPitchTenths) / 10.0f); break;
         case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
+        case PR_TMDBONEMODE: {
+            const LONG bmo = Rd(g_tmdBoneMode);
+            _snprintf_s(out, cap, _TRUNCATE, "BONE MODE      %s",
+                        bmo == 2 ? "NUDGE (find it)" : bmo == 1 ? "COLLAPSE" : "HIDE");
+            break;
+        }
         case PR_TMDBONESLOT:
             _snprintf_s(out, cap, _TRUNCATE, "BONE SLOT      %ld of %d",
                         Rd(g_tmdBoneSlot) + 1, kTmdBoneSlots);
@@ -6311,6 +6336,13 @@ void PanelAdjust(int row, int dir) {
             // exist, which is how a raw vertex-count setting goes stale between saves.
             InterlockedExchange(&g_tmdHideVerts, NextPassMesh(Rd(g_tmdHideVerts), dir));
             break;
+        case PR_TMDBONEMODE: {
+            LONG bmo = Rd(g_tmdBoneMode) + (dir >= 0 ? 1 : -1);
+            if (bmo < 0) bmo = 2;
+            if (bmo > 2) bmo = 0;
+            InterlockedExchange(&g_tmdBoneMode, bmo);
+            break;
+        }
         case PR_TMDBONESLOT: {
             LONG sv = Rd(g_tmdBoneSlot) + (dir >= 0 ? 1 : -1);
             if (sv < 0) sv = kTmdBoneSlots - 1;
@@ -6343,7 +6375,7 @@ void PanelAdjust(int row, int dir) {
             if (row == PR_TMDBONELO) {
                 LONG v = lo + dir;
                 if (v < -1) v = -1;
-                if (v > 40) v = 40;
+                if (v > kTmdBoneMax) v = kTmdBoneMax;
                 InterlockedExchange(&g_tmdBoneLo[sI], v);
                 // Together when they were together, and never inverted otherwise. A backwards range
                 // collapses nothing, which looks exactly like OFF, and the two mean opposite things.
@@ -6353,7 +6385,7 @@ void PanelAdjust(int row, int dir) {
                 if (lo < 0) break;                 // widening an OFF range is meaningless
                 LONG v = hi + dir;
                 if (v < lo) v = lo;
-                if (v > 40) v = 40;
+                if (v > kTmdBoneMax) v = kTmdBoneMax;
                 InterlockedExchange(&g_tmdBoneHi[sI], v);
             }
             break;
@@ -6781,6 +6813,7 @@ bool InitXRInput() {
         InterlockedExchange(&g_tmdBoneHi[sI], GetPrivateProfileIntA("Input", bkey, -1, path));
     }
     InterlockedExchange(&g_tmdBoneMode,   GetPrivateProfileIntA("Input", "TmdBoneMode",  0, path));
+    InterlockedExchange(&g_tmdBoneCensus, GetPrivateProfileIntA("Input", "TmdBoneCensus", 0, path));
     InterlockedExchange(&g_tmdArmStep,    GetPrivateProfileIntA("Input", "TmdArmStep",  50, path));
     InterlockedExchange(&g_tmdHideVerts,  GetPrivateProfileIntA("Input", "TmdHideVerts", 0, path));
     Log("ini: TmdOnOffHand=%ld (the TMD and the hand holding it ride the OFF controller while"
@@ -12868,7 +12901,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         // several disjoint ranges (the right arm and the left upper arm both live in 4818), and
         // stopping at the first match made the second range unreachable.
         LONG bl = -1, bh = -1;                    // the span to save: min lo, max hi across matches
-        bool covers[64] = { false };              // which bone indices any slot asks to collapse
+        bool covers[kTmdBoneMax + 1] = { false };              // which bone indices any slot asks to collapse
         for (int sI = 0; sI < kTmdBoneSlots; ++sI) {
             const LONG m = Rd(g_tmdBoneMesh[sI]);
             const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
@@ -12876,7 +12909,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
             if (target != numVertices || lo < 0 || hi < lo) continue;
             if (bl < 0 || lo < bl) bl = lo;
             if (hi > bh) bh = hi;
-            for (LONG b = lo; b <= hi && b < 64; ++b) covers[b] = true;
+            for (LONG b = lo; b <= hi && b < kTmdBoneMax + 1; ++b) covers[b] = true;
         }
         if (bl >= 0 && bh >= bl) {
             boneRegLo = kBoneReg0 + (int)bl * kBoneRegsPerBone;
@@ -12910,8 +12943,18 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                     // exactly as the engine set them or the gap becomes a hole in the arm.
                     for (int i = 0; i < boneRegN; ++i) {
                         const LONG bone = bl + (i / kBoneRegsPerBone);
-                        if (bone >= 0 && bone < 64 && covers[bone])
+                        if (bone >= 0 && bone <= kTmdBoneMax && covers[bone])
                             z[i][0] = z[i][1] = z[i][2] = z[i][3] = nan;
+                    }
+                } else if (Rd(g_tmdBoneMode) == 2) {
+                    // ⭐ run 241: shove the bone a long way UP. Its geometry lifts out of place and
+                    // makes itself obvious; everything else is untouched, so what MOVED is the answer.
+                    // 200 UU is roughly four metres - far enough that a small part is unmistakable and
+                    // not so far that it leaves the view entirely before you see which way it went.
+                    for (int i = 0; i < boneRegN; ++i) {
+                        const LONG bone = bl + (i / kBoneRegsPerBone);
+                        if (bone < 0 || bone > kTmdBoneMax || !covers[bone]) continue;
+                        if ((i % kBoneRegsPerBone) == 2) z[i][3] = savedBones[i][3] + 200.0f;
                     }
                 } else {
                     const float tx = savedBones[0][3];
@@ -12919,7 +12962,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                     const float tz = boneRegN > 2 ? savedBones[2][3] : 0.0f;
                     for (int i = 0; i < boneRegN; ++i) {
                         const LONG bone = bl + (i / kBoneRegsPerBone);
-                        if (bone < 0 || bone >= 64 || !covers[bone]) continue;
+                        if (bone < 0 || bone > kTmdBoneMax || !covers[bone]) continue;
                         z[i][0] = z[i][1] = z[i][2] = 0.0f;
                         z[i][3] = (i % 3) == 0 ? tx : (i % 3) == 1 ? ty : tz;
                     }
@@ -12934,6 +12977,32 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, dStart, dPrims);
     });
     if (boneRegN) dev->SetVertexShaderConstantF(boneRegLo, &savedBones[0][0], boneRegN);
+
+    // ⭐ run 241: how many bones this mesh REALLY has, so the sweep range stops being a guess.
+    // Reads the whole possible block once a second and reports the last register that is not all
+    // zero - an unused palette slot is left zeroed, a used one never is. Costs one read per second.
+    if (Rd(g_tmdBoneCensus) && g_thisDrawMoved != 0) {
+        static DWORD lastCensus = 0;
+        const DWORD nowMs = GetTickCount();
+        if (nowMs - lastCensus > 1000) {
+            lastCensus = nowMs;
+            const int regs = kTmdBoneMax * kBoneRegsPerBone;
+            static float all[kTmdBoneMax * 3][4];
+            if (SUCCEEDED(dev->GetVertexShaderConstantF(kBoneReg0, &all[0][0], regs))) {
+                int lastLive = -1;
+                for (int b = 0; b < kTmdBoneMax; ++b) {
+                    bool live = false;
+                    for (int k = 0; k < kBoneRegsPerBone && !live; ++k)
+                        for (int c = 0; c < 4; ++c)
+                            if (all[b * kBoneRegsPerBone + k][c] != 0.0f) { live = true; break; }
+                    if (live) lastLive = b;
+                }
+                Log("bone census: mesh %u uses bones 0..%d (%d live) - sweep no further than that."
+                    " The 77 ceiling is derived: 256 vs registers, bones from c23, 3 each. (run 241)",
+                    numVertices, lastLive, lastLive + 1);
+            }
+        }
+    }
     g_thisDrawMoved = 0;
     return dhr;
 }
