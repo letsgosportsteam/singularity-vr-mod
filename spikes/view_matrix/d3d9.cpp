@@ -1882,6 +1882,11 @@ enum ArmedState { ARMED_UNKNOWN = 0, ARMED_YES, ARMED_NO };
 // every hot-path consumer reads a plain aligned 32-bit word. Same shape as g_healPending, and for the
 // same reason run 203 gave: the hot path must not touch anything that can block.
 volatile LONG g_armedState = ARMED_UNKNOWN;
+// ⭐ run 258: the equipped weapon OBJECT, and a one-shot edge for the mesh latch. See RefreshArmedState
+// for why the pointer is the identity, and UpdateFgLatch for what consumes the edge.
+volatile LONG g_weaponObj     = 0;
+volatile LONG g_weaponSwapped = 0;
+volatile LONG g_weaponSwapDrop = 1;   // ini [Input] WeaponSwapDrop - 0 falls back to the 240-frame wait
 
 inline ArmedState PlayerArmed() { return (ArmedState)Rd(g_armedState); }
 
@@ -1942,6 +1947,25 @@ static void RefreshArmedState() {
                 const uintptr_t w = *reinterpret_cast<const uintptr_t*>(pawn + g_offWeapon);
                 st = w ? ARMED_YES : ARMED_NO;
                 LogEquippedClass(w);            // ⭐ run 235
+                // ---- ⭐ run 258: the pointer IS the weapon, and we were throwing it away ----
+                //
+                // Reported: "I switch weapons, see nothing for a while, then the gun appears with the
+                // arms and snaps to the controller." That is 240 frames of kLatchMiss plus 30 of
+                // kLatchSteady - 2.25 s at 120 fps, and LONGER when the frame rate is lower, because
+                // both are frame counts rather than durations.
+                //
+                // None of that waiting is necessary. This value was already being read every frame
+                // and collapsed to a bool. Run 235b established that the OBJECT is the identity -
+                // every weapon shares the class RvWeaponShared - so a change here IS a swap, known on
+                // the frame it happens, with no inference from what is being drawn.
+                //
+                // ⚠️ Raising the TMD does NOT trip this. Run 236 measured that Pawn.Weapon stays on
+                // the gun while the TMD is up: the weapon is HIDDEN, not swapped. That is exactly the
+                // false positive a draw-derived signal would have produced.
+                const LONG wl = (LONG)w;
+                if (w && wl != Rd(g_weaponObj) && Rd(g_weaponObj) != 0)
+                    InterlockedExchange(&g_weaponSwapped, 1);
+                if (wl != Rd(g_weaponObj)) InterlockedExchange(&g_weaponObj, wl);
             }
         }
     }
@@ -7254,6 +7278,16 @@ bool InitXRInput() {
     }
     InterlockedExchange(&g_tmdBoneMode,   GetPrivateProfileIntA("Input", "TmdBoneMode",  0, path));
     InterlockedExchange(&g_tmdBoneCensus, GetPrivateProfileIntA("Input", "TmdBoneCensus", 0, path));
+    // ⭐ run 258: 0 reverts to the pure frame-count drop, which is a 2.25 s wait at 120 fps and longer
+    // below it. Here because a latch change is the highest-consequence thing in this file - the wrong
+    // roles cost a session - and this one fires on a signal that has only ever been read, never acted on.
+    InterlockedExchange(&g_weaponSwapDrop,
+                        GetPrivateProfileIntA("Input", "WeaponSwapDrop", 1, path) ? 1 : 0);
+    Log("ini: WeaponSwapDrop=%ld (%s). Run 258: Pawn.Weapon changing IS the swap, known on the frame"
+        " it happens - run 235c measured it moving on real switches and NOT for the TMD.",
+        Rd(g_weaponSwapDrop),
+        Rd(g_weaponSwapDrop) ? "drop the mesh latch the moment the weapon object changes"
+                             : "OFF - wait for kLatchMiss frames of the old gun not being drawn");
     InterlockedExchange(&g_tmdArmStep,    GetPrivateProfileIntA("Input", "TmdArmStep",  50, path));
     InterlockedExchange(&g_tmdHideVerts,  GetPrivateProfileIntA("Input", "TmdHideVerts", 0, path));
     Log("ini: TmdOnOffHand=%ld (the TMD and the hand holding it ride the OFF controller while"
@@ -13070,6 +13104,31 @@ void UpdateFgLatch() {
             return;
         }
         if (armed != ARMED_UNKNOWN) prev = armed;
+    }
+
+    // ---- ⭐ run 258: drop on the SWAP ITSELF, not on 240 frames of noticing ----
+    //
+    // Same shape as the unarmed -> armed edge above, and for the same reason: the engine knows, so
+    // the latch should not be inferring it from what is on screen. Reported as "switch weapons, see
+    // nothing for a while, then the gun appears with the arms and snaps" - the "nothing" is the new
+    // gun being hidden as a stray (it is outside the OLD baseline), and it lasts until kLatchMiss
+    // has counted 240 frames of the old gun not being drawn. Clearing the baseline here ends both at
+    // once: the drop stops the hiding AND lets the re-take happen, leaving only kLatchSteady's 30
+    // frames before the roles are taken.
+    //
+    // ⚠️ kLatchMiss STAYS as the fallback. This edge needs Pawn.Weapon resolved, and it is not
+    // resolved on a cold start or where the property solver has not run - so the frame-count path
+    // still has to work on its own. It is a second route to the same drop, not a replacement.
+    if (Rd(g_weaponSwapDrop) && InterlockedExchange(&g_weaponSwapped, 0)) {
+        if (gun || arms) {
+            InterlockedExchange(&g_gunVerts, 0);
+            InterlockedExchange(&g_armsVerts, 0);
+            InterlockedExchange(&g_fgBaseCount, 0);
+            Log("mesh latch: Pawn.Weapon CHANGED - dropping the latch on the swap itself rather than"
+                " after %d frames of the old gun not being drawn (run 258)", kLatchMiss);
+            LogFgList("at the SWAP drop - this is what it will re-take from");
+            return;
+        }
     }
 
     if (gun && arms) {
