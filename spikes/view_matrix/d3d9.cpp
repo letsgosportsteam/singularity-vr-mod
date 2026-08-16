@@ -2781,6 +2781,16 @@ volatile LONG g_tmdHideVerts = 0;
 LONG NextPassMesh(LONG cur, int dir);   // ⭐ run 237d: defined with the pass arrays, far below
 volatile LONG g_tmdFwd = 30, g_tmdRight = -9, g_tmdUp = -13;
 volatile LONG g_tmdYawTenths = 0, g_tmdPitchTenths = 0;
+// ⭐ run 245: a ROLL trim, which the gun rows do not have and the TMD needs.
+//
+// The run-243 diagnostic cleared the position path - ride target 2, offHandValid 1, G and H both
+// live - which leaves rotation. A gun points along the line of your grip, so the controller's
+// orientation IS the weapon's. A gauntlet is strapped ACROSS a forearm, and roll is precisely the
+// axis those two differ in: same hand pose, device rotated a quarter turn about the wrist.
+//
+// Added before it was asked for by a test rather than after, because the alternative was a run that
+// could only report "it needs roll" and then wait for this build anyway.
+volatile LONG g_tmdRollTenths = 0;
 volatile LONG g_tmdOnOffHand = 1;      // ini [Input] TmdOnOffHand - the whole feature's off switch
 
 // ---- ⭐ run 230: the note is a full-screen 2D panel, and a headset FOV is not a monitor ----
@@ -5702,6 +5712,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TMDHIDE,                   // ⭐ run 237d
        PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH, PR_TMDBONESLOT,   // ⭐ run 239
        PR_TMDBONEMODE,               // ⭐ run 241
+       PR_TMDROLL,                   // ⭐ run 245
        PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
@@ -5722,7 +5733,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // on it change meaning when you switch guns, and mixing that with global settings on a shared page is
 // how someone tunes the rifle and wonders why the pistol moved.
 const int kPanelPages    = 7;      // ⭐ run 237: + TMD ALIGN
-const int kPanelRowsMax  = 13;     // ⭐ run 242: + HIDE MESH back on the TMD page
+const int kPanelRowsMax  = 14;     // ⭐ run 245: + TMD ROLL
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
       PR_GOTO_WEAPON, PR_GOTO_TMD },
@@ -5751,7 +5762,7 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ALIGNGUN, PR_ALIGNFWD, PR_ALIGNRIGHT, PR_ALIGNUP, PR_ALIGNYAW, PR_ALIGNPITCH, PR_BACK },
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
-    { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
+    { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH, PR_TMDROLL,
       PR_TMDBONESLOT, PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI,
       // 💥 run 242: HIDE MESH came BACK. It was dropped in run 239 to make room for BONE SLOT and
       // that was never mentioned - so the capability still existed, in the ini and in FgHidden, with
@@ -5761,7 +5772,7 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
       PR_TMDBONEMODE, PR_TMDHIDE, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 13 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 14 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5940,10 +5951,11 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdOnOffHand", &g_tmdOnOffHand }, { "TmdFwd", &g_tmdFwd },
                 { "TmdRight", &g_tmdRight }, { "TmdUp", &g_tmdUp },
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
+                { "TmdRollTenths", &g_tmdRollTenths },
                 { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
                 { "TmdHideVerts", &g_tmdHideVerts }, { "TmdBoneMode", &g_tmdBoneMode },
             };
-            for (int i = 0; i < 10; ++i) {
+            for (int i = 0; i < 11; ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
             }
@@ -5964,7 +5976,7 @@ void PanelSaveRow(int rowId, const char* path) {
             return;
         }
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
-        case PR_TMDYAW: case PR_TMDPITCH:
+        case PR_TMDYAW: case PR_TMDPITCH: case PR_TMDROLL:
         case PR_TMDARMFROM: case PR_TMDARMTO:
         case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI:
         case PR_TMDBONEMESH: case PR_TMDBONESLOT: case PR_TMDBONEMODE:
@@ -6129,6 +6141,8 @@ void PanelRowText(int row, char* out, size_t cap) {
             _snprintf_s(out, cap, _TRUNCATE, "TMD YAW    %+.1f", Rd(g_tmdYawTenths) / 10.0f);   break;
         case PR_TMDPITCH:
             _snprintf_s(out, cap, _TRUNCATE, "TMD PITCH  %+.1f", Rd(g_tmdPitchTenths) / 10.0f); break;
+        case PR_TMDROLL:
+            _snprintf_s(out, cap, _TRUNCATE, "TMD ROLL   %+.1f", Rd(g_tmdRollTenths) / 10.0f);  break;
         case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
         case PR_TMDBONEMODE: {
             const LONG bmo = Rd(g_tmdBoneMode);
@@ -6415,7 +6429,16 @@ void PanelAdjust(int row, int dir) {
             }
             break;
         }
-        case PR_TMDYAW: case PR_TMDPITCH: {
+        case PR_TMDYAW: case PR_TMDPITCH: case PR_TMDROLL: {
+            // 1 tenth of a degree a press is far too fine for a quarter-turn hunt, so roll steps in
+            // whole degrees. Yaw and pitch keep the tenth - those are trims, this is an orientation.
+            if (row == PR_TMDROLL) {
+                LONG v = Rd(g_tmdRollTenths) + dir * 10;
+                if (v < -1800) v = -1800;
+                if (v >  1800) v =  1800;
+                InterlockedExchange(&g_tmdRollTenths, v);
+                break;
+            }
             volatile LONG* t = row == PR_TMDYAW ? &g_tmdYawTenths : &g_tmdPitchTenths;
             LONG v = Rd(*t) + dir;
             if (v < -900) v = -900;
@@ -6806,6 +6829,7 @@ bool InitXRInput() {
     InterlockedExchange(&g_tmdUp,         GetPrivateProfileIntA("Input", "TmdUp",   -13, path));
     InterlockedExchange(&g_tmdYawTenths,  GetPrivateProfileIntA("Input", "TmdYawTenths",   0, path));
     InterlockedExchange(&g_tmdPitchTenths,GetPrivateProfileIntA("Input", "TmdPitchTenths", 0, path));
+    InterlockedExchange(&g_tmdRollTenths, GetPrivateProfileIntA("Input", "TmdRollTenths",  0, path));
     InterlockedExchange(&g_tmdArmFrom,    GetPrivateProfileIntA("Input", "TmdArmFrom",    0, path));
     InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   1000, path));
     for (int sI = 0; sI < kTmdBoneSlots; ++sI) {
@@ -11699,10 +11723,11 @@ static void BuildTmdC(float C[4][4]) {
     int sy, sp, sr; GunSigns(sy, sp, sr);
     const int32_t trimYaw   = (int32_t)(Rd(g_tmdYawTenths)   * 18.2044f);
     const int32_t trimPitch = (int32_t)(Rd(g_tmdPitchTenths) * 18.2044f);
+    const int32_t trimRoll  = (int32_t)(Rd(g_tmdRollTenths)  * 18.2044f);   // ⭐ run 245
     BuildGunTransform(C, G,
         (int32_t)(sy * Rd(g_offHandDevYawUU))   + trimYaw,
         (int32_t)(sp * Rd(g_offHandDevPitchUU)) + trimPitch,
-        (int32_t)(sr * Rd(g_offHandDevRollUU)),
+        (int32_t)(sr * Rd(g_offHandDevRollUU)) + trimRoll,   // ⭐ run 245
         GunViewFrame() ? g_wantYaw : 0,
         H[0] - G[0], H[1] - G[1], H[2] - G[2]);
 }
