@@ -17358,10 +17358,30 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     // ⚠️ Brackets, not a leading dash. The dash used to mark the selected axis and it read as a
     // MINUS SIGN - "-R9" looks exactly like "R is -9" and was reported that way. A readout whose
     // marker is indistinguishable from its data is worse than no marker.
-    _snprintf_s(l4, sizeof(l4), _TRUNCATE, "ANCHOR %sF%ld%s %sR%ld%s %sU%ld%s",
-                ax == 0 ? "(" : " ", g_gunAnchorFwd,   ax == 0 ? ")" : " ",
-                ax == 1 ? "(" : " ", g_gunAnchorRight, ax == 1 ? ")" : " ",
-                ax == 2 ? "(" : " ", g_gunAnchorUp,    ax == 2 ? ")" : " ");
+    // 💥 run 241: this printed g_gunAnchor* - the GLOBAL FALLBACK - not the anchor in force. So
+    // it read F30 R9 U-13 whatever was in your hands, while the assault rifle was being drawn at its
+    // own 26/8/-13. Reported as a reasonable inference from a wrong number: "I thought the per-weapon
+    // values were offsetting those defaults", which is exactly what the readout implied.
+    //
+    // ⚠ This is the run-174 trap that three comments in this file already warn about - a readout
+    // showing one value while another is applied - and it was sitting in the readout those comments
+    // are attached to. The per-weapon anchors have been correct since run 217; only the display lied.
+    //
+    // Now shows what is ACTUALLY in force: the TMD's while the TMD is up, since the markers already
+    // switch to the TMD there and a cross and a number describing different objects is the same trap
+    // again.
+    LONG afN, arN, auN;
+    const bool tmdNow = InterlockedCompareExchange(&g_tmdOnOffHand, 0, 0) != 0 && TmdRaised();
+    if (tmdNow) {
+        afN = Rd(g_tmdFwd); arN = Rd(g_tmdRight); auN = Rd(g_tmdUp);
+    } else {
+        GunAnchorInForce(&afN, &arN, &auN);
+    }
+    _snprintf_s(l4, sizeof(l4), _TRUNCATE, "%s %sF%ld%s %sR%ld%s %sU%ld%s",
+                tmdNow ? "TMD ANCH" : "ANCHOR  ",
+                ax == 0 ? "(" : " ", afN, ax == 0 ? ")" : " ",
+                ax == 1 ? "(" : " ", arN, ax == 1 ? ")" : " ",
+                ax == 2 ? "(" : " ", auN, ax == 2 ? ")" : " ");
 
     DWORD oldScissor = FALSE;
     dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
