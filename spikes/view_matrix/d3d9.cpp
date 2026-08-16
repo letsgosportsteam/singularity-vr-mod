@@ -1083,21 +1083,48 @@ inline LONG Rd(const volatile LONG& v) { return v; }
 // thread_local, so no other thread's walk can seed it, and cleared at the start of every walk and
 // once per frame. That caps the window at one walk, which after this change is milliseconds rather
 // than the 1.4 seconds it used to be.
-struct ReadableRegion { uintptr_t base = 0, end = 0; bool valid = false; };
-static thread_local ReadableRegion g_readOk;
+// ---- 💥 run 257: ONE cache slot hit NEVER, because a walk rotates between regions ----
+//
+// Run 256's single-entry cache changed the measured walk by nothing at all: 1365 ms before,
+// 1275-1342 ms after. The reasoning was that consecutive objects share a region - true, and
+// irrelevant, because the loop does not touch consecutive objects. Per object it reads the OBJECT,
+// then its CLASS, then GNames, then the name data: three or four different regions in rotation, so a
+// one-slot cache is evicted by the next lookup every time and hits approximately zero percent.
+//
+// A small set fixes exactly that. Eight slots, round-robin replacement, no LRU bookkeeping - the
+// working set here is the handful of arenas a walk actually touches, and eight covers it with room.
+//
+// ⚠️ MEASURED, NOT ASSUMED, this time. `player pawn: ... after walking N object(s)` prints the walk's
+// size and the breakdown line prints its cost, so if this one also does nothing the log says so in
+// the same two numbers that caught run 256.
+const int kReadCacheSlots = 8;
+struct ReadableRegion { uintptr_t base = 0, end = 0; };
+static thread_local ReadableRegion g_readOk[kReadCacheSlots];
+static thread_local int g_readOkNext = 0;
+volatile LONG g_readableCache = 1;   // ini [Render] ReadableCache - the escape hatch, see below
 
-void ReadableForget() { g_readOk.valid = false; }
+void ReadableForget() {
+    for (int i = 0; i < kReadCacheSlots; ++i) { g_readOk[i].base = 0; g_readOk[i].end = 0; }
+    g_readOkNext = 0;
+}
 
 bool Readable(const void* p, size_t n) {
     const uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    if (g_readOk.valid && a >= g_readOk.base && (a + n) <= g_readOk.end) return true;
+    const bool useCache = Rd(g_readableCache) != 0;
+    if (useCache)
+        for (int i = 0; i < kReadCacheSlots; ++i)
+            if (g_readOk[i].end && a >= g_readOk[i].base && (a + n) <= g_readOk[i].end) return true;
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
     if (mbi.State != MEM_COMMIT) return false;
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
     const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
     if ((a + n) > base + mbi.RegionSize) return false;
-    g_readOk.base = base; g_readOk.end = base + mbi.RegionSize; g_readOk.valid = true;
+    if (useCache) {
+        g_readOk[g_readOkNext].base = base;
+        g_readOk[g_readOkNext].end  = base + mbi.RegionSize;
+        g_readOkNext = (g_readOkNext + 1) % kReadCacheSlots;
+    }
     return true;
 }
 
@@ -1993,6 +2020,17 @@ static uintptr_t FindPlayerPawn(bool force) {
     if (g_playerPawn && g_playerPawnClass && Readable((void*)g_playerPawn, 0x40) &&
         *reinterpret_cast<uintptr_t*>(g_playerPawn + OBJ_CLASS) == g_playerPawnClass)
         return g_playerPawn;
+    // ---- ⚠️ run 257: a pawn we HAD and lost must be re-found at once ----
+    //
+    // Run 256's backoff is right for a splash screen, where no pawn can exist, and wrong for a level
+    // transition, where one certainly will in a moment. Without this a load would inherit whatever
+    // backoff the splash had escalated to - up to 15 s of PlayerArmed() reading UNKNOWN, and that
+    // feeds the mesh latch's "is a weapon equipped" test (runs 227-228), so the arms/gun roles could
+    // be decided on a stale answer for seconds after every load.
+    //
+    // Losing a pawn is a state CHANGE, not a repeat miss, so it resets the backoff rather than
+    // advancing it. The splash case is unaffected: there was never a pawn there to lose.
+    const bool hadPawn = g_playerPawn != 0;
     g_playerPawn = 0;
     // ---- 💥 run 256: the miss throttle counted FRAMES, which is backwards when the walk is the
     // thing making frames slow ----
@@ -2012,6 +2050,7 @@ static uintptr_t FindPlayerPawn(bool force) {
     // returns from the cache above without reaching here.
     static ULONGLONG lastWalk = 0;
     static int consecutiveMisses = 0;
+    if (hadPawn) { consecutiveMisses = 0; lastWalk = 0; }   // ⭐ run 257: a loss is not a repeat miss
     if (!force) {
         const ULONGLONG nowMs = GetTickCount64();
         const ULONGLONG waitMs = (consecutiveMisses >= 3) ? 15000 : 2000;
@@ -21254,6 +21293,16 @@ void LoadIniSettings() {
     // Default 40 rather than 100: a full-screen page of text is the REPORTED DEFECT, so shipping the
     // default at 100 would ship the bug and make the setting a thing you have to discover. 40 is the
     // measured comfortable value in a headset, not a guess - 65 was the guess and it was too big.
+    // ⭐ run 257: the escape hatch for the Readable region cache. It is the one change in this area
+    // that can plausibly cause a CRASH rather than a slowdown - a region freed or re-protected inside
+    // one frame would make a cached "yes" a lie - so it gets a switch, per this file's habit of
+    // making a fix revertible without a rebuild. Set 0 if anything starts faulting in a GObjects walk.
+    InterlockedExchange(&g_readableCache,
+                        GetPrivateProfileIntA("Render", "ReadableCache", 1, path) ? 1 : 0);
+    Log("ini: ReadableCache=%ld (%s). Run 257: Readable() is a VirtualQuery syscall and a GObjects"
+        " walk makes ~4 per object across 112,000 objects. Set 0 to go back to querying every time.",
+        Rd(g_readableCache),
+        Rd(g_readableCache) ? "8-slot region cache" : "OFF - every check is a syscall");
     // ⭐ run 253: default 0 - the build MEASURES the one-shot arm before it changes it. See
     // g_hudXformLive for why sticky is plausible and why "plausible" is not enough to default to.
     InterlockedExchange(&g_hudArmSticky,
