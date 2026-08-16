@@ -13003,7 +13003,10 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // ⭐ run 241: how many bones this mesh REALLY has, so the sweep range stops being a guess.
     // Reads the whole possible block once a second and reports the last register that is not all
     // zero - an unused palette slot is left zeroed, a used one never is. Costs one read per second.
-    if (Rd(g_tmdBoneCensus) && g_thisDrawMoved != 0) {
+    // 💥 run 244b: NOT gated on the draw being moved. Run 244 removed that requirement from the
+    // collapse and left it on the census, so 4818 - the one mesh in question - was the one mesh the
+    // census could not report. A blind spot in the instrument, aimed exactly at the subject.
+    if (Rd(g_tmdBoneCensus) && FgMatchWindow() && FgMatchesSignature(numVertices)) {
         static DWORD lastCensus = 0;
         const DWORD nowMs = GetTickCount();
         if (nowMs - lastCensus > 1000) {
