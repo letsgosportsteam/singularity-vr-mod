@@ -2703,8 +2703,35 @@ volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DIS
 // blocks, so a contiguous window cannot separate them however fine it gets.
 //
 // Kept as ini-only, off the panel: it is a real capability with a proven limit, not a knob worth a row.
-volatile LONG g_tmdArmFrom = 0, g_tmdArmTo = 1000;
-volatile LONG g_tmdArmStep = 50;
+//
+// ---- 💥 run 250: SLOTS, and its own mesh - the window could not be pointed at 4818 ----
+//
+// Reported as "the triangle range selector is only the hand, not the arms" while wanting to check
+// mesh 4818. Two separate reasons it could not, and both are the same mistake made twice:
+//
+//   1. The mesh came from the BONE slot (run 246b, deliberately - "one row already says which mesh is
+//      under surgery"). That reasoning was sound when the bone rows and these rows were one page and
+//      one job. It stopped being sound the moment you want a triangle range on one mesh while a bone
+//      range is set up on another: choosing 4818 here silently retargeted the bone sweep too.
+//   2. There was ONE range for all meshes, so parking a measured window on 7444 and trying another on
+//      4818 meant losing the first. The bone rows learned this in run 240 - "several slots may name
+//      the same mesh" - and the triangle window never did.
+//
+// Four slots of {mesh, from, to}, mirroring the bone slots, and its own mesh row.
+//
+// ⚠ NOT unioned across slots, unlike the bones, and the difference is real rather than an omission.
+// A bone range says which bones to COLLAPSE, so two ranges are additive and one draw can honour both.
+// A triangle window says which contiguous run of triangles to DRAW, so two windows on one mesh would
+// need two draw calls. The FIRST slot naming this mesh wins, and it logs once when a second one is
+// also set - a silent "your other slot is being ignored" is exactly the class of failure this feature
+// keeps producing.
+const int kTmdArmSlots = 4;
+volatile LONG g_tmdArmFrom[kTmdArmSlots] = { 0, 0, 0, 0 };
+volatile LONG g_tmdArmTo[kTmdArmSlots]   = { 1000, 1000, 1000, 1000 };
+// 0 = the arms mesh of the moment (largest non-weapon), same convention as g_tmdBoneMesh.
+volatile LONG g_tmdArmMesh[kTmdArmSlots] = { 0, 0, 0, 0 };
+volatile LONG g_tmdArmSlot = 0;            // which slot the panel rows edit
+volatile LONG g_tmdArmStep = 50;           // the sweep's stride, shared - it is a UI speed, not data
 
 // ---- ⭐ run 237f: collapse a range of BONES instead ----
 //
@@ -5709,6 +5736,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_NOTESIZE,          // ⭐ run 230
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
        PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,   // ⭐ run 237c, un-retired in 247b
+       PR_TMDARMSLOT, PR_TMDARMMESH,                // ⭐ run 250
        PR_TMDHIDE,                   // ⭐ run 237d
        PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH, PR_TMDBONESLOT,   // ⭐ run 239
        PR_TMDBONEMODE,               // ⭐ run 241
@@ -5803,10 +5831,14 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // to reach it. Asked for directly as "make the whole mesh disappear so I can confirm both arms
     // share it", which is exactly what it is for: one press answers a question that otherwise costs
     // a bone sweep. It sits here because it is the same question the triangle window asks.
-    { PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP, PR_TMDHIDE, PR_BACK_TMD },
+    // ⭐ run 250: TRI SLOT and TRI MESH lead, because they say WHAT the two range rows below them are
+    // pointing at. Same shape as the bone page on purpose - the two tools are used the same way and
+    // the muscle memory should transfer.
+    { PR_TMDARMSLOT, PR_TMDARMMESH, PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,
+      PR_TMDHIDE, PR_BACK_TMD },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10, 6, 5 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page; ⭐ run 249: TMD 17 -> 10 + two sub-pages
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10, 6, 7 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page; ⭐ run 249: TMD 17 -> 10 + two sub-pages; ⭐ run 250: TMD MESH 5 -> 7
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5988,10 +6020,11 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdRight", &g_tmdRight }, { "TmdUp", &g_tmdUp },
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
                 { "TmdRollTenths", &g_tmdRollTenths },
-                { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
                 // ⭐ run 249: TmdArmStep was adjustable-but-never-saved, which is exactly the defect
                 // this one-case-writes-the-block shape exists to prevent. It is read back at startup
                 // (see the ini loader) so the omission silently reset it to 50 every launch.
+                // ⭐ run 250: TmdArmFrom/TmdArmTo left this table when they became per-slot - they are
+                // written by the slot loop below, alongside the bone slots.
                 { "TmdArmStep", &g_tmdArmStep },
                 { "TmdHideVerts", &g_tmdHideVerts }, { "TmdBoneMode", &g_tmdBoneMode },
             };
@@ -6014,6 +6047,19 @@ void PanelSaveRow(int rowId, const char* path) {
                 WritePrivateProfileStringA("Input", key, v, path);
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdBoneHi%d", sI);
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdBoneHi[sI]));
+                WritePrivateProfileStringA("Input", key, v, path);
+            }
+            // ⭐ run 250: the triangle-window slots, in the same pass and for the same reason.
+            for (int sI = 0; sI < kTmdArmSlots; ++sI) {
+                char key[32];
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdArmMesh%d", sI);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdArmMesh[sI]));
+                WritePrivateProfileStringA("Input", key, v, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdArmFrom%d", sI);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdArmFrom[sI]));
+                WritePrivateProfileStringA("Input", key, v, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdArmTo%d", sI);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdArmTo[sI]));
                 WritePrivateProfileStringA("Input", key, v, path);
             }
             return;
@@ -6202,12 +6248,33 @@ void PanelRowText(int row, char* out, size_t cap) {
         // ⚠ A `default` that quietly does something plausible is why: a missing case reads as a row
         // that works. Fixed here rather than by removing the default, because the default is also
         // the PR_DEBUG row's own text and rewiring that is a bigger change than this run wants.
-        case PR_TMDARMFROM:
-            _snprintf_s(out, cap, _TRUNCATE, "ARM FROM       %ld", Rd(g_tmdArmFrom)); break;
-        case PR_TMDARMTO:
-            _snprintf_s(out, cap, _TRUNCATE, "ARM TO         %ld", Rd(g_tmdArmTo));   break;
+        // ⭐ run 250: per-slot. FROM/TO read the SELECTED slot, exactly as the bone rows do.
+        case PR_TMDARMSLOT:
+            _snprintf_s(out, cap, _TRUNCATE, "TRI SLOT       %ld of %d",
+                        Rd(g_tmdArmSlot) + 1, kTmdArmSlots);
+            break;
+        case PR_TMDARMMESH: {
+            const LONG am = Rd(g_tmdArmMesh[Rd(g_tmdArmSlot)]);
+            if (!am) _snprintf_s(out, cap, _TRUNCATE, "TRI MESH       ARMS");
+            else     _snprintf_s(out, cap, _TRUNCATE, "TRI MESH       %ld", am);
+            break;
+        }
+        // The window says OFF when it is inert (the full 0-1000), because "0" and "1000" sitting in
+        // the two rows look like settings while doing nothing at all - and that reads as the feature
+        // being broken, which is how run 237f's measured-dead window got reported twice more.
+        case PR_TMDARMFROM: case PR_TMDARMTO: {
+            const LONG sI = Rd(g_tmdArmSlot);
+            const LONG lo = Rd(g_tmdArmFrom[sI]), hi = Rd(g_tmdArmTo[sI]);
+            const bool inert = (lo <= 0 && hi >= 1000);
+            if (inert) _snprintf_s(out, cap, _TRUNCATE, "%s        OFF (FULL MESH)",
+                                   row == PR_TMDARMFROM ? "TRI FROM" : "TRI TO  ");
+            else       _snprintf_s(out, cap, _TRUNCATE, "%s        %ld",
+                                   row == PR_TMDARMFROM ? "TRI FROM" : "TRI TO  ",
+                                   row == PR_TMDARMFROM ? lo : hi);
+            break;
+        }
         case PR_TMDARMSTEP:
-            _snprintf_s(out, cap, _TRUNCATE, "ARM STEP       %ld", Rd(g_tmdArmStep)); break;
+            _snprintf_s(out, cap, _TRUNCATE, "TRI STEP       %ld", Rd(g_tmdArmStep)); break;
         case PR_GOTO_TMDBONE: _snprintf_s(out, cap, _TRUNCATE, "BONE RANGES        >"); break;
         case PR_GOTO_TMDMESH: _snprintf_s(out, cap, _TRUNCATE, "TRIANGLE WINDOW    >"); break;
         case PR_BACK_TMD:     _snprintf_s(out, cap, _TRUNCATE, "<  TMD ALIGN");         break;
@@ -6491,22 +6558,42 @@ void PanelAdjust(int row, int dir) {
             InterlockedExchange(&g_tmdArmStep, kSteps[at]);
             break;
         }
+        // ⭐ run 250: the triangle window's own slot and mesh, mirroring the bone rows exactly - the
+        // point of the change is that these two are no longer the BONE slot's.
+        case PR_TMDARMSLOT: {
+            LONG sv = Rd(g_tmdArmSlot) + (dir >= 0 ? 1 : -1);
+            if (sv < 0) sv = kTmdArmSlots - 1;
+            if (sv >= kTmdArmSlots) sv = 0;
+            InterlockedExchange(&g_tmdArmSlot, sv);
+            break;
+        }
+        case PR_TMDARMMESH: {
+            // Changing the mesh RESETS the window to inert, for the bone rows' reason: a triangle
+            // index measured against one mesh names different geometry in another, and carrying the
+            // range across silently is how a window gets credited to a mesh it was never measured on.
+            const LONG sI = Rd(g_tmdArmSlot);
+            InterlockedExchange(&g_tmdArmMesh[sI], NextPassMesh(Rd(g_tmdArmMesh[sI]), dir));
+            InterlockedExchange(&g_tmdArmFrom[sI], 0);
+            InterlockedExchange(&g_tmdArmTo[sI], 1000);
+            break;
+        }
         case PR_TMDARMFROM: case PR_TMDARMTO: {
             // Kept ordered so the range can never invert into "draw nothing", which looks identical
             // to the mesh being hidden - and the two want opposite fixes.
+            const LONG sI = Rd(g_tmdArmSlot);
             const LONG st = Rd(g_tmdArmStep);
-            volatile LONG* t = row == PR_TMDARMFROM ? &g_tmdArmFrom : &g_tmdArmTo;
+            volatile LONG* t = row == PR_TMDARMFROM ? &g_tmdArmFrom[sI] : &g_tmdArmTo[sI];
             LONG v = Rd(*t) + dir * st;
             if (v < 0)    v = 0;
             if (v > 1000) v = 1000;
             InterlockedExchange(t, v);
-            if (Rd(g_tmdArmFrom) >= Rd(g_tmdArmTo)) {
+            if (Rd(g_tmdArmFrom[sI]) >= Rd(g_tmdArmTo[sI])) {
                 if (row == PR_TMDARMFROM) {
                     LONG w = v + st; if (w > 1000) w = 1000;
-                    InterlockedExchange(&g_tmdArmTo, w);
+                    InterlockedExchange(&g_tmdArmTo[sI], w);
                 } else {
                     LONG w = v - st; if (w < 0) w = 0;
-                    InterlockedExchange(&g_tmdArmFrom, w);
+                    InterlockedExchange(&g_tmdArmFrom[sI], w);
                 }
             }
             break;
@@ -6918,8 +7005,23 @@ bool InitXRInput() {
     InterlockedExchange(&g_tmdYawTenths,  GetPrivateProfileIntA("Input", "TmdYawTenths",   0, path));
     InterlockedExchange(&g_tmdPitchTenths,GetPrivateProfileIntA("Input", "TmdPitchTenths", 0, path));
     InterlockedExchange(&g_tmdRollTenths, GetPrivateProfileIntA("Input", "TmdRollTenths",  0, path));
-    InterlockedExchange(&g_tmdArmFrom,    GetPrivateProfileIntA("Input", "TmdArmFrom",    0, path));
-    InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   1000, path));
+    // ⭐ run 250: per-slot now. Slot 0 inherits the pre-slot TmdArmFrom/TmdArmTo as its default, so an
+    // existing ini keeps whatever window was parked in it rather than silently resetting to inert.
+    {
+        const int legacyFrom = GetPrivateProfileIntA("Input", "TmdArmFrom",    0, path);
+        const int legacyTo   = GetPrivateProfileIntA("Input", "TmdArmTo",   1000, path);
+        for (int sI = 0; sI < kTmdArmSlots; ++sI) {
+            char akey[32];
+            _snprintf_s(akey, sizeof(akey), _TRUNCATE, "TmdArmMesh%d", sI);
+            InterlockedExchange(&g_tmdArmMesh[sI], GetPrivateProfileIntA("Input", akey, 0, path));
+            _snprintf_s(akey, sizeof(akey), _TRUNCATE, "TmdArmFrom%d", sI);
+            InterlockedExchange(&g_tmdArmFrom[sI],
+                                GetPrivateProfileIntA("Input", akey, sI == 0 ? legacyFrom : 0, path));
+            _snprintf_s(akey, sizeof(akey), _TRUNCATE, "TmdArmTo%d", sI);
+            InterlockedExchange(&g_tmdArmTo[sI],
+                                GetPrivateProfileIntA("Input", akey, sI == 0 ? legacyTo : 1000, path));
+        }
+    }
     for (int sI = 0; sI < kTmdBoneSlots; ++sI) {
         char bkey[32];
         _snprintf_s(bkey, sizeof(bkey), _TRUNCATE, "TmdBoneMesh%d", sI);
@@ -12980,22 +13082,54 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         g_msMeshMatch += dm;
         if (dm > g_msMeshMatchPeak) g_msMeshMatchPeak = dm;
     }
-    // ⭐ run 237c: clip the arms mesh to a range of its triangles. The lambda captures by reference,
-    // so adjusting these before the call is all it takes - no second draw path.
+    // ---- 💥 run 250: the TMD gate, hoisted - the triangle window had the run-244 defect too ----
+    //
+    // This test used to be computed further down for the bone collapse alone, and the triangle window
+    // above it carried `g_thisDrawMoved == 2` instead. That is the EXACT gate run 244 removed from the
+    // collapse, for the exact reason it is wrong here: the left arm is drawn by something FgRidesGun
+    // rejects, so a draw the window most needs to reach never reached it. Reported this run as "the
+    // triangle range selector is only the hand, not the arms" - which is what a range that can only
+    // ever be applied to controller-ridden draws looks like from inside a headset.
+    //
+    // ⚠ THIRD time this gate has been too narrow in this feature (240b, 244, now). Both tools are on
+    // one test now, so the next widening cannot fix one and leave the other behind.
+    //
+    // ⚠ Bounded by FgMatchWindow, not opened to every draw in the frame. A slot names a vertex count
+    // and world geometry can share one - run 215 measured 322 such collisions in a second - and the
+    // window is what has kept every count-matched rule in this file off the level.
+    const bool tmdSurgeryOn = InterlockedCompareExchange(&g_tmdOnOffHand, 0, 0) != 0 &&
+                              TmdRaised() && FgMatchWindow();
+    // ⭐ run 237c: clip a mesh to a range of its triangles. The lambda captures by reference, so
+    // adjusting these before the call is all it takes - no second draw path.
     UINT dStart = startIndex, dPrims = primCount;
-    if (g_thisDrawMoved == 2 && primCount > 0) {
-        // ⭐ run 246b: the triangle window now follows the CURRENT BONE SLOT's mesh rather than
-        // being hardwired to the arms. It was measured dead on 7444 - the two hands interleave, so no
-        // contiguous range separates them - but an ARM is a long simple limb and its triangles have a
-        // far better chance of sitting in one block. Worth having aimable rather than rebuilt later.
+    if (tmdSurgeryOn && primCount > 0) {
+        // ⭐ run 250: the window has its OWN slots and its OWN mesh row. It used to borrow the bone
+        // slot's mesh (run 246b), which meant pointing it at 4818 silently retargeted the bone sweep.
         //
-        // Sharing the bone slot's mesh rather than adding a selector: one row already says which mesh
-        // is under surgery, and two independent "which mesh" settings is how a range gets applied to
-        // something it was not measured on.
-        const LONG lo = Rd(g_tmdArmFrom), hi = Rd(g_tmdArmTo);
-        const LONG clipMeshSel = Rd(g_tmdBoneMesh[Rd(g_tmdBoneSlot)]);
-        const UINT clipMesh = clipMeshSel > 0 ? (UINT)clipMeshSel : ArmsMeshNow();
-        if ((lo > 0 || hi < 1000) && hi > lo && clipMesh == numVertices) {
+        // First slot naming this mesh wins - NOT a union, unlike the bones. A bone range says which
+        // bones to collapse and two ranges are additive within one draw; a triangle window says which
+        // contiguous run to DRAW, and honouring two would take two draw calls. The loser is LOGGED
+        // rather than dropped quietly, because "my other slot does nothing" is how this feature has
+        // been misread twice already.
+        LONG lo = 0, hi = 1000; int used = -1, alsoSet = 0;
+        for (int sI = 0; sI < kTmdArmSlots; ++sI) {
+            const LONG m = Rd(g_tmdArmMesh[sI]);
+            const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
+            const LONG sLo = Rd(g_tmdArmFrom[sI]), sHi = Rd(g_tmdArmTo[sI]);
+            if (target != numVertices) continue;
+            if (!(sLo > 0 || sHi < 1000) || sHi <= sLo) continue;      // inert slot, not a match
+            if (used < 0) { used = sI; lo = sLo; hi = sHi; } else ++alsoSet;
+        }
+        if (used >= 0) {
+            if (alsoSet) {
+                static bool saidMulti = false;
+                if (!saidMulti) {
+                    saidMulti = true;
+                    Log("*** TRI WINDOW: %d slot(s) past slot %d also name mesh %u and are being"
+                        " IGNORED - one contiguous window per mesh, by construction. ***",
+                        alsoSet, used + 1, numVertices);
+                }
+            }
             const UINT a = (UINT)((primCount * (UINT64)lo) / 1000);
             const UINT b = (UINT)((primCount * (UINT64)hi) / 1000);
             if (b > a) { dStart = startIndex + a * 3; dPrims = b - a; }   // triangle LIST: 3 per prim
@@ -13054,9 +13188,10 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // ⚠ Bounded by FgMatchWindow, not opened to every draw in the frame. The slot names a vertex
     // count, and world geometry can share one - run 215 measured 322 such collisions in a second. The
     // window is what has kept every other count-matched rule from hitting the level.
-    const bool tmdBoneOn = InterlockedCompareExchange(&g_tmdOnOffHand, 0, 0) != 0 &&
-                           TmdRaised() && FgMatchWindow();
-    if (tmdBoneOn) {
+    // ⭐ run 250: ONE test, shared with the triangle window above - see tmdSurgeryOn. It was computed
+    // here and duplicated nowhere, which is precisely how the window kept the narrow gate through two
+    // rounds of widening this one.
+    if (tmdSurgeryOn) {
         // ⭐ run 240: EVERY slot naming this mesh, unioned - not the first match. One mesh can need
         // several disjoint ranges (the right arm and the left upper arm both live in 4818), and
         // stopping at the first match made the second range unreachable.

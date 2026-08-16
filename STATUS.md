@@ -108,6 +108,35 @@ discount a perfect empirical correlation. **Matching a tested value costs nothin
 3. **The cheap control first.** Rename `d3d9.dll` to `d3d9.dll.off` and run the game unmodded at the
    same resolution. One minute, and it settles "is this us at all" before any bisection starts.
 
+### ⚠️ SHIPPED, NOT YET FLOWN (run 250) — the triangle window had the run-244 gate defect too
+
+Reported as *"the triangle range selector is only the hand, not the arms"*, while wanting to check
+the triangles of mesh **4818**. Two independent reasons it could not do either, and the first is a
+defect this feature has now had **three times**:
+
+- **It was gated on `g_thisDrawMoved == 2`** — draws riding the off-hand controller. That is the
+  exact gate run 244 removed from the **bone collapse**, for the exact reason it is wrong here: the
+  left arm is drawn by something `FgRidesGun` rejects, so the draw the window most needs never
+  reached it. Both tools now share one hoisted `tmdSurgeryOn` test (`TmdOnOffHand && TmdRaised() &&
+  FgMatchWindow()`), so the next widening cannot fix one and leave the other behind.
+- **Its mesh came from the BONE slot** (run 246b, deliberately). Sound while the two were one page
+  and one job; it meant that pointing the window at 4818 silently retargeted the bone sweep too.
+
+The window now has **its own four slots** of `{mesh, from, to}` and its own `TRI MESH` row, mirroring
+the bone slots. Panel → `TMD ALIGN` → `TRIANGLE WINDOW`: `TRI SLOT`, `TRI MESH`, `TRI FROM`,
+`TRI TO`, `TRI STEP`, `HIDE MESH`. Saved per slot as `TmdArmMesh%d` / `TmdArmFrom%d` / `TmdArmTo%d`;
+slot 0 inherits the old single `TmdArmFrom`/`TmdArmTo` so an existing ini keeps its parked window.
+
+⚠️ **NOT unioned across slots, unlike the bones, and that difference is deliberate.** A bone range
+says which bones to *collapse*, so two ranges are additive within one draw. A triangle window says
+which contiguous run to *draw*, so two windows on one mesh would need two draw calls. **The first
+slot naming a mesh wins and the others are LOGGED**, because "my other slot does nothing" is how
+this feature has been misread twice already.
+
+The rows also **say `OFF (FULL MESH)`** when the window is inert (0/1000). Two rows reading `0` and
+`1000` look like settings while doing nothing, which is how run 237f's measured-dead window got
+re-reported as broken.
+
 ### ⚠️ SHIPPED, NOT YET FLOWN (run 249) — the TMD panel page drew no text at all
 
 Reported twice: the TMD page is a dark plate with the selection bar visible and **every glyph

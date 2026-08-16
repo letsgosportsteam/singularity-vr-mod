@@ -24,6 +24,33 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## 💥 Run 250: the triangle window was gated on the same test that was wrong for bones, twice before
+
+Reported as *"the triangle range selector is only the hand, not the arms"*, wanting to sweep mesh
+**4818**. Two reasons, and the first had already been diagnosed and fixed — next door, in the same
+function, for the same geometry.
+
+**The gate.** The window ran under `g_thisDrawMoved == 2`: draws riding the off-hand controller.
+Run 240b widened the bone collapse from `== 2` to `!= 0` and run 244 widened it again to every draw
+in `FgMatchWindow()`, because *the left arm is drawn by something `FgRidesGun` rejects*. Both times
+the triangle window sat ten lines above with the original gate and was not touched. **Third time
+this gate has been too narrow in this feature.** The test is now hoisted into `tmdSurgeryOn` and
+both tools read it, so there is no longer a version of it to forget.
+
+**The mesh.** Run 246b pointed the window at the **bone slot's** mesh on the reasoning that "one row
+already says which mesh is under surgery". That was true while the bone rows and the range rows were
+one page and one job. It is false the moment you want a triangle range on 4818 and a bone range on
+7444: choosing one retargets the other. The window has its own four `{mesh, from, to}` slots now.
+
+⚠️ **Not unioned, unlike the bone slots.** A bone range is additive within one draw; a triangle
+window is a contiguous run to draw, and two would take two draw calls. First slot naming the mesh
+wins and the rest are logged.
+
+**Method note.** *A fix applied to one of two adjacent call sites is half a fix, and the half that
+was missed does not report itself.* The commit that fixed the bone gate says "the gate was narrower
+than the problem twice, and the second time I had the evidence to see it and did not" — and it was
+still narrower than the problem a third time, ten lines away, in the diff that said so.
+
 ## 💥 Run 249: the TMD panel page was blank because ONE `Clear()` was too big, not because rows were dropped
 
 Reported twice, the second time as *"i see a big black screen. i can see what row i'm on, but the
