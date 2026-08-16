@@ -984,6 +984,31 @@ int32_t g_frozenYaw = 0, g_frozenPitch = 0;
 volatile LONG g_cutsceneAuto = 1;   // ini: CutsceneAuto
 int  g_userCutMode = 1;             // the mode NUMPAD8 last selected, restored when a cutscene ends
 bool g_cineAutoActive = false;      // are we currently overriding?
+
+// ---- 💥 run 238: a gesture fired during the intro MOVIE and wrote the result to the ini ----
+//
+// Reported as "the laser is on every time I load in", and the ini was innocent: it says LaserSight=0,
+// the loader reads 0, and the log says `ini: LaserSight=0`. Two hundred lines later it says
+// `laser sight ON (held A for 1000 ms) - saved to the ini`, and the surrounding lines are Bink video
+// frames - `tex 1280x720 fmt 50`. The gesture fires while you hold A to SKIP THE INTRO, every launch.
+//
+// ⚠ What makes this worse than a stray toggle is that the laser gesture WRITES THROUGH to the ini.
+// Every other accidental input is forgotten at quit; this one edits the config and comes back
+// tomorrow looking like a default. A gesture with a persistent side effect needs a stricter gate than
+// one without.
+//
+// So: gestures only while the player is actually in a first-person view. A TIMESTAMP rather than a
+// live test of the pass, because the pass legitimately reads empty on alternating frames (measured -
+// 183 of 391 census entries in the run-232 log) and a live test would flicker.
+volatile LONG g_fgSeenMs = 0;
+
+inline bool InGameplay() {
+    if (g_cineAutoActive) return false;
+    // Rd() is defined below this point in the file, so the interlocked read is spelled out.
+    const DWORD last = (DWORD)InterlockedCompareExchange(&g_fgSeenMs, 0, 0);
+    if (!last) return false;                       // never seen one: menus, loading, the intro movie
+    return (DWORD)(GetTickCount() - last) < 1000;
+}
 bool g_cinePrev = false;            // last seen CINE state, for edge detection
 bool    g_haveWant = false;
 int     g_hookHits = 0;
@@ -7296,7 +7321,8 @@ void SyncXRInput(XrTime displayTime) {
         // laser: you will jump once on the way to toggling it. That is the deliberate trade, and it is
         // why the threshold is an ini value - if holding A turns out to mean something in play, this
         // moves without a rebuild.
-        if (i == g_jumpBtnIdx && Rd(g_laserHoldMs) > 0) {
+        // ⭐ run 238: not during the intro movie, a cutscene, or the menus. See InGameplay.
+        if (i == g_jumpBtnIdx && Rd(g_laserHoldMs) > 0 && InGameplay()) {
             static LARGE_INTEGER since{};
             static bool consumed = false;
             if (down) {
@@ -19568,6 +19594,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     InterlockedExchange(&g_fgStableVerts[i],
                         i < sc ? InterlockedCompareExchange(&g_fgSigVerts[i], 0, 0) : 0);
                 InterlockedExchange(&g_fgStableCount, sc);
+                if (sc > 0) InterlockedExchange(&g_fgSeenMs, (LONG)GetTickCount());   // ⭐ run 238
 
                 // ---- ⭐ run 232: report the pass whenever its CONTENTS change ----
                 //
