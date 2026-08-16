@@ -3985,6 +3985,31 @@ double g_msGameplayHooks = 0.0, g_msGameplayPeak = 0.0;
 double g_msResolveOff = 0.0, g_msResolveOffPeak = 0.0;
 int    g_gameplayHookFrames = 0;
 
+// ---- ⭐ run 255: split the block, because ResolveGameplayOffsets is NOT all of it ----
+//
+// Run 254 measured the block at 85 ms mean and a **4847 ms** worst frame, with
+// ResolveGameplayOffsets 2682 ms of it. That named a real cost - but one window in the same run
+// reads `ResolveGameplayOffsets 0.01 ms` next to a **1354 ms** worst frame, which says outright
+// that something ELSE in the block dominates at least some of the time.
+//
+// So each call gets its own accumulator rather than a fifth round of picking a favourite. Every one
+// of these can walk GObjects when its cache misses, and a splash screen is where every cache misses
+// at once - no pawn, no weapon, no HUD, nothing to find and nothing to stop it looking again:
+//
+//   SolvePropertyLayout        self-throttling ONCE SOLVED - and it cannot solve at a splash
+//   RefreshArmedState          calls FindPlayerPawn every frame (1-in-30 miss throttle)
+//   UpdateFgLatch              "two interlocked reads a frame until it takes" - it never takes here
+//   ApplyMuzzleFxSuppression   its own comment: "a GObjects walk only when the cached objects stop
+//                              validating". At a splash the weapon does not exist, so they never
+//                              validate, so that is a walk EVERY FRAME.
+//
+// ⚠️ Peaks per function, for run 254's reason: these are throttled on different periods, so a mean
+// hides a once-in-30-frames walk behind twenty-nine cheap ones.
+double g_msHookPart[4] = { 0, 0, 0, 0 };
+double g_msHookPartPeak[4] = { 0, 0, 0, 0 };
+const char* const kHookPartName[4] = { "SolvePropertyLayout", "RefreshArmedState",
+                                       "UpdateFgLatch", "ApplyMuzzleFxSuppression" };
+
 IDirect3DQuery9* g_gpuFence = nullptr;
 double g_msGpuWait = 0.0;
 int    g_gpuWaitFrames = 0;
@@ -19239,9 +19264,18 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // ⭐ run 254: this whole block is TIMED now. It was never in any bucket, so all of it has
         // always landed in "our work" - see g_msGameplayHooks.
         const LARGE_INTEGER tGp = Now();
-        SolvePropertyLayout();
-        RefreshArmedState();   // ⭐ run 228b: once a frame, BEFORE the latch consults it
-        UpdateFgLatch();
+        // ⭐ run 255: one accumulator each - see kHookPartName. The macro keeps the call sites
+        // readable; spelling out four timestamp pairs here would bury what the block actually does.
+        #define TIME_HOOK(idx, call) do {                                   \
+                const LARGE_INTEGER tH = Now();                             \
+                call;                                                       \
+                const double dH = MsSince(tH);                              \
+                g_msHookPart[idx] += dH;                                    \
+                if (dH > g_msHookPartPeak[idx]) g_msHookPartPeak[idx] = dH; \
+            } while (0)
+        TIME_HOOK(0, SolvePropertyLayout());
+        TIME_HOOK(1, RefreshArmedState());   // ⭐ run 228b: once a frame, BEFORE the latch consults it
+        TIME_HOOK(2, UpdateFgLatch());
         // Run 200: the heal gate's offsets, retried until resolved. Free once it has them, and the HUD
         // often does not exist at the mesh latch where the first attempt runs.
         // ⭐ run 254: timed SEPARATELY - it is the specific suspect, because run 228d gave it
@@ -19262,7 +19296,8 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // Run 189: suppress the first-person muzzle flash and barrel smoke. Cheap enough for a per-frame
         // call because it only ACTS on a change of state - a few interlocked reads while nothing is
         // happening, and a GObjects walk only when the cached objects stop validating (a weapon swap).
-        ApplyMuzzleFxSuppression();
+        TIME_HOOK(3, ApplyMuzzleFxSuppression());
+        #undef TIME_HOOK
         {
             const double dGp = MsSince(tGp);
             g_msGameplayHooks += dGp;
@@ -19783,6 +19818,17 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                         " GObjects on a miss and there is no pawn at a splash screen, so every"
                         " attempt there is a walk that cannot succeed. (run 254)",
                         gp, g_msGameplayPeak, g_msResolveOff, g_msResolveOffPeak);
+                // ⭐ run 255: and WHICH call. Printed whenever any part is worth a millisecond, in
+                // one line so the four are read against each other rather than in isolation.
+                if (g_msGameplayPeak > 1.0) {
+                    Log("    gameplay hook breakdown (total ms this window / WORST single call):"
+                        " %s %.1f/%.1f | %s %.1f/%.1f | %s %.1f/%.1f | %s %.1f/%.1f (run 255)",
+                        kHookPartName[0], g_msHookPart[0], g_msHookPartPeak[0],
+                        kHookPartName[1], g_msHookPart[1], g_msHookPartPeak[1],
+                        kHookPartName[2], g_msHookPart[2], g_msHookPartPeak[2],
+                        kHookPartName[3], g_msHookPart[3], g_msHookPartPeak[3]);
+                }
+                for (int i = 0; i < 4; ++i) g_msHookPart[i] = g_msHookPartPeak[i] = 0.0;
                 g_msGameplayHooks = g_msGameplayPeak = 0.0;
                 g_msResolveOff = g_msResolveOffPeak = 0.0;
                 g_gameplayHookFrames = 0;
