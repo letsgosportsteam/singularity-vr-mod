@@ -9154,6 +9154,7 @@ extern volatile LONG g_drawWriteLo, g_drawWriteHi;
 extern int g_flashProbeLeft;
 extern int           g_upXformDump;
 extern volatile LONG g_hudConstsWritten;
+extern volatile LONG g_hudXformLive;   // ⭐ run 253, defined with the UI census
 extern bool          g_inHudRemap;
 
 HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
@@ -9181,8 +9182,10 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     // a 4-vector minimum would filter out exactly the writes being looked for.
     // The UI marker. Cheap enough for the hot path - a range test and a store - and deliberately
     // not gated on the probe, because it now drives the feature rather than a diagnostic.
-    if (!g_inHudRemap && startReg <= 8 && startReg + vec4Count > 5)
+    if (!g_inHudRemap && startReg <= 8 && startReg + vec4Count > 5) {
         InterlockedExchange(&g_hudConstsWritten, 1);
+        InterlockedExchange(&g_hudXformLive, 1);   // ⭐ run 253: survives the first draw; cleared per frame
+    }
 
     if (g_upXformDump > 0 && startReg < 32) {
         LONG add = 0;
@@ -13693,6 +13696,37 @@ volatile LONG g_uiSeen     = 0;   // reached HudStereoPair at all
 volatile LONG g_uiOffTgt   = 0;   // rejected: drawing into an OFFSCREEN target, not the scene
 volatile LONG g_uiPersp    = 0;   // rejected: transform is not orthographic - world-space UI
 volatile LONG g_uiElemsThisFrame = 0;   // reached the census - these are the insettable ones
+
+// ---- 💥 run 253: the HUD arm flag is ONE-SHOT, and a UI transform serves SEVERAL draws ----
+//
+// Reported with two screenshots: on the TMD ENERGY and TMD pickup popups, part of the body text is
+// drawn ONCE across the middle of the full side-by-side frame - and noticeably LARGER than the text
+// that came out right. Both symptoms have one cause.
+//
+// `g_hudConstsWritten` is set by the constant hook on any write covering c5-c8, and every
+// user-pointer draw CONSUMES it with an InterlockedExchange. So when the game writes the UI
+// transform once and then issues several draws against it, only the FIRST draw is treated as HUD.
+// The rest fall through to StereoPair, which remaps the CAMERA register - which a UI shader never
+// reads - so they are duplicated at unchanged full-frame clip coordinates and straddle the seam,
+// each eye's scissor keeping half. That is the run-213 scope-quad signature exactly.
+//
+// And the note inset lives INSIDE HudStereoPair, so a draw that misses the arm also misses the
+// scale-about-centre and stays full size. Not duplicated AND too big, from one flag.
+//
+// ⭐ HudArmSticky, DEFAULT 0 - measure first, then switch.
+//
+//   0  today's behaviour, plus g_uiUnarmed counting how many draws WOULD have been captured
+//   1  the transform stays armed until the end of the frame, so every draw sharing it is HUD
+//
+// ⚠ Run 149 is the reason this is not simply switched on. Arming on a c5-c8 write once squashed the
+// scene's FULLSCREEN COMPOSITE quad and produced four panels. What makes sticky safer now than it
+// was then: the quad classifier runs FIRST and a quad can never reach here, HudStereoPair rejects an
+// offscreen target, and it rejects a non-orthographic transform. Three guards that did not exist in
+// run 149 - but "safer than the thing that broke it" is an argument, not a measurement, which is why
+// the default measures instead of acting.
+volatile LONG g_hudXformLive = 0;   // a UI transform was written this frame and is still in force
+volatile LONG g_uiUnarmed    = 0;   // non-quad user-ptr draws that missed the one-shot arm
+volatile LONG g_hudArmSticky = 0;   // ini [Render] HudArmSticky
 int g_uiLastDumpedCount = -1;
 
 // ---- ⭐ run 153: the crosshair, identified by measurement ----
@@ -14338,8 +14372,13 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     //
     // The classifier that separates a fullscreen quad from real geometry already exists and is the
     // project's established tool for this. It just has to run FIRST.
-    const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
+    const bool hudFresh = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
+    // ⭐ run 253: a draw that missed the one-shot arm while a UI transform is still in force. Counted
+    // whatever HudArmSticky says, so the default build MEASURES the size of the problem.
+    const bool hudSticky = !hudFresh && !quad && Rd(g_hudXformLive) != 0;
+    if (hudSticky) InterlockedIncrement(&g_uiUnarmed);
+    const bool hudArmed = hudFresh || (hudSticky && Rd(g_hudArmSticky) != 0);
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(2, t, primCount, vtxStride, vtxData, quad, 0);
@@ -14391,8 +14430,13 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     DumpUserPtrVertex(primCount, vtxData, vtxStride, "DrawIndexedPrimUP");
     DumpUserPtrTransform(dev, vtxStride, "DrawIndexedPrimUP");
     // Quad test first - see the note in Hook_DrawPrimUP for what happens when it is not.
-    const bool hudArmed = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
+    const bool hudFresh = InterlockedExchange(&g_hudConstsWritten, 0) != 0;
     const bool quad = UserPtrQuad(primCount, vtxData, vtxStride);
+    // ⭐ run 253: see the note at g_hudXformLive. Same rule on both user-pointer hooks - the popup
+    // body text arrives on this one, and applying it to only one would fix half a note.
+    const bool hudSticky = !hudFresh && !quad && Rd(g_hudXformLive) != 0;
+    if (hudSticky) InterlockedIncrement(&g_uiUnarmed);
+    const bool hudArmed = hudFresh || (hudSticky && Rd(g_hudArmSticky) != 0);
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(3, t, primCount, vtxStride, vtxData, quad, numVertices);
@@ -19462,6 +19506,21 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 Log("    note elements inset to %ld%%: %ld draw(s) this second (run 230)",
                     InterlockedCompareExchange(&g_noteInsetPct, 0, 0), ni);
 
+            // ⭐ run 253: the one-shot arm, measured. A nonzero count while a POPUP is open is the
+            // reported bug - those draws share the UI transform, missed the arm, went to StereoPair
+            // unremapped and landed across the seam at full size.
+            // ⚠ A nonzero count during ordinary play is NOT automatically the bug: any non-quad
+            // user-pointer draw after a c5-c8 write counts here, and some of those are world effects
+            // that belong on StereoPair. The number to watch is the CHANGE when a popup opens.
+            if (const LONG ua = InterlockedExchange(&g_uiUnarmed, 0))
+                Log("    UI draws that MISSED the one-shot arm: %ld this second (HudArmSticky=%ld,"
+                    " so they %s). A jump when a popup opens is run 253's reported bug. ⚠ Some of"
+                    " these are world draws and belong where they went - watch the CHANGE, not the"
+                    " absolute. (run 253)",
+                    ua, Rd(g_hudArmSticky),
+                    Rd(g_hudArmSticky) ? "WERE captured as HUD"
+                                       : "went to StereoPair unremapped, as before");
+
             // ⭐ run 223: separates "I froze it and nothing changed" from "the freeze never fired",
             // which look identical in a headset and mean opposite things.
             if (const LONG fz = InterlockedExchange(&g_adsFrozenDraws, 0))
@@ -20497,6 +20556,10 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // ⭐ run 230: this frame's sighting becomes next frame's state, then clears.
             InterlockedExchange(&g_noteOpen, InterlockedExchange(&g_noteSeenFrame, 0));
             InterlockedExchange(&g_uiElemsThisFrame, 0);   // ⭐ run 230
+            // ⭐ run 253: the UI transform does not survive a frame boundary. Per-frame is the
+            // conservative choice - within one frame the game writes it once and draws several
+            // elements against it, which is the whole defect; across frames it is rewritten anyway.
+            InterlockedExchange(&g_hudXformLive, 0);
             InterlockedExchange(&g_uiSeen,   0);
             InterlockedExchange(&g_uiOffTgt, 0);
             InterlockedExchange(&g_uiPersp,  0);
@@ -21026,6 +21089,18 @@ void LoadIniSettings() {
     // Default 40 rather than 100: a full-screen page of text is the REPORTED DEFECT, so shipping the
     // default at 100 would ship the bug and make the setting a thing you have to discover. 40 is the
     // measured comfortable value in a headset, not a guess - 65 was the guess and it was too big.
+    // ⭐ run 253: default 0 - the build MEASURES the one-shot arm before it changes it. See
+    // g_hudXformLive for why sticky is plausible and why "plausible" is not enough to default to.
+    InterlockedExchange(&g_hudArmSticky,
+                        GetPrivateProfileIntA("Render", "HudArmSticky", 0, path) ? 1 : 0);
+    Log("ini: HudArmSticky=%ld (%s). Run 253: the arm flag is consumed by the FIRST user-pointer"
+        " draw, so later draws sharing one UI transform miss the HUD path - they are duplicated"
+        " unremapped across the seam AND miss the note inset, which is the popup text drawn once,"
+        " large, in the middle. Set 1 to keep the transform armed for the whole frame.",
+        Rd(g_hudArmSticky),
+        Rd(g_hudArmSticky) ? "the UI transform stays armed for the frame"
+                           : "one-shot, today's behaviour - measured by 'UI draws that MISSED the"
+                             " one-shot arm'");
     LONG noteIni = GetPrivateProfileIntA("Render", "NoteInsetPct", 40, path);
     if (noteIni < 25)  noteIni = 25;
     if (noteIni > 100) noteIni = 100;
