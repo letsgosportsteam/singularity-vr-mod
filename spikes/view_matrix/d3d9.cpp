@@ -3962,6 +3962,29 @@ double g_displayPeriodMs = 0.0;   // from XrFrameState, so the pacing target is 
 double g_msEngineObjects = 0.0;
 int    g_engineObjectFrames = 0;
 
+// ---- 💥 run 254: the GObjects walk bucket times TWO functions, and the pawn walk is not one ----
+//
+// Run 252 timed the register scan on the strength of a good-looking argument and measured
+// **0.00 ms**. The scan is exonerated; resolution is anti-correlated (the FASTEST splash ran the
+// LARGEST frame); logging volume does not correlate. The 122 ms is still entirely in the residual.
+//
+// The gap is here. `GObjects walk` covers `RefreshCameraPosition` + `ApplyVrFov` and nothing else,
+// so the whole per-frame gameplay block in Present - SolvePropertyLayout, RefreshArmedState,
+// UpdateFgLatch, ResolveGameplayOffsets, ApplyMuzzleFxSuppression - has never been timed and falls
+// into "our work" by construction.
+//
+// ⭐ That block is what BOTH recent staircase steps touched. Aug 14's `4b96043` removed a throttle so
+// `ResolveGameplayOffsets` calls `FindPlayerPawn(force=true)`, and a MISS is a full GObjects walk. At
+// a splash screen there is no pawn, so it is a walk that cannot succeed, every time it runs.
+//
+// ⚠️ THE PEAK IS THE STATISTIC, not the mean. This is throttled to once per 2 s (15 s after three
+// misses), so a walk costing hundreds of ms would show as a small average and an enormous peak - and
+// an average alone would exonerate it exactly the way it deserves not to be. Run 252's mistake was
+// picking the suspect; the mistake available HERE is picking the wrong summary of it.
+double g_msGameplayHooks = 0.0, g_msGameplayPeak = 0.0;
+double g_msResolveOff = 0.0, g_msResolveOffPeak = 0.0;
+int    g_gameplayHookFrames = 0;
+
 IDirect3DQuery9* g_gpuFence = nullptr;
 double g_msGpuWait = 0.0;
 int    g_gpuWaitFrames = 0;
@@ -19213,12 +19236,23 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // ⭐ run 208: solved HERE as well as at the latch take, and BEFORE UpdateFgLatch. The run-207 latch
         // gate needs the property layout, and the layout used to be solved only by the latch itself - a
         // circular dependency that meant the latch never took at all. Self-throttling; a no-op once solved.
+        // ⭐ run 254: this whole block is TIMED now. It was never in any bucket, so all of it has
+        // always landed in "our work" - see g_msGameplayHooks.
+        const LARGE_INTEGER tGp = Now();
         SolvePropertyLayout();
         RefreshArmedState();   // ⭐ run 228b: once a frame, BEFORE the latch consults it
         UpdateFgLatch();
         // Run 200: the heal gate's offsets, retried until resolved. Free once it has them, and the HUD
         // often does not exist at the mesh latch where the first attempt runs.
-        ResolveGameplayOffsets();
+        // ⭐ run 254: timed SEPARATELY - it is the specific suspect, because run 228d gave it
+        // FindPlayerPawn(force=true) and a miss is a full GObjects walk. At a splash there is no pawn.
+        {
+            const LARGE_INTEGER tRo = Now();
+            ResolveGameplayOffsets();
+            const double dRo = MsSince(tRo);
+            g_msResolveOff += dRo;
+            if (dRo > g_msResolveOffPeak) g_msResolveOffPeak = dRo;
+        }
         // ⚠️ EVERYTHING FROM HERE RUNS ONCE PER FRAME. Not on a slow tick - see UpdateFgLatch's own note
         // above ("two interlocked reads a frame"). Run 202 lost 120 fps to a logging call placed here on
         // the belief that this block was periodic. **Nothing added here may call Log() unconditionally.**
@@ -19229,6 +19263,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         // call because it only ACTS on a change of state - a few interlocked reads while nothing is
         // happening, and a GObjects walk only when the cached objects stop validating (a weapon swap).
         ApplyMuzzleFxSuppression();
+        {
+            const double dGp = MsSince(tGp);
+            g_msGameplayHooks += dGp;
+            if (dGp > g_msGameplayPeak) g_msGameplayPeak = dGp;
+            ++g_gameplayHookFrames;
+        }
         // Once per frame, and it prints only for frames that look like video or a splash.
         VidProbeFrameEnd();
 
@@ -19726,12 +19766,26 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 // per-second total spread over however many frames were armed, so it is divided by
                 // the window's frame count to sit in the same per-frame units as everything else.
                 const double sc = frames > 0 ? g_msScan / frames : 0.0;
+                // ⭐ run 254: the per-frame gameplay block, which had never been in any bucket.
+                const double gp = g_gameplayHookFrames ? g_msGameplayHooks / g_gameplayHookFrames : 0.0;
                 Log("    frame budget: xrWaitFrame %.2f (idle) + copy %.2f + GObjects walk %.2f"
-                    " + XR submit %.2f + reg scan %.2f + our work %.2f = %.2f ms (%.0f%% of the"
-                    " %.2f ms display period)",
-                    wf, copy, eng, xs, sc, ms - wf - copy - eng - xs - sc, ms,
+                    " + XR submit %.2f + reg scan %.2f + gameplay hooks %.2f + our work %.2f"
+                    " = %.2f ms (%.0f%% of the %.2f ms display period)",
+                    wf, copy, eng, xs, sc, gp, ms - wf - copy - eng - xs - sc - gp, ms,
                     g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
                     g_displayPeriodMs);
+                // ⚠️ The PEAK is the statistic. ResolveGameplayOffsets is throttled to once per 2 s
+                // (15 s after three misses), so a walk costing hundreds of ms shows as a tiny mean
+                // and a huge peak - and reading the mean alone would clear it wrongly.
+                if (g_msGameplayPeak > 1.0 || g_msResolveOffPeak > 1.0)
+                    Log("    gameplay hooks: mean %.2f ms/frame, WORST SINGLE FRAME %.2f ms | of"
+                        " which ResolveGameplayOffsets %.2f ms total, WORST %.2f ms. It walks"
+                        " GObjects on a miss and there is no pawn at a splash screen, so every"
+                        " attempt there is a walk that cannot succeed. (run 254)",
+                        gp, g_msGameplayPeak, g_msResolveOff, g_msResolveOffPeak);
+                g_msGameplayHooks = g_msGameplayPeak = 0.0;
+                g_msResolveOff = g_msResolveOffPeak = 0.0;
+                g_gameplayHookFrames = 0;
                 // Printed only when it actually ran, so a normal frame does not carry a row of zeros -
                 // and so that its ABSENCE is meaningful. A scan at a splash screen can never succeed:
                 // there is no view matrix to find, so `candidates` stays 0 and it re-arms forever.
