@@ -2723,6 +2723,28 @@ volatile LONG g_tmdArmStep = 50;
 // collapses the arm to a point at its own joint instead, so a stray sliver is short and local rather
 // than a triangle across the screen.
 volatile LONG g_tmdBoneLo = -1, g_tmdBoneHi = -1;    // bone INDEX range, -1 = off
+// 💥 run 238d: WHICH MESH the range applies to. The first version applied it to everything riding
+// the off hand, and a bone palette is PER MESH - so "bones 13-29" meant the right hand in 7444 and
+// something unrelated in 4818, which came out as both sleeves spiking into points. A bone index is
+// only meaningful against the mesh it was measured on.
+// 0 = the arms mesh of the moment (largest non-weapon), which is where 13-29 was measured.
+volatile LONG g_tmdBoneMesh = 0;
+// 💥 run 238e: a shared collapse POINT is not enough, and the reason is blending.
+//
+// A vertex weighted entirely to a collapsed bone does land on the point, and its triangles do
+// degenerate. But a vertex blended between a collapsed bone and a LIVE one lands PARTWAY - the live
+// term survives the blend - so it stretches from the hand toward the point. Reported as the hand
+// "collapsing instead of disappearing", which is exactly right: sharing the translation cannot help,
+// because the problem is the half of the blend that was never touched.
+//
+// NaN has no such half. Any blend involving a NaN matrix is NaN whatever the weight, and a NaN
+// position is discarded by the rasteriser - so partially weighted vertices vanish with the rest
+// instead of stretching. It is the standard way to make skinned geometry disappear from outside the
+// shader, and it is the only one here that survives a weight it does not control.
+//
+// 1 = the shared point, kept as an escape hatch: NaN handling is technically undefined and if some
+// driver rasterises it as garbage rather than discarding it, this switches back without a rebuild.
+volatile LONG g_tmdBoneMode = 0;   // ini [Input] TmdBoneMode - 0 = NaN, 1 = collapse to a point
 // ⭐ run 237d: one mesh to hide outright while the TMD is up. Reported: clipping the hand mesh never
 // touches the ARM, so the visible right arm is a DIFFERENT mesh - a range on one draw call cannot
 // reach it. Naming it is a solo-cycler job; dropping it once named is this.
@@ -5649,7 +5671,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
        PR_TMDARMFROM, PR_TMDARMTO,   // ⭐ run 237c
        PR_TMDHIDE,                   // ⭐ run 237d
-       PR_TMDBONELO, PR_TMDBONEHI,   // ⭐ run 237f
+       PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH,   // ⭐ run 237f / 238d
        PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
@@ -5700,10 +5722,10 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
     { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
-      PR_TMDBONELO, PR_TMDBONEHI, PR_TMDHIDE },   // ⭐ run 237f
+      PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI, PR_TMDHIDE },   // ⭐ run 238d
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 9 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5885,8 +5907,9 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
                 { "TmdHideVerts", &g_tmdHideVerts },
                 { "TmdBoneLo", &g_tmdBoneLo }, { "TmdBoneHi", &g_tmdBoneHi },
+                { "TmdBoneMesh", &g_tmdBoneMesh },
             };
-            for (int i = 0; i < 11; ++i) {
+            for (int i = 0; i < 12; ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
             }
@@ -5895,7 +5918,7 @@ void PanelSaveRow(int rowId, const char* path) {
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
         case PR_TMDYAW: case PR_TMDPITCH:
         case PR_TMDARMFROM: case PR_TMDARMTO:
-        case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI:
+        case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI: case PR_TMDBONEMESH:
             return;   // written by PR_TMDON above
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
@@ -6058,6 +6081,12 @@ void PanelRowText(int row, char* out, size_t cap) {
         case PR_TMDPITCH:
             _snprintf_s(out, cap, _TRUNCATE, "TMD PITCH  %+.1f", Rd(g_tmdPitchTenths) / 10.0f); break;
         case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
+        case PR_TMDBONEMESH: {
+            const LONG bm = Rd(g_tmdBoneMesh);
+            if (!bm) _snprintf_s(out, cap, _TRUNCATE, "BONE MESH      ARMS");
+            else     _snprintf_s(out, cap, _TRUNCATE, "BONE MESH      %ld", bm);
+            break;
+        }
         case PR_TMDBONELO:
             if (Rd(g_tmdBoneLo) < 0) _snprintf_s(out, cap, _TRUNCATE, "BONE FROM      OFF");
             else _snprintf_s(out, cap, _TRUNCATE, "BONE FROM      %ld", Rd(g_tmdBoneLo));
@@ -6248,6 +6277,14 @@ void PanelAdjust(int row, int dir) {
             // cycle. Offering only what is on screen means the row cannot name a mesh that does not
             // exist, which is how a raw vertex-count setting goes stale between saves.
             InterlockedExchange(&g_tmdHideVerts, NextPassMesh(Rd(g_tmdHideVerts), dir));
+            break;
+        case PR_TMDBONEMESH:
+            // Same cycle as HIDE MESH - only what is actually in the pass, so it cannot name a mesh
+            // that is not there. The range means nothing without the mesh it was measured against, so
+            // changing the mesh clears the range rather than silently re-pointing it at new bones.
+            InterlockedExchange(&g_tmdBoneMesh, NextPassMesh(Rd(g_tmdBoneMesh), dir));
+            InterlockedExchange(&g_tmdBoneLo, -1);
+            InterlockedExchange(&g_tmdBoneHi, -1);
             break;
         case PR_TMDBONELO: case PR_TMDBONEHI: {
             // 💥 run 238b: the two ends were independent, and the collapse needs BOTH set - so
@@ -6693,6 +6730,8 @@ bool InitXRInput() {
     InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   1000, path));
     InterlockedExchange(&g_tmdBoneLo,     GetPrivateProfileIntA("Input", "TmdBoneLo",   -1, path));
     InterlockedExchange(&g_tmdBoneHi,     GetPrivateProfileIntA("Input", "TmdBoneHi",   -1, path));
+    InterlockedExchange(&g_tmdBoneMesh,   GetPrivateProfileIntA("Input", "TmdBoneMesh",  0, path));
+    InterlockedExchange(&g_tmdBoneMode,   GetPrivateProfileIntA("Input", "TmdBoneMode",  0, path));
     InterlockedExchange(&g_tmdArmStep,    GetPrivateProfileIntA("Input", "TmdArmStep",  50, path));
     InterlockedExchange(&g_tmdHideVerts,  GetPrivateProfileIntA("Input", "TmdHideVerts", 0, path));
     Log("ini: TmdOnOffHand=%ld (the TMD and the hand holding it ride the OFF controller while"
@@ -12766,7 +12805,9 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     int   boneRegLo = 0, boneRegN = 0;
     if (g_thisDrawMoved == 2) {
         const LONG bl = Rd(g_tmdBoneLo), bh = Rd(g_tmdBoneHi);
-        if (bl >= 0 && bh >= bl) {
+        const LONG bm = Rd(g_tmdBoneMesh);
+        const UINT boneTarget = bm > 0 ? (UINT)bm : ArmsMeshNow();
+        if (bl >= 0 && bh >= bl && boneTarget == numVertices) {
             boneRegLo = kBoneReg0 + (int)bl * kBoneRegsPerBone;
             boneRegN  = (int)(bh - bl + 1) * kBoneRegsPerBone;
             if (boneRegN > kMaxSaveRegs) boneRegN = kMaxSaveRegs;
@@ -12788,12 +12829,19 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
                 // triangle through the viewer's face to reach it. A joint on the hand keeps the point
                 // local, so a stray sliver stays inside the arm.
                 float z[kMaxSaveRegs][4];
-                const float tx = savedBones[0][3];
-                const float ty = boneRegN > 1 ? savedBones[1][3] : 0.0f;
-                const float tz = boneRegN > 2 ? savedBones[2][3] : 0.0f;
-                for (int i = 0; i < boneRegN; ++i) {
-                    z[i][0] = z[i][1] = z[i][2] = 0.0f;
-                    z[i][3] = (i % 3) == 0 ? tx : (i % 3) == 1 ? ty : tz;
+                if (Rd(g_tmdBoneMode) == 0) {
+                    const DWORD kQNaN = 0x7FC00000u;          // a quiet NaN, written as a bit pattern
+                    float nan; memcpy(&nan, &kQNaN, sizeof(nan));
+                    for (int i = 0; i < boneRegN; ++i)
+                        z[i][0] = z[i][1] = z[i][2] = z[i][3] = nan;
+                } else {
+                    const float tx = savedBones[0][3];
+                    const float ty = boneRegN > 1 ? savedBones[1][3] : 0.0f;
+                    const float tz = boneRegN > 2 ? savedBones[2][3] : 0.0f;
+                    for (int i = 0; i < boneRegN; ++i) {
+                        z[i][0] = z[i][1] = z[i][2] = 0.0f;
+                        z[i][3] = (i % 3) == 0 ? tx : (i % 3) == 1 ? ty : tz;
+                    }
                 }
                 dev->SetVertexShaderConstantF(boneRegLo, &z[0][0], boneRegN);
             } else {
