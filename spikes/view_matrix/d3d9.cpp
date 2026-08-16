@@ -2667,6 +2667,11 @@ volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DIS
 // Percent rather than raw primitives so the whole 4402-triangle mesh sweeps in 20 presses instead of
 // 4402. Defaults 0/100 draw everything, so the feature is inert until someone moves it.
 volatile LONG g_tmdArmFrom = 0, g_tmdArmTo = 100;
+// ⭐ run 237d: one mesh to hide outright while the TMD is up. Reported: clipping the hand mesh never
+// touches the ARM, so the visible right arm is a DIFFERENT mesh - a range on one draw call cannot
+// reach it. Naming it is a solo-cycler job; dropping it once named is this.
+volatile LONG g_tmdHideVerts = 0;
+LONG NextPassMesh(LONG cur, int dir);   // ⭐ run 237d: defined with the pass arrays, far below
 volatile LONG g_tmdFwd = 30, g_tmdRight = -9, g_tmdUp = -13;
 volatile LONG g_tmdYawTenths = 0, g_tmdPitchTenths = 0;
 volatile LONG g_tmdOnOffHand = 1;      // ini [Input] TmdOnOffHand - the whole feature's off switch
@@ -5587,6 +5592,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_NOTESIZE,          // ⭐ run 230
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
        PR_TMDARMFROM, PR_TMDARMTO,   // ⭐ run 237c
+       PR_TMDHIDE,                   // ⭐ run 237d
        PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
@@ -5607,7 +5613,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // on it change meaning when you switch guns, and mixing that with global settings on a shared page is
 // how someone tunes the rifle and wonders why the pistol moved.
 const int kPanelPages    = 7;      // ⭐ run 237: + TMD ALIGN
-const int kPanelRowsMax  = 8;
+const int kPanelRowsMax  = 10;     // ⭐ run 237d: the TMD page needs 9
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
       PR_GOTO_WEAPON, PR_GOTO_TMD },
@@ -5637,10 +5643,10 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
     { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
-      PR_TMDARMFROM, PR_TMDARMTO },      // ⭐ run 237c - no BACK row, the page is full at 8
+      PR_TMDARMFROM, PR_TMDARMTO, PR_TMDHIDE },   // ⭐ run 237d
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 8 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 9 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5820,8 +5826,9 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdRight", &g_tmdRight }, { "TmdUp", &g_tmdUp },
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
                 { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
+                { "TmdHideVerts", &g_tmdHideVerts },
             };
-            for (int i = 0; i < 8; ++i) {
+            for (int i = 0; i < 9; ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
             }
@@ -5829,7 +5836,8 @@ void PanelSaveRow(int rowId, const char* path) {
         }
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
         case PR_TMDYAW: case PR_TMDPITCH:
-        case PR_TMDARMFROM: case PR_TMDARMTO: return;   // written by PR_TMDON above
+        case PR_TMDARMFROM: case PR_TMDARMTO:
+        case PR_TMDHIDE: return;   // written by PR_TMDON above
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
             // survives a relaunch is a state somebody meets tomorrow as a bug report - with the
@@ -5995,6 +6003,12 @@ void PanelRowText(int row, char* out, size_t cap) {
             _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS FROM  %ld%%", Rd(g_tmdArmFrom)); break;
         case PR_TMDARMTO:
             _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS TO    %ld%%", Rd(g_tmdArmTo));   break;
+        case PR_TMDHIDE: {
+            const LONG hv = Rd(g_tmdHideVerts);
+            if (!hv) _snprintf_s(out, cap, _TRUNCATE, "HIDE MESH      NONE");
+            else     _snprintf_s(out, cap, _TRUNCATE, "HIDE MESH      %ld", hv);
+            break;
+        }
         case PR_NOTESIZE: {
             const LONG p = InterlockedCompareExchange(&g_noteInsetPct, 0, 0);
             if (p == 100) _snprintf_s(out, cap, _TRUNCATE, "NOTE SIZE      100%% (FULL SCREEN)");
@@ -6166,6 +6180,12 @@ void PanelAdjust(int row, int dir) {
             InterlockedExchange(t, v);
             break;
         }
+        case PR_TMDHIDE:
+            // Steps through the meshes actually in the pass right now, largest first, with NONE in the
+            // cycle. Offering only what is on screen means the row cannot name a mesh that does not
+            // exist, which is how a raw vertex-count setting goes stale between saves.
+            InterlockedExchange(&g_tmdHideVerts, NextPassMesh(Rd(g_tmdHideVerts), dir));
+            break;
         case PR_TMDARMFROM: case PR_TMDARMTO: {
             // 5% a press: the whole mesh sweeps in 20 presses. Kept ordered so the range can never
             // invert into "draw nothing", which looks identical to the mesh being hidden.
@@ -6578,6 +6598,7 @@ bool InitXRInput() {
     InterlockedExchange(&g_tmdPitchTenths,GetPrivateProfileIntA("Input", "TmdPitchTenths", 0, path));
     InterlockedExchange(&g_tmdArmFrom,    GetPrivateProfileIntA("Input", "TmdArmFrom",   0, path));
     InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   100, path));
+    InterlockedExchange(&g_tmdHideVerts,  GetPrivateProfileIntA("Input", "TmdHideVerts", 0, path));
     Log("ini: TmdOnOffHand=%ld (the TMD and the hand holding it ride the OFF controller while"
         " mPlayerHandsStatus says it is raised) anchor F%ld R%ld U%ld, trim yaw %+.1f pitch %+.1f."
         " Panel: TMD ALIGN.",
@@ -11711,6 +11732,20 @@ static void FgSoloStep() {
 }
 
 static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
+    // ⭐ run 233: solo overrides every rule below it, including the exemptions. That is the point -
+    // an exemption that let a second mesh through would make two meshes visible and the answer
+    // ambiguous, which is the one thing this measurement cannot afford.
+    //
+    // ⚠ run 233c: but NOT run 203's large-pass guard. The first version tested solo before it, so on
+    // a pass too big to be the first-person pass this did per-draw work on every one of thousands of
+    // draws - which is the exact case run 203 added that guard for after it cost 120 fps at the dock.
+    // A diagnostic is allowed to hide things; it is not allowed to reintroduce a fixed performance
+    // defect, and it would have fired on the very cutscene this run has to sit through.
+    if (const LONG solo = Rd(g_fgSoloVerts)) {
+        if (Rd(g_fgDrawCount) > kFgSanePass) return false;
+        return (UINT)solo != verts && FgMatchWindow();
+    }
+
     // ---- 💥 run 237b: with the TMD up, hide NOTHING in the first-person pass ----
     //
     // Reported: "left hand with tmd was not visible", and the cause is upstream of the TMD work. The
@@ -11732,21 +11767,18 @@ static bool FgHidden(UINT verts) {                    // arms, in modes 2 and 3
     // 📝 The stale baseline itself is NOT fixed here - the latch still describes a pass that stopped
     // existing. That wants a re-take when the pass composition changes fundamentally, and it is a
     // bigger change to the most-repaired function in this file than one report justifies today.
-    if (Rd(g_tmdOnOffHand) && TmdRaised()) return false;
-
-    // ⭐ run 233: solo overrides every rule below it, including the exemptions. That is the point -
-    // an exemption that let a second mesh through would make two meshes visible and the answer
-    // ambiguous, which is the one thing this measurement cannot afford.
-    //
-    // ⚠ run 233c: but NOT run 203's large-pass guard. The first version tested solo before it, so on
-    // a pass too big to be the first-person pass this did per-draw work on every one of thousands of
-    // draws - which is the exact case run 203 added that guard for after it cost 120 fps at the dock.
-    // A diagnostic is allowed to hide things; it is not allowed to reintroduce a fixed performance
-    // defect, and it would have fired on the very cutscene this run has to sit through.
-    if (const LONG solo = Rd(g_fgSoloVerts)) {
-        if (Rd(g_fgDrawCount) > kFgSanePass) return false;
-        return (UINT)solo != verts && FgMatchWindow();
+    // ⚠ run 237d: this sits BELOW the solo check, not above it. The first version had it first,
+    // which disabled the solo cycler in the one state we then needed it for - identifying the arm mesh
+    // with the TMD raised. A diagnostic has to outrank a feature's exemption or it stops being able to
+    // measure the feature.
+    if (Rd(g_tmdOnOffHand) && TmdRaised()) {
+        // ...except for one mesh, chosen on the panel, so a piece identified as unwanted can be
+        // dropped without another rebuild. 0 = hide nothing, which is the shipping state.
+        const LONG hv = Rd(g_tmdHideVerts);
+        if (hv && (UINT)hv == verts) return FgMatchWindow();
+        return false;
     }
+
 
     const LONG m = Rd(g_hideMeshIdx);
     if (m != 2 && m != 3) return false;
@@ -12118,6 +12150,24 @@ void ReportFgRide() {
 // Derived rather than hardcoded: the latched arms role is stale once the TMD is acquired (it still
 // names 3314, a mesh that stopped being drawn), and a literal 7444 would be a number measured on one
 // build of one save. Returns 0 when there is nothing to name.
+// ⭐ run 237d: the next mesh in the pass by size, with 0 (NONE) in the cycle. Lives here because
+// g_fgStableVerts does; the panel that drives it is thousands of lines earlier and only has the
+// declaration. Same single-translation-unit shape as the TMD anchors.
+LONG NextPassMesh(LONG cur, int dir) {
+    LONG v[kFgSigMax]; LONG m = 0;
+    const LONG n = Rd(g_fgStableCount);
+    for (LONG i = 0; i < n && i < kFgSigMax; ++i) v[m++] = Rd(g_fgStableVerts[i]);
+    for (LONG i = 1; i < m; ++i)
+        for (LONG j = i; j > 0 && v[j - 1] < v[j]; --j) { const LONG t = v[j]; v[j] = v[j-1]; v[j-1] = t; }
+    if (!m) return cur;
+    LONG at = -1;                                  // -1 is the NONE slot
+    for (LONG i = 0; i < m; ++i) if (v[i] == cur) { at = i; break; }
+    at += (dir >= 0 ? 1 : -1);
+    if (at < -1)  at = m - 1;
+    if (at >= m)  at = -1;
+    return at < 0 ? 0 : v[at];
+}
+
 static UINT ArmsMeshNow() {
     const LONG gun = Rd(g_gunVerts);
     const LONG n = Rd(g_fgStableCount);
