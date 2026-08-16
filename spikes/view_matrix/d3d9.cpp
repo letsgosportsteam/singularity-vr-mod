@@ -12852,7 +12852,18 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     const int kBoneReg0 = 23, kBoneRegsPerBone = 3, kMaxSaveRegs = 128;
     float savedBones[kMaxSaveRegs][4];
     int   boneRegLo = 0, boneRegN = 0;
-    if (g_thisDrawMoved == 2) {
+    // 💥 run 240b: ANY moved draw, not just the off-hand ones.
+    //
+    // Reported: every bone 0-40 was swept on 4818 and none hid the left arm above the elbow. That
+    // rules out the slot limit I blamed - and points at the gate instead. This ran only for draws
+    // riding the OFF hand, so a mesh riding the GUN hand, or one FgRidesGun rejects outright, could
+    // never be touched however many bones were tried. Forty-one presses on geometry the code was
+    // not looking at.
+    //
+    // The mesh selector is the real gate and always was: a slot names a vertex count, and only that
+    // count is collapsed. Restricting by which hand the draw rides added nothing except a class of
+    // mesh that silently could not be reached.
+    if (g_thisDrawMoved != 0) {
         // ⭐ run 240: EVERY slot naming this mesh, unioned - not the first match. One mesh can need
         // several disjoint ranges (the right arm and the left upper arm both live in 4818), and
         // stopping at the first match made the second range unreachable.
