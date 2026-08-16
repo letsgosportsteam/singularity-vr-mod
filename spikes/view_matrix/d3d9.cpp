@@ -12896,8 +12896,18 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // so adjusting these before the call is all it takes - no second draw path.
     UINT dStart = startIndex, dPrims = primCount;
     if (g_thisDrawMoved == 2 && primCount > 0) {
+        // ⭐ run 246b: the triangle window now follows the CURRENT BONE SLOT's mesh rather than
+        // being hardwired to the arms. It was measured dead on 7444 - the two hands interleave, so no
+        // contiguous range separates them - but an ARM is a long simple limb and its triangles have a
+        // far better chance of sitting in one block. Worth having aimable rather than rebuilt later.
+        //
+        // Sharing the bone slot's mesh rather than adding a selector: one row already says which mesh
+        // is under surgery, and two independent "which mesh" settings is how a range gets applied to
+        // something it was not measured on.
         const LONG lo = Rd(g_tmdArmFrom), hi = Rd(g_tmdArmTo);
-        if ((lo > 0 || hi < 1000) && hi > lo && ArmsMeshNow() == numVertices) {
+        const LONG clipMeshSel = Rd(g_tmdBoneMesh[Rd(g_tmdBoneSlot)]);
+        const UINT clipMesh = clipMeshSel > 0 ? (UINT)clipMeshSel : ArmsMeshNow();
+        if ((lo > 0 || hi < 1000) && hi > lo && clipMesh == numVertices) {
             const UINT a = (UINT)((primCount * (UINT64)lo) / 1000);
             const UINT b = (UINT)((primCount * (UINT64)hi) / 1000);
             if (b > a) { dStart = startIndex + a * 3; dPrims = b - a; }   // triangle LIST: 3 per prim
@@ -12912,7 +12922,22 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // ⚠ Saved and restored around the draw. StereoPair only rewrites the CAMERA register, so there is
     // no overlap - but leaving a zeroed bone behind for whatever the engine draws next is exactly the
     // kind of thing this file has learned surfaces three runs later as an unrelated mystery.
-    const int kBoneReg0 = 23, kBoneRegsPerBone = 3, kMaxSaveRegs = 128;
+    // 💥 run 246: this was 128, and it SILENTLY truncated the range.
+    //
+    // 78 bones is 234 registers. Clamped to 128, a sweep of "0-77" was really 0-42 - and the earlier
+    // 0-40 sweep fit entirely inside that, so both attempts covered identical ground while appearing
+    // to cover twice as much. The census says these meshes use bones 0..75, so 43-75 had never been
+    // touched by anything. That is why nothing moved the sleeve however wide the range was set.
+    //
+    // ⚠ FOURTH bound in this feature chosen without checking the real range: the mesh census at 8,
+    // the bone index at 40, the moved-draw gate three times, and now this. The file already carries a
+    // note listing five of these from earlier runs - "every one a bound chosen without checking the
+    // real range, every one excluding the answer without saying so" - and it kept being true.
+    //
+    // Sized from the derived ceiling now: kTmdBoneMax bones at three registers each, no arithmetic
+    // left for anyone to get wrong, and the clamp below SAYS SO rather than quietly narrowing.
+    const int kBoneReg0 = 23, kBoneRegsPerBone = 3;
+    const int kMaxSaveRegs = kTmdBoneMax * kBoneRegsPerBone;
     float savedBones[kMaxSaveRegs][4];
     int   boneRegLo = 0, boneRegN = 0;
     // 💥 run 240b: ANY moved draw, not just the off-hand ones.
@@ -12961,7 +12986,16 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
         if (bl >= 0 && bh >= bl) {
             boneRegLo = kBoneReg0 + (int)bl * kBoneRegsPerBone;
             boneRegN  = (int)(bh - bl + 1) * kBoneRegsPerBone;
-            if (boneRegN > kMaxSaveRegs) boneRegN = kMaxSaveRegs;
+            if (boneRegN > kMaxSaveRegs) {
+                static bool saidClamp = false;
+                if (!saidClamp) {
+                    saidClamp = true;
+                    Log("*** bone range CLAMPED: %d registers wanted, %d available. The sweep is"
+                        " narrower than it looks - this is what hid bones 43-75 for three runs. ***",
+                        boneRegN, kMaxSaveRegs);
+                }
+                boneRegN = kMaxSaveRegs;
+            }
             if (SUCCEEDED(dev->GetVertexShaderConstantF(boneRegLo, &savedBones[0][0], boneRegN))) {
                 // 💥 run 238c: ONE shared point, not each bone's own.
                 //
