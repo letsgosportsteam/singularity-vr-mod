@@ -127,11 +127,31 @@ the bone slots. Panel → `TMD ALIGN` → `TRIANGLE WINDOW`: `TRI SLOT`, `TRI ME
 `TRI TO`, `TRI STEP`, `HIDE MESH`. Saved per slot as `TmdArmMesh%d` / `TmdArmFrom%d` / `TmdArmTo%d`;
 slot 0 inherits the old single `TmdArmFrom`/`TmdArmTo` so an existing ini keeps its parked window.
 
-⚠️ **NOT unioned across slots, unlike the bones, and that difference is deliberate.** A bone range
-says which bones to *collapse*, so two ranges are additive within one draw. A triangle window says
-which contiguous run to *draw*, so two windows on one mesh would need two draw calls. **The first
-slot naming a mesh wins and the others are LOGGED**, because "my other slot does nothing" is how
-this feature has been misread twice already.
+⛔ **The "one contiguous window per mesh" limit is GONE (run 251)** — see below. Run 250 shipped it
+with a comment explaining why two windows would need two draw calls, and the first sweep with it
+found the case that needs exactly that.
+
+### ⚠️ SHIPPED, NOT YET FLOWN (run 251) — a slot is KEEP or CUT, and the mesh draws as SEGMENTS
+
+Reported after the first sweep: *"90-1000 cuts away a lot of what I want to get rid of but keeps
+the rest. What I actually found ideal is keeping 0-29, trimming 30-89, and keeping 90-1000."* That
+is two kept ranges with a hole between them — precisely what run 250 documented as out of reach.
+
+Each slot now carries a **mode**: `KEEP` draws only its range, `CUT` removes its range from whatever
+survived the keeps. The result is a list of disjoint segments and **the draw lambda emits one call
+per segment**, inside `StereoPair` so each eye draws the whole set. The ordinary path is one segment
+and emits exactly the call it always did. The reported case is a single `CUT 30–89` slot.
+
+Panel → `TMD ALIGN` → `TRIANGLE WINDOW`: `TRI SLOT`, `TRI MESH`, **`TRI MODE`**, `TRI FROM`,
+`TRI TO`, `TRI STEP`, `HIDE MESH`. Saved as `TmdArmMode%d`.
+
+- **Keeps are unioned and merged**, so two overlapping keeps cannot draw their overlap twice.
+- ⚠️ **Inert is mode-dependent.** `KEEP 0–1000` keeps everything; `CUT 0–1000` **deletes the mesh**.
+  Same two numbers, opposite results — so switching mode resets the range to that mode's inert value,
+  and the rows say `OFF (FULL MESH)` or `OFF (NO CUT)` rather than showing numbers that do nothing.
+- ⚠️ **Cutting everything draws nothing, and does NOT early-return.** The bone palette still has to
+  be restored and `g_thisDrawMoved` cleared; a return that skips those leaves a zeroed bone behind
+  for the next draw, which this file already warns about three times.
 
 The rows also **say `OFF (FULL MESH)`** when the window is inert (0/1000). Two rows reading `0` and
 `1000` look like settings while doing nothing, which is how run 237f's measured-dead window got

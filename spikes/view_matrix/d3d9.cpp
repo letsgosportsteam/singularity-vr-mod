@@ -2719,19 +2719,38 @@ volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DIS
 //
 // Four slots of {mesh, from, to}, mirroring the bone slots, and its own mesh row.
 //
-// ⚠ NOT unioned across slots, unlike the bones, and the difference is real rather than an omission.
-// A bone range says which bones to COLLAPSE, so two ranges are additive and one draw can honour both.
-// A triangle window says which contiguous run of triangles to DRAW, so two windows on one mesh would
-// need two draw calls. The FIRST slot naming this mesh wins, and it logs once when a second one is
-// also set - a silent "your other slot is being ignored" is exactly the class of failure this feature
-// keeps producing.
+// ---- 💥 run 251: a slot is KEEP or CUT, and the mesh is drawn as SEGMENTS ----
+//
+// ⛔ Run 250 shipped one contiguous window per mesh and said so in a comment: "two windows on one
+// mesh would need two draw calls". The very first sweep with it found the case that needs exactly
+// that - *"keeping 0-29, trimming 30-89, and keeping 90-1000 would be the sweet spot"*. The
+// limitation was real; the conclusion that it was acceptable lasted one run.
+//
+// So the draw is no longer one range. Every slot naming this mesh contributes:
+//   KEEP - the visible set is the UNION of the keeps (the whole mesh if no slot keeps anything)
+//   CUT  - subtracted from whatever survived the keeps
+// What is left is a list of disjoint segments, and the lambda draws each one. Two draw calls where
+// the geometry needs two, one where it does not, and the ordinary path still emits exactly one.
+//
+// A CUT is what a wearer actually reaches for: you find the band that is wrong and take it out, and
+// what remains on both sides is untouched. Expressing that as two KEEPs means re-deriving both
+// borders every time the band moves.
 const int kTmdArmSlots = 4;
 volatile LONG g_tmdArmFrom[kTmdArmSlots] = { 0, 0, 0, 0 };
 volatile LONG g_tmdArmTo[kTmdArmSlots]   = { 1000, 1000, 1000, 1000 };
 // 0 = the arms mesh of the moment (largest non-weapon), same convention as g_tmdBoneMesh.
 volatile LONG g_tmdArmMesh[kTmdArmSlots] = { 0, 0, 0, 0 };
+volatile LONG g_tmdArmMode[kTmdArmSlots] = { 0, 0, 0, 0 };   // 0 = KEEP, 1 = CUT
 volatile LONG g_tmdArmSlot = 0;            // which slot the panel rows edit
 volatile LONG g_tmdArmStep = 50;           // the sweep's stride, shared - it is a UI speed, not data
+
+// A slot that changes nothing, which is mode-dependent and is the reason this is a function rather
+// than a comparison written out at each site. KEEP 0-1000 keeps everything; CUT 0-1000 removes the
+// mesh entirely. The same two numbers, opposite meanings - so the panel must never call one "OFF"
+// when the other would blank the geometry.
+inline bool TmdTriInert(LONG mode, LONG lo, LONG hi) {
+    return mode == 0 ? (lo <= 0 && hi >= 1000) : (hi <= lo);
+}
 
 // ---- ⭐ run 237f: collapse a range of BONES instead ----
 //
@@ -5737,6 +5756,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
        PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,   // ⭐ run 237c, un-retired in 247b
        PR_TMDARMSLOT, PR_TMDARMMESH,                // ⭐ run 250
+       PR_TMDARMMODE,                               // ⭐ run 251
        PR_TMDHIDE,                   // ⭐ run 237d
        PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH, PR_TMDBONESLOT,   // ⭐ run 239
        PR_TMDBONEMODE,               // ⭐ run 241
@@ -5834,11 +5854,11 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // ⭐ run 250: TRI SLOT and TRI MESH lead, because they say WHAT the two range rows below them are
     // pointing at. Same shape as the bone page on purpose - the two tools are used the same way and
     // the muscle memory should transfer.
-    { PR_TMDARMSLOT, PR_TMDARMMESH, PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,
+    { PR_TMDARMSLOT, PR_TMDARMMESH, PR_TMDARMMODE, PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP,
       PR_TMDHIDE, PR_BACK_TMD },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10, 6, 7 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page; ⭐ run 249: TMD 17 -> 10 + two sub-pages; ⭐ run 250: TMD MESH 5 -> 7
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10, 6, 8 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page; ⭐ run 249: TMD 17 -> 10 + two sub-pages; ⭐ run 250: TMD MESH 5 -> 7; ⭐ run 251: + TRI MODE
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -6055,6 +6075,9 @@ void PanelSaveRow(int rowId, const char* path) {
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdArmMesh%d", sI);
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdArmMesh[sI]));
                 WritePrivateProfileStringA("Input", key, v, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdArmMode%d", sI);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdArmMode[sI]));
+                WritePrivateProfileStringA("Input", key, v, path);
                 _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdArmFrom%d", sI);
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdArmFrom[sI]));
                 WritePrivateProfileStringA("Input", key, v, path);
@@ -6067,6 +6090,7 @@ void PanelSaveRow(int rowId, const char* path) {
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
         case PR_TMDYAW: case PR_TMDPITCH: case PR_TMDROLL:
         case PR_TMDARMFROM: case PR_TMDARMTO: case PR_TMDARMSTEP:
+        case PR_TMDARMSLOT: case PR_TMDARMMESH: case PR_TMDARMMODE:
         case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI:
         case PR_TMDBONEMESH: case PR_TMDBONESLOT: case PR_TMDBONEMODE:
             return;   // written by PR_TMDON above
@@ -6259,18 +6283,29 @@ void PanelRowText(int row, char* out, size_t cap) {
             else     _snprintf_s(out, cap, _TRUNCATE, "TRI MESH       %ld", am);
             break;
         }
-        // The window says OFF when it is inert (the full 0-1000), because "0" and "1000" sitting in
-        // the two rows look like settings while doing nothing at all - and that reads as the feature
-        // being broken, which is how run 237f's measured-dead window got reported twice more.
+        // ⭐ run 251: KEEP draws only the range, CUT draws everything except it. Worded as what each
+        // one DOES rather than as a mode number, because the two are exact opposites and a wrong
+        // guess blanks the mesh.
+        case PR_TMDARMMODE:
+            _snprintf_s(out, cap, _TRUNCATE, "TRI MODE       %s",
+                        Rd(g_tmdArmMode[Rd(g_tmdArmSlot)]) == 1 ? "CUT (REMOVE IT)"
+                                                                : "KEEP (ONLY IT)");
+            break;
+        // The window says OFF when it is inert, because two rows reading numbers while doing nothing
+        // at all reads as the feature being broken - which is how run 237f's measured-dead window got
+        // reported twice more. ⚠ Inert is MODE-DEPENDENT: KEEP 0-1000 keeps everything, CUT 0-1000
+        // removes the mesh. Same numbers, opposite results, so this must never call one of them OFF.
         case PR_TMDARMFROM: case PR_TMDARMTO: {
             const LONG sI = Rd(g_tmdArmSlot);
+            const LONG mode = Rd(g_tmdArmMode[sI]);
             const LONG lo = Rd(g_tmdArmFrom[sI]), hi = Rd(g_tmdArmTo[sI]);
-            const bool inert = (lo <= 0 && hi >= 1000);
-            if (inert) _snprintf_s(out, cap, _TRUNCATE, "%s        OFF (FULL MESH)",
-                                   row == PR_TMDARMFROM ? "TRI FROM" : "TRI TO  ");
-            else       _snprintf_s(out, cap, _TRUNCATE, "%s        %ld",
-                                   row == PR_TMDARMFROM ? "TRI FROM" : "TRI TO  ",
-                                   row == PR_TMDARMFROM ? lo : hi);
+            const char* nm = row == PR_TMDARMFROM ? "TRI FROM" : "TRI TO  ";
+            if (TmdTriInert(mode, lo, hi))
+                _snprintf_s(out, cap, _TRUNCATE, "%s        OFF (%s)", nm,
+                            mode == 1 ? "NO CUT" : "FULL MESH");
+            else
+                _snprintf_s(out, cap, _TRUNCATE, "%s        %ld", nm,
+                            row == PR_TMDARMFROM ? lo : hi);
             break;
         }
         case PR_TMDARMSTEP:
@@ -6573,8 +6608,20 @@ void PanelAdjust(int row, int dir) {
             // range across silently is how a window gets credited to a mesh it was never measured on.
             const LONG sI = Rd(g_tmdArmSlot);
             InterlockedExchange(&g_tmdArmMesh[sI], NextPassMesh(Rd(g_tmdArmMesh[sI]), dir));
+            InterlockedExchange(&g_tmdArmMode[sI], 0);
             InterlockedExchange(&g_tmdArmFrom[sI], 0);
             InterlockedExchange(&g_tmdArmTo[sI], 1000);
+            break;
+        }
+        // ⭐ run 251: switching mode RESETS the range to that mode's inert value. 0-1000 means "keep
+        // everything" in KEEP and "delete the mesh" in CUT, so carrying the numbers across would make
+        // one press blank the geometry - and the row that did it would still read 0 and 1000.
+        case PR_TMDARMMODE: {
+            const LONG sI = Rd(g_tmdArmSlot);
+            const LONG next = Rd(g_tmdArmMode[sI]) == 1 ? 0 : 1;
+            InterlockedExchange(&g_tmdArmMode[sI], next);
+            InterlockedExchange(&g_tmdArmFrom[sI], 0);
+            InterlockedExchange(&g_tmdArmTo[sI], next == 1 ? 0 : 1000);
             break;
         }
         case PR_TMDARMFROM: case PR_TMDARMTO: {
@@ -7014,6 +7061,8 @@ bool InitXRInput() {
             char akey[32];
             _snprintf_s(akey, sizeof(akey), _TRUNCATE, "TmdArmMesh%d", sI);
             InterlockedExchange(&g_tmdArmMesh[sI], GetPrivateProfileIntA("Input", akey, 0, path));
+            _snprintf_s(akey, sizeof(akey), _TRUNCATE, "TmdArmMode%d", sI);
+            InterlockedExchange(&g_tmdArmMode[sI], GetPrivateProfileIntA("Input", akey, 0, path));
             _snprintf_s(akey, sizeof(akey), _TRUNCATE, "TmdArmFrom%d", sI);
             InterlockedExchange(&g_tmdArmFrom[sI],
                                 GetPrivateProfileIntA("Input", akey, sI == 0 ? legacyFrom : 0, path));
@@ -12617,6 +12666,104 @@ static UINT ArmsMeshNow() {
     return (UINT)best;
 }
 
+// Cheap "is any slot actually pointed at this mesh" test, so an ordinary draw pays a handful of reads
+// rather than a solve. Every draw in the first-person pass runs this.
+static bool TmdTriSlotApplies(UINT numVertices) {
+    for (int sI = 0; sI < kTmdArmSlots; ++sI) {
+        const LONG m = Rd(g_tmdArmMesh[sI]);
+        const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
+        if (target != numVertices) continue;
+        if (!TmdTriInert(Rd(g_tmdArmMode[sI]), Rd(g_tmdArmFrom[sI]), Rd(g_tmdArmTo[sI]))) return true;
+    }
+    return false;
+}
+
+// ---- ⭐ run 251: turn this mesh's KEEP/CUT slots into a list of triangle segments to draw ----
+//
+// Works in the panel's 0-1000 permille space and converts to primitives at the end, so the rows mean
+// the same thing whatever the mesh's triangle count - which is the whole reason run 237c chose
+// permille over raw indices.
+//
+// Returns the segment count. Zero means every triangle was cut, and the caller must then draw
+// NOTHING rather than falling back to the whole mesh: "you cut it all" and "no slot applies" are
+// opposite intentions that would otherwise look identical.
+//
+// ⚠ Segments are half-open in permille and converted with the SAME arithmetic the single window used
+// (primCount * p / 1000), so a range that was landed on with the old build lands identically here.
+static int TmdTriSegments(UINT numVertices, UINT startIndex, UINT primCount,
+                          UINT* outStart, UINT* outPrims, int maxOut) {
+    struct Seg { LONG lo, hi; };
+    Seg seg[kTmdArmSlots * 2 + 2];
+    int n = 0;
+
+    // 1. The keeps. Their UNION, not the first one - a mesh can want two separate pieces, which is
+    //    the case that retired run 250's single window.
+    for (int sI = 0; sI < kTmdArmSlots; ++sI) {
+        const LONG m = Rd(g_tmdArmMesh[sI]);
+        const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
+        if (target != numVertices) continue;
+        const LONG mode = Rd(g_tmdArmMode[sI]);
+        const LONG lo = Rd(g_tmdArmFrom[sI]), hi = Rd(g_tmdArmTo[sI]);
+        if (mode != 0 || TmdTriInert(mode, lo, hi) || hi <= lo) continue;
+        if (n < (int)_countof(seg)) seg[n++] = { lo < 0 ? 0 : lo, hi > 1000 ? 1000 : hi };
+    }
+    if (!n) seg[n++] = { 0, 1000 };            // nothing kept explicitly -> start from the whole mesh
+
+    // Sort and merge the keeps. Two overlapping keeps would otherwise draw their overlap TWICE -
+    // invisible on opaque geometry and a double-blend on anything translucent, which is the kind of
+    // artefact that gets reported later as "the sleeve looks wrong" with nothing pointing back here.
+    for (int i = 1; i < n; ++i) {                          // insertion sort; n is at most 4
+        const Seg k = seg[i];
+        int j = i - 1;
+        while (j >= 0 && seg[j].lo > k.lo) { seg[j + 1] = seg[j]; --j; }
+        seg[j + 1] = k;
+    }
+    for (int i = 0; i + 1 < n; ) {
+        if (seg[i + 1].lo <= seg[i].hi) {                  // touching or overlapping -> one segment
+            if (seg[i + 1].hi > seg[i].hi) seg[i].hi = seg[i + 1].hi;
+            for (int j = i + 1; j + 1 < n; ++j) seg[j] = seg[j + 1];
+            --n;
+        } else ++i;
+    }
+
+    // 2. The cuts, subtracted from whatever survived. A cut through the middle of a segment splits it
+    //    in two, which is exactly the reported case (keep 0-29, cut 30-89, keep 90-1000).
+    for (int sI = 0; sI < kTmdArmSlots; ++sI) {
+        const LONG m = Rd(g_tmdArmMesh[sI]);
+        const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
+        if (target != numVertices) continue;
+        const LONG mode = Rd(g_tmdArmMode[sI]);
+        const LONG clo = Rd(g_tmdArmFrom[sI]), chi = Rd(g_tmdArmTo[sI]);
+        if (mode != 1 || TmdTriInert(mode, clo, chi)) continue;
+        Seg next[kTmdArmSlots * 2 + 2];
+        int nn = 0;
+        for (int i = 0; i < n; ++i) {
+            if (chi <= seg[i].lo || clo >= seg[i].hi) {         // no overlap - survives whole
+                if (nn < (int)_countof(next)) next[nn++] = seg[i];
+                continue;
+            }
+            if (seg[i].lo < clo && nn < (int)_countof(next)) next[nn++] = { seg[i].lo, clo };
+            if (chi < seg[i].hi && nn < (int)_countof(next)) next[nn++] = { chi, seg[i].hi };
+        }
+        memcpy(seg, next, sizeof(Seg) * nn);
+        n = nn;
+        if (!n) break;                                          // everything cut away
+    }
+
+    // 3. Permille -> primitives. A segment that rounds to zero triangles is dropped rather than drawn
+    //    as an empty call.
+    int out = 0;
+    for (int i = 0; i < n && out < maxOut; ++i) {
+        const UINT a = (UINT)((primCount * (UINT64)seg[i].lo) / 1000);
+        const UINT b = (UINT)((primCount * (UINT64)seg[i].hi) / 1000);
+        if (b <= a) continue;
+        outStart[out] = startIndex + a * 3;                     // triangle LIST: 3 indices per prim
+        outPrims[out] = b - a;
+        ++out;
+    }
+    return out;
+}
+
 static bool FgMatchesSignature(UINT verts) {
     if (!verts) return false;
     const LONG n = Rd(g_fgStableCount);
@@ -13099,42 +13246,19 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // window is what has kept every count-matched rule in this file off the level.
     const bool tmdSurgeryOn = InterlockedCompareExchange(&g_tmdOnOffHand, 0, 0) != 0 &&
                               TmdRaised() && FgMatchWindow();
-    // ⭐ run 237c: clip a mesh to a range of its triangles. The lambda captures by reference, so
-    // adjusting these before the call is all it takes - no second draw path.
-    UINT dStart = startIndex, dPrims = primCount;
-    if (tmdSurgeryOn && primCount > 0) {
-        // ⭐ run 250: the window has its OWN slots and its OWN mesh row. It used to borrow the bone
-        // slot's mesh (run 246b), which meant pointing it at 4818 silently retargeted the bone sweep.
-        //
-        // First slot naming this mesh wins - NOT a union, unlike the bones. A bone range says which
-        // bones to collapse and two ranges are additive within one draw; a triangle window says which
-        // contiguous run to DRAW, and honouring two would take two draw calls. The loser is LOGGED
-        // rather than dropped quietly, because "my other slot does nothing" is how this feature has
-        // been misread twice already.
-        LONG lo = 0, hi = 1000; int used = -1, alsoSet = 0;
-        for (int sI = 0; sI < kTmdArmSlots; ++sI) {
-            const LONG m = Rd(g_tmdArmMesh[sI]);
-            const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
-            const LONG sLo = Rd(g_tmdArmFrom[sI]), sHi = Rd(g_tmdArmTo[sI]);
-            if (target != numVertices) continue;
-            if (!(sLo > 0 || sHi < 1000) || sHi <= sLo) continue;      // inert slot, not a match
-            if (used < 0) { used = sI; lo = sLo; hi = sHi; } else ++alsoSet;
-        }
-        if (used >= 0) {
-            if (alsoSet) {
-                static bool saidMulti = false;
-                if (!saidMulti) {
-                    saidMulti = true;
-                    Log("*** TRI WINDOW: %d slot(s) past slot %d also name mesh %u and are being"
-                        " IGNORED - one contiguous window per mesh, by construction. ***",
-                        alsoSet, used + 1, numVertices);
-                }
-            }
-            const UINT a = (UINT)((primCount * (UINT64)lo) / 1000);
-            const UINT b = (UINT)((primCount * (UINT64)hi) / 1000);
-            if (b > a) { dStart = startIndex + a * 3; dPrims = b - a; }   // triangle LIST: 3 per prim
-        }
-    }
+    // ⭐ run 237c: clip a mesh to a range of its triangles, and ⭐ run 251: to SEVERAL ranges. The
+    // lambda captures by reference, so filling these in before the call is all it takes.
+    //
+    // ⚠ nSeg == 0 means every triangle was cut away and the mesh must draw NOTHING. It deliberately
+    // does not early-return: the bone palette below has to be restored and g_thisDrawMoved has to be
+    // cleared, and a return that skips those leaves a zeroed bone behind for whatever the engine
+    // draws next - the failure mode this file already warns about three times.
+    UINT segStart[kTmdArmSlots * 2 + 2] = { startIndex };
+    UINT segPrims[kTmdArmSlots * 2 + 2] = { primCount };
+    int  nSeg = 1;
+    if (tmdSurgeryOn && primCount > 0 && TmdTriSlotApplies(numVertices))
+        nSeg = TmdTriSegments(numVertices, startIndex, primCount,
+                              segStart, segPrims, (int)_countof(segStart));
     // ---- ⭐ run 237f: collapse a bone range for this draw, then put it back ----
     //
     // Bone i occupies c(23 + 3i)..c(25 + 3i) - run 223's layout. The 3x3 basis goes to zero and each
@@ -13277,8 +13401,17 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
             }
         }
     }
+    // ⭐ run 251: one call per surviving segment, INSIDE the StereoPair lambda so each eye draws the
+    // whole set. Putting the loop outside would run the per-eye setup once and the geometry twice.
+    // The ordinary path is nSeg == 1 and emits exactly the call it always did.
     const HRESULT dhr = StereoPair(dev, [&] {
-        return g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices, dStart, dPrims);
+        HRESULT hr = D3D_OK;
+        for (int s = 0; s < nSeg; ++s) {
+            const HRESULT h = g_origDrawIndexedPrim(dev, t, baseVertex, minIndex, numVertices,
+                                                    segStart[s], segPrims[s]);
+            if (FAILED(h) && SUCCEEDED(hr)) hr = h;      // keep the FIRST failure, not the last
+        }
+        return hr;
     });
     if (boneRegN) dev->SetVertexShaderConstantF(boneRegLo, &savedBones[0][0], boneRegN);
 

@@ -24,6 +24,34 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Run 251: KEEP or CUT per slot, and the mesh draws as segments
+
+The first sweep with run 250's slots found the case run 250 had just documented as unreachable:
+*"keeping 0-29, trimming 30-89, and keeping 90-1000 would be the sweet spot"* — two kept ranges with
+a hole between them.
+
+Run 250's comment said it plainly: *"two windows on one mesh would need two draw calls"*. The
+limitation was real and correctly described; the judgement that it was **acceptable** lasted exactly
+one run. So the draw is no longer one range. Each slot is `KEEP` (union of the keeps, or the whole
+mesh if none) or `CUT` (subtracted from what survived), the result is a list of disjoint segments,
+and the `StereoPair` lambda emits one call per segment — inside the lambda, so each eye draws the
+whole set rather than the per-eye setup running once and the geometry twice.
+
+`CUT` is the mode a wearer actually reaches for: find the band that is wrong, take it out, leave
+both sides untouched. Expressing that as two `KEEP`s means re-deriving both borders every time the
+band moves.
+
+- Keeps are sorted and merged, so an overlap cannot be drawn twice (invisible on opaque geometry, a
+  double-blend on anything translucent, and unattributable months later).
+- ⚠️ **Inert is mode-dependent**: `KEEP 0-1000` keeps everything, `CUT 0-1000` deletes the mesh.
+  Switching mode resets the range to that mode's inert value, and the rows say which.
+- ⚠️ Cutting everything draws nothing **without early-returning** — the bone palette still needs
+  restoring and `g_thisDrawMoved` clearing.
+
+**Method note.** *A limitation you can describe precisely is not thereby justified.* The comment
+naming the missing capability was written, read back, and shipped in the same diff that made the
+capability worth having.
+
 ## 💥 Run 250: the triangle window was gated on the same test that was wrong for bones, twice before
 
 Reported as *"the triangle range selector is only the hand, not the arms"*, wanting to sweep mesh
