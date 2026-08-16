@@ -2664,9 +2664,16 @@ volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DIS
 // the buffer and this approach is dead, which is a real answer worth one run. Bone-level control would
 // be the remaining route, and a much longer one.
 //
-// Percent rather than raw primitives so the whole 4402-triangle mesh sweeps in 20 presses instead of
-// 4402. Defaults 0/100 draw everything, so the feature is inert until someone moves it.
-volatile LONG g_tmdArmFrom = 0, g_tmdArmTo = 100;
+// 💥 run 237e: PER MILLE, not percent. At 5% a press the step is 220 triangles, and the reported
+// result is exactly what too coarse a control looks like: at 95% "part of the left hand is missing",
+// at 100% "a little of the right hand" survives. The boundary is INSIDE that 220-triangle window and
+// no setting could land on it. A sweep whose step is bigger than the thing it is looking for cannot
+// find it however carefully it is used.
+//
+// So the range is 0-1000 and the step is selectable: 50 (5%) to find the region, 10 (1%) to close in,
+// 1 (0.1%, about 4 triangles) to land on it. Defaults are run 237c's measured 55/95 in the new units.
+volatile LONG g_tmdArmFrom = 550, g_tmdArmTo = 950;
+volatile LONG g_tmdArmStep = 50;      // per-mille per press: 50, 10 or 1
 // ⭐ run 237d: one mesh to hide outright while the TMD is up. Reported: clipping the hand mesh never
 // touches the ARM, so the visible right arm is a DIFFERENT mesh - a range on one draw call cannot
 // reach it. Naming it is a solo-cycler job; dropping it once named is this.
@@ -5593,6 +5600,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
        PR_TMDARMFROM, PR_TMDARMTO,   // ⭐ run 237c
        PR_TMDHIDE,                   // ⭐ run 237d
+       PR_TMDARMSTEP,                // ⭐ run 237e
        PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
@@ -5643,10 +5651,10 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
     { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
-      PR_TMDARMFROM, PR_TMDARMTO, PR_TMDHIDE },   // ⭐ run 237d
+      PR_TMDARMFROM, PR_TMDARMTO, PR_TMDARMSTEP, PR_TMDHIDE },   // ⭐ run 237e
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 9 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
@@ -5826,9 +5834,9 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdRight", &g_tmdRight }, { "TmdUp", &g_tmdUp },
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
                 { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
-                { "TmdHideVerts", &g_tmdHideVerts },
+                { "TmdHideVerts", &g_tmdHideVerts }, { "TmdArmStep", &g_tmdArmStep },
             };
-            for (int i = 0; i < 9; ++i) {
+            for (int i = 0; i < 10; ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
             }
@@ -5837,7 +5845,7 @@ void PanelSaveRow(int rowId, const char* path) {
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
         case PR_TMDYAW: case PR_TMDPITCH:
         case PR_TMDARMFROM: case PR_TMDARMTO:
-        case PR_TMDHIDE: return;   // written by PR_TMDON above
+        case PR_TMDHIDE: case PR_TMDARMSTEP: return;   // written by PR_TMDON above
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
             // survives a relaunch is a state somebody meets tomorrow as a bug report - with the
@@ -6000,9 +6008,15 @@ void PanelRowText(int row, char* out, size_t cap) {
             _snprintf_s(out, cap, _TRUNCATE, "TMD PITCH  %+.1f", Rd(g_tmdPitchTenths) / 10.0f); break;
         case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
         case PR_TMDARMFROM:
-            _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS FROM  %ld%%", Rd(g_tmdArmFrom)); break;
+            _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS FROM %.1f%%", Rd(g_tmdArmFrom) / 10.0f); break;
         case PR_TMDARMTO:
-            _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS TO    %ld%%", Rd(g_tmdArmTo));   break;
+            _snprintf_s(out, cap, _TRUNCATE, "ARM TRIS TO   %.1f%%", Rd(g_tmdArmTo) / 10.0f);   break;
+        case PR_TMDARMSTEP: {
+            const LONG st = Rd(g_tmdArmStep);
+            _snprintf_s(out, cap, _TRUNCATE, "TRIS STEP     %s",
+                        st >= 50 ? "5%  COARSE" : st >= 10 ? "1%  MEDIUM" : "0.1% FINE");
+            break;
+        }
         case PR_TMDHIDE: {
             const LONG hv = Rd(g_tmdHideVerts);
             if (!hv) _snprintf_s(out, cap, _TRUNCATE, "HIDE MESH      NONE");
@@ -6186,20 +6200,27 @@ void PanelAdjust(int row, int dir) {
             // exist, which is how a raw vertex-count setting goes stale between saves.
             InterlockedExchange(&g_tmdHideVerts, NextPassMesh(Rd(g_tmdHideVerts), dir));
             break;
+        case PR_TMDARMSTEP: {
+            const LONG st = Rd(g_tmdArmStep);
+            InterlockedExchange(&g_tmdArmStep, dir >= 0 ? (st >= 50 ? 1 : st >= 10 ? 50 : 10)
+                                                        : (st >= 50 ? 10 : st >= 10 ? 1 : 50));
+            break;
+        }
         case PR_TMDARMFROM: case PR_TMDARMTO: {
-            // 5% a press: the whole mesh sweeps in 20 presses. Kept ordered so the range can never
-            // invert into "draw nothing", which looks identical to the mesh being hidden.
+            // Kept ordered so the range can never invert into "draw nothing", which looks identical
+            // to the mesh being hidden - and the two want opposite fixes.
+            const LONG st = Rd(g_tmdArmStep);
             volatile LONG* t = row == PR_TMDARMFROM ? &g_tmdArmFrom : &g_tmdArmTo;
-            LONG v = Rd(*t) + dir * 5;
-            if (v < 0)   v = 0;
-            if (v > 100) v = 100;
+            LONG v = Rd(*t) + dir * st;
+            if (v < 0)    v = 0;
+            if (v > 1000) v = 1000;
             InterlockedExchange(t, v);
             if (Rd(g_tmdArmFrom) >= Rd(g_tmdArmTo)) {
                 if (row == PR_TMDARMFROM) {
-                    LONG w = v + 5; if (w > 100) w = 100;
+                    LONG w = v + st; if (w > 1000) w = 1000;
                     InterlockedExchange(&g_tmdArmTo, w);
                 } else {
-                    LONG w = v - 5; if (w < 0) w = 0;
+                    LONG w = v - st; if (w < 0) w = 0;
                     InterlockedExchange(&g_tmdArmFrom, w);
                 }
             }
@@ -6596,8 +6617,9 @@ bool InitXRInput() {
     InterlockedExchange(&g_tmdUp,         GetPrivateProfileIntA("Input", "TmdUp",   -13, path));
     InterlockedExchange(&g_tmdYawTenths,  GetPrivateProfileIntA("Input", "TmdYawTenths",   0, path));
     InterlockedExchange(&g_tmdPitchTenths,GetPrivateProfileIntA("Input", "TmdPitchTenths", 0, path));
-    InterlockedExchange(&g_tmdArmFrom,    GetPrivateProfileIntA("Input", "TmdArmFrom",   0, path));
-    InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   100, path));
+    InterlockedExchange(&g_tmdArmFrom,    GetPrivateProfileIntA("Input", "TmdArmFrom", 550, path));
+    InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   950, path));
+    InterlockedExchange(&g_tmdArmStep,    GetPrivateProfileIntA("Input", "TmdArmStep",  50, path));
     InterlockedExchange(&g_tmdHideVerts,  GetPrivateProfileIntA("Input", "TmdHideVerts", 0, path));
     Log("ini: TmdOnOffHand=%ld (the TMD and the hand holding it ride the OFF controller while"
         " mPlayerHandsStatus says it is raised) anchor F%ld R%ld U%ld, trim yaw %+.1f pitch %+.1f."
@@ -12649,9 +12671,9 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     UINT dStart = startIndex, dPrims = primCount;
     if (g_thisDrawMoved == 2 && primCount > 0) {
         const LONG lo = Rd(g_tmdArmFrom), hi = Rd(g_tmdArmTo);
-        if ((lo > 0 || hi < 100) && hi > lo && ArmsMeshNow() == numVertices) {
-            const UINT a = (UINT)((primCount * (UINT64)lo) / 100);
-            const UINT b = (UINT)((primCount * (UINT64)hi) / 100);
+        if ((lo > 0 || hi < 1000) && hi > lo && ArmsMeshNow() == numVertices) {
+            const UINT a = (UINT)((primCount * (UINT64)lo) / 1000);
+            const UINT b = (UINT)((primCount * (UINT64)hi) / 1000);
             if (b > a) { dStart = startIndex + a * 3; dPrims = b - a; }   // triangle LIST: 3 per prim
         }
     }
