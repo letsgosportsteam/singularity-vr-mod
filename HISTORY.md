@@ -24,6 +24,46 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## 📉 Run 252: the splash screen degraded in four steps, and the archive dated every one of them
+
+Reported as *"the game is lagging to all heck now, even in the splash screens"*, with *"I know this
+is a recent issue"* — and the archive settles it, because **every run ever flown is still on disk**.
+Taking the first perf window of all 149 logs gives a staircase: **~27 fps** (Aug 4–5) → **~18**
+(Aug 6–13) → **~13** (Aug 14, from 22:36) → **~8** (Aug 15, from 19:08, and today).
+
+**Not today's build.** Today's cumulative figures run 119.2 / 118.0 / 114.5 / 115.6 / **92.1** /
+103.8 — the worst was the run *before* the panel fix, whose code cannot execute with the panel shut.
+
+**All of it is in `our work`.** Splash-window budgets, oldest to newest: 35.9 → 51.0 → 51.9 → 121.2
+→ 121.2 ms, with `GObjects walk` flat at 1.86 ms and XR idle. Log volume does not correlate at all
+(391/226/437/238/258 lines before the first perf line), which kills the run-24/25 logging theory
+before it was built on.
+
+**Both recent steps land on pawn/property resolution, within minutes of the boundary.** Aug 14
+22:30–22:36 is `52c6acf` plus `4b96043` — the latter *removed a throttle* so `ResolveGameplayOffsets`
+calls `FindPlayerPawn(force=true)`, and a miss is a full `GObjects` walk. There is no pawn at a
+splash screen, so every one of those is a walk that cannot succeed. Aug 15 19:00–19:18 is the
+property-dump and `g_wantNames` registration work.
+
+**The structural finding, and the first suspect:** the auto-rescan fires on `!g_haveLock &&
+g_camPosValid && dupDraws`. A splash screen satisfies all three and has **no view matrix to find**,
+so the lock never takes and it re-arms every 20 frames forever. The log says so outright and often:
+`0 candidate window(s) ... no window even had a plausible forward vector`. Its own comment reads
+*"far too expensive to leave running"*.
+
+⚠️ **Timed, not fixed.** `reg scan` is broken out of the residual onto the frame-budget line with a
+per-window total, peak and candidate count. Fixing the rescan in the same build would have meant two
+changes and one measurement, which is how runs get wasted here. A small number exonerates the scan.
+
+**Method notes.**
+- **The archive is an instrument, and nobody had read it as one.** 149 runs of a number nobody was
+  looking at dated a regression to the hour, across twelve days, for free. "Never delete a log" paid
+  for itself here.
+- **"Recent" was checkable and the user was right** — but not about *which* recent. The complaint
+  arrived attached to the newest build; the data put the first step eleven days earlier.
+- **A residual that grows in STEPS is not noise and not thermals.** Four flat plateaus with sharp
+  transitions is a code change every time.
+
 ## ⭐ Run 251: KEEP or CUT per slot, and the mesh draws as segments
 
 The first sweep with run 250's slots found the case run 250 had just documented as unreachable:

@@ -3904,6 +3904,30 @@ volatile LONG g_aimModeParts = 3;      // ini [Input] AimModeParts
 double g_msStereoPair = 0.0, g_msMeshMatch = 0.0;
 double g_msStereoPairPeak = 0.0, g_msMeshMatchPeak = 0.0;
 
+// ---- 💥 run 252: the REGISTER SCAN, timed - it runs forever at a splash screen ----
+//
+// The splash screen has degraded in four steps since Aug 5 (27 -> 18 -> 13 -> 8 fps), all of it in
+// "our work", which is a residual and therefore not a measurement of anything. This is the first
+// suspect and it is timed rather than argued about, because the residual has misattributed a stall
+// in this project once already - `xrEndFrame` hid 189 ms in there for a day.
+//
+// Why it is a suspect: the auto-rescan fires whenever `!g_haveLock && g_camPosValid && dupDraws`.
+// A splash screen satisfies all three - there IS a camera position, VR mode is on from startup since
+// run 159, and there is NO view matrix to find, so the lock can never be acquired and the rescan
+// never stops. The scan's own comment says "a scan tests every window of every upload and is far too
+// expensive to leave running".
+//
+// ⚠️ NOT gated on TimeOurWork. That key exists to keep per-DRAW timing out of normal play; this only
+// takes a timestamp on frames the scan is actually armed for, which is at most one frame in twenty
+// and none at all once a lock exists. A diagnostic nobody switches on cannot answer a question that
+// only shows up on someone else's machine.
+//
+// ⚠️ Timed, NOT fixed, and deliberately so. Rate-limiting the rescan in the same build would leave
+// two changes and one measurement - "one question per run", and this file has lost runs to exactly
+// that. If the number comes back small, the scan is exonerated and the staircase is elsewhere.
+double g_msScan = 0.0, g_msScanPeak = 0.0;
+int    g_scanArmedFrames = 0;
+
 double g_msXrSubmit = 0.0;
 int    g_xrSubmitFrames = 0;
 double g_msXrSubmitPeak = 0.0;
@@ -9284,6 +9308,8 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     if (!scan && !modify) return g_origSetVSConstF(dev, startReg, data, vec4Count);
 
     if (scan) {
+        // ⭐ run 252: one QPC pair per upload, on armed frames only - see g_msScan.
+        const LARGE_INTEGER tScan = Now();
         const float* const pts[3] = { g_camPos, g_povPos, g_zeroPos };
         const UINT windows = (vec4Count - 4 < kMaxScanWindows) ? vec4Count - 4 : kMaxScanWindows;
         for (UINT j = 0; j <= windows; ++j) {
@@ -9297,6 +9323,9 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
                 else                       NoteNearMiss(startReg + j, c, w, len);
             }
         }
+        const double dScan = MsSince(tScan);
+        g_msScan += dScan;
+        if (dScan > g_msScanPeak) g_msScanPeak = dScan;
     }
 
     if (modify) {
@@ -19634,11 +19663,27 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 // work", which is why "our work" has looked like an unexplained game-side stall all
                 // the way through: this is the only call in the mod that reaches the wireless link.
                 const double xs = g_xrSubmitFrames ? g_msXrSubmit / g_xrSubmitFrames : 0.0;
+                // ⭐ run 252: the register scan, out of the residual and onto the line. It is a
+                // per-second total spread over however many frames were armed, so it is divided by
+                // the window's frame count to sit in the same per-frame units as everything else.
+                const double sc = frames > 0 ? g_msScan / frames : 0.0;
                 Log("    frame budget: xrWaitFrame %.2f (idle) + copy %.2f + GObjects walk %.2f"
-                    " + XR submit %.2f + our work %.2f = %.2f ms (%.0f%% of the %.2f ms display period)",
-                    wf, copy, eng, xs, ms - wf - copy - eng - xs, ms,
+                    " + XR submit %.2f + reg scan %.2f + our work %.2f = %.2f ms (%.0f%% of the"
+                    " %.2f ms display period)",
+                    wf, copy, eng, xs, sc, ms - wf - copy - eng - xs - sc, ms,
                     g_displayPeriodMs > 0.0 ? 100.0 * ms / g_displayPeriodMs : 0.0,
                     g_displayPeriodMs);
+                // Printed only when it actually ran, so a normal frame does not carry a row of zeros -
+                // and so that its ABSENCE is meaningful. A scan at a splash screen can never succeed:
+                // there is no view matrix to find, so `candidates` stays 0 and it re-arms forever.
+                if (g_scanArmedFrames)
+                    Log("    ⚠ REGISTER SCAN ran on %d frame(s) this window: %.2f ms total, peak"
+                        " %.3f ms in one upload, %d candidate(s) found. It re-arms every 20 frames"
+                        " while no view matrix is locked - which at a splash or a movie is FOREVER,"
+                        " because there is no matrix there to find. (run 252)",
+                        g_scanArmedFrames, g_msScan, g_msScanPeak, g_hitCount);
+                g_msScan = g_msScanPeak = 0.0;
+                g_scanArmedFrames = 0;
                 // ---- ⭐ run 204: how much of that residual is actually OURS? ----
                 //
                 // Printed right next to the budget deliberately: "our work" is frame time minus the
@@ -19942,6 +19987,7 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
     bool k7 = (DebugKey(VK_F7) & 0x8000) != 0;
     if (InterlockedCompareExchange(&g_scanArmed, 0, 0)) {
         InterlockedExchange(&g_scanArmed, 0);
+        ++g_scanArmedFrames;               // ⭐ run 252: count the frames that paid for a scan
         ReportScan();
     } else if (k7 && !p7) {
         if (!InterlockedCompareExchange(&g_camPosValid, 0, 0)) {

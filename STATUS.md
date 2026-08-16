@@ -131,6 +131,52 @@ slot 0 inherits the old single `TmdArmFrom`/`TmdArmTo` so an existing ini keeps 
 with a comment explaining why two windows would need two draw calls, and the first sweep with it
 found the case that needs exactly that.
 
+### 📉 MEASURED (run 252) — the splash screen has degraded in FOUR STEPS since Aug 5
+
+Reported as *"the game is lagging to all heck now, even in the splash screens"*. Taking the **first
+perf window** of all 149 archived runs — the splash, before any gameplay — gives a staircase, not
+noise. Each step persists until the next one:
+
+| period | splash fps |
+|---|---|
+| Aug 4–5 | **~27** |
+| Aug 6–13 | **~18** |
+| Aug 14, from 22:36 | **~13** |
+| Aug 15, from 19:08 → today | **~8** |
+
+**It is not today's build.** Today's runs, cumulatively: 119.2 / 118.0 / 114.5 / 115.6 / **92.1** /
+103.8 fps — the worst was the run *before* the panel fix, and the panel code cannot execute with the
+panel closed.
+
+**All of it is in `our work`**, which STATUS has warned for months is a *residual, not a
+measurement*. Splash-window budget, oldest to newest: `our work` **35.9 → 51.0 → 51.9 → 121.2 →
+121.2 ms**, while `GObjects walk` stays flat at **1.86 ms** and XR is idle throughout. Log volume
+does *not* correlate (391/226/437/238/258 lines before the first perf line), so it is not the
+run-24/25 logging trap.
+
+**Both recent step boundaries land on pawn/property resolution**, within minutes:
+- Aug 14 22:30–22:36 — `52c6acf` (the Weapon lookup was unreachable) and **`4b96043`, which removed
+  a throttle**: `ResolveGameplayOffsets` now calls `FindPlayerPawn(force=true)`, skipping the 1-in-30
+  miss throttle. A miss is a full `GObjects` walk, and **at a splash screen there is no pawn**.
+- Aug 15 19:00–19:18 — the property dump and `g_wantNames` registration commits.
+
+**▶ First suspect, and it is structural: the auto-rescan can NEVER succeed at a splash screen.**
+It fires whenever `!g_haveLock && g_camPosValid && dupDraws`, and a splash satisfies all three —
+there *is* a camera position, VR mode is on from startup (run 159), and there is **no view matrix to
+find**, so the lock is never acquired and it re-arms every 20 frames forever. The log shows it
+plainly, repeatedly: `--- scan complete: 0 candidate window(s) ... no window even had a plausible
+forward vector`. The scan's own comment: *"a scan tests every window of every upload and is far too
+expensive to leave running"*.
+
+**⚠️ TIMED, NOT FIXED.** `reg scan` is now its own term on the frame-budget line, subtracted from the
+residual, plus a `⚠ REGISTER SCAN ran on N frame(s)` line with the total, the peak and the candidate
+count. Rate-limiting the rescan in the same build would have shipped two changes and one
+measurement. **If the number comes back small the scan is exonerated** and the staircase is
+elsewhere — which is the point of measuring it.
+
+⚠️ Not gated on `TimeOurWork`: it only takes a timestamp on frames the scan is armed for, and a
+diagnostic nobody switches on cannot answer a question that shows up on someone else's machine.
+
 ### ⚠️ SHIPPED, NOT YET FLOWN (run 251) — a slot is KEEP or CUT, and the mesh draws as SEGMENTS
 
 Reported after the first sweep: *"90-1000 cuts away a lot of what I want to get rid of but keeps
