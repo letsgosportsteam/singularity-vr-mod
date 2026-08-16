@@ -5722,7 +5722,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
 // on it change meaning when you switch guns, and mixing that with global settings on a shared page is
 // how someone tunes the rifle and wonders why the pistol moved.
 const int kPanelPages    = 7;      // ⭐ run 237: + TMD ALIGN
-const int kPanelRowsMax  = 12;     // ⭐ run 241: the TMD page needs 12 with MODE and BACK
+const int kPanelRowsMax  = 13;     // ⭐ run 242: + HIDE MESH back on the TMD page
 const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     { PR_ENABLEVR, PR_AIMMETHOD, PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV,
       PR_GOTO_WEAPON, PR_GOTO_TMD },
@@ -5753,10 +5753,15 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // change meaning when you switch guns; these are one object held one way, always the same.
     { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
       PR_TMDBONESLOT, PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI,
-      PR_TMDBONEMODE, PR_BACK },        // 💥 run 241: BACK went missing when the page filled up
+      // 💥 run 242: HIDE MESH came BACK. It was dropped in run 239 to make room for BONE SLOT and
+      // that was never mentioned - so the capability still existed, in the ini and in FgHidden, with
+      // no way to reach it. Asked for directly as "make the whole mesh disappear so I can confirm
+      // both arms share it", which is exactly what it is for: one press answers a question that
+      // otherwise costs a bone sweep.
+      PR_TMDBONEMODE, PR_TMDHIDE, PR_BACK },
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
-const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 12 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
+const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 13 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
 
 // Width per page, so a two-row sub-page is not as wide as the root. Sized to the LONGEST VALUE each
 // page's rows can display, not to what they happen to show now - that is what keeps the box from
