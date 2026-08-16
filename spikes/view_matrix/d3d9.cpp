@@ -12901,7 +12901,24 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     // The mesh selector is the real gate and always was: a slot names a vertex count, and only that
     // count is collapsed. Restricting by which hand the draw rides added nothing except a class of
     // mesh that silently could not be reached.
-    if (g_thisDrawMoved != 0) {
+    // ---- 💥 run 244: the collapse must not require the draw to be MOVED ----
+    //
+    // Two facts pin this. HIDE MESH removes the left arm, so its draw reaches FgHidden. NUDGE across
+    // the FULL 0-77 range moves nothing, so the same geometry never reaches the collapse. The only
+    // difference between those two paths was this test: FgHidden runs on every foreground draw, the
+    // collapse ran only on draws that ride a controller.
+    //
+    // So the left arm is drawn by something FgRidesGun rejects - or by a copy outside the ride window
+    // - and every bone tried was applied to a draw the code was not looking at. Run 240b moved this
+    // from "== 2" to "!= 0" for the same reason and did not go far enough: the gate was narrower than
+    // the problem, twice.
+    //
+    // ⚠ Bounded by FgMatchWindow, not opened to every draw in the frame. The slot names a vertex
+    // count, and world geometry can share one - run 215 measured 322 such collisions in a second. The
+    // window is what has kept every other count-matched rule from hitting the level.
+    const bool tmdBoneOn = InterlockedCompareExchange(&g_tmdOnOffHand, 0, 0) != 0 &&
+                           TmdRaised() && FgMatchWindow();
+    if (tmdBoneOn) {
         // ⭐ run 240: EVERY slot naming this mesh, unioned - not the first match. One mesh can need
         // several disjoint ranges (the right arm and the left upper arm both live in 4818), and
         // stopping at the first match made the second range unreachable.
