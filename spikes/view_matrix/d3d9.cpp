@@ -6250,18 +6250,31 @@ void PanelAdjust(int row, int dir) {
             InterlockedExchange(&g_tmdHideVerts, NextPassMesh(Rd(g_tmdHideVerts), dir));
             break;
         case PR_TMDBONELO: case PR_TMDBONEHI: {
-            // -1 is OFF and sits below 0 in the cycle, so the collapse can always be switched off from
-            // either row without remembering which value meant "inert".
-            volatile LONG* t = row == PR_TMDBONELO ? &g_tmdBoneLo : &g_tmdBoneHi;
-            LONG v = Rd(*t) + dir;
-            if (v < -1) v = -1;
-            if (v > 40) v = 40;
-            InterlockedExchange(t, v);
-            // A range that runs backwards collapses nothing, which looks exactly like OFF. Keep it
-            // ordered so "nothing happened" only ever has one meaning.
-            if (Rd(g_tmdBoneLo) >= 0 && Rd(g_tmdBoneHi) >= 0 && Rd(g_tmdBoneHi) < Rd(g_tmdBoneLo)) {
-                if (row == PR_TMDBONELO) InterlockedExchange(&g_tmdBoneHi, v);
-                else                     InterlockedExchange(&g_tmdBoneLo, v);
+            // 💥 run 238b: the two ends were independent, and the collapse needs BOTH set - so
+            // reported, correctly, as "BONE FROM did nothing". Moving one end of a range that starts
+            // OFF at both ends can never produce a valid range, so the row that a sweep most needs was
+            // the one row that could not do anything.
+            //
+            // They are coupled now. FROM carries TO with it while they are equal, so raising FROM from
+            // OFF walks a SINGLE bone up the skeleton one press at a time - which is the sweep this
+            // actually wants, since a single collapsed bone stretches exactly the part it drives and
+            // that is what names it. TO alone still widens the range once a region is found.
+            const LONG lo = Rd(g_tmdBoneLo), hi = Rd(g_tmdBoneHi);
+            if (row == PR_TMDBONELO) {
+                LONG v = lo + dir;
+                if (v < -1) v = -1;
+                if (v > 40) v = 40;
+                InterlockedExchange(&g_tmdBoneLo, v);
+                // Together when they were together, and never inverted otherwise. A backwards range
+                // collapses nothing, which looks exactly like OFF, and the two mean opposite things.
+                if (v < 0)            InterlockedExchange(&g_tmdBoneHi, -1);
+                else if (hi <= lo || hi < 0) InterlockedExchange(&g_tmdBoneHi, v);
+            } else {
+                if (lo < 0) break;                 // widening an OFF range is meaningless
+                LONG v = hi + dir;
+                if (v < lo) v = lo;
+                if (v > 40) v = 40;
+                InterlockedExchange(&g_tmdBoneHi, v);
             }
             break;
         }
