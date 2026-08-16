@@ -18819,6 +18819,37 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             if (const LONG sq = InterlockedExchange(&g_scopeQuadDraws, 0))
                 Log("    scope overlay quads drawn per eye: %ld this second", sq);
 
+            // ---- ⭐ run 243: what the TMD transform is ACTUALLY using ----
+            //
+            // Reported: aligned perfectly in head mode with the magenta cross, then in motion
+            // controller mode it does not arrive at the cyan one. Four things could each cause that
+            // and they look identical from inside a headset - so this prints all four rather than
+            // testing my next guess about which it is. I have offered three explanations for TMD
+            // behaviour that did not survive a run; a fourth is not worth your time.
+            //
+            //   ride target   2 = the OFF hand. A 1 here means the off-hand pose was invalid and it
+            //                 silently fell back to the GUN hand, which is a different anchor AND a
+            //                 different controller - it would look wrong in exactly this way.
+            //   G             the anchor the magenta cross is drawn at
+            //   H             the off-hand position the cyan cross is drawn at
+            //   H-G           the translation actually applied. The mesh point sitting at G lands at
+            //                 H, so if the crosses agree and the mesh does not, the error is in the
+            //                 ROTATION rather than the offset.
+            if (InterlockedCompareExchange(&g_tmdOnOffHand, 0, 0) && TmdRaised()) {
+                float G[3]; TmdAnchorWorld(G);
+                const float hx = (float)Rd(g_offHandOffX) / kHandFixed;
+                const float hy = (float)Rd(g_offHandOffY) / kHandFixed;
+                const float hz = (float)(g_gunSignPosZ * Rd(g_offHandOffZ)) / kHandFixed;
+                Log("    tmd transform: ride target %d (2=off hand, 1=FELL BACK to the gun hand)"
+                    " | offHandValid %ld | anchor G (%.1f %.1f %.1f) | hand H (%.1f %.1f %.1f)"
+                    " | applied H-G (%.1f %.1f %.1f) | off-hand dev yaw %ld pitch %ld roll %ld"
+                    " | followPos %d headOffset %d (run 243)",
+                    Rd(g_offHandValid) ? 2 : 1, Rd(g_offHandValid),
+                    G[0], G[1], G[2], hx, hy, hz, hx - G[0], hy - G[1], hz - G[2],
+                    Rd(g_offHandDevYawUU), Rd(g_offHandDevPitchUU), Rd(g_offHandDevRollUU),
+                    g_gunFollowPos ? 1 : 0, g_gunHeadOffset ? 1 : 0);
+            }
+
             // ⭐ run 234: the verdict, once a second, so it does not have to be assembled by hand.
             if (Rd(g_fgIdentityVerts) && g_fgIdentCount) {
                 char b4[512]; int o4 = 0;
