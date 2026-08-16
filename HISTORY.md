@@ -24,6 +24,38 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Runs 258-259: the swap drop lands, and my own warning label was the thing I ignored
+
+**258 — the mesh latch drops on the swap.** Asked directly whether "something checks every two
+seconds" was why weapon switching lagged. Close: **270 frames**, not a timer — `kLatchMiss` 240 plus
+`kLatchSteady` 30, which is 2.25 s at 120 fps and worse below it. `RefreshArmedState` had been
+reading `Pawn.Weapon` every frame since run 227 and throwing away everything but "is it null", while
+runs 235b and 235c had already measured that the object pointer is the weapon's identity and that it
+does not move for the TMD. **The signal was measured three runs before anything used it.** Verified:
+10 pointer drops against 1 fallback, the fallback being the session's first swap, before the offset
+resolved. A pointer compare, so weapon-agnostic — asked about specifically, because a fix that works
+for the two weapons someone happened to test is this project's recurring failure.
+
+**259 — `HudArmSticky=1` broke world geometry, and the counter had said so all along.** Reported as
+"a lot of geometry culled — DRAW ALL is fine, ENGINE CULL has a lot missing, and this used to work".
+Not the occlusion setting: **1284–2538 draws per second** were taken onto the HUD path, with the
+non-orthographic guard rejecting **zero** of them, and squashed in clip space as if they were UI.
+
+**Method notes, and the second is the expensive one.**
+- **A stale claim in a LOG LINE is worse than one in a comment.** "Every weapon shares the class
+  `RvWeaponShared`" had been measured wrong, corrected in a comment, and left standing in the log
+  text — where the next person greps it as fact. I then repeated it in a new comment four lines from
+  the correction.
+- **⛔ I printed the caveat every second and argued past it.** The counter's own text read *"some of
+  these are world draws and belong where they went — watch the CHANGE, not the absolute"*, and I
+  read 1122–3019 as "that many UI draws are being lost". The measurement was right; the inference
+  was not. **Writing the warning is not the same as heeding it**, and the run that flew on it cost a
+  visible regression.
+- **Where NOT to start next time**, recorded because it is the obvious wrong next step:
+  content-matching `c5`–`c8` cannot work. Those draws never wrote those registers — that is exactly
+  why they missed the arm — so the values still match and the same bad set is captured. The
+  discriminator has to be something the DRAW carries, not something the register does.
+
 ## 📉 Run 252: the splash screen degraded in four steps, and the archive dated every one of them
 
 Reported as *"the game is lagging to all heck now, even in the splash screens"*, with *"I know this

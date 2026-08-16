@@ -131,7 +131,35 @@ slot 0 inherits the old single `TmdArmFrom`/`TmdArmTo` so an existing ini keeps 
 with a comment explaining why two windows would need two draw calls, and the first sweep with it
 found the case that needs exactly that.
 
+### ✅ FIXED and VERIFIED (run 258) — the mesh latch drops on the SWAP, not 240 frames later
+
+Reported as *"switch weapons, see nothing for a while, then the gun appears with the arms and snaps
+to the controller"* — and it was **270 frames, not a 2 s timer**: `kLatchMiss` 240 + `kLatchSteady`
+30, so 2.25 s at 120 fps and **longer whenever the frame rate is lower**. The "nothing" phase is the
+new gun being hidden as a stray, because it is outside the *old* baseline.
+
+`RefreshArmedState` already read `Pawn.Weapon` **every frame** and collapsed it to a bool. The
+pointer is the weapon's identity, and it was already measured twice: run 235b named the object as
+the identity, run 235c watched it move across `ARMachineGun → ARShotgun → ARMachineGun` and **not**
+move for the TMD (which is *hidden*, not swapped — exactly the false positive a draw-derived signal
+would trip on). The latch now drops on the frame the pointer changes.
+
+**Verified:** 10 × `Pawn.Weapon CHANGED` against 1 × the old frame-count path, and user-confirmed in
+play. It is a **pointer compare** — no name, class or vertex count — so it is weapon-agnostic and
+needs no per-weapon entry the way `GunAlign` does.
+
+⚠️ **The one fallback was the FIRST swap of the session**, because `Pawn.Weapon`'s offset had not
+resolved yet (`ResolveGameplayOffsets` is throttled to once per 2 s). `kLatchMiss` stays as the
+fallback for exactly that. Fixable by resolving that offset sooner if one slow first swap matters.
+
+⚠️ **`RvWeaponShared` is NOT shared by every weapon** — the shotgun is `RvWeaponShared_Shotgun`. That
+claim was measured wrong once, was still in a comment *and in a log line*, and got repeated into the
+run-258 comment before being corrected. **Classes vary and can also be shared; the object pointer is
+the only key with neither failure mode.**
+
 ### ⛔ REJECTED (run 259) — `HudArmSticky=1` breaks world geometry. Keep it 0.
+
+**Confirmed resolved by the revert** — geometry is correct again on `OcclusionQueryMode=2`.
 
 Reported as *"a lot of geometry being culled out — DRAW ALL was fine but ENGINE CULL had a lot
 missing, and this setting used to work fine."* **It was not the occlusion setting.** With sticky on,
