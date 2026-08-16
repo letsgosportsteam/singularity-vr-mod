@@ -2722,13 +2722,19 @@ volatile LONG g_tmdArmStep = 50;
 // partially weighted vertices would stretch through your face to get there. Keeping the translation
 // collapses the arm to a point at its own joint instead, so a stray sliver is short and local rather
 // than a triangle across the screen.
-volatile LONG g_tmdBoneLo = -1, g_tmdBoneHi = -1;    // bone INDEX range, -1 = off
+// ⭐ run 239: TWO slots. The hands (7444) and the arms (4818) are separate meshes with separate
+// bone palettes, so each needs its own range - a bone index measured on one means nothing on the
+// other. Two is what the job needs; a third would be a guess about a mesh nobody has looked at.
+const int kTmdBoneSlots = 2;
+volatile LONG g_tmdBoneLo[kTmdBoneSlots]   = { -1, -1 };   // bone INDEX range, -1 = off
+volatile LONG g_tmdBoneHi[kTmdBoneSlots]   = { -1, -1 };
+volatile LONG g_tmdBoneSlot = 0;                           // which slot the panel rows edit
 // 💥 run 238d: WHICH MESH the range applies to. The first version applied it to everything riding
 // the off hand, and a bone palette is PER MESH - so "bones 13-29" meant the right hand in 7444 and
 // something unrelated in 4818, which came out as both sleeves spiking into points. A bone index is
 // only meaningful against the mesh it was measured on.
 // 0 = the arms mesh of the moment (largest non-weapon), which is where 13-29 was measured.
-volatile LONG g_tmdBoneMesh = 0;
+volatile LONG g_tmdBoneMesh[kTmdBoneSlots] = { 0, 0 };
 // 💥 run 238e: a shared collapse POINT is not enough, and the reason is blending.
 //
 // A vertex weighted entirely to a collapsed bone does land on the point, and its triangles do
@@ -5671,7 +5677,7 @@ enum { PR_ENABLEVR = 0, PR_AIMMETHOD, PR_MOVEDIR, PR_TURNMODE, PR_TURNSPEED, PR_
        PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,   // ⭐ run 237
        PR_TMDARMFROM, PR_TMDARMTO,   // ⭐ run 237c
        PR_TMDHIDE,                   // ⭐ run 237d
-       PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH,   // ⭐ run 237f / 238d
+       PR_TMDBONELO, PR_TMDBONEHI, PR_TMDBONEMESH, PR_TMDBONESLOT,   // ⭐ run 239
        PR_GOTO_TMD,
        PR_GOTO_CTRL, PR_GOTO_COMFORT, PR_GOTO_DISPLAY, PR_GOTO_ADV, PR_GOTO_WEAPON, PR_BACK };
 
@@ -5722,7 +5728,7 @@ const uint8_t kPageRows[kPanelPages][kPanelRowsMax] = {
     // ⭐ run 237: its own page, not a row on WEAPON ALIGN. That page's values are PER WEAPON and
     // change meaning when you switch guns; these are one object held one way, always the same.
     { PR_TMDON, PR_TMDFWD, PR_TMDRIGHT, PR_TMDUP, PR_TMDYAW, PR_TMDPITCH,
-      PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI, PR_TMDHIDE },   // ⭐ run 238d
+      PR_TMDBONESLOT, PR_TMDBONEMESH, PR_TMDBONELO, PR_TMDBONEHI },   // ⭐ run 239
 };
 // ADVANCED lost MENU CAM in run 180 and gained WEAPON FX in 181; DISPLAY gained MUZZLE FX in 189.
 const int kPageCount[kPanelPages] = { 8, 8, 3, 6, 5, 7, 10 };   // ⭐ run 230: DISPLAY 5 -> 6; ⭐ run 237: root 7 -> 8 and a TMD page
@@ -5906,19 +5912,32 @@ void PanelSaveRow(int rowId, const char* path) {
                 { "TmdYawTenths", &g_tmdYawTenths }, { "TmdPitchTenths", &g_tmdPitchTenths },
                 { "TmdArmFrom", &g_tmdArmFrom }, { "TmdArmTo", &g_tmdArmTo },
                 { "TmdHideVerts", &g_tmdHideVerts },
-                { "TmdBoneLo", &g_tmdBoneLo }, { "TmdBoneHi", &g_tmdBoneHi },
-                { "TmdBoneMesh", &g_tmdBoneMesh },
             };
-            for (int i = 0; i < 12; ++i) {
+            for (int i = 0; i < 9; ++i) {
                 _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(*tm[i].p));
                 WritePrivateProfileStringA("Input", tm[i].k, v, path);
+            }
+            // ⭐ run 239: the per-slot bone keys, written in the same pass so that no slot can be
+            // adjustable and persist nowhere - the defect PanelSaveRow was restructured to prevent.
+            for (int sI = 0; sI < kTmdBoneSlots; ++sI) {
+                char key[32];
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdBoneMesh%d", sI);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdBoneMesh[sI]));
+                WritePrivateProfileStringA("Input", key, v, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdBoneLo%d", sI);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdBoneLo[sI]));
+                WritePrivateProfileStringA("Input", key, v, path);
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "TmdBoneHi%d", sI);
+                _snprintf_s(v, sizeof(v), _TRUNCATE, "%ld", Rd(g_tmdBoneHi[sI]));
+                WritePrivateProfileStringA("Input", key, v, path);
             }
             return;
         }
         case PR_TMDFWD: case PR_TMDRIGHT: case PR_TMDUP:
         case PR_TMDYAW: case PR_TMDPITCH:
         case PR_TMDARMFROM: case PR_TMDARMTO:
-        case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI: case PR_TMDBONEMESH:
+        case PR_TMDHIDE: case PR_TMDBONELO: case PR_TMDBONEHI:
+        case PR_TMDBONEMESH: case PR_TMDBONESLOT:
             return;   // written by PR_TMDON above
         case PR_WEAPONFX: {
             // ⚠️ Mode 2 is NEVER saved. It blacks out the weapon by design, and a test state that
@@ -6081,20 +6100,28 @@ void PanelRowText(int row, char* out, size_t cap) {
         case PR_TMDPITCH:
             _snprintf_s(out, cap, _TRUNCATE, "TMD PITCH  %+.1f", Rd(g_tmdPitchTenths) / 10.0f); break;
         case PR_GOTO_TMD: _snprintf_s(out, cap, _TRUNCATE, "TMD ALIGN..."); break;
+        case PR_TMDBONESLOT:
+            _snprintf_s(out, cap, _TRUNCATE, "BONE SLOT      %ld of %d",
+                        Rd(g_tmdBoneSlot) + 1, kTmdBoneSlots);
+            break;
         case PR_TMDBONEMESH: {
-            const LONG bm = Rd(g_tmdBoneMesh);
+            const LONG bm = Rd(g_tmdBoneMesh[Rd(g_tmdBoneSlot)]);
             if (!bm) _snprintf_s(out, cap, _TRUNCATE, "BONE MESH      ARMS");
             else     _snprintf_s(out, cap, _TRUNCATE, "BONE MESH      %ld", bm);
             break;
         }
-        case PR_TMDBONELO:
-            if (Rd(g_tmdBoneLo) < 0) _snprintf_s(out, cap, _TRUNCATE, "BONE FROM      OFF");
-            else _snprintf_s(out, cap, _TRUNCATE, "BONE FROM      %ld", Rd(g_tmdBoneLo));
+        case PR_TMDBONELO: {
+            const LONG bv = Rd(g_tmdBoneLo[Rd(g_tmdBoneSlot)]);
+            if (bv < 0) _snprintf_s(out, cap, _TRUNCATE, "BONE FROM      OFF");
+            else        _snprintf_s(out, cap, _TRUNCATE, "BONE FROM      %ld", bv);
             break;
-        case PR_TMDBONEHI:
-            if (Rd(g_tmdBoneHi) < 0) _snprintf_s(out, cap, _TRUNCATE, "BONE TO        OFF");
-            else _snprintf_s(out, cap, _TRUNCATE, "BONE TO        %ld", Rd(g_tmdBoneHi));
+        }
+        case PR_TMDBONEHI: {
+            const LONG bv = Rd(g_tmdBoneHi[Rd(g_tmdBoneSlot)]);
+            if (bv < 0) _snprintf_s(out, cap, _TRUNCATE, "BONE TO        OFF");
+            else        _snprintf_s(out, cap, _TRUNCATE, "BONE TO        %ld", bv);
             break;
+        }
         case PR_TMDHIDE: {
             const LONG hv = Rd(g_tmdHideVerts);
             if (!hv) _snprintf_s(out, cap, _TRUNCATE, "HIDE MESH      NONE");
@@ -6278,14 +6305,23 @@ void PanelAdjust(int row, int dir) {
             // exist, which is how a raw vertex-count setting goes stale between saves.
             InterlockedExchange(&g_tmdHideVerts, NextPassMesh(Rd(g_tmdHideVerts), dir));
             break;
-        case PR_TMDBONEMESH:
-            // Same cycle as HIDE MESH - only what is actually in the pass, so it cannot name a mesh
-            // that is not there. The range means nothing without the mesh it was measured against, so
-            // changing the mesh clears the range rather than silently re-pointing it at new bones.
-            InterlockedExchange(&g_tmdBoneMesh, NextPassMesh(Rd(g_tmdBoneMesh), dir));
-            InterlockedExchange(&g_tmdBoneLo, -1);
-            InterlockedExchange(&g_tmdBoneHi, -1);
+        case PR_TMDBONESLOT: {
+            LONG sv = Rd(g_tmdBoneSlot) + (dir >= 0 ? 1 : -1);
+            if (sv < 0) sv = kTmdBoneSlots - 1;
+            if (sv >= kTmdBoneSlots) sv = 0;
+            InterlockedExchange(&g_tmdBoneSlot, sv);
             break;
+        }
+        case PR_TMDBONEMESH: {
+            // Only what is actually in the pass, so it cannot name a mesh that is not there. Changing
+            // the mesh CLEARS the range: a bone index measured against one mesh means something
+            // unrelated against another, and silently re-pointing it is how 13-29 mangled the sleeves.
+            const LONG sI = Rd(g_tmdBoneSlot);
+            InterlockedExchange(&g_tmdBoneMesh[sI], NextPassMesh(Rd(g_tmdBoneMesh[sI]), dir));
+            InterlockedExchange(&g_tmdBoneLo[sI], -1);
+            InterlockedExchange(&g_tmdBoneHi[sI], -1);
+            break;
+        }
         case PR_TMDBONELO: case PR_TMDBONEHI: {
             // 💥 run 238b: the two ends were independent, and the collapse needs BOTH set - so
             // reported, correctly, as "BONE FROM did nothing". Moving one end of a range that starts
@@ -6296,22 +6332,23 @@ void PanelAdjust(int row, int dir) {
             // OFF walks a SINGLE bone up the skeleton one press at a time - which is the sweep this
             // actually wants, since a single collapsed bone stretches exactly the part it drives and
             // that is what names it. TO alone still widens the range once a region is found.
-            const LONG lo = Rd(g_tmdBoneLo), hi = Rd(g_tmdBoneHi);
+            const LONG sI = Rd(g_tmdBoneSlot);
+            const LONG lo = Rd(g_tmdBoneLo[sI]), hi = Rd(g_tmdBoneHi[sI]);
             if (row == PR_TMDBONELO) {
                 LONG v = lo + dir;
                 if (v < -1) v = -1;
                 if (v > 40) v = 40;
-                InterlockedExchange(&g_tmdBoneLo, v);
+                InterlockedExchange(&g_tmdBoneLo[sI], v);
                 // Together when they were together, and never inverted otherwise. A backwards range
                 // collapses nothing, which looks exactly like OFF, and the two mean opposite things.
-                if (v < 0)            InterlockedExchange(&g_tmdBoneHi, -1);
-                else if (hi <= lo || hi < 0) InterlockedExchange(&g_tmdBoneHi, v);
+                if (v < 0)                   InterlockedExchange(&g_tmdBoneHi[sI], -1);
+                else if (hi <= lo || hi < 0) InterlockedExchange(&g_tmdBoneHi[sI], v);
             } else {
                 if (lo < 0) break;                 // widening an OFF range is meaningless
                 LONG v = hi + dir;
                 if (v < lo) v = lo;
                 if (v > 40) v = 40;
-                InterlockedExchange(&g_tmdBoneHi, v);
+                InterlockedExchange(&g_tmdBoneHi[sI], v);
             }
             break;
         }
@@ -6728,9 +6765,15 @@ bool InitXRInput() {
     InterlockedExchange(&g_tmdPitchTenths,GetPrivateProfileIntA("Input", "TmdPitchTenths", 0, path));
     InterlockedExchange(&g_tmdArmFrom,    GetPrivateProfileIntA("Input", "TmdArmFrom",    0, path));
     InterlockedExchange(&g_tmdArmTo,      GetPrivateProfileIntA("Input", "TmdArmTo",   1000, path));
-    InterlockedExchange(&g_tmdBoneLo,     GetPrivateProfileIntA("Input", "TmdBoneLo",   -1, path));
-    InterlockedExchange(&g_tmdBoneHi,     GetPrivateProfileIntA("Input", "TmdBoneHi",   -1, path));
-    InterlockedExchange(&g_tmdBoneMesh,   GetPrivateProfileIntA("Input", "TmdBoneMesh",  0, path));
+    for (int sI = 0; sI < kTmdBoneSlots; ++sI) {
+        char bkey[32];
+        _snprintf_s(bkey, sizeof(bkey), _TRUNCATE, "TmdBoneMesh%d", sI);
+        InterlockedExchange(&g_tmdBoneMesh[sI], GetPrivateProfileIntA("Input", bkey, 0, path));
+        _snprintf_s(bkey, sizeof(bkey), _TRUNCATE, "TmdBoneLo%d", sI);
+        InterlockedExchange(&g_tmdBoneLo[sI], GetPrivateProfileIntA("Input", bkey, -1, path));
+        _snprintf_s(bkey, sizeof(bkey), _TRUNCATE, "TmdBoneHi%d", sI);
+        InterlockedExchange(&g_tmdBoneHi[sI], GetPrivateProfileIntA("Input", bkey, -1, path));
+    }
     InterlockedExchange(&g_tmdBoneMode,   GetPrivateProfileIntA("Input", "TmdBoneMode",  0, path));
     InterlockedExchange(&g_tmdArmStep,    GetPrivateProfileIntA("Input", "TmdArmStep",  50, path));
     InterlockedExchange(&g_tmdHideVerts,  GetPrivateProfileIntA("Input", "TmdHideVerts", 0, path));
@@ -12804,10 +12847,17 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrim(IDirect3DDevice9* dev, D3DPRIMITI
     float savedBones[kMaxSaveRegs][4];
     int   boneRegLo = 0, boneRegN = 0;
     if (g_thisDrawMoved == 2) {
-        const LONG bl = Rd(g_tmdBoneLo), bh = Rd(g_tmdBoneHi);
-        const LONG bm = Rd(g_tmdBoneMesh);
-        const UINT boneTarget = bm > 0 ? (UINT)bm : ArmsMeshNow();
-        if (bl >= 0 && bh >= bl && boneTarget == numVertices) {
+        // ⭐ run 239: whichever slot names THIS mesh. At most one can match, because a draw has one
+        // vertex count - so this is a lookup, not a merge, and two slots cannot fight over a mesh.
+        LONG bl = -1, bh = -1;
+        for (int sI = 0; sI < kTmdBoneSlots; ++sI) {
+            const LONG m = Rd(g_tmdBoneMesh[sI]);
+            const UINT target = m > 0 ? (UINT)m : ArmsMeshNow();
+            if (target == numVertices && Rd(g_tmdBoneLo[sI]) >= 0) {
+                bl = Rd(g_tmdBoneLo[sI]); bh = Rd(g_tmdBoneHi[sI]); break;
+            }
+        }
+        if (bl >= 0 && bh >= bl) {
             boneRegLo = kBoneReg0 + (int)bl * kBoneRegsPerBone;
             boneRegN  = (int)(bh - bl + 1) * kBoneRegsPerBone;
             if (boneRegN > kMaxSaveRegs) boneRegN = kMaxSaveRegs;
@@ -16973,6 +17023,43 @@ static int AnchorMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
     return n;
 }
 
+// ---- \u2b50 run 239: the same two markers, for the TMD's anchor on the OFF hand ----
+//
+// The gun anchor was tuned this way and the method is worth repeating exactly: in HEAD mode the
+// MAGENTA cross sits where the anchor currently is, so you move it onto the spot you want; in MOTION
+// CONTROLLER mode the CYAN cross is where the controller actually is, and the mesh arrives with the
+// anchor in that same relative place. Two points and the gap between them is the whole calibration.
+//
+// \u26a0 It reads the SAME globals the transform does - TmdAnchorWorld and g_offHandOff* through the same
+// kHandFixed divide. A readout in different units from the thing it describes is the run-174 trap:
+// the panel showed one number while another was applied, and tuning by feel stopped being possible.
+static int TmdMarkerRects(D3DRECT* r, int n, int cap, bool wantHand) {
+    float G[3]; TmdAnchorWorld(G);
+    if (wantHand) {
+        G[0] = (float)InterlockedCompareExchange(&g_offHandOffX, 0, 0) / kHandFixed;
+        G[1] = (float)InterlockedCompareExchange(&g_offHandOffY, 0, 0) / kHandFixed;
+        G[2] = (float)(g_gunSignPosZ * InterlockedCompareExchange(&g_offHandOffZ, 0, 0)) / kHandFixed;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < kMaxCamMats; ++i) if (g_camMats[i].valid) { slot = i; break; }
+    if (slot < 0) return n;
+
+    const LONG arm = (LONG)(g_srcH / 90), th = (LONG)(g_srcH / 400) + 1;
+    for (int eye = 0; eye < 2; ++eye) {
+        float m[16];
+        memcpy(m, g_camMats[slot].m, sizeof(m));
+        ApplyEyeRemap(reinterpret_cast<Reg4*>(m), g_camMats[slot].conv, eye ? +0.5f : -0.5f);
+        LONG sx = 0, sy = 0;
+        if (!ProjectToScreen(m, g_camMats[slot].conv, G,
+                             (LONG)g_srcW, (LONG)g_srcH, sx, sy)) continue;
+        if (n + 2 > cap) break;
+        r[n].x1 = sx - arm; r[n].y1 = sy - th; r[n].x2 = sx + arm; r[n].y2 = sy + th; ++n;
+        r[n].x1 = sx - th;  r[n].y1 = sy - arm; r[n].x2 = sx + th; r[n].y2 = sy + arm; ++n;
+    }
+    return n;
+}
+
 // ---- ⭐ run 142: the VR settings panel, drawn ----
 //
 // Same machinery as the state readout - a 5x7 bitmap font turned into Clear() rectangles, drawn
@@ -17300,11 +17387,15 @@ static void DrawStateReadout(IDirect3DDevice9* dev) {
     }
     if (n) dev->Clear((DWORD)n, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 255, 90), 0.0f, 0);
 
-    // MAGENTA: the pivot G, which is head-relative because the gun hangs off the view.
-    int mn = AnchorMarkerRects(r, 0, kCap, false);
+    // \u2b50 run 239: with the TMD up these describe the TMD instead of the gun. Same colours on
+    // purpose - the meaning is identical and the tuning gesture is the one already learned - and never
+    // both pairs at once, because two magenta crosses on screen is worse than none.
+    const bool tmdMarkers = InterlockedCompareExchange(&g_tmdOnOffHand, 0, 0) != 0 && TmdRaised();
+    // MAGENTA: the pivot G, which is head-relative because the mesh hangs off the view.
+    int mn = tmdMarkers ? TmdMarkerRects(r, 0, kCap, false) : AnchorMarkerRects(r, 0, kCap, false);
     if (mn) dev->Clear((DWORD)mn, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(255, 0, 200), 0.0f, 0);
     // CYAN: the destination H, which is where your controller is.
-    mn = AnchorMarkerRects(r, 0, kCap, true);
+    mn = tmdMarkers ? TmdMarkerRects(r, 0, kCap, true) : AnchorMarkerRects(r, 0, kCap, true);
     if (mn) dev->Clear((DWORD)mn, r, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 220, 255), 0.0f, 0);
 
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
