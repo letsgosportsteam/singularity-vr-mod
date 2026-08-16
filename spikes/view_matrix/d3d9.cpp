@@ -18919,6 +18919,32 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                 const float hx = (float)Rd(g_offHandOffX) / kHandFixed;
                 const float hy = (float)Rd(g_offHandOffY) / kHandFixed;
                 const float hz = (float)(g_gunSignPosZ * Rd(g_offHandOffZ)) / kHandFixed;
+                // ⭐ run 247: BOTH hands, side by side, and the RAW XR metres they came from.
+                //
+                // Reported: the cyan cross does not sit on the controller. That marker is the off-hand
+                // position, so if it is wrong the anchor work cannot start - and the first sample
+                // reads right = +20.9 UU, which is 40 cm to the RIGHT for what should be a LEFT hand.
+                //
+                // The aim hand is the control. It is the same maths on the other index and it is known
+                // good, because the gun has been aligned with it for twenty runs. If both hands report
+                // the same sign the hand INDEX is wrong; if they differ the conversion is; if the raw
+                // XR values already disagree the fault is upstream of both.
+                Log("    hands raw XR (metres, head-relative): AIM[%d] (%.3f %.3f %.3f)"
+                    "  OFF[%d] (%.3f %.3f %.3f)  | derived UU: AIM (%.1f %.1f %.1f)"
+                    "  OFF (%.1f %.1f %.1f)  | leftHanded %d (run 247)",
+                    AimHand(),
+                    g_handLastPos[AimHand()].x - g_headPosXR[0],
+                    g_handLastPos[AimHand()].y - g_headPosXR[1],
+                    g_handLastPos[AimHand()].z - g_headPosXR[2],
+                    OffHand(),
+                    g_handLastPos[OffHand()].x - g_headPosXR[0],
+                    g_handLastPos[OffHand()].y - g_headPosXR[1],
+                    g_handLastPos[OffHand()].z - g_headPosXR[2],
+                    (float)Rd(g_handOffX) / kHandFixed, (float)Rd(g_handOffY) / kHandFixed,
+                    (float)Rd(g_handOffZ) / kHandFixed,
+                    (float)Rd(g_offHandOffX) / kHandFixed, (float)Rd(g_offHandOffY) / kHandFixed,
+                    (float)Rd(g_offHandOffZ) / kHandFixed,
+                    g_leftHanded ? 1 : 0);
                 Log("    tmd transform: ride target %d (2=off hand, 1=FELL BACK to the gun hand)"
                     " | offHandValid %ld | anchor G (%.1f %.1f %.1f) | hand H (%.1f %.1f %.1f)"
                     " | applied H-G (%.1f %.1f %.1f) | off-hand dev yaw %ld pitch %ld roll %ld"
