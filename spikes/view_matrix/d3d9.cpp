@@ -1934,9 +1934,13 @@ static void LogEquippedClass(uintptr_t w) {
             if (const uintptr_t cls = *reinterpret_cast<const uintptr_t*>(w + OBJ_CLASS))
                 NameOf(cls, cn, sizeof(cn));
     }
-    Log("equipped: Pawn.Weapon -> object '%s'  (class %s)   run 235b: the OBJECT name is the"
-        " identity here - every weapon shares the class RvWeaponShared. If this names the TMD while"
-        " the TMD is out, that is the 'is the TMD active' signal.", on, cn);
+    // ⚠️ run 258: this line used to say "every weapon shares the class RvWeaponShared", which the note
+    // above records as MEASURED WRONG - and it was saying it in the log, where it would be read as
+    // fact by whoever greps for it next. Classes DO differ (RvWeaponShared_Shotgun); the object is
+    // the better key because two weapons can also share one, not because classes are all identical.
+    Log("equipped: Pawn.Weapon -> object '%s'  (class %s)   run 235b: the OBJECT is the identity -"
+        " classes vary but can also be shared, so the pointer is the only key with neither failure"
+        " mode. Run 235c: it never names the TMD, which is HIDDEN rather than swapped.", on, cn);
 }
 
 static void RefreshArmedState() {
@@ -1955,9 +1959,22 @@ static void RefreshArmedState() {
                 // both are frame counts rather than durations.
                 //
                 // None of that waiting is necessary. This value was already being read every frame
-                // and collapsed to a bool. Run 235b established that the OBJECT is the identity -
-                // every weapon shares the class RvWeaponShared - so a change here IS a swap, known on
-                // the frame it happens, with no inference from what is being drawn.
+                // and collapsed to a bool. Run 235b established that the OBJECT is the identity, so a
+                // change here IS a swap, known on the frame it happens, with no inference from what
+                // is being drawn.
+                //
+                // ⚠️ It is a POINTER COMPARE. No name, no class, no vertex count - so it is weapon
+                // AGNOSTIC by construction and cannot need a per-weapon entry the way GunAlign does.
+                // Run 235c's log names ARMachineGun and ARShotgun only because those were in hand
+                // that run; a pistol, a sniper rifle or anything else swaps the same pointer. The one
+                // requirement is that the two weapons are different OBJECTS, which is what switching
+                // weapons means.
+                //
+                // ⚠️ Deliberately NOT keyed on the class, and the note above LogEquippedClass says why
+                // from both directions: the claim "every weapon shares the class RvWeaponShared" was
+                // measured WRONG (the shotgun is RvWeaponShared_Shotgun), and its correction carries
+                // the other half - two weapons genuinely CAN share a class, so a class compare would
+                // miss a swap between two that do. The object pointer has neither failure mode.
                 //
                 // ⚠️ Raising the TMD does NOT trip this. Run 236 measured that Pawn.Weapon stays on
                 // the gun while the TMD is up: the weapon is HIDDEN, not swapped. That is exactly the
