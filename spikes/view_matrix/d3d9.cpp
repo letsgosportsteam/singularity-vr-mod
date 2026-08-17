@@ -14200,6 +14200,7 @@ volatile LONG g_hudArmSticky = 0;   // ini [Render] HudArmSticky
 // spills into two has its remainder unarmed. That is a length threshold, which is a BATCH boundary,
 // not a transform difference.
 volatile LONG g_hudArmTex = 0;      // texture bound at the draw that consumed the arm
+volatile LONG g_hudArmStride = 0;   // ⭐ run 269: stride of the draw that consumed the arm
 volatile LONG g_hudArmTook = 0;     // continuations the same-texture rule captured, per second
 int g_uiLastDumpedCount = -1;
 
@@ -14973,14 +14974,35 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     // texture, and a note must be open. See g_noteTextStride - world geometry cannot start a chain
     // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
+    if (hudFresh) InterlockedExchange(&g_hudArmStride, (LONG)vtxStride);   // ⭐ run 269
     // ⭐ run 268: log EVERY offered draw, gate or no gate. Reported: in the runs where geometry was
     // broken the POP-UP MENUS were fixed - so the continuation draws are real and capturing them
     // works; only the gate is wrong, because NoteMarker recognises NOTES and a popup is not one.
     // With the gate false for popups, neither the match nor the rejection below fires, so this run
     // would have gone quiet on exactly the case being tested. Distinct strides only.
     if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0) NoteOfferLog(vtxStride, Rd(g_noteOpen));
-    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
-        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0) {
+    // ---- ⭐ run 269: the note gate comes OFF, because the arm no longer needs it ----
+    //
+    // Measured this run: the run-265 shape test separates the writes cleanly. ARMS on 1, 3, 4, 6 and
+    // 9 vec4s at c5/c8 - targeted UI transforms. REJECTS 18, 24, 33, 45, 54, 57, 63, 69, 90, 105,
+    // 108, 183, 210, 219 - bulk scene uploads. THAT is what run 264 was missing: back then the arm
+    // accepted those bulk writes, which is exactly how world geometry got armed and squashed.
+    //
+    // With the arm itself UI-shaped, the continuation only needs to belong to the same batch, and
+    // the stride says that: the popup's spilled text was OFFERED at stride 20, which is the text
+    // stride run 230 measured on the note. The note gate was blocking it - "panel recognised 0" -
+    // and NoteMarker cannot be taught every panel in the game.
+    //
+    // ⚠️ The geometry risk is now carried by the ARM's shape test rather than by a panel marker. If
+    // world draws come back, the arm census names the write that let them in, and HudArmSticky=0
+    // reverts. That is a narrower and more measurable place for the risk to sit than a marker that
+    // has to recognise every UI panel by hand.
+    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 && Rd(g_hudArmStride) != 0 &&
+        (LONG)vtxStride == Rd(g_hudArmStride)) {
+        hudArmed = true;
+        InterlockedIncrement(&g_hudArmTook);
+    }
+    if (false) {
         // ⭐ run 267: STRIDE, not stride+texture. The texture check rejected the continuation and
         // the likely reason is the reason the batch splits at all - a long run spills onto a second
         // glyph atlas page, so the second draw carries a DIFFERENT texture by construction. Keying
@@ -15064,14 +15086,35 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     // texture, and a note must be open. See g_noteTextStride - world geometry cannot start a chain
     // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
+    if (hudFresh) InterlockedExchange(&g_hudArmStride, (LONG)vtxStride);   // ⭐ run 269
     // ⭐ run 268: log EVERY offered draw, gate or no gate. Reported: in the runs where geometry was
     // broken the POP-UP MENUS were fixed - so the continuation draws are real and capturing them
     // works; only the gate is wrong, because NoteMarker recognises NOTES and a popup is not one.
     // With the gate false for popups, neither the match nor the rejection below fires, so this run
     // would have gone quiet on exactly the case being tested. Distinct strides only.
     if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0) NoteOfferLog(vtxStride, Rd(g_noteOpen));
-    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
-        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0) {
+    // ---- ⭐ run 269: the note gate comes OFF, because the arm no longer needs it ----
+    //
+    // Measured this run: the run-265 shape test separates the writes cleanly. ARMS on 1, 3, 4, 6 and
+    // 9 vec4s at c5/c8 - targeted UI transforms. REJECTS 18, 24, 33, 45, 54, 57, 63, 69, 90, 105,
+    // 108, 183, 210, 219 - bulk scene uploads. THAT is what run 264 was missing: back then the arm
+    // accepted those bulk writes, which is exactly how world geometry got armed and squashed.
+    //
+    // With the arm itself UI-shaped, the continuation only needs to belong to the same batch, and
+    // the stride says that: the popup's spilled text was OFFERED at stride 20, which is the text
+    // stride run 230 measured on the note. The note gate was blocking it - "panel recognised 0" -
+    // and NoteMarker cannot be taught every panel in the game.
+    //
+    // ⚠️ The geometry risk is now carried by the ARM's shape test rather than by a panel marker. If
+    // world draws come back, the arm census names the write that let them in, and HudArmSticky=0
+    // reverts. That is a narrower and more measurable place for the risk to sit than a marker that
+    // has to recognise every UI panel by hand.
+    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 && Rd(g_hudArmStride) != 0 &&
+        (LONG)vtxStride == Rd(g_hudArmStride)) {
+        hudArmed = true;
+        InterlockedIncrement(&g_hudArmTook);
+    }
+    if (false) {
         // ⭐ run 267: STRIDE, not stride+texture. The texture check rejected the continuation and
         // the likely reason is the reason the batch splits at all - a long run spills onto a second
         // glyph atlas page, so the second draw carries a DIFFERENT texture by construction. Keying
