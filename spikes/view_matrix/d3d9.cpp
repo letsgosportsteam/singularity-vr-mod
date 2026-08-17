@@ -11125,7 +11125,17 @@ static VidSig CaptureDrawSig(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYP
 // ⚠️ SATURATION IS REPORTED. Four separate runs in this project were lost to a cap that silently
 // excluded the answer, and the file carries the list. If this one fills, it says so.
 volatile LONG g_spriteQuadDraws = 0;    // ⭐ run 262, reported per second
-volatile LONG g_spriteQuadPerEye = 1;   // ini [Render] SpriteQuadPerEye
+// ⛔ run 270: DEFAULT 0. It breaks the sniper scope and has never been shown to fix anything.
+//
+// The scope overlay is a centred quad that does not span NDC, so this splits it by construction -
+// and run 213 established the scope needs THREE things together: the per-eye viewport, c1
+// ScreenPositionScaleBias X-only, and the halved aspect that keeps the circle round. Doing the
+// geometry and neither of the other two breaks a scope that was intact.
+//
+// ⚠️ And it never earned its place: run 262 shipped it on run 192's extent theory, it engaged on 104
+// draws a second - proven by its own counter - and the artefact it was built for did not change. A
+// change that fixes nothing and breaks something real defaults OFF.
+volatile LONG g_spriteQuadPerEye = 0;   // ini [Render] SpriteQuadPerEye
 const int kQuadSigMax = 24;
 VidSig g_quadSig[kQuadSigMax]{};
 int    g_quadSigN = 0;
@@ -21788,7 +21798,7 @@ void LoadIniSettings() {
     // ⭐ run 262: the extent test run 192 specified, applied. 0 restores the old behaviour - every
     // misclassified sprite back to one draw across the seam - without a rebuild.
     InterlockedExchange(&g_spriteQuadPerEye,
-                        GetPrivateProfileIntA("Render", "SpriteQuadPerEye", 1, path) ? 1 : 0);
+                        GetPrivateProfileIntA("Render", "SpriteQuadPerEye", 0, path) ? 1 : 0);
     Log("ini: SpriteQuadPerEye=%ld (%s). Run 192 named this defect and its remedy and neither was"
         " applied: a small sprite already in clip space passes UserPtrQuad's first-vertex NDC test,"
         " is passed through undivided, and lands once across the FULL side-by-side frame. The extent"
