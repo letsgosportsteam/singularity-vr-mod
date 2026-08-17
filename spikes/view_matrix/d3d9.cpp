@@ -10220,6 +10220,9 @@ struct VidSig {
     uint32_t texW, texH, texFmt;
     uint32_t rtW, rtH;
     uint32_t count;
+    // ⭐ run 261: the BOUNDS across several vertices, not just the first one. See CaptureDrawSig.
+    float bbMinX, bbMaxX, bbMinY, bbMaxY;
+    uint32_t bbVerts;
 };
 VidSig g_vidSig[kVidSigMax]{};
 int       g_vidSigN = 0;
@@ -10994,6 +10997,37 @@ static VidSig CaptureDrawSig(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYP
         const float* v = static_cast<const float*>(vtx);
         s.v0x = v[0]; s.v0y = v[1];
     }
+    // ---- 💥 run 261: ONE vertex cannot tell clip space from world space, and (0,0) is in both ----
+    //
+    // Run 47 separated a fullscreen quad from a decal by testing whether the FIRST vertex is inside
+    // NDC, on the reasoning that clip space is +-1 and world space is +-40000. Four signatures in
+    // run 260's census came back with first vertex EXACTLY (0.000, 0.000) - stride 72 and 12,
+    // textures 64x64/128x128 DXT1 and 32x32 DXT5, which are effect billboards, not fullscreen
+    // quads. A local origin passes an NDC test no matter what space it is in, so those draws are
+    // classified as pass-through and land ONCE across the whole side-by-side frame.
+    //
+    // The bounds over several vertices settle it: a real fullscreen quad spans about -1..+1 in both
+    // axes, while world geometry starting at its own origin spreads far outside that. This only
+    // MEASURES - the classifier still decides on the first vertex - so the census can say whether
+    // run 47's test has a hole without changing what anything draws.
+    if (vtx && stride >= 8) {
+        const UINT want = (t == D3DPT_TRIANGLESTRIP || t == D3DPT_TRIANGLEFAN) ? primCount + 2
+                                                                               : primCount * 3;
+        const UINT n = want > 6 ? 6 : want;      // a bounded peek, never a walk of the buffer
+        for (UINT i = 0; i < n; ++i) {
+            const uint8_t* p = static_cast<const uint8_t*>(vtx) + (size_t)i * stride;
+            if (!Readable(p, 8)) break;
+            const float* v = reinterpret_cast<const float*>(p);
+            if (s.bbVerts == 0) { s.bbMinX = s.bbMaxX = v[0]; s.bbMinY = s.bbMaxY = v[1]; }
+            else {
+                if (v[0] < s.bbMinX) s.bbMinX = v[0];
+                if (v[0] > s.bbMaxX) s.bbMaxX = v[0];
+                if (v[1] < s.bbMinY) s.bbMinY = v[1];
+                if (v[1] > s.bbMaxY) s.bbMaxY = v[1];
+            }
+            ++s.bbVerts;
+        }
+    }
     // The two device queries this probe exists for. Both AddRef, so both are released.
     if (IDirect3DBaseTexture9* bt = nullptr; SUCCEEDED(dev->GetTexture(0, &bt)) && bt) {
         if (bt->GetType() == D3DRTYPE_TEXTURE) {
@@ -11048,11 +11082,22 @@ void QuadCensusRecord(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UI
     }
     if (g_quadSigN < kQuadSigMax) {
         VidSig n = s; n.count = 1; g_quadSig[g_quadSigN++] = n;
+        // ⭐ run 261: the verdict is computed here rather than left to whoever reads the log. A real
+        // fullscreen quad spans roughly -1..+1 in both axes; anything wider was misclassified by
+        // run 47's first-vertex test and is being drawn once across the frame by mistake.
+        const bool spansNdc = n.bbVerts >= 3 &&
+                              n.bbMaxX - n.bbMinX > 1.0f && n.bbMaxY - n.bbMinY > 1.0f &&
+                              n.bbMinX > -1.5f && n.bbMaxX < 1.5f &&
+                              n.bbMinY > -1.5f && n.bbMaxY < 1.5f;
         Log("QUAD CENSUS: new pass-through signature #%d - src %s, %u prim(s), stride %u,"
-            " texture %ux%u fmt %u, first vertex (%.3f, %.3f), target %ux%u. This draw is NOT split"
-            " per eye and NOT HUD-remapped - it lands once across the whole frame. (run 260)",
+            " texture %ux%u fmt %u, first vertex (%.3f, %.3f), target %ux%u | bounds over %u vert(s)"
+            " x[%.3f..%.3f] y[%.3f..%.3f] -> %s. This draw is NOT split per eye and NOT HUD-remapped"
+            " - it lands once across the whole frame. (run 260/261)",
             g_quadSigN, n.src == 2 ? "DrawPrimUP" : "DrawIndexedPrimUP", n.primCount, n.stride,
-            n.texW, n.texH, n.texFmt, n.v0x, n.v0y, n.rtW, n.rtH);
+            n.texW, n.texH, n.texFmt, n.v0x, n.v0y, n.rtW, n.rtH,
+            n.bbVerts, n.bbMinX, n.bbMaxX, n.bbMinY, n.bbMaxY,
+            spansNdc ? "a REAL fullscreen quad, correctly passed through"
+                     : "*** NOT a fullscreen quad - MISCLASSIFIED by the first-vertex test ***");
     } else if (!g_quadSigFull) {
         g_quadSigFull = true;
         Log("*** QUAD CENSUS is FULL at %d signatures - further distinct draws are NOT being"
