@@ -11299,16 +11299,37 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrim(IDirect3DDevice9* dev, D3DPRIMITIVETYPE 
         count == (UINT)g_scopeQuadPrimCount &&
         InterlockedCompareExchange(&g_dupDraws, 0, 0) &&
         InterlockedCompareExchange(&g_rtIsScene, 0, 0);
+    // ⭐ run 271: the aim trigger, read once and used for both the counter and the gate.
+    const bool scopeAiming = InterlockedCompareExchange(&g_rawAltTrigger, 0, 0) > 40;
     if (scopeShape) {
         ScopeQuadDump(dev, count);
         // The decisive datum, and it costs two counters: the real scope quad can only be drawn while
         // you are AIMING. A match with the aim trigger released is a false positive with no other
         // possible reading, and no knowledge of the shader is needed to say so.
-        if (InterlockedCompareExchange(&g_rawAltTrigger, 0, 0) > 40)
-             InterlockedIncrement(&g_scopeMatchAim);
-        else InterlockedIncrement(&g_scopeMatchIdle);
+        if (scopeAiming) InterlockedIncrement(&g_scopeMatchAim);
+        else             InterlockedIncrement(&g_scopeMatchIdle);
     }
-    if (g_scopeQuadPerEye && scopeShape) {
+    // ---- 💥 run 271: the over-match was MEASURED in run 231 and never ACTED ON ----
+    //
+    // Run 231 added the two counters above, proved the matcher fires on ordinary post-process quads,
+    // and unblocked the session by turning the whole feature off - which is why ScopeQuadPerEye has
+    // sat at 0 ever since and the scope has been drawn once across the seam. The reported "rifle
+    // still broken" is that setting, not a regression: this run's log reads
+    // "0 while AIMING, 120 while NOT aiming", 172 times.
+    //
+    // The fix was written in the comment above and never applied to the code below. A match with the
+    // aim trigger released is a false positive with no other possible reading, so requiring the
+    // trigger removes every one of them by construction rather than by tuning a shape.
+    //
+    // ⚠️ This gates the ACTION only. The shape test, the dump and both counters still run exactly as
+    // before, because run 231's note is explicit that turning the bug off must not turn off the
+    // instrument that identifies it - and the AIM counter is what will show this working.
+    //
+    // ⚠️ It also protects the four things ScopeActive() gates - the mesh latch, the laser, the ADS
+    // pull-back and the ADS mask - since g_scopeUpMs is only set inside this branch. A false match
+    // used to disable all four for 500 ms, which is run 231's "my gun was not attached to the
+    // controller".
+    if (g_scopeQuadPerEye && scopeShape && scopeAiming) {
         D3DVIEWPORT9 full{};
         if (SUCCEEDED(dev->GetViewport(&full)) && full.Width >= 4) {
             static bool said = false;
