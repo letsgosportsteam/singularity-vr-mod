@@ -11064,6 +11064,8 @@ static VidSig CaptureDrawSig(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYP
 //
 // ⚠️ SATURATION IS REPORTED. Four separate runs in this project were lost to a cap that silently
 // excluded the answer, and the file carries the list. If this one fills, it says so.
+volatile LONG g_spriteQuadDraws = 0;    // ⭐ run 262, reported per second
+volatile LONG g_spriteQuadPerEye = 1;   // ini [Render] SpriteQuadPerEye
 const int kQuadSigMax = 24;
 VidSig g_quadSig[kQuadSigMax]{};
 int    g_quadSigN = 0;
@@ -14596,6 +14598,91 @@ bool IsVideoQuad(IDirect3DDevice9* dev, UINT primCount) {
     return texW && texH && rtW && rtH && (texW != rtW || texH != rtH);
 }
 
+// ---- ⭐ run 262: the EXTENT test run 192 specified, and the remedy it named ----
+//
+// Run 192 wrote this diagnosis in full and then four runs chased a stride instead: "a muzzle-flash
+// sprite positioned by projecting a world point on the CPU is exactly that: two primitives, vertices
+// already in clip space. It would be passed through undivided, drawn once, and land wherever its NDC
+// coordinates put it - the centre of the FULL side-by-side frame. One effect, on the seam. Which is
+// the report." And: "THE MISSING TEST IS EXTENT... the fix is the one this codebase already has for
+// the Bink video quad - draw it once per eye."
+//
+// Run 260's census confirmed the shape on real data: pass-through signatures with first vertex at
+// exactly (0.000, 0.000) and 32x32/64x64/128x128 DXT textures, which are sprites, not fullscreen
+// quads. The reported popup body text is the same defect wearing different clothes - drawn once,
+// full size, straddling the seam, while the rest of the note (many glyphs, over the prim threshold)
+// comes out correctly per eye.
+//
+// ⚠️ x ONLY. DrawVideoQuadPerEye halves y as well, which is right for the letterboxed video and
+// wrong here: the two eye halves share the full vertical extent, so a sprite scaled in y would be
+// squashed. Full-frame clip x spans both eyes, so x' = 0.5x + eyeOffset lands it in one half at its
+// original height - the same mapping ApplyEyeRemap applies to tracked registers.
+//
+// ⚠️ The gate is deliberately narrow, because run 259's regression came from a broad one. A draw
+// reaches here only if the classifier ALREADY called it a pass-through quad AND its vertices do not
+// span NDC. A real fullscreen quad spans about -1..+1 and is untouched; the Bink video is handled by
+// its own path before this. `SpriteQuadPerEye=0` reverts without a rebuild.
+bool SpriteQuadNeedsSplit(const void* vtxData, UINT vtxStride, UINT nv) {
+    if (!vtxData || vtxStride < 8 || nv < 3) return false;
+    float minX = 0, maxX = 0, minY = 0, maxY = 0;
+    bool first = true;
+    for (UINT i = 0; i < nv && i < 8; ++i) {
+        const uint8_t* p = static_cast<const uint8_t*>(vtxData) + (size_t)i * vtxStride;
+        if (!Readable(p, 8)) return false;
+        const float* v = reinterpret_cast<const float*>(p);
+        if (first) { minX = maxX = v[0]; minY = maxY = v[1]; first = false; }
+        else {
+            if (v[0] < minX) minX = v[0];
+            if (v[0] > maxX) maxX = v[0];
+            if (v[1] < minY) minY = v[1];
+            if (v[1] > maxY) maxY = v[1];
+        }
+    }
+    if (first) return false;
+    // Every vertex must be inside clip space - otherwise this is world geometry that merely started
+    // near the origin, and rewriting its x would move real scene content.
+    if (minX < -1.5f || maxX > 1.5f || minY < -1.5f || maxY > 1.5f) return false;
+    // And it must NOT span the frame. A quad covering roughly -1..+1 in BOTH axes is the genuine
+    // fullscreen composite and has to keep passing through untouched.
+    return !(maxX - minX > 1.0f && maxY - minY > 1.0f);
+}
+
+// Returns false when it cannot do the job safely, and the caller then draws the quad exactly as
+// before - a sprite that is merely uncorrected beats a sprite replaced by nothing.
+bool DrawSpriteQuadPerEye(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT primCount,
+                          const void* vtxData, UINT vtxStride) {
+    UINT nv = 0;
+    switch (t) {
+        case D3DPT_TRIANGLESTRIP:
+        case D3DPT_TRIANGLEFAN:  nv = primCount + 2; break;
+        case D3DPT_TRIANGLELIST: nv = primCount * 3; break;
+        default: return false;
+    }
+    static uint8_t scratch[8 * 64];
+    if (!vtxData || vtxStride < 8 || vtxStride > 64 || nv > 8) return false;
+    if (!Readable(vtxData, (size_t)nv * vtxStride)) return false;
+    if (!SpriteQuadNeedsSplit(vtxData, vtxStride, nv)) return false;
+
+    DWORD oldScissor = FALSE;
+    dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+
+    HRESULT hr = D3D_OK;
+    for (int eye = 0; eye < 2; ++eye) {
+        memcpy(scratch, vtxData, (size_t)nv * vtxStride);
+        const float xOff = (eye == 0) ? -0.5f : +0.5f;
+        for (UINT i = 0; i < nv; ++i) {
+            float* p = reinterpret_cast<float*>(scratch + (size_t)i * vtxStride);
+            p[0] = p[0] * 0.5f + xOff;      // x only - see the note above
+        }
+        const HRESULT r = g_origDrawPrimUP(dev, t, primCount, scratch, vtxStride);
+        if (FAILED(r) && SUCCEEDED(hr)) hr = r;
+    }
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
+    InterlockedIncrement(&g_spriteQuadDraws);
+    return SUCCEEDED(hr);
+}
+
 // Returns false when it cannot do the job safely, and the caller then draws the quad exactly as
 // before - a video that is merely uncorrected beats a video replaced by nothing.
 bool DrawVideoQuadPerEye(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT primCount,
@@ -14752,6 +14839,13 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
             // Fell through: the vertex layout was not one this can rewrite. Draw it as before
             // rather than not at all.
         }
+        // ⭐ run 262: a SPRITE that was misclassified as a fullscreen quad - see DrawSpriteQuadPerEye.
+        // After the video check deliberately: the Bink quad spans NDC and would be rejected by the
+        // extent test anyway, but ordering it this way means the video path keeps its own behaviour.
+        if (Rd(g_spriteQuadPerEye) && VrModeOn() &&
+            InterlockedCompareExchange(&g_dupDraws, 0, 0) &&
+            DrawSpriteQuadPerEye(dev, t, primCount, vtxData, vtxStride))
+            return D3D_OK;
         return g_origDrawPrimUP(dev, t, primCount, vtxData, vtxStride);
     }
     NoteFirstUserPtrDraw("DrawPrimitiveUP");
@@ -14799,6 +14893,35 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
             return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                            idxData, idxFormat, vtxData, vtxStride); });
     if (quad) {
+        // ⭐ run 262: the same sprite split on the INDEXED hook. Run 260's census found the (0,0)
+        // signatures on THIS hook, not the other one, so fixing only DrawPrimUP would fix nothing.
+        // The indices are reused untouched - only the vertex x is rewritten - so a draw that indexes
+        // more vertices than the scratch buffer holds is refused and passes through as before.
+        if (Rd(g_spriteQuadPerEye) && VrModeOn() &&
+            InterlockedCompareExchange(&g_dupDraws, 0, 0) &&
+            numVertices <= 8 && vtxStride >= 8 && vtxStride <= 64 && vtxData &&
+            Readable(vtxData, (size_t)numVertices * vtxStride) &&
+            SpriteQuadNeedsSplit(vtxData, vtxStride, numVertices)) {
+            static uint8_t scratch[8 * 64];
+            DWORD oldScissor = FALSE;
+            dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &oldScissor);
+            dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+            HRESULT hr = D3D_OK;
+            for (int eye = 0; eye < 2; ++eye) {
+                memcpy(scratch, vtxData, (size_t)numVertices * vtxStride);
+                const float xOff = (eye == 0) ? -0.5f : +0.5f;
+                for (UINT i = 0; i < numVertices; ++i) {
+                    float* p = reinterpret_cast<float*>(scratch + (size_t)i * vtxStride);
+                    p[0] = p[0] * 0.5f + xOff;
+                }
+                const HRESULT r = g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices,
+                                                          primCount, idxData, idxFormat,
+                                                          scratch, vtxStride);
+                if (FAILED(r) && SUCCEEDED(hr)) hr = r;
+            }
+            dev->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissor);
+            if (SUCCEEDED(hr)) { InterlockedIncrement(&g_spriteQuadDraws); return D3D_OK; }
+        }
         return g_origDrawIndexedPrimUP(dev, t, minVtxIndex, numVertices, primCount,
                                        idxData, idxFormat, vtxData, vtxStride);
     }
@@ -19889,6 +20012,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             // ⚠ A nonzero count during ordinary play is NOT automatically the bug: any non-quad
             // user-pointer draw after a c5-c8 write counts here, and some of those are world effects
             // that belong on StereoPair. The number to watch is the CHANGE when a popup opens.
+            // ⭐ run 262: proves the split ENGAGED. "I saw no change" and "the filter never matched"
+            // are indistinguishable in a headset and mean opposite things - this file has paid for
+            // that ambiguity at least three times (runs 213a, 223, 230).
+            if (const LONG sq = InterlockedExchange(&g_spriteQuadDraws, 0))
+                Log("    sprite quads drawn PER EYE: %ld this second - these were classified as"
+                    " fullscreen pass-throughs but do not span NDC, so they used to land once across"
+                    " the seam (run 262)", sq);
+
             if (const LONG ua = InterlockedExchange(&g_uiUnarmed, 0))
                 Log("    UI draws that MISSED the one-shot arm: %ld this second (HudArmSticky=%ld,"
                     " so they %s). A jump when a popup opens is run 253's reported bug. ⚠ Some of"
@@ -21388,6 +21519,17 @@ void LoadIniSettings() {
 
     // Below this many primitives a user-pointer draw is treated as a fullscreen post-process quad
     // and passed through unsplit. See the note above Hook_DrawPrimUP.
+    // ⭐ run 262: the extent test run 192 specified, applied. 0 restores the old behaviour - every
+    // misclassified sprite back to one draw across the seam - without a rebuild.
+    InterlockedExchange(&g_spriteQuadPerEye,
+                        GetPrivateProfileIntA("Render", "SpriteQuadPerEye", 1, path) ? 1 : 0);
+    Log("ini: SpriteQuadPerEye=%ld (%s). Run 192 named this defect and its remedy and neither was"
+        " applied: a small sprite already in clip space passes UserPtrQuad's first-vertex NDC test,"
+        " is passed through undivided, and lands once across the FULL side-by-side frame. The extent"
+        " test separates it from a real fullscreen quad, which spans NDC.",
+        Rd(g_spriteQuadPerEye),
+        Rd(g_spriteQuadPerEye) ? "draw misclassified sprites once per eye"
+                               : "OFF - they land once across the seam, as before");
     // ⭐ run 260: names the draws UserPtrQuad passes through, so the popup text can be identified
     // rather than inferred. Pure logging - it changes nothing about how anything is drawn, which is
     // the point: UserPtrMinPrims=0 would answer the same question by wrecking the frame, and this
