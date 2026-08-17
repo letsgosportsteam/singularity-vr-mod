@@ -10980,10 +10980,11 @@ void FireCensusDump() {
 
 // Only called for SMALL draws - the ones that could be a quad - so the device queries below never
 // run on the hundreds of real geometry draws in a gameplay frame.
-void VidProbeRecord(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UINT primCount,
-                    const void* vtx, UINT stride) {
-    if (g_vidDumps >= kVidMaxDumps) return;
-
+// ⭐ run 260: split out of VidProbeRecord so the quad census can capture the SAME signature without a
+// second copy of the device queries. The texture size is the field that matters for both: a Bink movie
+// is 1280x720 and a UI element's atlas is not, so the number names the draw without guessing.
+static VidSig CaptureDrawSig(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UINT primCount,
+                             const void* vtx, UINT stride) {
     VidSig s{};
     s.src = src;
     s.primType = (uint32_t)t;
@@ -11008,6 +11009,62 @@ void VidProbeRecord(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UINT
         if (SUCCEEDED(rt->GetDesc(&d))) { s.rtW = d.Width; s.rtH = d.Height; }
         rt->Release();
     }
+    return s;
+}
+
+// ---- ⭐ run 260: WHICH draws are being passed through as "fullscreen quads" ----
+//
+// UserPtrQuad calls a draw a fullscreen quad when it is under 3 prims AND its first vertex is in NDC,
+// and a quad is then passed straight through - drawn ONCE across the whole side-by-side frame, with no
+// per-eye split, no HUD remap and no note inset. That is the sniper scope's original bug (run 213 gave
+// the scope a bespoke fix and left the general case), and it matches the reported popup text exactly:
+// once, large, straddling the seam.
+//
+// ⚠️ It also explains why HudArmSticky could never have fixed it: the hooks read
+// `if (hudArmed && g_hudRemap && !quad)`, so a quad-classified draw NEVER reaches HudStereoPair
+// whatever the arm flag says. Run 253's remedy was aimed at a path these draws do not take.
+//
+// This names them instead of inferring them. Distinct signatures only, so it prints a handful of lines
+// and goes quiet - then a NEW line appearing exactly when a popup opens is the draw we are after, and
+// its texture size is the handle a targeted fix needs.
+//
+// ⚠️ SATURATION IS REPORTED. Four separate runs in this project were lost to a cap that silently
+// excluded the answer, and the file carries the list. If this one fills, it says so.
+const int kQuadSigMax = 24;
+VidSig g_quadSig[kQuadSigMax]{};
+int    g_quadSigN = 0;
+bool   g_quadSigFull = false;
+volatile LONG g_quadCensus = 0;      // ini [Render] QuadCensus
+
+void QuadCensusRecord(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UINT primCount,
+                      const void* vtx, UINT stride) {
+    if (!Rd(g_quadCensus)) return;
+    const VidSig s = CaptureDrawSig(dev, src, t, primCount, vtx, stride);
+    for (int i = 0; i < g_quadSigN; ++i) {
+        VidSig& e = g_quadSig[i];
+        if (e.src == s.src && e.primType == s.primType && e.primCount == s.primCount &&
+            e.stride == s.stride && e.texW == s.texW && e.texH == s.texH &&
+            e.texFmt == s.texFmt) { ++e.count; return; }
+    }
+    if (g_quadSigN < kQuadSigMax) {
+        VidSig n = s; n.count = 1; g_quadSig[g_quadSigN++] = n;
+        Log("QUAD CENSUS: new pass-through signature #%d - src %s, %u prim(s), stride %u,"
+            " texture %ux%u fmt %u, first vertex (%.3f, %.3f), target %ux%u. This draw is NOT split"
+            " per eye and NOT HUD-remapped - it lands once across the whole frame. (run 260)",
+            g_quadSigN, n.src == 2 ? "DrawPrimUP" : "DrawIndexedPrimUP", n.primCount, n.stride,
+            n.texW, n.texH, n.texFmt, n.v0x, n.v0y, n.rtW, n.rtH);
+    } else if (!g_quadSigFull) {
+        g_quadSigFull = true;
+        Log("*** QUAD CENSUS is FULL at %d signatures - further distinct draws are NOT being"
+            " recorded. Raise kQuadSigMax. ***", kQuadSigMax);
+    }
+}
+
+void VidProbeRecord(IDirect3DDevice9* dev, uint8_t src, D3DPRIMITIVETYPE t, UINT primCount,
+                    const void* vtx, UINT stride) {
+    if (g_vidDumps >= kVidMaxDumps) return;
+
+    VidSig s = CaptureDrawSig(dev, src, t, primCount, vtx, stride);
 
     for (int i = 0; i < g_vidSigN; ++i) {
         VidSig& e = g_vidSig[i];
@@ -14624,6 +14681,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(2, t, primCount, vtxStride, vtxData, quad, 0);
+    if (quad) QuadCensusRecord(dev, 2, t, primCount, vtxData, vtxStride);   // ⭐ run 260
     if (g_flashProbeLeft > 0) {
         LONG lo, hi; TakeDrawWriteMask(&lo, &hi);
         if (vtxStride == kFlashStride) FlashRegDump(dev, lo, hi, primCount, vtxStride);
@@ -14682,6 +14740,7 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(3, t, primCount, vtxStride, vtxData, quad, numVertices);
+    if (quad) QuadCensusRecord(dev, 3, t, primCount, vtxData, vtxStride);   // ⭐ run 260
     // ⭐ Run 192 found shot geometry on THIS hook at stride 72.
     if (g_flashProbeLeft > 0) {
         LONG lo, hi; TakeDrawWriteMask(&lo, &hi);
@@ -21284,6 +21343,18 @@ void LoadIniSettings() {
 
     // Below this many primitives a user-pointer draw is treated as a fullscreen post-process quad
     // and passed through unsplit. See the note above Hook_DrawPrimUP.
+    // ⭐ run 260: names the draws UserPtrQuad passes through, so the popup text can be identified
+    // rather than inferred. Pure logging - it changes nothing about how anything is drawn, which is
+    // the point: UserPtrMinPrims=0 would answer the same question by wrecking the frame, and this
+    // file already records that a test which destroys its own readability is a wasted run.
+    InterlockedExchange(&g_quadCensus,
+                        GetPrivateProfileIntA("Render", "QuadCensus", 0, path) ? 1 : 0);
+    Log("ini: QuadCensus=%ld (%s). Run 260: a draw under UserPtrMinPrims prims whose first vertex is"
+        " in NDC is passed through UNSPLIT - once across the whole frame, no HUD remap, no note"
+        " inset. That is the sniper scope's original bug and the suspected popup-text bug.",
+        Rd(g_quadCensus),
+        Rd(g_quadCensus) ? "log each distinct pass-through signature once"
+                         : "off");
     g_userPtrMinPrims = GetPrivateProfileIntA("Render", "UserPtrMinPrims", 3, path);
     if (g_userPtrMinPrims < 0 || g_userPtrMinPrims > 1000) g_userPtrMinPrims = 3;
     Log("ini: UserPtrMinPrims=%d (user-pointer draws with fewer primitives pass through unsplit"
