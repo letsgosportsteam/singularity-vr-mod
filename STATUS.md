@@ -158,6 +158,24 @@ claim was measured wrong once, was still in a comment *and in a log line*, and g
 run-258 comment before being corrected. **Classes vary and can also be shared; the object pointer is
 the only key with neither failure mode.**
 
+### ⚠️ SHIPPED, NOT YET FLOWN (run 272) — cutscenes force DRAW ALL, gameplay keeps its setting
+
+`OcclusionCutsceneDrawAll=1` (default). While `g_inCinematic` is set, `OverrideOcclusion()` reports
+every query visible; the configured `OcclusionQueryMode` resumes the instant it clears.
+
+**Why this is the right trade rather than a preference.** Mode 2's recorded residual risk is
+*geometry winking out at distance or screen edges*. During gameplay that is a glance away from being
+missed; during a cutscene it is the thing you are being made to look at. And the ~2× draw count
+(1500–1693 vs 737–943 per frame) is paid while the camera is on rails and nobody is fighting.
+
+⚠️ **The premise was re-tested first** — see item C. Had the old "the exit never arrives" note been
+true, this would have latched `DRAW ALL` on for the rest of the level.
+
+**Verify on the edge, not by looking:** `occlusion: cutscene STARTED -> forcing DRAW ALL` and
+`... ENDED -> back to the configured mode`. **The false pass is a cutscene that never fires
+`SetCinematicMode`** — a scripted in-engine sequence that is not flagged cinematic would show no
+line at all, and "no line" means the override never ran, not that it failed.
+
 ### ✅ FIXED and VERIFIED (run 271) — the sniper scope was OFF BY CONFIGURATION, since run 231
 
 Reported as *"the rifle is still broken"*. It was not a regression: **`ScopeQuadPerEye=0`** had been
@@ -413,9 +431,18 @@ missing case reads as a row that works.**
 `YawDelta()` exists now. The one at the FRotator write path carries the same false
 `int32 wrap is correct` comment and is the first to check.
 
-**C. ⚠️ PARTLY FIXED (run 211) — `g_inCinematic` latched ON permanently.** `SetCinematicMode` is
+**C. ✅ RESOLVED — and the "exit never arrives" claim below is STALE (measured 2026-08-17).**
+`SetCinematicMode` **does** report the exit now: **92 × `arg raw 0x00000001 -> CINE ON` against
+88 × `arg raw 0x00000000 -> CINE OFF`** across one session's logs — a near-balance is exactly what
+enter/exit pairs look like — and every `view drift` line reads `cine off`, zero `cine ON`. The flag
+is a usable per-cutscene signal, and run 272 builds the occlusion override on it.
+
+⚠️ **Re-test a premise before building on it.** This note said the signal was one-way, which would
+have latched `DRAW ALL` on for a whole level. Checking cost one grep. The historical text follows.
+
+**C(historical). ⚠️ PARTLY FIXED (run 211) — `g_inCinematic` latched ON permanently.** `SetCinematicMode` was
 only ever *observed* with `arg raw 0x00000001`: the run-95 script hook sees native→script entry
-points and the cutscene **exit is not one of them**, so a `0` never arrives. Everything gated on
+points and the cutscene **exit was not one of them**, so a `0` never arrived. Everything gated on
 the flag then leaked out of cutscenes, which is why the two cutscene comfort settings were seen
 affecting normal gameplay. Both settings gate on it *correctly*; the flag was the bug.
 
