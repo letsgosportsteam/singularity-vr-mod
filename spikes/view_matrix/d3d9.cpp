@@ -13061,6 +13061,23 @@ static UINT ArmsMeshNow() {
     return (UINT)best;
 }
 
+// ⭐ run 268: every draw offered to the continuation rule, whether or not a panel was recognised.
+// The popup case reaches here with noteOpen FALSE, so this is the only line that can name the strides
+// the popup's spilled text arrives on. Distinct (stride, noteOpen) pairs only.
+void NoteOfferLog(UINT stride, LONG noteOpen) {
+    static LONG seen[24][2]{}; static int n = 0; static bool full = false;
+    for (int i = 0; i < n; ++i)
+        if (seen[i][0] == (LONG)stride && seen[i][1] == noteOpen) return;
+    if (n >= 24) {
+        if (!full) { full = true; Log("*** offer census FULL at 24 - not logging further. ***"); }
+        return;
+    }
+    seen[n][0] = (LONG)stride; seen[n][1] = noteOpen; ++n;
+    Log("UI continuation OFFERED: stride %u, panel recognised %ld. These are the draws that missed"
+        " the one-shot arm - the popup's spilled text is among them, and the stride is the handle."
+        " (run 268)", stride, noteOpen);
+}
+
 // ⭐ run 267: a draw offered to the continuation rule WHILE A NOTE IS OPEN and turned away. If the
 // popup text is still wrong, this is the line that says why: it prints the stride and texture that
 // did not match the anchor, so "the rule never fired" and "the rule fired on the wrong thing" stop
@@ -14956,6 +14973,12 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     // texture, and a note must be open. See g_noteTextStride - world geometry cannot start a chain
     // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
+    // ⭐ run 268: log EVERY offered draw, gate or no gate. Reported: in the runs where geometry was
+    // broken the POP-UP MENUS were fixed - so the continuation draws are real and capturing them
+    // works; only the gate is wrong, because NoteMarker recognises NOTES and a popup is not one.
+    // With the gate false for popups, neither the match nor the rejection below fires, so this run
+    // would have gone quiet on exactly the case being tested. Distinct strides only.
+    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0) NoteOfferLog(vtxStride, Rd(g_noteOpen));
     if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
         Rd(g_noteOpen) && Rd(g_noteTextStride) != 0) {
         // ⭐ run 267: STRIDE, not stride+texture. The texture check rejected the continuation and
@@ -15041,6 +15064,12 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     // texture, and a note must be open. See g_noteTextStride - world geometry cannot start a chain
     // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
+    // ⭐ run 268: log EVERY offered draw, gate or no gate. Reported: in the runs where geometry was
+    // broken the POP-UP MENUS were fixed - so the continuation draws are real and capturing them
+    // works; only the gate is wrong, because NoteMarker recognises NOTES and a popup is not one.
+    // With the gate false for popups, neither the match nor the rejection below fires, so this run
+    // would have gone quiet on exactly the case being tested. Distinct strides only.
+    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0) NoteOfferLog(vtxStride, Rd(g_noteOpen));
     if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
         Rd(g_noteOpen) && Rd(g_noteTextStride) != 0) {
         // ⭐ run 267: STRIDE, not stride+texture. The texture check rejected the continuation and
