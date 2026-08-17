@@ -1,6 +1,7 @@
 # STATUS — session handoff
 
-Last updated **2026-08-08** (defaults audit). Read this first, then `ENGINE_NOTES.md`.
+Last updated **2026-08-16** (runs 249–271: panel, splash regression, weapon swap, popup text, scope).
+Read this first, then `ENGINE_NOTES.md`.
 
 **This file is current state only.** The run-by-run log moved to `HISTORY.md` on 2026-08-04 — you
 do not need it cold, but go there before building on any premise you inherited.
@@ -157,27 +158,71 @@ claim was measured wrong once, was still in a comment *and in a log line*, and g
 run-258 comment before being corrected. **Classes vary and can also be shared; the object pointer is
 the only key with neither failure mode.**
 
-### ⛔ REJECTED (run 259) — `HudArmSticky=1` breaks world geometry. Keep it 0.
+### ✅ FIXED and VERIFIED (run 271) — the sniper scope was OFF BY CONFIGURATION, since run 231
 
-**Confirmed resolved by the revert** — geometry is correct again on `OcclusionQueryMode=2`.
+Reported as *"the rifle is still broken"*. It was not a regression: **`ScopeQuadPerEye=0`** had been
+in the ini since run 231, and that key's own comment states the cost — *"the sniper scope goes back
+to being drawn once across the whole frame."*
 
-Reported as *"a lot of geometry being culled out — DRAW ALL was fine but ENGINE CULL had a lot
-missing, and this setting used to work fine."* **It was not the occlusion setting.** With sticky on,
-**1284–2538 draws per second** were taken onto the HUD path and `HUD remap SKIPPED` — the
-non-orthographic guard — fired **zero** times. Those draws have an orthographic-looking `c5`–`c8`,
-pass every guard, and get squashed in clip space as if they were UI.
+**Why it was turned off, and the fix.** The matcher is a pure **shape** test — prim type, prim count,
+`dupDraws`, `rtIsScene` — with **no aim gate**, so it fires on ordinary post-process quads:
+`scope quad matches: 0 while AIMING, 120 while NOT aiming`, 172 times in one run. Every false match
+sets `g_scopeUpMs`, and `ScopeActive()` gates **four** things — the mesh latch, the laser, the ADS
+pull-back and the ADS mask — which is run 231's *"my gun was not attached to the controller"*.
 
-⚠️ **The measurement was right and the inference from it was wrong.** "1122–3019 UI draws/sec are
-missing the arm" is a real number; reading it as "that many *UI* draws are being lost" was the error
-— and the counter's own text warned that some are world draws. A frame-long arm captures every
-non-quad user-pointer draw following *any* `c5`–`c8` write, not the ones sharing the note's transform.
+⭐ **The fix was already written as a comment directly above the code that ignored it:** *"the real
+scope quad can only be drawn while you are AIMING. A match with the aim trigger released is a false
+positive with no other possible reading."* The trigger was read, counted, and never used as the gate.
+It is now, and `ScopeQuadPerEye` is back to **1**.
 
-⚠️ **Content-matching `c5`–`c8` will NOT fix it** — these draws never wrote those registers (that is
-why `hudFresh` was false), so the values still match. The discriminator has to be something the
-**draw** carries, not something the register does. The popup bug at run 253 is therefore still open.
+⚠️ **The ACTION is gated, not the shape test** — the dump and both counters still run, because run
+231's note is explicit that turning the bug off must not turn off the instrument that identifies it.
+**Verification is `0 while AIMING, 0 while NOT aiming` in ordinary play**, with a non-zero AIMING
+count only while scoped.
 
-**The run-249 → 253 diagnosis stands**: the arm flag is consumed by the first user-pointer draw, and
-later draws sharing one UI transform miss the HUD path. Only the *remedy* was wrong.
+⛔ **`SpriteQuadPerEye` is REJECTED and defaults 0.** Shipped in run 262 on run 192's extent theory;
+its own counter proved it engaged on 104 draws/sec and the artefact it targeted did not change. It
+also splits the scope overlay (a centred quad that does not span NDC) while doing **none** of the
+other two things run 213 proved are required — `c1 ScreenPositionScaleBias` and the halved aspect.
+⚠️ It was wrongly blamed for the rifle first; disabling it did **not** restore the scope.
+
+### ✅ FIXED and VERIFIED (runs 253–269) — popup/note text drawn once across the seam
+
+**`HudArmSticky=1`.** Long popup and note body text now lands correctly in both eyes.
+
+**The bug.** `g_hudConstsWritten` is consumed by the **first** user-pointer draw after a `c5`–`c8`
+write, but one UI transform serves a whole batch. A glyph run that **fits in one draw** was armed and
+correct; one that **spilled into two** had its remainder go to `StereoPair` unremapped — drawn at
+full-frame coordinates, each eye's scissor keeping half. It also missed the note inset, so the stray
+text was *larger*. Both symptoms, one flag.
+
+⭐ **The reported length dependence is what solved it** — *"if the menu text is short we get the whole
+thing; if it's longer it looks like this."* A length threshold is a **batch boundary**, not a
+transform difference, which is why every transform-keyed remedy missed.
+
+**Two changes make it work, and the second is what four earlier attempts lacked:**
+
+- The continuation must match the **stride** of the draw that consumed the arm.
+- **The arm is narrowed by SHAPE**: `startReg >= 4 && startReg + count <= 16`. Measured — it **arms**
+  on writes of 1, 3, 4, 6, 9 vec4s at `c5`/`c8` (targeted UI transforms) and **rejects** 18, 24, 33,
+  45, 54, 57, 63, 69, 90, 105, 108, 183, 210, 219 (bulk scene uploads).
+
+⚠️ **That is the whole story of the four failures.** Run 149 recorded that scene uploads overlap
+`c5`–`c8`; nobody followed it through. The arm was never a UI signal, so extending it captured world
+geometry, which got squashed in clip space and read as *"a lot of geometry culled out — DRAW ALL is
+fine, ENGINE CULL has a lot missing."* **The occlusion setting was never involved.** The one-shot
+limit had been containing the damage, not preventing it.
+
+⚠️ **Rejected remedies, so they are not retried:** a frame-long arm (captures world draws);
+content-matching `c5`–`c8` (those draws never wrote the registers, so the values still match);
+matching the **texture** (a long run spills *because* it needs a second glyph atlas page, so the
+continuation carries a different texture by construction); anchoring on `NoteMarker` (it recognises
+**notes**, and a pop-up menu is not one — `note elements inset: 0` while a popup is on screen means
+the detector did not recognise it, **not** that no popup was open).
+
+**A latent stereo bug fell out of this and is fixed independently:** `HudStereoPair`'s four rejection
+paths all did `return draw()` — one draw, **no stereo split at all**. A draw that turns out not to be
+insettable UI is not exempt from stereo; they now fall back to `StereoPair`.
 
 ### ✅ FIXED and VERIFIED (runs 252–257) — the splash regression was a failing `GObjects` walk
 

@@ -24,6 +24,61 @@ SUPERSEDED banner above your hit, and check the run number, before you act on it
 
 ---
 
+## ⭐ Runs 260-271: the popup text, seven remedies, and two bugs that were already written down
+
+The popup body text drew once across the seam, full size, while the rest of the note came out right.
+Seven attempts. The diagnosis at run 253 was correct from the start and every remedy after it was
+wrong, which is the part worth keeping.
+
+**What it was.** `g_hudConstsWritten` is consumed by the FIRST user-pointer draw after a `c5`-`c8`
+write, and one UI transform serves a whole batch. Text that fits in one draw is armed and correct;
+text that spills into two loses its remainder to `StereoPair`, unremapped, at full-frame coordinates,
+with each eye's scissor keeping half. It misses the note inset too, so the stray text is also larger.
+
+⭐ **The wearer's own observation is what cracked it** - *"if the menu text is short we get the whole
+thing; if it's longer it looks like this."* A length threshold is a BATCH BOUNDARY, not a transform
+difference. Every remedy up to that point had been keyed on transforms.
+
+**The remedies that failed, and why they are recorded rather than deleted:**
+
+| attempt | why it failed |
+|---|---|
+| frame-long arm (259, 264) | captured world geometry - read as "geometry culled out" |
+| content-match `c5`-`c8` | those draws never wrote the registers, so the values still match |
+| match the TEXTURE | a run spills BECAUSE it needs a second atlas page - different texture by construction |
+| anchor on `NoteMarker` | it recognises NOTES; a pop-up menu is not one |
+| `SpriteQuadPerEye` (262) | engaged on 104 draws/sec and changed nothing; broke the scope |
+| `StereoPair` fallback (263) | fixed a branch the log already showed was never entered |
+
+**What finally worked** is the stride of the arming draw, plus narrowing the ARM ITSELF by shape.
+Measured: it arms on 1, 3, 4, 6, 9 vec4s at `c5`/`c8` and rejects 18 through 219. Run 149 had
+recorded that scene uploads overlap that block; nobody followed it through, so the arm was never a UI
+signal and the one-shot limit had been containing the damage rather than preventing it.
+
+**And the rifle was never a regression.** `ScopeQuadPerEye=0` had been in the ini since run 231, and
+the key's own comment states the cost. The matcher fires on ordinary post-process quads - `0 while
+AIMING, 120 while NOT aiming`, 172 times - and the fix was sitting as a comment directly above the
+code that ignored it: *"the real scope quad can only be drawn while you are AIMING."* The trigger was
+read, counted, and never used as the gate.
+
+**Method notes.**
+- ⛔ **The answer was in the file three times.** Run 192 wrote the extent diagnosis AND named its
+  remedy; run 149 recorded that scene uploads span `c5`-`c8`; run 231 measured the scope over-match
+  and left the fix in a comment. Each was found only after a remedy built on a guess had failed.
+- ⛔ **I printed a caveat every second and argued past it.** The counter read *"some of these are
+  world draws and belong where they went - watch the CHANGE, not the absolute"* in my own text, and I
+  read the absolute as the bug anyway. **Writing a warning is not heeding it.**
+- ⛔ **A zero is a reading, and I misread the same one twice.** `note elements inset: 0` with a popup
+  on screen means the DETECTOR DID NOT RECOGNISE IT, not that no popup was opened.
+- ⭐ **"Stop classifying, start following."** At the D3D9 level there is no such thing as UI - every
+  signal (register write, transform shape, texture, primitive count) is shared with world rendering,
+  so each proxy has its own false positives. Asking "is this draw UI?" from ambient state produced
+  four different wrong answers. Anchoring on something positively identified and following the batch
+  is what worked.
+- ⚠️ **A probe that cannot parse its input must not print a verdict.** The run-261 bounds census
+  reported `x[-1.000..1047768376515762788371177406464]` and `y[-17.503..0.000]` because it assumed
+  every vertex layout begins with two floats.
+
 ## ⭐ Runs 258-259: the swap drop lands, and my own warning label was the thing I ignored
 
 **258 — the mesh latch drops on the swap.** Asked directly whether "something checks every two
