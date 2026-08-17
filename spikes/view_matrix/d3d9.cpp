@@ -9381,9 +9381,48 @@ HRESULT STDMETHODCALLTYPE Hook_SetVSConstF(IDirect3DDevice9* dev, UINT startReg,
     // a 4-vector minimum would filter out exactly the writes being looked for.
     // The UI marker. Cheap enough for the hot path - a range test and a store - and deliberately
     // not gated on the probe, because it now drives the feature rather than a diagnostic.
+    // ---- 💥 run 265: this marker was never a UI signal, and the one-shot limit was hiding it ----
+    //
+    // The condition below arms on ANY write overlapping c5-c8. Run 149 already recorded that scene
+    // constant uploads overlap that range - it is why the quad classifier had to run first - but the
+    // consequence was never followed through: during world rendering a scene upload arms the marker,
+    // the next WORLD draw is treated as UI, and with run 264's continuation rule every later world
+    // draw sharing its texture is captured too. Measured: captured == offered, exactly, at 999, 1617,
+    // 2349 and 2185 draws per second. The rule was faithfully extending an arm that should never have
+    // been set.
+    //
+    // A UI transform is written as a TARGETED 4x4 into this block. A scene upload is a bulk write
+    // that happens to span it. Requiring the write to sit inside a small window around c5-c8
+    // separates them by shape rather than by overlap.
+    //
+    // ⚠️ MEASURED, not assumed: every distinct (startReg, count) that touches this block is logged
+    // once with the verdict, so if UI and scene writes are NOT separable this way the log says so
+    // instead of the geometry saying it.
     if (!g_inHudRemap && startReg <= 8 && startReg + vec4Count > 5) {
-        InterlockedExchange(&g_hudConstsWritten, 1);
-        InterlockedExchange(&g_hudXformLive, 1);   // ⭐ run 253: survives the first draw; cleared per frame
+        const bool targeted = startReg >= 4 && (startReg + vec4Count) <= 16;
+        {
+            static LONG seen[24][2]{}; static int nSeen = 0; static bool full = false;
+            bool known = false;
+            for (int i = 0; i < nSeen; ++i)
+                if (seen[i][0] == (LONG)startReg && seen[i][1] == (LONG)vec4Count) { known = true; break; }
+            if (!known) {
+                if (nSeen < 24) {
+                    seen[nSeen][0] = (LONG)startReg; seen[nSeen][1] = (LONG)vec4Count; ++nSeen;
+                    Log("UI ARM census: a write of %u vec4(s) starting at c%u touches c5-c8 -> %s."
+                        " A targeted 4x4 is the UI transform; a bulk upload that merely spans the"
+                        " block is the scene's. (run 265)",
+                        vec4Count, startReg,
+                        targeted ? "ARMS the UI marker" : "REJECTED, too broad to be a UI transform");
+                } else if (!full) {
+                    full = true;
+                    Log("*** UI ARM census is FULL at 24 shapes - further ones are NOT logged. ***");
+                }
+            }
+        }
+        if (targeted) {
+            InterlockedExchange(&g_hudConstsWritten, 1);
+            InterlockedExchange(&g_hudXformLive, 1);   // ⭐ run 253: survives the first draw; cleared per frame
+        }
     }
 
     if (g_upXformDump > 0 && startReg < 32) {
