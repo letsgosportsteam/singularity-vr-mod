@@ -13061,6 +13061,25 @@ static UINT ArmsMeshNow() {
     return (UINT)best;
 }
 
+// ⭐ run 267: a draw offered to the continuation rule WHILE A NOTE IS OPEN and turned away. If the
+// popup text is still wrong, this is the line that says why: it prints the stride and texture that
+// did not match the anchor, so "the rule never fired" and "the rule fired on the wrong thing" stop
+// being indistinguishable. Distinct combinations only, so it cannot flood a note that stays up.
+void NoteMissLog(UINT stride, LONG tex) {
+    static LONG seen[16][2]{}; static int n = 0; static bool full = false;
+    for (int i = 0; i < n; ++i)
+        if (seen[i][0] == (LONG)stride && seen[i][1] == tex) return;
+    if (n >= 16) {
+        if (!full) { full = true; Log("*** note-miss census FULL at 16 - not logging further. ***"); }
+        return;
+    }
+    seen[n][0] = (LONG)stride; seen[n][1] = tex; ++n;
+    Log("note continuation REJECTED: stride %u, texture 0x%08lX - a note is open but the anchor is"
+        " stride %ld / texture 0x%08lX. If the popup text is still split, one of these strides is"
+        " the missing draw. (run 267)",
+        stride, (unsigned long)tex, Rd(g_noteTextStride), (unsigned long)Rd(g_noteTextTex));
+}
+
 // ⭐ run 264: the texture bound to stage 0, as a comparable value. GetTexture AddRefs, so it is
 // released immediately - the pointer is used only as an identity, never dereferenced.
 static LONG BoundTexId(IDirect3DDevice9* dev) {
@@ -14938,11 +14957,20 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
     if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
-        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0 &&
-        (LONG)vtxStride == Rd(g_noteTextStride) &&
-        BoundTexId(dev) == Rd(g_noteTextTex)) {
-        hudArmed = true;
-        InterlockedIncrement(&g_hudArmTook);
+        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0) {
+        // ⭐ run 267: STRIDE, not stride+texture. The texture check rejected the continuation and
+        // the likely reason is the reason the batch splits at all - a long run spills onto a second
+        // glyph atlas page, so the second draw carries a DIFFERENT texture by construction. Keying
+        // on the thing that splits is self-defeating.
+        //
+        // Still anchored and still bounded: a note must be open, and the stride must match an
+        // element the inset actually scaled. Outside a note this cannot fire at all.
+        if ((LONG)vtxStride == Rd(g_noteTextStride)) {
+            hudArmed = true;
+            InterlockedIncrement(&g_hudArmTook);
+        } else {
+            NoteMissLog(vtxStride, BoundTexId(dev));
+        }
     }
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
@@ -15014,11 +15042,20 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
     if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
-        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0 &&
-        (LONG)vtxStride == Rd(g_noteTextStride) &&
-        BoundTexId(dev) == Rd(g_noteTextTex)) {
-        hudArmed = true;
-        InterlockedIncrement(&g_hudArmTook);
+        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0) {
+        // ⭐ run 267: STRIDE, not stride+texture. The texture check rejected the continuation and
+        // the likely reason is the reason the batch splits at all - a long run spills onto a second
+        // glyph atlas page, so the second draw carries a DIFFERENT texture by construction. Keying
+        // on the thing that splits is self-defeating.
+        //
+        // Still anchored and still bounded: a note must be open, and the stride must match an
+        // element the inset actually scaled. Outside a note this cannot fire at all.
+        if ((LONG)vtxStride == Rd(g_noteTextStride)) {
+            hudArmed = true;
+            InterlockedIncrement(&g_hudArmTook);
+        } else {
+            NoteMissLog(vtxStride, BoundTexId(dev));
+        }
     }
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
