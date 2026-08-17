@@ -3006,6 +3006,27 @@ volatile LONG g_noteInsetPct   = 40;   // ini [Render] NoteInsetPct, and a DISPL
 volatile LONG g_noteSeenFrame  = 0;    // a note marker was drawn THIS frame
 volatile LONG g_noteOpen       = 0;    // ...was drawn LAST frame - what the inset actually reads
 volatile LONG g_noteInsetDraws = 0;    // elements actually scaled, reported per second
+// ---- ⭐ run 266: STOP CLASSIFYING, START FOLLOWING ----
+//
+// Asked directly: "we can already identify the text - is there no way to say, once we identify text
+// we are duplicating, check whether there is more text?" That is the right question and it undoes
+// four failed attempts.
+//
+// At the D3D9 level there is no such thing as UI. Every signal reached for so far - a c5-c8 write, an
+// orthographic transform, a bound texture, a primitive count - is SHARED with world rendering, so
+// each is a proxy with its own false positives, and each attempt found a new one: run 259 and 264
+// captured world geometry, run 262 split the wrong draws, run 263 fixed a branch nothing entered.
+//
+// Anchoring inverts it. A note element is positively identified ALREADY, by NoteMarker, which run 230
+// validated at 3 note batches matched and 0 of the other 34 across 888 elements. So: record the
+// stride and texture of a draw CONFIRMED to be a note element, and extend the arm only to draws
+// matching that pair, only while a note is open. World geometry can never start the chain, because
+// world geometry is never a note element.
+//
+// ⚠️ Outside a note this is completely inert, which is the point - the geometry loss was in ordinary
+// gameplay, where there is no note and this rule now does nothing at all.
+volatile LONG g_noteTextStride = 0;    // stride of a confirmed note element
+volatile LONG g_noteTextTex    = 0;    // and the texture it was drawn with
 
 // Validated against every element the run-230 census captured: 3 note batches matched, 0 of the
 // other 34 did, over 888 elements. Tolerances are wide enough to survive small layout drift and
@@ -14570,6 +14591,11 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
             Reg4* q = reinterpret_cast<Reg4*>(cIn);
             for (int i = 0; i < 4; ++i) { q[i].x *= k; q[i].y *= k; }
             InterlockedIncrement(&g_noteInsetDraws);
+            // ⭐ run 266: THE ANCHOR. This draw is a confirmed note element - a note is open and it
+            // sits inside the panel - so its stride and texture identify the rest of its batch. The
+            // continuation that spills past the first draw carries both.
+            InterlockedExchange(&g_noteTextStride, (LONG)stride);
+            InterlockedExchange(&g_noteTextTex, BoundTexId(dev));
         }
     }
 
@@ -14907,12 +14933,17 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     // whatever HudArmSticky says, so the default build MEASURES the size of the problem.
     const bool hudSticky = !hudFresh && !quad && Rd(g_hudXformLive) != 0;
     if (hudSticky) InterlockedIncrement(&g_uiUnarmed);
-    // ⭐ run 264: the continuation must carry the SAME TEXTURE as the draw that armed. See g_hudArmTex.
+    // ⭐ run 266: ANCHORED. The continuation must match a CONFIRMED note element's stride and
+    // texture, and a note must be open. See g_noteTextStride - world geometry cannot start a chain
+    // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
-    if (hudFresh) InterlockedExchange(&g_hudArmTex, BoundTexId(dev));
-    else if (hudSticky && Rd(g_hudArmSticky) != 0)
-        { hudArmed = Rd(g_hudArmTex) != 0 && BoundTexId(dev) == Rd(g_hudArmTex);
-          if (hudArmed) InterlockedIncrement(&g_hudArmTook); }
+    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
+        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0 &&
+        (LONG)vtxStride == Rd(g_noteTextStride) &&
+        BoundTexId(dev) == Rd(g_noteTextTex)) {
+        hudArmed = true;
+        InterlockedIncrement(&g_hudArmTook);
+    }
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(2, t, primCount, vtxStride, vtxData, quad, 0);
@@ -14978,13 +15009,17 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     // body text arrives on this one, and applying it to only one would fix half a note.
     const bool hudSticky = !hudFresh && !quad && Rd(g_hudXformLive) != 0;
     if (hudSticky) InterlockedIncrement(&g_uiUnarmed);
-    // ⭐ run 264: same-texture rule, shared with the other hook. A text batch that spills across both
-    // hooks still matches, because the atlas is the same whichever hook issues the glyphs.
+    // ⭐ run 266: ANCHORED. The continuation must match a CONFIRMED note element's stride and
+    // texture, and a note must be open. See g_noteTextStride - world geometry cannot start a chain
+    // because world geometry is never a note element, and outside a note this is entirely inert.
     bool hudArmed = hudFresh;
-    if (hudFresh) InterlockedExchange(&g_hudArmTex, BoundTexId(dev));
-    else if (hudSticky && Rd(g_hudArmSticky) != 0)
-        { hudArmed = Rd(g_hudArmTex) != 0 && BoundTexId(dev) == Rd(g_hudArmTex);
-          if (hudArmed) InterlockedIncrement(&g_hudArmTook); }
+    if (!hudFresh && hudSticky && Rd(g_hudArmSticky) != 0 &&
+        Rd(g_noteOpen) && Rd(g_noteTextStride) != 0 &&
+        (LONG)vtxStride == Rd(g_noteTextStride) &&
+        BoundTexId(dev) == Rd(g_noteTextTex)) {
+        hudArmed = true;
+        InterlockedIncrement(&g_hudArmTook);
+    }
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(3, t, primCount, vtxStride, vtxData, quad, numVertices);
@@ -21204,6 +21239,12 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
             InterlockedExchange(&g_fgDrawCount, 0);
             // ⭐ run 230: this frame's sighting becomes next frame's state, then clears.
             InterlockedExchange(&g_noteOpen, InterlockedExchange(&g_noteSeenFrame, 0));
+            // ⭐ run 266: the anchor dies with the note. Leaving a stride/texture behind would let a
+            // world draw match it later, which is the whole class of bug this replaces.
+            if (!Rd(g_noteOpen)) {
+                InterlockedExchange(&g_noteTextStride, 0);
+                InterlockedExchange(&g_noteTextTex, 0);
+            }
             InterlockedExchange(&g_uiElemsThisFrame, 0);   // ⭐ run 230
             // ⭐ run 253: the UI transform does not survive a frame boundary. Per-frame is the
             // conservative choice - within one frame the game writes it once and draws several
