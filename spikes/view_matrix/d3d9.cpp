@@ -13001,6 +13001,17 @@ static UINT ArmsMeshNow() {
     return (UINT)best;
 }
 
+// ⭐ run 264: the texture bound to stage 0, as a comparable value. GetTexture AddRefs, so it is
+// released immediately - the pointer is used only as an identity, never dereferenced.
+static LONG BoundTexId(IDirect3DDevice9* dev) {
+    LONG id = 0;
+    if (IDirect3DBaseTexture9* bt = nullptr; SUCCEEDED(dev->GetTexture(0, &bt)) && bt) {
+        id = (LONG)(uintptr_t)bt;
+        bt->Release();
+    }
+    return id;
+}
+
 // Cheap "is any slot actually pointed at this mesh" test, so an ordinary draw pays a handful of reads
 // rather than a solve. Every draw in the first-person pass runs this.
 static bool TmdTriSlotApplies(UINT numVertices) {
@@ -14073,6 +14084,27 @@ volatile LONG g_uiElemsThisFrame = 0;   // reached the census - these are the in
 volatile LONG g_hudXformLive = 0;   // a UI transform was written this frame and is still in force
 volatile LONG g_uiUnarmed    = 0;   // non-quad user-ptr draws that missed the one-shot arm
 volatile LONG g_hudArmSticky = 0;   // ini [Render] HudArmSticky
+// ---- 💥 run 264: the broad arm was flown TWICE and broke geometry both times ----
+//
+// Run 259 and again now. The mechanism, which I had the data for and did not use: the sticky arm
+// routed 1284-2538 draws/sec into HudStereoPair and `HUD remap SKIPPED` fired **ZERO** times against
+// them. Zero rejections means those world draws PASSED every guard - orthographic-looking c5-c8,
+// scene target - and were squashed in clip space as if they were UI. Run 263 then fixed the
+// REJECTION path, which nothing was taking. A fix aimed at a branch the log says is never entered
+// cannot change anything, and the log said so before it was written.
+//
+// So "any non-quad draw while a UI transform is live" is not a workable rule and no amount of
+// widening or narrowing that phrasing will make it one. The continuation has to be tied to the draw
+// that armed it, and the tie used here is the TEXTURE: a run of glyphs is one text batch sharing one
+// font atlas, so a second draw carrying the same texture is the rest of that batch. A world draw
+// following a UI write has its own texture and is left alone.
+//
+// ⭐ The reported evidence this is built on: "if the menu text is short we get the whole thing; if
+// it is longer it looks like this" - a batch that fits in one draw is armed and correct, a batch that
+// spills into two has its remainder unarmed. That is a length threshold, which is a BATCH boundary,
+// not a transform difference.
+volatile LONG g_hudArmTex = 0;      // texture bound at the draw that consumed the arm
+volatile LONG g_hudArmTook = 0;     // continuations the same-texture rule captured, per second
 int g_uiLastDumpedCount = -1;
 
 // ---- ⭐ run 153: the crosshair, identified by measurement ----
@@ -14836,7 +14868,12 @@ HRESULT STDMETHODCALLTYPE Hook_DrawPrimUP(IDirect3DDevice9* dev, D3DPRIMITIVETYP
     // whatever HudArmSticky says, so the default build MEASURES the size of the problem.
     const bool hudSticky = !hudFresh && !quad && Rd(g_hudXformLive) != 0;
     if (hudSticky) InterlockedIncrement(&g_uiUnarmed);
-    const bool hudArmed = hudFresh || (hudSticky && Rd(g_hudArmSticky) != 0);
+    // ⭐ run 264: the continuation must carry the SAME TEXTURE as the draw that armed. See g_hudArmTex.
+    bool hudArmed = hudFresh;
+    if (hudFresh) InterlockedExchange(&g_hudArmTex, BoundTexId(dev));
+    else if (hudSticky && Rd(g_hudArmSticky) != 0)
+        { hudArmed = Rd(g_hudArmTex) != 0 && BoundTexId(dev) == Rd(g_hudArmTex);
+          if (hudArmed) InterlockedIncrement(&g_hudArmTook); }
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(2, t, primCount, vtxStride, vtxData, quad, 0);
@@ -14902,7 +14939,13 @@ HRESULT STDMETHODCALLTYPE Hook_DrawIndexedPrimUP(IDirect3DDevice9* dev, D3DPRIMI
     // body text arrives on this one, and applying it to only one would fix half a note.
     const bool hudSticky = !hudFresh && !quad && Rd(g_hudXformLive) != 0;
     if (hudSticky) InterlockedIncrement(&g_uiUnarmed);
-    const bool hudArmed = hudFresh || (hudSticky && Rd(g_hudArmSticky) != 0);
+    // ⭐ run 264: same-texture rule, shared with the other hook. A text batch that spills across both
+    // hooks still matches, because the atlas is the same whichever hook issues the glyphs.
+    bool hudArmed = hudFresh;
+    if (hudFresh) InterlockedExchange(&g_hudArmTex, BoundTexId(dev));
+    else if (hudSticky && Rd(g_hudArmSticky) != 0)
+        { hudArmed = Rd(g_hudArmTex) != 0 && BoundTexId(dev) == Rd(g_hudArmTex);
+          if (hudArmed) InterlockedIncrement(&g_hudArmTook); }
     // Run 192: recorded AFTER the classifier, so the census reports the decision actually taken
     // rather than re-deriving it and risking disagreement with the code it is measuring.
     FireCensusRecord(3, t, primCount, vtxStride, vtxData, quad, numVertices);
@@ -20047,13 +20090,20 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     " fullscreen pass-throughs but do not span NDC, so they used to land once across"
                     " the seam (run 262)", sq);
 
+            // ⭐ run 264: how many of the missed draws the SAME-TEXTURE rule actually took. The gap
+            // between this and the line below measures how far the old frame-wide rule over-reached
+            // - and it over-reached into world geometry twice.
+            if (const LONG ht = InterlockedExchange(&g_hudArmTook, 0))
+                Log("    UI draws captured by the SAME-TEXTURE continuation rule: %ld this second."
+                    " Compare with the next line: the difference is what the old frame-wide rule"
+                    " would ALSO have taken, and that difference was world geometry. (run 264)", ht);
             if (const LONG ua = InterlockedExchange(&g_uiUnarmed, 0))
                 Log("    UI draws that MISSED the one-shot arm: %ld this second (HudArmSticky=%ld,"
                     " so they %s). A jump when a popup opens is run 253's reported bug. ⚠ Some of"
                     " these are world draws and belong where they went - watch the CHANGE, not the"
                     " absolute. (run 253)",
                     ua, Rd(g_hudArmSticky),
-                    Rd(g_hudArmSticky) ? "WERE captured as HUD"
+                    Rd(g_hudArmSticky) ? "were OFFERED to the same-texture rule"
                                        : "went to StereoPair unremapped, as before");
 
             // ⭐ run 223: separates "I froze it and nothing changed" from "the freeze never fired",
