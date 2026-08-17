@@ -14314,15 +14314,37 @@ inline bool UserPtrQuad(UINT primCount, const void* vtxData, UINT stride) {
 // draws/frame with a message on screen against ~671 without the remap, so it is in the noise.
 int g_hudRemap = 0;
 
+// ---- 💥 run 263: a REJECTED draw here lost its stereo split entirely ----
+//
+// Every guard below used to `return draw()` - one draw, no per-eye duplication at all - when the
+// correct fallback is the ORDINARY path, StereoPair. A draw that reaches HudStereoPair and turns out
+// not to be insettable UI is not thereby exempt from stereo; it is just normal geometry.
+//
+// This is the run-259 regression, mechanism and all. With the one-shot arm only the first draw after
+// each c5-c8 write could be affected, a handful a frame, so it went unnoticed for however long it has
+// been here. HudArmSticky=1 routed THOUSANDS of draws through these guards, the non-orthographic one
+// rejected them, and each rejection cost that draw its second eye - which is exactly the reported
+// "a lot of geometry culled out, DRAW ALL is fine, ENGINE CULL has a lot missing".
+//
+// ⚠️ The occlusion setting was never involved. It looked like culling because a draw appearing in one
+// eye and not the other reads as geometry going missing, and DRAW ALL changed enough about the frame
+// to mask it.
+//
+// ⚠️ StereoPair has its OWN offscreen guard (it returns draw() for a non-scene target), so routing
+// the offscreen rejection there is a no-op rather than a behaviour change - it is done anyway so
+// that every exit from this function goes through one place.
 template <typename DrawFn>
 HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn&& draw) {
-    if (!g_hudRemap || !InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
+    // ⚠️ The ONE exit that must stay a bare draw(): with duplication off there is no stereo to fall
+    // back to, and StereoPair would just return draw() anyway.
+    if (!InterlockedCompareExchange(&g_dupDraws, 0, 0)) return draw();
+    if (!g_hudRemap) return StereoPair(dev, draw);
     InterlockedIncrement(&g_uiSeen);          // ⭐ run 230
 
     float c[16];
     D3DVIEWPORT9 vp{};
     if (FAILED(dev->GetVertexShaderConstantF(5, c, 4)) || FAILED(dev->GetViewport(&vp)))
-        return draw();
+        return StereoPair(dev, draw);          // ⭐ run 263: could not read it - still needs splitting
     // ---- ⭐ run 151: never remap a draw aimed at an OFFSCREEN target ----
     //
     // This is what broke the main menu, and the evidence was in the screenshots the whole time:
@@ -14336,7 +14358,9 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
     // StereoPair has guarded this since the shadow-map work - `if (!g_rtIsScene) return draw()` -
     // and HudStereoPair simply did not inherit it. Same rule, same reason: a draw into a target
     // that is not the scene has no eye halves to be split between.
-    if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) { InterlockedIncrement(&g_uiOffTgt); return draw(); }  // ⭐ run 230
+    // ⭐ run 263: StereoPair, not draw(). It has the same offscreen guard, so this is a no-op today -
+    // kept so that no exit from this function silently drops the split if that guard ever changes.
+    if (!InterlockedCompareExchange(&g_rtIsScene, 0, 0)) { InterlockedIncrement(&g_uiOffTgt); return StereoPair(dev, draw); }  // ⭐ run 230
 
     // ---- run 150: only ORTHOGRAPHIC UI may be squashed in clip space ----
     //
@@ -14372,7 +14396,10 @@ HRESULT HudStereoPair(IDirect3DDevice9* dev, UINT primCount, UINT stride, DrawFn
                     " this is world-space UI (the diegetic main menu) and clip-space squashing"
                     " would not be valid.", r[0].w, r[1].w, r[2].w, r[3].w);
             }
-            return draw();
+            // 💥 run 263: THE regression. World-space geometry that reaches here is not exempt from
+            // stereo - it needs the ordinary camera-register remap, which is precisely what
+            // StereoPair does. Returning draw() gave it to ONE eye.
+            return StereoPair(dev, draw);
         }
     }
 
