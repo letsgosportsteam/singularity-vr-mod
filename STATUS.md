@@ -158,23 +158,34 @@ claim was measured wrong once, was still in a comment *and in a log line*, and g
 run-258 comment before being corrected. **Classes vary and can also be shared; the object pointer is
 the only key with neither failure mode.**
 
-### ⚠️ SHIPPED, NOT YET FLOWN (run 272) — cutscenes force DRAW ALL, gameplay keeps its setting
+### ⛔ MEASURED DEAD and REVERTED (runs 272–273) — occlusion queries cannot fix cutscene culling
 
-`OcclusionCutsceneDrawAll=1` (default). While `g_inCinematic` is set, `OverrideOcclusion()` reports
-every query visible; the configured `OcclusionQueryMode` resumes the instant it clears.
+Forcing `DRAW ALL` for the duration of a cutscene **engaged** — the log shows two `STARTED`/`ENDED`
+pairs — **and the geometry was still missing.** Reverted rather than kept as a setting that does
+nothing. ⚠️ **The reverted experiment is the valuable part**, because it retires an entire lever.
 
-**Why this is the right trade rather than a preference.** Mode 2's recorded residual risk is
-*geometry winking out at distance or screen edges*. During gameplay that is a glance away from being
-missed; during a cutscene it is the thing you are being made to look at. And the ~2× draw count
-(1500–1693 vs 737–943 per frame) is paid while the camera is on rails and nobody is fighting.
+**The mechanism, from the same log:**
 
-⚠️ **The premise was re-tested first** — see item C. Had the old "the exit never arrives" note been
-true, this would have latched `DRAW ALL` on for the rest of the level.
+```
+worst engine VERTICAL cull this window, from mCurrentPOV: 38.3 deg vs 98.0 deg rendered -> SHORTFALL, geometry culled
+```
 
-**Verify on the edge, not by looking:** `occlusion: cutscene STARTED -> forcing DRAW ALL` and
-`... ENDED -> back to the configured mode`. **The false pass is a cutscene that never fires
-`SetCinematicMode`** — a scripted in-engine sequence that is not flagged cinematic would show no
-line at all, and "no line" means the override never ran, not that it failed.
+The engine believes its vertical FOV is **38.3°** while we render **98°**, so it discards everything
+outside that cone **on the CPU, before a draw call is issued**. An occlusion query cannot rescue
+geometry that was never submitted — the query hook is downstream of the decision.
+
+⚠️ **Cutscenes are the worst case, which is why it shows there.** Gameplay windows read 86–98° against
+98° rendered; cutscene windows read **38.3°** and **43.5°**. The engine sets a narrow cinematic FOV
+and our ask does not survive it.
+
+**▶ If picked up again, the lever is the FOV CULLING HEADROOM, not the query hook.** `ApplyVrFov`
+already asks the engine for a wider FOV than we render (`kFovHeadroom`, cycled on PAGE UP) precisely
+to give its culling room — `asked the engine for 127.9 deg (culling headroom x1.00)`. The question is
+**why that ask does not hold during a cutscene**, and that is a different subsystem.
+
+⚠️ **The cutscene edge line was KEPT** (`cutscene STARTED / ENDED`). It is what proved the override
+ran and still changed nothing — without it this would have been another "maybe it didn't fire" — and
+it will do the same job for whatever is tried against cutscene culling next.
 
 ### ✅ FIXED and VERIFIED (run 271) — the sniper scope was OFF BY CONFIGURATION, since run 231
 
