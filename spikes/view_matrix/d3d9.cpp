@@ -15296,11 +15296,38 @@ PFN_QueryGetData g_origQueryGetData = nullptr;
 // A pixel count large enough that no visibility threshold treats it as occluded.
 const DWORD kPretendVisiblePixels = 0x00010000;
 
+// ---- ⭐ run 272: a CUTSCENE always draws everything, whatever the setting says ----
+//
+// Asked for directly: keep ENGINE CULL for gameplay, but force DRAW ALL during in-engine cutscenes.
+//
+// It is the right shape for this engine. `OcclusionQueryMode=2` leaves the engine's own culling live,
+// and STATUS records its residual risk as "geometry WINKING OUT at distance or screen edges" - which
+// during gameplay is a glance away from being missed and during a cutscene is the thing you are being
+// made to look at. A cutscene is also the cheap case for the trade: the ~2x draw count that mode 0/1
+// costs (1500-1693 against 737-943 per frame) is paid while the camera is on rails and the player is
+// not fighting.
+//
+// ⚠️ RE-TESTED BEFORE BUILDING ON IT, because STATUS said this signal was broken. Item C states
+// "SetCinematicMode is only ever observed with arg raw 0x00000001 ... so a 0 never arrives", which
+// would have made this latch DRAW ALL on for the rest of the level. That note is STALE. Measured
+// across this session's logs: **92 x `arg raw 0x00000001 -> CINE ON` against 88 x
+// `arg raw 0x00000000 -> CINE OFF`** - a near-balance is exactly what enter/exit pairs look like -
+// and every `view drift` line reads `cine off`, zero `cine ON`. The exit event does arrive.
+//
+// ⚠️ Gated on duplication for the same reason auto mode is: mono has no split frame invalidating the
+// query and no reason to pay for the extra draws.
+//
+// ⚠️ A plain read, not InterlockedCompareExchange. This is the occlusion query path - run 203 measured
+// what a locked read costs when the render thread does it against a variable Present writes.
+int g_occlusionCineDrawAll = 1;   // ini [Render] OcclusionCutsceneDrawAll
+
 // Auto mode overrides only while duplication is on - that is the configuration whose split frame
 // invalidates the query, and mono has no reason to pay for it.
 inline bool OverrideOcclusion() {
+    const bool dup = InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    if (g_occlusionCineDrawAll && dup && Rd(g_inCinematic)) return true;   // ⭐ run 272
     if (g_occlusionMode == 1) return true;
-    return g_occlusionMode == 0 && InterlockedCompareExchange(&g_dupDraws, 0, 0) != 0;
+    return g_occlusionMode == 0 && dup;
 }
 
 HRESULT STDMETHODCALLTYPE Hook_QueryGetData(IDirect3DQuery9* q, void* data, DWORD size, DWORD flags) {
@@ -19710,6 +19737,14 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
         const bool cineNow = InterlockedCompareExchange(&g_inCinematic, 0, 0) != 0;
         if (cineNow != g_cinePrev) {
             g_cinePrev = cineNow;
+            // ⭐ run 272: says the occlusion override engaged and disengaged, on the edge rather than
+            // per frame. Without it "the cutscene still had geometry missing" and "the override never
+            // ran" are indistinguishable - the ambiguity this file has paid for repeatedly.
+            if (g_occlusionCineDrawAll)
+                Log("occlusion: cutscene %s -> %s (OcclusionQueryMode=%d is %s; run 272)",
+                    cineNow ? "STARTED" : "ENDED",
+                    cineNow ? "forcing DRAW ALL" : "back to the configured mode",
+                    g_occlusionMode, cineNow ? "overridden" : "in force again");
             if (cineNow) {
                 // Capture what the user had rather than assuming mode 1 - they may be mid-test.
                 g_userCutMode = CutsceneMode();
@@ -21597,6 +21632,10 @@ void LoadIniSettings() {
     // the draws (1500-1693 vs 737-943 per frame). Its risk is geometry winking out at distance or
     // screen edges, which is a visual judgement no run has made on 2 yet - so if objects start
     // vanishing, set OcclusionQueryMode=0 in the ini and this is the first suspect.
+    // ⭐ run 272: DRAW ALL for the duration of an in-engine cutscene, then straight back to whatever
+    // OcclusionQueryMode says. 0 disables it and leaves the configured mode in force throughout.
+    g_occlusionCineDrawAll =
+        GetPrivateProfileIntA("Render", "OcclusionCutsceneDrawAll", 1, path) ? 1 : 0;
     g_occlusionMode = GetPrivateProfileIntA("Render", "OcclusionQueryMode", 2, path);
     if (g_occlusionMode < 0 || g_occlusionMode > 3) g_occlusionMode = 2;
     Log("ini: OcclusionQueryMode=%d (%s)", g_occlusionMode,
