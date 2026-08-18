@@ -11,8 +11,10 @@
     Output lands in packaging\dist\ (gitignored):
 
         SingularityVR-<version>.zip  <- attach this to the GitHub release AS AN ASSET
-                                         d3d9.dll + openxr_loader.dll + SingularityVR.ini -
-                                         everything a player pastes into Binaries, one zip
+                                         d3d9.dll + openxr_loader.dll + SingularityVR.ini,
+                                         and NOTHING ELSE - exactly what gets pasted into
+                                         Binaries. Docs/licence/setup-script live in the
+                                         repo and the release notes, not in this archive.
         d3d9-<version>.pdb           <- attach this too; it decodes crash addresses
         SHA256SUMS.txt               <- paste into the release notes
 
@@ -37,8 +39,6 @@ $xrBin = Join-Path $sdk 'native\Win32\release\bin'
 $stage = Join-Path $here 'staging'
 $dist  = Join-Path $here 'dist'
 
-# Computed early (needs only $Version) so the in-zip README.txt can be told its own
-# filename during staging, rather than the archive being packed before that's known.
 $zipName = "SingularityVR-$Version.zip"
 
 function Step ($m) { Write-Host ""; Write-Host "==> $m" -ForegroundColor Cyan }
@@ -86,14 +86,15 @@ Step "Staging"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage | Out-Null
 
+# Only the two DLLs are copied verbatim. Everything else that used to ship alongside them
+# (README.txt, LICENSE, THIRD-PARTY-NOTICES.txt, SingularityVR.ini.example, setup_physx.ps1)
+# is already git-tracked, so it is already in GitHub's own auto-generated source archive
+# for this tag - bundling a second copy into OUR archive was pure duplication. The release
+# notes (packaging\RELEASE-<version>.md) are the readme for the release; this zip is just
+# the install.
 $payload = @(
-    @{ From = $dll;                                        To = 'd3d9.dll' },
-    @{ From = (Join-Path $xrBin 'openxr_loader.dll');       To = 'openxr_loader.dll' },
-    @{ From = (Join-Path $src 'SingularityVR.ini.example'); To = 'SingularityVR.ini.example' },
-    @{ From = (Join-Path $here 'README.txt');               To = 'README.txt' },
-    @{ From = (Join-Path $root 'LICENSE');                  To = 'LICENSE' },
-    @{ From = (Join-Path $root 'THIRD-PARTY-NOTICES.txt');  To = 'THIRD-PARTY-NOTICES.txt' },
-    @{ From = (Join-Path $src 'setup_physx.ps1');           To = 'setup_physx.ps1' }
+    @{ From = $dll;                                  To = 'd3d9.dll' },
+    @{ From = (Join-Path $xrBin 'openxr_loader.dll'); To = 'openxr_loader.dll' }
 )
 
 foreach ($p in $payload) {
@@ -102,21 +103,7 @@ foreach ($p in $payload) {
     Ok $p.To
 }
 
-# README.txt's install step names the zip it came in, so it needs the actual filename.
-# Substituted rather than hardcoded per release - a hardcoded version drifts the moment
-# this template ships inside a DIFFERENT version's archive, which is silent and exactly
-# the kind of stale-claim mistake this project's own docs are otherwise careful about.
-$stagedReadme = Join-Path $stage 'README.txt'
-$readmeText = Get-Content -LiteralPath $stagedReadme -Raw
-if ($readmeText -notmatch [regex]::Escape('{{ZIP_NAME}}')) {
-    throw "README.txt no longer contains the {{ZIP_NAME}} placeholder - was it hand-edited?"
-}
-$readmeText = $readmeText -replace [regex]::Escape('{{ZIP_NAME}}'), $zipName
-[System.IO.File]::WriteAllText($stagedReadme, $readmeText, (New-Object System.Text.UTF8Encoding($false)))
-Ok "README.txt ({{ZIP_NAME}} -> $zipName)"
-
-# The active SingularityVR.ini ships too now - it is what a player actually pastes into
-# Binaries, not just the .example. It is generated rather than copied verbatim: the dev
+# The active SingularityVR.ini is the third file - generated, not copied verbatim. The dev
 # copy carries AutoResX/AutoResY, this machine's own cached headset resolution, and
 # STATUS.md is explicit that shipping those injects one person's resolution into
 # everyone's first launch. Stripping just those two lines leaves every tuned value intact
@@ -141,22 +128,18 @@ Ok "SingularityVR.ini (AutoResX/AutoResY stripped)"
 # reason they are checks rather than good intentions.
 Step "Checking the archive for machine-specific leakage"
 
-# (a) Neither ini in the archive may carry an UNCOMMENTED AutoResX/AutoResY. The .example
-#     ships commented out and SingularityVR.ini is generated with the lines removed above -
-#     this is the check that catches it if either ever changes.
-foreach ($iniName in 'SingularityVR.ini', 'SingularityVR.ini.example') {
-    $iniPath = Join-Path $stage $iniName
-    if (-not (Test-Path $iniPath)) { continue }
-    $badRes = Select-String -Path $iniPath -Pattern '^\s*AutoRes[XY]\s*=' -ErrorAction SilentlyContinue
-    if ($badRes) {
-        throw ("$iniName has an active AutoResX/Y on line {0}. Strip or comment it before shipping." -f $badRes[0].LineNumber)
-    }
+# (a) SingularityVR.ini may not carry an UNCOMMENTED AutoResX/AutoResY - generated with
+#     the lines removed above, this is the check that catches it if that ever changes.
+$stagedIniPath = Join-Path $stage 'SingularityVR.ini'
+$badRes = Select-String -Path $stagedIniPath -Pattern '^\s*AutoRes[XY]\s*=' -ErrorAction SilentlyContinue
+if ($badRes) {
+    throw ("SingularityVR.ini has an active AutoResX/Y on line {0}. Strip or comment it before shipping." -f $badRes[0].LineNumber)
 }
-Ok "no active AutoResX/AutoResY in either ini"
+Ok "no active AutoResX/AutoResY"
 
-# (b) No home directories anywhere in the shipped text.
+# (b) No home directories anywhere in the shipped text (the ini - the DLLs are binary).
 $leaks = Get-ChildItem $stage -File |
-         Where-Object { $_.Extension -in '.txt', '.example', '.ps1', '.ini', '' } |
+         Where-Object { $_.Extension -eq '.ini' } |
          Select-String -Pattern 'C:[\\/]+Users[\\/]+[A-Za-z0-9_.-]+' -ErrorAction SilentlyContinue |
          Where-Object { $_.Line -notmatch '<you>|<user>|<username>|%LOCALAPPDATA%|%USERPROFILE%|\$env:' }
 if ($leaks) {
@@ -164,6 +147,14 @@ if ($leaks) {
     throw "a machine-specific path is in the archive"
 }
 Ok "no machine paths"
+
+# (c) Exactly three files, nothing extra slipped in.
+$fileCount = (Get-ChildItem $stage -File).Count
+if ($fileCount -ne 3) {
+    Get-ChildItem $stage -File | ForEach-Object { Warn $_.Name }
+    throw "expected exactly 3 files in the archive, found $fileCount"
+}
+Ok "exactly 3 files"
 
 # ---- 5. archive + checksums ------------------------------------------------------------
 Step "Packing"

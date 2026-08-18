@@ -134,11 +134,14 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-896b36eebc745d1c1299a6c706df11d2206ceedd880c2721a923a1e59fe8772c  SingularityVR-0.1.0-alpha.zip
+9419d020ec9366d4d12a40af20d6d538f5cb4f1d5d42b4087532b5c1d4a0f552  SingularityVR-0.1.0-alpha.zip
 3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
 ```
 
 Full development notes, including everything that did not work, are in the repository —
 `STATUS.md` for current state, `HISTORY.md` for the run log.
 
-MIT licensed. Not affiliated with or endorsed by Activision or Raven Software.
+MIT licensed — see [`LICENSE`](https://github.com/letsgosportsteam/singularity-vr-mod/blob/main/LICENSE)
+and [`THIRD-PARTY-NOTICES.txt`](https://github.com/letsgosportsteam/singularity-vr-mod/blob/main/THIRD-PARTY-NOTICES.txt)
+in the repository — neither ships inside the zip. Not affiliated with or endorsed by Activision or
+Raven Software.

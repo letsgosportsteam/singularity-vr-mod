@@ -38,8 +38,8 @@ THIS IS AN ALPHA. It has run on very few machines so far.
 2. INSTALL
 --------------------------------------------------------------------------------
 
-Unzip everything from {{ZIP_NAME}} into the game's Binaries folder, beside
-Singularity.exe:
+Download the release zip and unzip everything from it into the game's
+Binaries folder, beside Singularity.exe:
 
     d3d9.dll
     openxr_loader.dll
@@ -54,8 +54,8 @@ That is the whole install. SingularityVR.ini ships pre-configured - the VR
 settings menu (section 4) changes it live and saves automatically, so you
 rarely need to touch it by hand.
 
-SingularityVR.ini.example is also included, as a fully-documented reference of
-every setting the mod reads, in case you want to go further than the menu.
+SingularityVR.ini.example, in the repository, is a fully-documented reference
+of every setting the mod reads, in case you want to go further than the menu.
 
 To uninstall: delete d3d9.dll. Nothing else was touched.
 
@@ -224,10 +224,10 @@ still there, it is not this mod. Please say in the report whether you tried it.
 10. LICENCE
 --------------------------------------------------------------------------------
 
-MIT. See LICENSE.
+MIT. See LICENSE in the repository.
 
 Third-party components and their licences are listed in
-THIRD-PARTY-NOTICES.txt, which is included in this archive.
+THIRD-PARTY-NOTICES.txt, also in the repository.
 
 Not affiliated with or endorsed by Activision or Raven Software. Singularity is
 their trademark. This mod contains no game code or assets, redistributes no
