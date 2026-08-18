@@ -84,7 +84,7 @@ controllers and what it does.
 | Thumbstick | Move / strafe |
 | Thumbstick click | Dash |
 | Trigger | Aim |
-| Grip | Impulse |
+| Grip | Impulse / melee |
 | X | Age / renovate (TMD) |
 | Y | Flashlight — **hold ~1 s** to open the VR settings menu instead |
 | Menu | Pause menu — **hold ~1 s** to recentre (re-zeroes your view and seating) |

@@ -69,7 +69,7 @@ Every physical input on both Touch controllers, and what it does.
 | Thumbstick | Move / strafe |
 | Thumbstick click | Dash |
 | Trigger | Aim |
-| Grip | Impulse |
+| Grip | Impulse / melee |
 | X | Age / renovate (TMD) |
 | Y | Flashlight — **hold ~1 s** for the VR settings menu instead |
 | Menu | Pause menu — **hold ~1 s** to recentre |
@@ -129,7 +129,7 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-00b018995afbf2897c2d067f1a29cc3bf49acf29a45b9464c63ded7c15fd14d3  SingularityVR-0.1.0-alpha.zip
+97899ac56ca2a444ed3deee4e85b4e254f412fdc0620bb563aee52b55c06e248  SingularityVR-0.1.0-alpha.zip
 3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
 ```
 

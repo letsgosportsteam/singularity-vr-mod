@@ -90,7 +90,7 @@ both controllers, and what it does:
     Thumbstick ............... move / strafe
     Thumbstick click ......... dash
     Trigger ................... aim
-    Grip ....................... impulse
+    Grip ....................... impulse / melee
     X ........................... age / renovate (TMD)
     Y ........................... flashlight
                                   HOLD ~1 sec: open the VR settings menu instead
