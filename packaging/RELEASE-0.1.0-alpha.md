@@ -103,7 +103,7 @@ Next up: more testing, general bug fixes, and performance improvements.
 
 Further out: SteamVR/OpenVR support, and Xbox controller support for the head-aiming mode.
 
-Longer shots, and both will be tough: two-hand tracking, and maybe manual reloading.
+Longer shots, and both will be tough: two-hand tracking, and possibly manual reloading.
 
 ## The network matters more than your GPU
 
@@ -129,7 +129,7 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-0cab43d9a45301d1be2bef694a9add8643d68ce743c2f3fa17488f4c159f6825  SingularityVR-0.1.0-alpha.zip
+00b018995afbf2897c2d067f1a29cc3bf49acf29a45b9464c63ded7c15fd14d3  SingularityVR-0.1.0-alpha.zip
 3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
 ```
 

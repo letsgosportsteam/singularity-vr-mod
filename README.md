@@ -138,7 +138,7 @@ Next up: more testing, general bug fixes, and performance improvements.
 
 Further out: SteamVR/OpenVR support, and Xbox controller support for the head-aiming mode.
 
-Longer shots, and both will be tough: two-hand tracking, and maybe manual reloading.
+Longer shots, and both will be tough: two-hand tracking, and possibly manual reloading.
 
 ## Reporting a bug
 
