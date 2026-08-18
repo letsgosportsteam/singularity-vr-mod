@@ -10,8 +10,7 @@ library and, along the way, renders the game in stereo to an OpenXR headset with
 
 No game files are modified. Uninstall by deleting one file.
 
-THIS IS AN ALPHA. It is shared to gather reports, not because it is finished.
-Expect crashes. It has run on very few machines.
+THIS IS AN ALPHA. It has run on very few machines so far.
 
 
 --------------------------------------------------------------------------------
@@ -20,16 +19,12 @@ Expect crashes. It has run on very few machines.
 
  * Singularity (2010) for PC - Steam or GOG.
 
- * A Quest or Pico headset running VIRTUAL DESKTOP, with VDXR selected as the
-   OpenXR runtime.
-
-   This is not a preference. Singularity is a 32-bit process and almost no
-   modern OpenXR runtime still supports x86. Meta's own runtime crashes in
-   xrCreateSession; SteamVR has no 32-bit runtime at all. VDXR is the one that
-   works.
+ * VIRTUAL DESKTOP, with VDXR selected as the OpenXR runtime. This build only
+   supports VDXR. All testing has been done on a Quest 3S.
 
  * Microsoft Visual C++ 2015-2022 Redistributable (x86).
-   The x86 one. The x64 one you already have will not do.
+   The x86 one. The x64 one you already have will not do. This is needed to
+   RUN the game with the mod installed, not just to build it.
    https://aka.ms/vs/17/release/vc_redist.x86.exe
 
  * Windows 10 or 11.
@@ -42,23 +37,24 @@ Expect crashes. It has run on very few machines.
 2. INSTALL
 --------------------------------------------------------------------------------
 
-Copy these two files into the game's Binaries folder, beside Singularity.exe:
+Unzip everything from this archive into the game's Binaries folder, beside
+Singularity.exe:
 
     d3d9.dll
     openxr_loader.dll
+    SingularityVR.ini
 
 Typical locations:
 
     Steam:  ...\steamapps\common\Singularity\Binaries\
     GOG:    ...\GOG Games\Singularity\Binaries\
 
-That is the whole install.
+That is the whole install. SingularityVR.ini ships pre-configured - the VR
+settings menu (section 4) changes it live and saves automatically, so you
+rarely need to touch it by hand.
 
-SingularityVR.ini.example is optional and is NOT loaded. Every setting in it
-already has a tested default compiled in, and the settings panel (section 4)
-writes its own SingularityVR.ini when you change something. Only rename the
-example to SingularityVR.ini if you want to hand-edit before you have ever run
-the mod - and read the warning in section 6 first.
+SingularityVR.ini.example is also included, as a fully-documented reference of
+every setting the mod reads, in case you want to go further than the menu.
 
 To uninstall: delete d3d9.dll. Nothing else was touched.
 
@@ -86,20 +82,16 @@ then correct.
 --------------------------------------------------------------------------------
 
 Touch controllers act as a gamepad, with haptics. Every button is spoken for,
-so the three extra functions are long presses:
+so the extra functions are long presses:
 
     HOLD MENU  ~1 sec ....... recentre (re-zeroes your view and your seating)
     TAP  MENU ............... pause menu
-    HOLD Y     ~1 sec ....... open the VR settings panel
+    HOLD Y     ~1 sec ....... open the VR settings menu
     HOLD A     ~1 sec ....... toggle the laser sight
                               (you will jump once on the way - A is jump, and
                               jump has to stay instant)
-    APPS .................... gun follows the controller, on/off
 
-    BACKSPACE (keyboard) .... drop to the flat game and back, for peeking.
-                              Deliberately does not save.
-
-Everything else is configured from the settings panel, in the headset, while
+Everything else is configured from the settings menu, in the headset, while
 the game runs. Changes apply live and are saved when you close it.
 
 Note: the F-key debug bindings mentioned in the repo's development notes are
@@ -115,7 +107,7 @@ for up to 189 ms. That reads as seconds-long stalls and it is not something the
 render code can fix.
 
 With a dedicated router, and the PC wired to it by ethernet, the same build
-locks to 120 fps with submission under about 1 ms.
+runs at 120 fps with only occasional dips or stutters.
 
 If it stutters, suspect the link before anything else.
 
@@ -124,8 +116,8 @@ If it stutters, suspect the link before anything else.
 6. CONFIGURATION
 --------------------------------------------------------------------------------
 
-Settings live in SingularityVR.ini in the same Binaries folder, and the in-game
-panel is the intended way to change them.
+Settings live in SingularityVR.ini in the same Binaries folder, and the VR
+settings menu is the intended way to change them.
 
 Two warnings if you hand-edit:
 
@@ -144,14 +136,12 @@ delete the ini and let the code defaults take over.
 7. KNOWN ISSUES
 --------------------------------------------------------------------------------
 
-  * It is an alpha and it crashes. Very few machines have run it.
+  * This has only been tested on one machine, so your experience may vary.
 
-  * Geometry can occasionally wink out at distance or near the screen edges.
-    If you see this, set OcclusionQueryMode=0 in the ini - it costs roughly
-    twice the draw calls but forces everything visible.
-
-  * Geometry culling during in-engine cutscenes is not fully solved. Parts of a
-    scene may be missing while a cutscene plays.
+  * Missing or culled geometry is mostly resolved outside of in-engine
+    cutscenes, where it isn't fixable yet. If you notice geometry not
+    rendering elsewhere, set OCCLUSION to DRAW ALL on the ADVANCED page of the
+    settings menu.
 
   * A menu rotation bug: entering a game, pausing, then exiting to the main
     menu can leave the menu rotated. Restart the game to clear it.
@@ -167,7 +157,18 @@ more current than this file will ever be.
 
 
 --------------------------------------------------------------------------------
-8. REPORTING A BUG
+8. PLANNED
+--------------------------------------------------------------------------------
+
+Next up: more testing, general bug fixes, and performance improvements.
+
+Further out, and not committed to: SteamVR/OpenVR support, Xbox controller
+support for the head-aiming mode, two-hand tracking, and maybe manual
+reloading.
+
+
+--------------------------------------------------------------------------------
+9. REPORTING A BUG
 --------------------------------------------------------------------------------
 
 Open an issue at:
@@ -190,7 +191,7 @@ still there, it is not this mod. Please say in the report whether you tried it.
 
 
 --------------------------------------------------------------------------------
-9. LICENCE
+10. LICENCE
 --------------------------------------------------------------------------------
 
 MIT. See LICENSE.

@@ -10,9 +10,11 @@
 
     Output lands in packaging\dist\ (gitignored):
 
-        sing-vr-<version>.zip     <- attach this to the GitHub release AS AN ASSET
-        d3d9-<version>.pdb        <- attach this too; it decodes crash addresses
-        SHA256SUMS.txt            <- paste into the release notes
+        SingularityVR-<version>.zip  <- attach this to the GitHub release AS AN ASSET
+                                         d3d9.dll + openxr_loader.dll + SingularityVR.ini -
+                                         everything a player pastes into Binaries, one zip
+        d3d9-<version>.pdb           <- attach this too; it decodes crash addresses
+        SHA256SUMS.txt               <- paste into the release notes
 
     Nothing here touches the remote. It prints the gh command and stops.
 #>
@@ -96,30 +98,48 @@ foreach ($p in $payload) {
     Ok $p.To
 }
 
+# The active SingularityVR.ini ships too now - it is what a player actually pastes into
+# Binaries, not just the .example. It is generated rather than copied verbatim: the dev
+# copy carries AutoResX/AutoResY, this machine's own cached headset resolution, and
+# STATUS.md is explicit that shipping those injects one person's resolution into
+# everyone's first launch. Stripping just those two lines leaves every tuned value intact
+# and lets the mod's normal self-detect-on-first-run behaviour take over, same as if the
+# key had never been written.
+#
+# Written via WriteAllLines with an un-BOM'd UTF8Encoding rather than Set-Content: the mod
+# reads this file with the ANSI GetPrivateProfileString family, and a UTF-8 BOM ahead of
+# the first section header is exactly the kind of silent corruption this project's own
+# notes warn about elsewhere (STATUS.md: "the ini takes the first key of a duplicated name,
+# silently"). Verified there is no BOM in the output before this shipped.
+$devIniSrc  = Join-Path $src 'SingularityVR.ini'
+$stagedIni  = Join-Path $stage 'SingularityVR.ini'
+if (-not (Test-Path $devIniSrc)) { throw "missing payload file: $devIniSrc" }
+$iniLines = Get-Content -LiteralPath $devIniSrc | Where-Object { $_ -notmatch '^\s*AutoRes[XY]\s*=' }
+[System.IO.File]::WriteAllLines($stagedIni, $iniLines, (New-Object System.Text.UTF8Encoding($false)))
+Ok "SingularityVR.ini (AutoResX/AutoResY stripped)"
+
 # ---- 4. the guards that matter ---------------------------------------------------------
 #
-# Both of these have already gone wrong once in this project's history, which is the only
+# All of these have already gone wrong once in this project's history, which is the only
 # reason they are checks rather than good intentions.
 Step "Checking the archive for machine-specific leakage"
 
-# (a) The DEV ini must never ship. It carries AutoResX/AutoResY - this machine's headset
-#     size - and shipping it injects one person's resolution into everyone's first launch.
-$devIni = Join-Path $stage 'SingularityVR.ini'
-if (Test-Path $devIni) { throw "SingularityVR.ini is in the archive. Only the .example may ship." }
-Ok "no live SingularityVR.ini"
-
-# (b) The example must not carry an UNCOMMENTED AutoResX/AutoResY either. They are correctly
-#     commented out today; this fails the build if that ever changes.
-$badRes = Select-String -Path (Join-Path $stage 'SingularityVR.ini.example') `
-                        -Pattern '^\s*AutoRes[XY]\s*=' -ErrorAction SilentlyContinue
-if ($badRes) {
-    throw ("SingularityVR.ini.example has an active AutoResX/Y on line {0}. Comment it out." -f $badRes[0].LineNumber)
+# (a) Neither ini in the archive may carry an UNCOMMENTED AutoResX/AutoResY. The .example
+#     ships commented out and SingularityVR.ini is generated with the lines removed above -
+#     this is the check that catches it if either ever changes.
+foreach ($iniName in 'SingularityVR.ini', 'SingularityVR.ini.example') {
+    $iniPath = Join-Path $stage $iniName
+    if (-not (Test-Path $iniPath)) { continue }
+    $badRes = Select-String -Path $iniPath -Pattern '^\s*AutoRes[XY]\s*=' -ErrorAction SilentlyContinue
+    if ($badRes) {
+        throw ("$iniName has an active AutoResX/Y on line {0}. Strip or comment it before shipping." -f $badRes[0].LineNumber)
+    }
 }
-Ok "no active AutoResX/AutoResY in the example ini"
+Ok "no active AutoResX/AutoResY in either ini"
 
-# (c) No home directories anywhere in the shipped text.
+# (b) No home directories anywhere in the shipped text.
 $leaks = Get-ChildItem $stage -File |
-         Where-Object { $_.Extension -in '.txt', '.example', '.ps1', '' } |
+         Where-Object { $_.Extension -in '.txt', '.example', '.ps1', '.ini', '' } |
          Select-String -Pattern 'C:[\\/]+Users[\\/]+[A-Za-z0-9_.-]+' -ErrorAction SilentlyContinue |
          Where-Object { $_.Line -notmatch '<you>|<user>|<username>|%LOCALAPPDATA%|%USERPROFILE%|\$env:' }
 if ($leaks) {
@@ -132,7 +152,7 @@ Ok "no machine paths"
 Step "Packing"
 if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist | Out-Null }
 
-$zipName = "sing-vr-$Version.zip"
+$zipName = "SingularityVR-$Version.zip"
 $zipPath = Join-Path $dist $zipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -CompressionLevel Optimal

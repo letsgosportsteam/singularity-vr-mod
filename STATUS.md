@@ -950,6 +950,13 @@ recorded rather than filtered out, because a long enough transient reads as a vi
 13. **Decals — leave alone unless it bothers you.** Five theories are dead (shadows, `G16R16`,
    `ScreenPositionScaleBias`, `vs c13`, unhooked user-pointer draws) and the workaround is free:
    turn **High Quality Decals** off in the in-game video options.
+14. 📋 **OPEN — has SteamVR or OpenVR actually been tried against this mod? No.** Every run in
+   this project's history has been on VDXR. "SteamVR/OpenVR has no 32-bit runtime" was inherited
+   from the same assumption on the sibling Mirror's Edge mod — and a modder there has since
+   reportedly gotten it running via SteamVR, mentioning OpenVR as well. Neither claim is confirmed
+   here first-hand; that cuts both ways, and it does not prove either runtime works with *this*
+   mod. It does mean the "no 32-bit runtime" line was never independently tested for Singularity.
+   Worth an actual attempt before it gets repeated as fact again. Not started.
 
 > **RETRACTED (run 136).** This list used to end with *"one object still culls early at distance —
 > PAGE DOWN fixes it, which points at the run-21 mechanism: FOV inflation makes objects project
@@ -1010,8 +1017,11 @@ document approaches that did *not* work, which is most of their value.
 .\spikes\view_matrix\build.ps1 -Install     # builds x86, copies into the dev game copy
 ```
 
-Connect **Virtual Desktop** first (VDXR is the only usable 32-bit OpenXR runtime — Meta's own
-crashes in `xrCreateSession`, SteamVR has no 32-bit runtime at all), then launch:
+Connect **Virtual Desktop** first — VDXR is what every tested run here has used, and Meta's own
+runtime crashes in `xrCreateSession`. ⚠️ **"SteamVR/OpenVR has no 32-bit runtime" was carried here
+as settled fact and it is not.** Nobody has tried either against this mod. See item 14 below, and
+re-read *"Almost every hard problem here was a stale premise"* at the top of this file before
+repeating the claim again. Then launch:
 
 ```
 R:\SingularityVR-Dev\Singularity\Binaries\Singularity.exe

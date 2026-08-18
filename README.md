@@ -7,21 +7,24 @@ weapon that follows your hand.
 
 **No game files are modified.** One DLL goes in beside the game exe. Uninstalling is deleting it.
 
-> **This is an alpha.** It is published to gather reports, not because it is finished. It has run
-> on very few machines. Expect crashes.
+> **This is an alpha.** It has run on very few machines so far.
 
 **[Download the latest release →](https://github.com/letsgosportsteam/singularity-vr-mod/releases)**
 
 ---
 
-## Install — two files into one folder
+## Install — unzip into one folder
 
-Copy into the game's `Binaries` folder, beside `Singularity.exe`:
+Unzip the release into the game's `Binaries` folder, beside `Singularity.exe`:
 
 ```
 d3d9.dll
 openxr_loader.dll
+SingularityVR.ini
 ```
+
+`SingularityVR.ini` ships pre-configured. The in-headset settings menu changes it live and saves
+automatically, so you rarely need to touch it by hand.
 
 Then connect Virtual Desktop and launch `Singularity.exe` **with no arguments**. It starts in VR.
 
@@ -35,14 +38,13 @@ Launch once, quit, launch again.
 | | |
 |---|---|
 | Game | _Singularity_ (2010) for PC — Steam or GOG |
-| Headset | Quest or Pico via **Virtual Desktop**, with **VDXR** as the OpenXR runtime |
-| Runtime | **Visual C++ 2015–2022 Redistributable (x86)** — [installer](https://aka.ms/vs/17/release/vc_redist.x86.exe) |
+| Headset | **Virtual Desktop** with **VDXR** as the OpenXR runtime — all testing has been on a **Quest 3S** |
+| Runtime | **Visual C++ 2015–2022 Redistributable (x86)** — [installer](https://aka.ms/vs/17/release/vc_redist.x86.exe), needed to run the game with the mod installed, not just to build it |
 | OS | Windows 10 or 11 |
 | Network | A dedicated router, PC on ethernet to it |
 
-**VDXR is not a preference.** Singularity is a 32-bit process and almost no modern OpenXR runtime
-still supports x86 — Meta's own crashes in `xrCreateSession`, and SteamVR has no 32-bit runtime at
-all. VDXR is the one that works.
+This build only supports Virtual Desktop with VDXR. Nothing else has been tried against
+Singularity yet — see `STATUS.md` if SteamVR or OpenVR is what you're curious about.
 
 **The network matters more than your GPU.** On shared WiFi, frame submission was measured blocking
 for up to **189 ms**, which reads as seconds-long stalls and cannot be fixed in the render code.
@@ -57,14 +59,17 @@ If it stutters, suspect the link first.
 | 6-DOF head tracking | ✅ position and rotation, sampled inside the frame it is drawn for |
 | Head roll | ✅ applied in the view matrix |
 | Resolution | ✅ **100% of the headset's pixels**, inherited automatically |
-| Performance | ✅ **120 fps locked** on the development machine |
+| Performance | ✅ **120 fps** on the development machine, with occasional dips or stutters |
 | Motion controllers | ✅ full Touch mapping, menus, haptics, snap or smooth turn |
 | Aim decoupling | ✅ the shot follows the controller; the view never moves |
 | Weapon follows the controller | ✅ 6-DOF, arms hidden, anchor tuned |
+| Laser pointer | ✅ toggleable aiming aid |
+| Weapon alignment | ✅ position and rotation tunable live, in the settings menu |
+| Head-tracking aim option | ✅ aim with your head instead of a motion controller — works with mouse/keyboard or a gamepad |
 | HUD and menus in both eyes | ✅ health, ammo, crosshair, prompts, pause menu |
 | Sniper scope in both eyes | ✅ whole scope per eye, world drawn once |
 | Head tracking during cutscenes | ✅ automatic — look around freely, turning restored on exit |
-| In-headset settings panel | ✅ live changes, saved on close |
+| VR settings menu | ✅ live changes, in the headset, saved automatically |
 
 ## Controls
 
@@ -77,8 +82,6 @@ functions are long presses.
 | **Tap MENU** | Pause menu |
 | **Hold Y** ~1 s | Open the VR settings panel |
 | **Hold A** ~1 s | Toggle the laser sight (you will jump once on the way — A is jump, and jump has to stay instant) |
-| **APPS** | Weapon follows the controller, on/off |
-| **BACKSPACE** (keyboard) | Drop to the flat game and back, for peeking. Deliberately does not save |
 
 The F-key bindings described in `STATUS.md` are development keys. They are **inert** unless
 `Debug=1`.
@@ -99,16 +102,23 @@ Two traps if you hand-edit:
 
 ## Known issues
 
-- It is an alpha, and it crashes.
-- Geometry can wink out at distance or near screen edges. Set `OcclusionQueryMode=0` — roughly
-  twice the draw calls, but everything is forced visible.
-- Geometry culling during in-engine cutscenes is not solved. Parts of a scene may be missing.
+- This has only been tested on one machine, so your experience may vary.
+- Missing or culled geometry is mostly resolved outside of in-engine cutscenes, where it isn't
+  fixable yet. If you notice geometry not rendering elsewhere, set **OCCLUSION** to **DRAW ALL**
+  on the ADVANCED page of the settings menu.
 - A menu rotation bug: enter a game, pause, exit to the main menu, and the menu can be rotated.
 - If the game dies instantly with no message, that is usually a missing 32-bit `PhysXLoader.dll` —
   and the **unmodded** game does it too. Run [`setup_physx.ps1`](spikes/view_matrix/setup_physx.ps1),
   which makes the game self-contained from a copy already on your machine.
 
 `STATUS.md` is the live state of all of these and is always more current than this list.
+
+## Planned
+
+Next up: more testing, general bug fixes, and performance improvements.
+
+Further out, and not committed to: SteamVR/OpenVR support, Xbox controller support for the head-aiming
+mode, two-hand tracking, and maybe manual reloading.
 
 ## Reporting a bug
 
