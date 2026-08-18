@@ -101,8 +101,8 @@ both controllers, and what it does:
   RIGHT CONTROLLER
 
     Thumbstick ............... turn (snap or smooth, set in the settings menu)
-                                  tilt up/down: cycle weapons or use a health
-                                  item
+    Thumbstick - tilt up ..... cycle weapons
+    Thumbstick - tilt down ... use a health item
     Thumbstick click ......... anti-gravity
     Trigger ................... fire
     Grip ....................... use / reload

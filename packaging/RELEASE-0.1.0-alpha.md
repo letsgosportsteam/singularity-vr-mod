@@ -78,7 +78,9 @@ Every physical input on both Touch controllers, and what it does.
 
 | | |
 |---|---|
-| Thumbstick | Turn — tilt up/down cycles weapons or uses a health item |
+| Thumbstick | Turn |
+| Thumbstick — tilt up | Cycle weapons |
+| Thumbstick — tilt down | Use a health item |
 | Thumbstick click | Anti-gravity |
 | Trigger | Fire |
 | Grip | Use / reload |
@@ -129,7 +131,7 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-97899ac56ca2a444ed3deee4e85b4e254f412fdc0620bb563aee52b55c06e248  SingularityVR-0.1.0-alpha.zip
+b6abaf2b093dda7d418384cf9183e7bfb4ff3c840013b2f5b8c9fc3fc4ff7ba9  SingularityVR-0.1.0-alpha.zip
 3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
 ```
 

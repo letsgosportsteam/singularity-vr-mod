@@ -93,7 +93,9 @@ controllers and what it does.
 
 | | |
 |---|---|
-| Thumbstick | Turn (snap or smooth, set in the settings menu) — tilt up/down cycles weapons or uses a health item |
+| Thumbstick | Turn (snap or smooth, set in the settings menu) |
+| Thumbstick — tilt up | Cycle weapons |
+| Thumbstick — tilt down | Use a health item |
 | Thumbstick click | Anti-gravity |
 | Trigger | Fire |
 | Grip | Use / reload |
