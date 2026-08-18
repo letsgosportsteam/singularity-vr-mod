@@ -180,9 +180,7 @@ Unusually for a mod, the working notes are published as-is:
 
 They include the wrong turns, and sections marked ⛔ **SUPERSEDED** where a claim went stale in
 place. That is on purpose. The most expensive defects in this project were not hard problems — they
-were stale premises inherited from an earlier run and never re-tested. A yaw delta that was never
-wrapped cost months of misattribution; SSW silently halved every frame-rate number for thirty runs.
-Recording that is more useful to the next person than a clean narrative would be.
+were stale premises inherited from an earlier run and never re-tested.
 
 ## Licence
 
