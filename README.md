@@ -66,7 +66,7 @@ link first.
 | Weapon follows the controller | ✅ 6-DOF, arms hidden, anchor tuned |
 | Laser pointer | ✅ toggleable aiming aid |
 | Weapon alignment | ✅ position and rotation tunable live, in the settings menu |
-| Head-tracking aim option | ✅ aim with your head instead of a motion controller — works with mouse/keyboard or a gamepad |
+| Head-tracking aim option | ✅ aim with your head instead of a motion controller — keyboard/mouse only for now |
 | HUD and menus in both eyes | ✅ health, ammo, crosshair, prompts, pause menu |
 | Sniper scope in both eyes | ✅ whole scope per eye, world drawn once |
 | Head tracking during cutscenes | ✅ automatic — look around freely, turning restored on exit |

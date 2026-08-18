@@ -51,8 +51,8 @@ quit, launch again.**
 - **The weapon follows your hand**, 6-DOF
 - **Laser pointer** for aiming
 - **Weapon alignment** — position and rotation tunable live, in the settings menu
-- **Head-tracking aim option** — aim with your head instead of a motion controller, using regular
-  mouse/keyboard or a gamepad
+- **Head-tracking aim option** — aim with your head instead of a motion controller. Keyboard/mouse
+  only for now
 - **HUD and menus in both eyes** — health, ammo, crosshair, prompts, pause menu
 - **The sniper scope in both eyes**
 - **Head tracking during cutscenes** — look around freely
