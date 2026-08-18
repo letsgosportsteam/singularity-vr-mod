@@ -41,15 +41,16 @@ Launch once, quit, launch again.
 | Headset | **Virtual Desktop** with **VDXR** as the OpenXR runtime — all testing has been on a **Quest 3S** |
 | Runtime | **Visual C++ 2015–2022 Redistributable (x86)** — [installer](https://aka.ms/vs/17/release/vc_redist.x86.exe), needed to run the game with the mod installed, not just to build it |
 | OS | Windows 10 or 11 |
-| Network | A dedicated router, PC on ethernet to it |
+| Network | Highly recommended: a dedicated router (PC on ethernet), **or** Virtual Desktop's wired USB connection (currently in beta) |
 
 This build only supports Virtual Desktop with VDXR. Nothing else has been tried against
 Singularity yet — see `STATUS.md` if SteamVR or OpenVR is what you're curious about.
 
 **The network matters more than your GPU.** On shared WiFi, frame submission was measured blocking
 for up to **189 ms**, which reads as seconds-long stalls and cannot be fixed in the render code.
-Wired to a dedicated router, the same build locks to 120 fps with submission under a millisecond.
-If it stutters, suspect the link first.
+Wired to a dedicated router — or over Virtual Desktop's wired USB connection, currently in beta —
+the same build locks to 120 fps with submission under a millisecond. If it stutters, suspect the
+link first.
 
 ## What works today
 

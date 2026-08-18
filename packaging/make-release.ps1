@@ -37,6 +37,10 @@ $xrBin = Join-Path $sdk 'native\Win32\release\bin'
 $stage = Join-Path $here 'staging'
 $dist  = Join-Path $here 'dist'
 
+# Computed early (needs only $Version) so the in-zip README.txt can be told its own
+# filename during staging, rather than the archive being packed before that's known.
+$zipName = "SingularityVR-$Version.zip"
+
 function Step ($m) { Write-Host ""; Write-Host "==> $m" -ForegroundColor Cyan }
 function Ok   ($m) { Write-Host "    [ok]   $m" -ForegroundColor Green }
 function Warn ($m) { Write-Host "    [warn] $m" -ForegroundColor Yellow }
@@ -98,6 +102,19 @@ foreach ($p in $payload) {
     Ok $p.To
 }
 
+# README.txt's install step names the zip it came in, so it needs the actual filename.
+# Substituted rather than hardcoded per release - a hardcoded version drifts the moment
+# this template ships inside a DIFFERENT version's archive, which is silent and exactly
+# the kind of stale-claim mistake this project's own docs are otherwise careful about.
+$stagedReadme = Join-Path $stage 'README.txt'
+$readmeText = Get-Content -LiteralPath $stagedReadme -Raw
+if ($readmeText -notmatch [regex]::Escape('{{ZIP_NAME}}')) {
+    throw "README.txt no longer contains the {{ZIP_NAME}} placeholder - was it hand-edited?"
+}
+$readmeText = $readmeText -replace [regex]::Escape('{{ZIP_NAME}}'), $zipName
+[System.IO.File]::WriteAllText($stagedReadme, $readmeText, (New-Object System.Text.UTF8Encoding($false)))
+Ok "README.txt ({{ZIP_NAME}} -> $zipName)"
+
 # The active SingularityVR.ini ships too now - it is what a player actually pastes into
 # Binaries, not just the .example. It is generated rather than copied verbatim: the dev
 # copy carries AutoResX/AutoResY, this machine's own cached headset resolution, and
@@ -152,7 +169,6 @@ Ok "no machine paths"
 Step "Packing"
 if (-not (Test-Path $dist)) { New-Item -ItemType Directory -Path $dist | Out-Null }
 
-$zipName = "SingularityVR-$Version.zip"
 $zipPath = Join-Path $dist $zipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -CompressionLevel Optimal

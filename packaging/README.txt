@@ -29,15 +29,16 @@ THIS IS AN ALPHA. It has run on very few machines so far.
 
  * Windows 10 or 11.
 
- * A DEDICATED ROUTER, with the PC on ethernet to it. See section 5 - this is
-   the single most common cause of "the mod stutters".
+ * HIGHLY RECOMMENDED: a DEDICATED ROUTER, with the PC on ethernet to it - OR
+   Virtual Desktop's wired USB connection, currently in beta. See section 5 -
+   this is the single most common cause of "the mod stutters".
 
 
 --------------------------------------------------------------------------------
 2. INSTALL
 --------------------------------------------------------------------------------
 
-Unzip everything from this archive into the game's Binaries folder, beside
+Unzip everything from {{ZIP_NAME}} into the game's Binaries folder, beside
 Singularity.exe:
 
     d3d9.dll
@@ -106,8 +107,9 @@ On a shared WiFi network, frame submission to the headset was measured blocking
 for up to 189 ms. That reads as seconds-long stalls and it is not something the
 render code can fix.
 
-With a dedicated router, and the PC wired to it by ethernet, the same build
-runs at 120 fps with only occasional dips or stutters.
+With a dedicated router (PC wired to it by ethernet) - or over Virtual Desktop's
+wired USB connection, currently in beta - the same build runs at 120 fps with
+only occasional dips or stutters.
 
 If it stutters, suspect the link before anything else.
 

@@ -10,6 +10,9 @@ It is a `d3d9.dll` proxy. **No game files are modified**, and uninstalling is de
 **This build only supports Virtual Desktop with VDXR as your OpenXR runtime.** All testing has
 been done on a **Quest 3S**.
 
+**Highly recommended: a dedicated router (PC on ethernet), or Virtual Desktop's wired USB
+connection (currently in beta).** See *"The network matters more than your GPU"* below.
+
 **You need the Visual C++ 2015–2022 Redistributable (x86).** The x86 one — the x64 you already have
 will not do. Needed to *run* the game with the mod installed, not just to build it.
 [Installer](https://aka.ms/vs/17/release/vc_redist.x86.exe).
@@ -89,8 +92,9 @@ head-aiming mode, two-hand tracking, and maybe manual reloading.
 
 On shared WiFi, frame submission to the headset was measured blocking for up to **189 ms** — that
 reads as seconds-long stalls, and nothing in the render code can fix it. Wired to a dedicated
-router, the same build runs at 120 fps with only occasional dips or stutters. **If it stutters,
-suspect the link before anything else.**
+router — or over Virtual Desktop's wired USB connection, currently in beta — the same build runs
+at 120 fps with only occasional dips or stutters. **If it stutters, suspect the link before
+anything else.**
 
 ## Reporting a bug
 
@@ -108,7 +112,7 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-07946195a24445e354e07abe7eb350411b9e488beea3b63a8cee81c11c68b1c4  SingularityVR-0.1.0-alpha.zip
+cba1d2858cd982dcb4437331b241a198b52d8f6cf2bebcbe96a5ca0a9640d48f  SingularityVR-0.1.0-alpha.zip
 3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
 ```
 
