@@ -1,3 +1,24 @@
+// ------------------------------------------------------------------------------------------
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 letsgosportsteam.
+//
+// ⚠️ THIS FILE ALONE IS GPL-2.0-or-later. Everything else in this repository is MIT.
+//
+// Lzo1xDecompress() below was written by reference to minilzo's lzo1x_decompress and is
+// structurally the same code (see the note above it), which makes it a derivative work
+// rather than an independent implementation. miniLZO is
+// Copyright (C) 1996-2017 Markus F.X.J. Oberhumer <markus@oberhumer.com>, licensed
+// GPL-2.0-or-later, so this file inherits that licence. It cannot be MIT.
+// Full text: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+//
+// The LZO *format* is not what is at issue - a clean-room implementation from the container
+// description would be MIT-able. This one was not written that way, and saying so costs
+// nothing.
+//
+// Scope: this is a standalone command-line dev tool. It is NOT compiled into d3d9.dll and
+// shares no code with it, so nothing in the shipped mod is touched by this licence.
+// ------------------------------------------------------------------------------------------
+
 // uedecompress - unpack a UE3 "fully compressed" package (Singularity ships these as .xxx).
 //
 // Why this exists: RvGame\CookedPC\*.xxx are the game's .u SCRIPT packages, LZO-compressed
@@ -33,6 +54,9 @@
 // Structurally identical to minilzo's lzo1x_decompress, flattened so every label sits at function
 // scope - jumping into the body of a nested loop is a C idiom that C++ compilers are entitled to
 // refuse, and there is no reason to find out which way MSVC leans.
+//
+// ⚠️ That derivation is why this FILE is GPL-2.0-or-later while the rest of the repo is MIT.
+// See the licence header at the top. Nothing links this tool into d3d9.dll.
 //
 // Bounds are checked on every read and write. This parses a 13 MB file from disk; an out-of-range
 // match distance should be a diagnosable error, not an access violation.
