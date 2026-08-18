@@ -1,0 +1,111 @@
+================================================================================
+ THIRD-PARTY NOTICES
+ Singularity VR mod
+================================================================================
+
+The Singularity VR mod is licensed MIT (see LICENSE). It bundles and links the
+third-party components below, each under its own licence. The notices in this
+file are reproduced because those licences require it for binary distribution.
+
+Components in a RELEASE ARCHIVE (what users download):
+
+    d3d9.dll .............. this project (MIT), statically linking MinHook
+    openxr_loader.dll ..... the Khronos OpenXR loader (Apache-2.0)
+
+Not included in any release archive:
+
+    tools/uedecompress .... a development tool, GPL-2.0-or-later. See LICENSE.
+    PhysXLoader.dll ....... NOT redistributed. setup_physx.ps1 copies the file
+                            that is already on the user's own machine.
+
+
+================================================================================
+ 1. MinHook
+================================================================================
+
+Statically linked into d3d9.dll. Sources are vendored at third_party/minhook/.
+
+Home:    https://github.com/TsudaKageyu/minhook
+Licence: BSD 2-Clause
+
+--------------------------------------------------------------------------------
+
+MinHook - The Minimalistic API Hooking Library for x64/x86
+Copyright (C) 2009-2017 Tsuda Kageyu.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--------------------------------------------------------------------------------
+
+MinHook embeds HDE (Hacker Disassembler Engine) at third_party/minhook/src/hde/:
+
+Hacker Disassembler Engine 32/64
+Copyright (c) 2008-2009, Vyacheslav Patkov.
+All rights reserved.
+
+Distributed under the BSD 2-Clause terms reproduced above, as shipped with
+MinHook.
+
+
+================================================================================
+ 2. OpenXR Loader (Khronos Group)
+================================================================================
+
+Shipped alongside d3d9.dll as openxr_loader.dll, and linked at build time from
+the OpenXR SDK. Not modified.
+
+Home:    https://github.com/KhronosGroup/OpenXR-SDK
+Licence: Apache License 2.0
+
+Copyright (c) 2017-2024 The Khronos Group Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+>>> The full Apache License 2.0 text belongs here. Apache-2.0 section 4(a)
+>>> requires that recipients of a redistribution be given a copy of the
+>>> License, and a URL is weaker than the text. Append the verbatim licence
+>>> from http://www.apache.org/licenses/LICENSE-2.0.txt before publishing a
+>>> release archive.
+
+
+================================================================================
+ 3. What is NOT here
+================================================================================
+
+No game code, assets, or content of any kind from Singularity is included in
+this repository or in any release archive. The mod is a Direct3D 9 proxy: it
+loads beside the game, modifies no game files, and is removed by deleting one
+DLL.
+
+Singularity is a trademark of its respective owner. This project is not
+affiliated with or endorsed by Activision or Raven Software.

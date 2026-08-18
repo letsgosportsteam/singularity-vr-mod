@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# pre-push - last check before anything becomes permanent on a public remote.
+#
+# pre-commit guards the commit you are making now. This guards the whole range
+# you are about to publish, which is not the same set: --no-verify, a rebase, a
+# cherry-pick, or any commit made before core.hooksPath was configured all skip
+# pre-commit and arrive here anyway.
+#
+# Install (once per clone):  git config core.hooksPath .githooks
+# Bypass:                    git push --no-verify
+
+set -e
+
+suffix=$(git config hooks.allowedEmailSuffix || echo '@users.noreply.github.com')
+zero='0000000000000000000000000000000000000000'
+fail=0
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue          # branch deletion
+
+    if [ "$remote_sha" = "$zero" ]; then
+        # New branch on the remote. Limit the walk to commits not already on
+        # any other remote ref, so pushing a new branch does not re-scan the
+        # entire project history every time.
+        range=$(git rev-list "$local_sha" --not --remotes)
+    else
+        range=$(git rev-list "$remote_sha..$local_sha")
+    fi
+
+    for sha in $range; do
+        bad=$(git show -s --format='%ae%n%ce' "$sha" | grep -v "$suffix" || true)
+        if [ -n "$bad" ]; then
+            echo "pre-push: $(git show -s --format='%h %s' "$sha")" >&2
+            echo "          email(s) not ending in '$suffix':" >&2
+            echo "$bad" | sed 's/^/            /' >&2
+            fail=1
+        fi
+    done
+done
+
+if [ "$fail" = 1 ]; then
+    echo "" >&2
+    echo "  These commits would publish a real email address permanently." >&2
+    echo "  Rewrite them before pushing, or push with --no-verify if you are sure." >&2
+    echo "" >&2
+    exit 1
+fi
+
+exit 0

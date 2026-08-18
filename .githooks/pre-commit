@@ -1,0 +1,89 @@
+#!/bin/sh
+#
+# pre-commit - two guards on things that are permanent once pushed.
+#
+# Install (once per clone):
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass, if you ever genuinely need to: git commit --no-verify
+#
+# ---------------------------------------------------------------------------
+# 1. AUTHORSHIP
+#
+# Commit authorship is permanent and public. A single commit made with a real
+# email cannot be edited away - it needs a history rewrite and a force push,
+# and by then it is already in clones, forks and GitHub's own caches. The only
+# cheap moment to catch it is before the commit exists, which is here.
+#
+# 2. MACHINE PATHS
+#
+# This repo's whole history had to be rewritten once to strip two absolute home
+# directories out of ENVIRONMENT.md. That was cheap only because they were the
+# only two. Write C:\Users\<you>\... or %LOCALAPPDATA%\... instead. R:\ paths
+# are fine - a username is not.
+#
+# NB the path pattern uses [\/] rather than \+. Both look equivalent; only
+# the first one works. Verified against a literal C:\Users\<name>\ line before
+# this hook was trusted - the first version silently matched nothing, which is
+# the worst possible failure for a guard.
+# ---------------------------------------------------------------------------
+
+set -e
+
+fail=0
+
+# ---- 1. authorship --------------------------------------------------------
+suffix=$(git config hooks.allowedEmailSuffix || echo '@users.noreply.github.com')
+
+# The emails git will ACTUALLY use, resolved the same way the commit will
+# resolve them - not what is merely configured somewhere.
+author=$(git var GIT_AUTHOR_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')
+committer=$(git var GIT_COMMITTER_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')
+
+for who in "author:$author" "committer:$committer"; do
+    role=${who%%:*}
+    mail=${who#*:}
+    case "$mail" in
+        *"$suffix") ;;
+        *)
+            echo "pre-commit: $role email '$mail' does not end in '$suffix'." >&2
+            fail=1
+            ;;
+    esac
+done
+
+if [ "$fail" = 1 ]; then
+    echo "" >&2
+    echo "  Commit authorship is permanent and public. Fix it before committing:" >&2
+    echo "" >&2
+    echo "      git config user.email 'ID+username@users.noreply.github.com'" >&2
+    echo "" >&2
+    echo "  Your noreply address is on github.com/settings/emails." >&2
+    echo "  A different private-email provider? Set the expected suffix:" >&2
+    echo "" >&2
+    echo "      git config hooks.allowedEmailSuffix '@example.com'" >&2
+    echo "" >&2
+    exit 1
+fi
+
+# ---- 2. machine paths in staged content -----------------------------------
+# Added lines only, and only in text files git is willing to diff. <you>,
+# <user> and <username> are the documented placeholders and are allowed.
+paths=$(git diff --cached --diff-filter=ACM -U0 |
+        grep '^+' |
+        grep -iE 'C:[\/]+Users[\/]+[A-Za-z0-9_.-]+|/(home|Users)/[A-Za-z0-9_.-]+' |
+        grep -viE '<you>|<user>|<username>|%LOCALAPPDATA%|%USERPROFILE%|\$env:' || true)
+
+if [ -n "$paths" ]; then
+    echo "pre-commit: staged content contains what looks like a machine-specific path:" >&2
+    echo "" >&2
+    echo "$paths" | head -10 >&2
+    echo "" >&2
+    echo "  Write C:\Users\<you>\... or %LOCALAPPDATA%\... instead." >&2
+    echo "  If this is a false positive: git commit --no-verify" >&2
+    echo "" >&2
+    exit 1
+fi
+
+exit 0

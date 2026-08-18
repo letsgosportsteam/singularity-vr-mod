@@ -43,3 +43,8 @@ uscript/
 *.user
 Thumbs.db
 desktop.ini
+
+# ---- release staging ----
+# make-release.ps1 rebuilds both from source every run; nothing here is authored.
+packaging/staging/
+packaging/dist/

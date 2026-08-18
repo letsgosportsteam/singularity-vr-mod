@@ -1,0 +1,167 @@
+# Singularity VR
+
+A VR mod for _Singularity_ (2010, Raven Software, Unreal Engine 3.584). It is a `d3d9.dll`
+proxy: it forwards every Direct3D 9 export to the real system library, and along the way renders
+the game in stereo to an OpenXR headset with 6-DOF head tracking, motion-controller input, and a
+weapon that follows your hand.
+
+**No game files are modified.** One DLL goes in beside the game exe. Uninstalling is deleting it.
+
+> **This is an alpha.** It is published to gather reports, not because it is finished. It has run
+> on very few machines. Expect crashes.
+
+**[Download the latest release →](https://github.com/letsgosportsteam/singularity-vr-mod/releases)**
+
+---
+
+## Install — two files into one folder
+
+Copy into the game's `Binaries` folder, beside `Singularity.exe`:
+
+```
+d3d9.dll
+openxr_loader.dll
+```
+
+Then connect Virtual Desktop and launch `Singularity.exe` **with no arguments**. It starts in VR.
+
+**The first run will be at the wrong resolution.** That is expected. The mod must inject
+`-ResX`/`-ResY` before the engine reads the command line — which is before it can ask the headset
+anything — so it queries the headset during the run and uses the answer on the *next* launch.
+Launch once, quit, launch again.
+
+## Requirements
+
+| | |
+|---|---|
+| Game | _Singularity_ (2010) for PC — Steam or GOG |
+| Headset | Quest or Pico via **Virtual Desktop**, with **VDXR** as the OpenXR runtime |
+| Runtime | **Visual C++ 2015–2022 Redistributable (x86)** — [installer](https://aka.ms/vs/17/release/vc_redist.x86.exe) |
+| OS | Windows 10 or 11 |
+| Network | A dedicated router, PC on ethernet to it |
+
+**VDXR is not a preference.** Singularity is a 32-bit process and almost no modern OpenXR runtime
+still supports x86 — Meta's own crashes in `xrCreateSession`, and SteamVR has no 32-bit runtime at
+all. VDXR is the one that works.
+
+**The network matters more than your GPU.** On shared WiFi, frame submission was measured blocking
+for up to **189 ms**, which reads as seconds-long stalls and cannot be fixed in the render code.
+Wired to a dedicated router, the same build locks to 120 fps with submission under a millisecond.
+If it stutters, suspect the link first.
+
+## What works today
+
+| | |
+|---|---|
+| Native stereo, real per-eye parallax | ✅ draw-call duplication; eyes align, depth correct |
+| 6-DOF head tracking | ✅ position and rotation, sampled inside the frame it is drawn for |
+| Head roll | ✅ applied in the view matrix |
+| Resolution | ✅ **100% of the headset's pixels**, inherited automatically |
+| Performance | ✅ **120 fps locked** on the development machine |
+| Motion controllers | ✅ full Touch mapping, menus, haptics, snap or smooth turn |
+| Aim decoupling | ✅ the shot follows the controller; the view never moves |
+| Weapon follows the controller | ✅ 6-DOF, arms hidden, anchor tuned |
+| HUD and menus in both eyes | ✅ health, ammo, crosshair, prompts, pause menu |
+| Sniper scope in both eyes | ✅ whole scope per eye, world drawn once |
+| Head tracking during cutscenes | ✅ automatic — look around freely, turning restored on exit |
+| In-headset settings panel | ✅ live changes, saved on close |
+
+## Controls
+
+Touch controllers act as a gamepad, with haptics. Every button is already spoken for, so the extra
+functions are long presses.
+
+| | |
+|---|---|
+| **Hold MENU** ~1 s | Recentre — re-zeroes your view and seating |
+| **Tap MENU** | Pause menu |
+| **Hold Y** ~1 s | Open the VR settings panel |
+| **Hold A** ~1 s | Toggle the laser sight (you will jump once on the way — A is jump, and jump has to stay instant) |
+| **APPS** | Weapon follows the controller, on/off |
+| **BACKSPACE** (keyboard) | Drop to the flat game and back, for peeking. Deliberately does not save |
+
+The F-key bindings described in `STATUS.md` are development keys. They are **inert** unless
+`Debug=1`.
+
+## Configuration
+
+Settings live in `SingularityVR.ini` beside the DLL, and the in-headset panel is the intended way
+to change them. `SingularityVR.ini.example` documents every key but is **not loaded** — the
+compiled-in defaults are the tested configuration, and the panel writes its own ini when you change
+something.
+
+Two traps if you hand-edit:
+
+- **The ini takes the first key of a duplicated name, silently.** A second copy further down does
+  nothing.
+- **`AutoResX`/`AutoResY` are the mod's own cache of _your_ headset's size.** Never copy them from
+  someone else's ini.
+
+## Known issues
+
+- It is an alpha, and it crashes.
+- Geometry can wink out at distance or near screen edges. Set `OcclusionQueryMode=0` — roughly
+  twice the draw calls, but everything is forced visible.
+- Geometry culling during in-engine cutscenes is not solved. Parts of a scene may be missing.
+- A menu rotation bug: enter a game, pause, exit to the main menu, and the menu can be rotated.
+- If the game dies instantly with no message, that is usually a missing 32-bit `PhysXLoader.dll` —
+  and the **unmodded** game does it too. Run [`setup_physx.ps1`](spikes/view_matrix/setup_physx.ps1),
+  which makes the game self-contained from a copy already on your machine.
+
+`STATUS.md` is the live state of all of these and is always more current than this list.
+
+## Reporting a bug
+
+[Open an issue](https://github.com/letsgosportsteam/singularity-vr-mod/issues) and attach the log
+from `%LOCALAPPDATA%\SingularityVR\`. `view_matrix.log` is always the run that just happened;
+older runs sit beside it stamped with their start time.
+
+Say which headset, which OpenXR runtime, Steam or GOG, and whether you had already relaunched once.
+
+**One control worth a minute of your time:** rename `d3d9.dll` to `d3d9.dll.off` and run the game
+again at the same resolution. If the problem is still there, it is not this mod. Please say whether
+you tried it.
+
+## Building
+
+```powershell
+.\spikes\view_matrix\build.ps1        # builds x86
+.\packaging\make-release.ps1 -Version 0.1.0-alpha
+```
+
+Needs Visual Studio 2022 with the C++ x86 toolset, and the OpenXR SDK. Point at your own SDK with
+`$env:OPENXR_SDK`; the build also runs an `/analyze` pass first that fails on format-string defects,
+which is there because one such mistake cost four debugging sessions.
+
+**On the layout:** `spikes/view_matrix/` is the live build — a single large `d3d9.cpp`.
+`spikes/vr_render/` is the known-good fallback. The earlier spikes are kept deliberately: several
+record approaches that did *not* work, which is most of their value.
+
+## The development notes
+
+Unusually for a mod, the working notes are published as-is:
+
+| | |
+|---|---|
+| [`STATUS.md`](STATUS.md) | Current state, and what to do next |
+| [`ENGINE_NOTES.md`](ENGINE_NOTES.md) | Engine internals, addresses, structures, Ghidra findings |
+| [`HISTORY.md`](HISTORY.md) | The run log, newest first — search it, don't read it |
+| [`FEASIBILITY.md`](FEASIBILITY.md) | The original assessment, kept for the record |
+
+They include the wrong turns, and sections marked ⛔ **SUPERSEDED** where a claim went stale in
+place. That is on purpose. The most expensive defects in this project were not hard problems — they
+were stale premises inherited from an earlier run and never re-tested. A yaw delta that was never
+wrapped cost months of misattribution; SSW silently halved every frame-rate number for thirty runs.
+Recording that is more useful to the next person than a clean narrative would be.
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE), which notes one GPL-licensed development tool that is not part of
+the mod and ships in no release.
+
+Third-party components and their required notices are in
+[`THIRD-PARTY-NOTICES.txt`](THIRD-PARTY-NOTICES.txt).
+
+Not affiliated with or endorsed by Activision or Raven Software. _Singularity_ is their trademark.
+This mod contains no game code or assets, redistributes no game content, and modifies no game
+files.
