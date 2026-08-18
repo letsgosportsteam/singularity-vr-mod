@@ -82,18 +82,40 @@ then correct.
 4. CONTROLS
 --------------------------------------------------------------------------------
 
-Touch controllers act as a gamepad, with haptics. Every button is spoken for,
-so the extra functions are long presses:
+Touch controllers act as a full gamepad, with haptics. Every physical input on
+both controllers, and what it does:
 
-    HOLD MENU  ~1 sec ....... recentre (re-zeroes your view and your seating)
-    TAP  MENU ............... pause menu
-    HOLD Y     ~1 sec ....... open the VR settings menu
-    HOLD A     ~1 sec ....... toggle the laser sight
-                              (you will jump once on the way - A is jump, and
-                              jump has to stay instant)
+  LEFT CONTROLLER
 
-Everything else is configured from the settings menu, in the headset, while
-the game runs. Changes apply live and are saved when you close it.
+    Thumbstick ............... move / strafe
+    Thumbstick click ......... dash
+    Trigger ................... aim
+    Grip ....................... impulse
+    X ........................... age / renovate (TMD)
+    Y ........................... flashlight
+                                  HOLD ~1 sec: open the VR settings menu instead
+    Menu ..................... pause menu
+                                  HOLD ~1 sec: recentre (re-zeroes your view
+                                  and your seating)
+
+  RIGHT CONTROLLER
+
+    Thumbstick ............... turn (snap or smooth, set in the settings menu)
+                                  tilt up/down: cycle weapons or use a health
+                                  item
+    Thumbstick click ......... anti-gravity
+    Trigger ................... fire
+    Grip ....................... use / reload
+    A ............................ jump
+                                  HOLD ~1 sec: also toggles the laser sight
+                                  (you will jump once on the way - jump has to
+                                  stay instant)
+    B ............................ crouch
+
+Everything beyond the two long presses is Raven's own binding, passed straight
+through. The settings menu (HOLD Y) is where everything else - turn mode,
+weapon alignment, occlusion, and the rest - is configured, in the headset,
+while the game runs. Changes apply live and are saved when you close it.
 
 Note: the F-key debug bindings mentioned in the repo's development notes are
 inert in this build. They only exist when Debug=1.

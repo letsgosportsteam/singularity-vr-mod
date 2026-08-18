@@ -74,15 +74,33 @@ link first.
 
 ## Controls
 
-Touch controllers act as a gamepad, with haptics. Every button is already spoken for, so the extra
-functions are long presses.
+Touch controllers act as a full gamepad, with haptics — this is every physical input on both
+controllers and what it does.
+
+**Left controller**
 
 | | |
 |---|---|
-| **Hold MENU** ~1 s | Recentre — re-zeroes your view and seating |
-| **Tap MENU** | Pause menu |
-| **Hold Y** ~1 s | Open the VR settings panel |
-| **Hold A** ~1 s | Toggle the laser sight (you will jump once on the way — A is jump, and jump has to stay instant) |
+| Thumbstick | Move / strafe |
+| Thumbstick click | Dash |
+| Trigger | Aim |
+| Grip | Impulse |
+| X | Age / renovate (TMD) |
+| Y | Flashlight — **hold ~1 s** to open the VR settings menu instead |
+| Menu | Pause menu — **hold ~1 s** to recentre (re-zeroes your view and seating) |
+
+**Right controller**
+
+| | |
+|---|---|
+| Thumbstick | Turn (snap or smooth, set in the settings menu) — tilt up/down cycles weapons or uses a health item |
+| Thumbstick click | Anti-gravity |
+| Trigger | Fire |
+| Grip | Use / reload |
+| A | Jump — **hold ~1 s** to also toggle the laser sight (you'll jump once on the way, since jump has to stay instant) |
+| B | Crouch |
+
+Every button beyond the two long presses is Raven's own binding, passed straight through.
 
 The F-key bindings described in `STATUS.md` are development keys. They are **inert** unless
 `Debug=1`.

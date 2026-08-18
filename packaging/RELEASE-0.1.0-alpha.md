@@ -60,14 +60,30 @@ quit, launch again.**
 
 ## Controls
 
-Every controller button is already spoken for, so the extra functions are long presses.
+Every physical input on both Touch controllers, and what it does.
+
+**Left controller**
 
 | | |
 |---|---|
-| **Hold MENU** ~1 s | Recentre |
-| **Tap MENU** | Pause menu |
-| **Hold Y** ~1 s | VR settings menu |
-| **Hold A** ~1 s | Laser sight (you will jump once on the way — A is jump) |
+| Thumbstick | Move / strafe |
+| Thumbstick click | Dash |
+| Trigger | Aim |
+| Grip | Impulse |
+| X | Age / renovate (TMD) |
+| Y | Flashlight — **hold ~1 s** for the VR settings menu instead |
+| Menu | Pause menu — **hold ~1 s** to recentre |
+
+**Right controller**
+
+| | |
+|---|---|
+| Thumbstick | Turn — tilt up/down cycles weapons or uses a health item |
+| Thumbstick click | Anti-gravity |
+| Trigger | Fire |
+| Grip | Use / reload |
+| A | Jump — **hold ~1 s** to also toggle the laser sight (you'll jump once on the way) |
+| B | Crouch |
 
 ## Known issues
 
@@ -112,7 +128,7 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-cba1d2858cd982dcb4437331b241a198b52d8f6cf2bebcbe96a5ca0a9640d48f  SingularityVR-0.1.0-alpha.zip
+7ffd267ac512f6ba906f29550b804c7c03aad5b00468b1549f35e8bda143e463  SingularityVR-0.1.0-alpha.zip
 3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
 ```
 
