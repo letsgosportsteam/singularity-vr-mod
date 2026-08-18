@@ -184,7 +184,11 @@ more current than this file will ever be.
 8. PLANNED
 --------------------------------------------------------------------------------
 
-Next up: more testing, general bug fixes, and performance improvements.
+Next up: more testing, general bug fixes, and performance improvements. Also
+on deck: comfort settings (height adjustment, vignettes), shrinking flat
+cutscenes so they don't fill your whole view in the headset, testing the
+late-game weapons, fixing ammo/health/radio HUD positioning for better
+headset visibility, and an improved settings menu.
 
 Further out: SteamVR/OpenVR support, and Xbox controller support for the
 head-aiming mode.

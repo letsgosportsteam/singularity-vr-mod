@@ -101,7 +101,10 @@ Every physical input on both Touch controllers, and what it does.
 
 ## Planned
 
-Next up: more testing, general bug fixes, and performance improvements.
+Next up: more testing, general bug fixes, and performance improvements. Also on deck: comfort
+settings (height adjustment, vignettes), shrinking flat cutscenes so they don't fill your whole
+view in the headset, testing the late-game weapons, fixing ammo/health/radio HUD positioning for
+better headset visibility, and an improved settings menu.
 
 Further out: SteamVR/OpenVR support, and Xbox controller support for the head-aiming mode.
 
@@ -131,7 +134,7 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-b6abaf2b093dda7d418384cf9183e7bfb4ff3c840013b2f5b8c9fc3fc4ff7ba9  SingularityVR-0.1.0-alpha.zip
+896b36eebc745d1c1299a6c706df11d2206ceedd880c2721a923a1e59fe8772c  SingularityVR-0.1.0-alpha.zip
 3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
 ```
 
