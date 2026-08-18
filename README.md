@@ -43,8 +43,8 @@ Launch once, quit, launch again.
 | OS | Windows 10 or 11 |
 | Network | Highly recommended: a dedicated router (PC on ethernet), **or** Virtual Desktop's wired USB connection (currently in beta) |
 
-This build only supports Virtual Desktop with VDXR. Nothing else has been tried against
-Singularity yet — see `STATUS.md` if SteamVR or OpenVR is what you're curious about.
+This build only supports Virtual Desktop with VDXR. SteamVR and OpenVR are planned for later —
+see `STATUS.md` for where that stands.
 
 **The network matters more than your GPU.** On shared WiFi, frame submission was measured blocking
 for up to **189 ms**, which reads as seconds-long stalls and cannot be fixed in the render code.
