@@ -136,8 +136,9 @@ Two traps if you hand-edit:
 
 Next up: more testing, general bug fixes, and performance improvements.
 
-Further out, and not committed to: SteamVR/OpenVR support, Xbox controller support for the head-aiming
-mode, two-hand tracking, and maybe manual reloading.
+Further out: SteamVR/OpenVR support, and Xbox controller support for the head-aiming mode.
+
+Longer shots, and both will be tough: two-hand tracking, and maybe manual reloading.
 
 ## Reporting a bug
 
