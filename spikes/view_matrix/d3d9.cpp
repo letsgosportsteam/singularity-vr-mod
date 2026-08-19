@@ -2877,11 +2877,14 @@ volatile LONG g_worldScalePct = 100;    // ini [Render] WorldScalePct, and a DIS
 // what remains on both sides is untouched. Expressing that as two KEEPs means re-deriving both
 // borders every time the band moves.
 const int kTmdArmSlots = 4;
-volatile LONG g_tmdArmFrom[kTmdArmSlots] = { 0, 0, 0, 0 };
-volatile LONG g_tmdArmTo[kTmdArmSlots]   = { 1000, 1000, 1000, 1000 };
+// Slot 0 promoted to the tested value (mesh 4818, triangles 36-90, CUT): same story as
+// g_hudArmSticky above - only ever saved to the dev-machine ini, so v0.1.0-alpha shipped
+// with the TMD gauntlet's full mesh instead of the trimmed one, on every fresh install.
+volatile LONG g_tmdArmFrom[kTmdArmSlots] = { 36, 0, 0, 0 };
+volatile LONG g_tmdArmTo[kTmdArmSlots]   = { 90, 1000, 1000, 1000 };
 // 0 = the arms mesh of the moment (largest non-weapon), same convention as g_tmdBoneMesh.
-volatile LONG g_tmdArmMesh[kTmdArmSlots] = { 0, 0, 0, 0 };
-volatile LONG g_tmdArmMode[kTmdArmSlots] = { 0, 0, 0, 0 };   // 0 = KEEP, 1 = CUT
+volatile LONG g_tmdArmMesh[kTmdArmSlots] = { 4818, 0, 0, 0 };
+volatile LONG g_tmdArmMode[kTmdArmSlots] = { 1, 0, 0, 0 };   // 0 = KEEP, 1 = CUT
 volatile LONG g_tmdArmSlot = 0;            // which slot the panel rows edit
 volatile LONG g_tmdArmStep = 50;           // the sweep's stride, shared - it is a UI speed, not data
 
@@ -2919,15 +2922,18 @@ inline bool TmdTriInert(LONG mode, LONG lo, LONG hi) {
 // The ranges are now a UNION over every slot naming this mesh. Four because the job already needs
 // three - the hands, the right arm, the left upper arm - and a spare costs two integers.
 const int kTmdBoneSlots = 4;
-volatile LONG g_tmdBoneLo[kTmdBoneSlots]   = { -1, -1, -1, -1 };   // bone INDEX range, -1 = off
-volatile LONG g_tmdBoneHi[kTmdBoneSlots]   = { -1, -1, -1, -1 };
+// Slots 0-1 promoted to the tested values: slot 0 is the arms mesh (bones 13-29, the right
+// arm/hand), slot 1 is mesh 4818 (bones 7-8). Same story as g_tmdArmFrom above - dev-ini-only,
+// never shipped, so v0.1.0-alpha's TMD showed the full left arm on every fresh install.
+volatile LONG g_tmdBoneLo[kTmdBoneSlots]   = { 13, 7, -1, -1 };   // bone INDEX range, -1 = off
+volatile LONG g_tmdBoneHi[kTmdBoneSlots]   = { 29, 8, -1, -1 };
 volatile LONG g_tmdBoneSlot = 0;                           // which slot the panel rows edit
 // 💥 run 238d: WHICH MESH the range applies to. The first version applied it to everything riding
 // the off hand, and a bone palette is PER MESH - so "bones 13-29" meant the right hand in 7444 and
 // something unrelated in 4818, which came out as both sleeves spiking into points. A bone index is
 // only meaningful against the mesh it was measured on.
 // 0 = the arms mesh of the moment (largest non-weapon), which is where 13-29 was measured.
-volatile LONG g_tmdBoneMesh[kTmdBoneSlots] = { 0, 0, 0, 0 };
+volatile LONG g_tmdBoneMesh[kTmdBoneSlots] = { 0, 4818, 4818, 0 };
 // 💥 run 238e: a shared collapse POINT is not enough, and the reason is blending.
 //
 // A vertex weighted entirely to a collapsed bone does land on the point, and its triangles do
@@ -2966,7 +2972,7 @@ volatile LONG g_tmdBoneCensus = 0;   // ini [Input] TmdBoneCensus - log the live
 // reach it. Naming it is a solo-cycler job; dropping it once named is this.
 volatile LONG g_tmdHideVerts = 0;
 LONG NextPassMesh(LONG cur, int dir);   // ⭐ run 237d: defined with the pass arrays, far below
-volatile LONG g_tmdFwd = 30, g_tmdRight = -9, g_tmdUp = -13;
+volatile LONG g_tmdFwd = 40, g_tmdRight = -9, g_tmdUp = -14;   // v0.1.0-alpha shipped 30/-9/-13
 volatile LONG g_tmdYawTenths = 0, g_tmdPitchTenths = 0;
 // ⭐ run 245: a ROLL trim, which the gun rows do not have and the TMD needs.
 //
@@ -14210,7 +14216,12 @@ volatile LONG g_uiElemsThisFrame = 0;   // reached the census - these are the in
 // the default measures instead of acting.
 volatile LONG g_hudXformLive = 0;   // a UI transform was written this frame and is still in force
 volatile LONG g_uiUnarmed    = 0;   // non-quad user-ptr draws that missed the one-shot arm
-volatile LONG g_hudArmSticky = 0;   // ini [Render] HudArmSticky
+// v0.1.0-alpha shipped 0 - only ever fixed in the dev-machine ini, never promoted, so the
+// public release had run 253's popup-text-across-the-seam bug the whole time. Confirmed via
+// a Steam-build headset test after release: log read HudArmSticky=0 and self-reported the
+// exact symptom ("UI draws that MISSED the one-shot arm ... A jump when a popup opens is
+// run 253's reported bug").
+volatile LONG g_hudArmSticky = 1;   // ini [Render] HudArmSticky
 // ---- 💥 run 264: the broad arm was flown TWICE and broke geometry both times ----
 //
 // Run 259 and again now. The mechanism, which I had the data for and did not use: the sticky arm

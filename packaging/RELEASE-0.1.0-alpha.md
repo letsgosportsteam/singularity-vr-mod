@@ -5,6 +5,15 @@ It is a `d3d9.dll` proxy. **No game files are modified**, and uninstalling is de
 
 ---
 
+**Updated 2026-08-19** (same tag, assets replaced): two fixes that were confirmed working on the
+dev machine the whole time but only ever saved to a local, unshipped config. If you downloaded
+before this note appeared, redownload.
+
+- Long popup/note text spanned the stereo seam unremapped, drawn once and large. Fixed.
+- The TMD's left arm and gauntlet mesh drew in full instead of trimmed. Fixed.
+
+---
+
 ## Before you download
 
 **This build only supports Virtual Desktop with VDXR as your OpenXR runtime.** All testing has
@@ -137,8 +146,8 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-9419d020ec9366d4d12a40af20d6d538f5cb4f1d5d42b4087532b5c1d4a0f552  SingularityVR-0.1.0-alpha.zip
-3ca6e1e023c7b42c3a1f8711057f0fb0a3316a58583bfcbf61dcf188932e1e6b  d3d9-0.1.0-alpha.pdb
+200d78c0ade230bf555c1d22130777cd2383732d520ab22bdb34cfe8e9a45e23  SingularityVR-0.1.0-alpha.zip
+a827d9d4db0b7dcc301c2a61d9f5cfc05b108ee4a883f819cf4812650168a302  d3d9-0.1.0-alpha.pdb
 ```
 
 Full development notes, including everything that did not work, are in the repository —
