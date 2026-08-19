@@ -49,12 +49,6 @@ Launch once, quit, launch again.
 This build only supports Virtual Desktop with VDXR. SteamVR and OpenVR are planned for later —
 see `STATUS.md` for where that stands.
 
-**The network matters more than your GPU.** On shared WiFi, frame submission was measured blocking
-for up to **189 ms**, which reads as seconds-long stalls and cannot be fixed in the render code.
-Wired to a dedicated router — or over Virtual Desktop's wired USB connection, currently in beta —
-the same build locks to 120 fps with submission under a millisecond. If it stutters, suspect the
-link first.
-
 ## What works today
 
 | | |

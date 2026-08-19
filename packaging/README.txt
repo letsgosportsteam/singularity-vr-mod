@@ -30,8 +30,7 @@ THIS IS AN ALPHA. It has run on very few machines so far.
  * Windows 10 or 11.
 
  * HIGHLY RECOMMENDED: a DEDICATED ROUTER, with the PC on ethernet to it - OR
-   Virtual Desktop's wired USB connection, currently in beta. See section 5 -
-   this is the single most common cause of "the mod stutters".
+   Virtual Desktop's wired USB connection, currently in beta.
 
 
 --------------------------------------------------------------------------------
@@ -125,22 +124,7 @@ inert in this build. They only exist when Debug=1.
 
 
 --------------------------------------------------------------------------------
-5. THE NETWORK MATTERS MORE THAN YOUR GPU
---------------------------------------------------------------------------------
-
-On a shared WiFi network, frame submission to the headset was measured blocking
-for up to 189 ms. That reads as seconds-long stalls and it is not something the
-render code can fix.
-
-With a dedicated router (PC wired to it by ethernet) - or over Virtual Desktop's
-wired USB connection, currently in beta - the same build runs at 120 fps with
-only occasional dips or stutters.
-
-If it stutters, suspect the link before anything else.
-
-
---------------------------------------------------------------------------------
-6. CONFIGURATION
+5. CONFIGURATION
 --------------------------------------------------------------------------------
 
 Settings live in SingularityVR.ini in the same Binaries folder, and the VR
@@ -160,7 +144,7 @@ delete the ini and let the code defaults take over.
 
 
 --------------------------------------------------------------------------------
-7. KNOWN ISSUES
+6. KNOWN ISSUES
 --------------------------------------------------------------------------------
 
   * This has only been tested on one machine, so your experience may vary.
@@ -184,7 +168,7 @@ more current than this file will ever be.
 
 
 --------------------------------------------------------------------------------
-8. PLANNED
+7. PLANNED
 --------------------------------------------------------------------------------
 
 Next up: more testing, general bug fixes, and performance improvements. Also
@@ -201,7 +185,7 @@ reloading.
 
 
 --------------------------------------------------------------------------------
-9. REPORTING A BUG
+8. REPORTING A BUG
 --------------------------------------------------------------------------------
 
 Open an issue at:
@@ -224,7 +208,7 @@ still there, it is not this mod. Please say in the report whether you tried it.
 
 
 --------------------------------------------------------------------------------
-10. LICENCE
+9. LICENCE
 --------------------------------------------------------------------------------
 
 MIT. See LICENSE in the repository.

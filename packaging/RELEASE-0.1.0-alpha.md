@@ -11,7 +11,7 @@ It is a `d3d9.dll` proxy. **No game files are modified**, and uninstalling is de
 been done on a **Quest 3S**.
 
 **Highly recommended: a dedicated router (PC on ethernet), or Virtual Desktop's wired USB
-connection (currently in beta).** See *"The network matters more than your GPU"* below.
+connection (currently in beta).**
 
 **You need the Visual C++ 2015–2022 Redistributable (x86).** The x86 one — the x64 you already have
 will not do. Needed to *run* the game with the mod installed, not just to build it.
@@ -113,14 +113,6 @@ Further out: SteamVR/OpenVR support, and Xbox controller support for the head-ai
 
 Longer shots, and both will be tough: two-hand tracking, and possibly manual reloading.
 
-## The network matters more than your GPU
-
-On shared WiFi, frame submission to the headset was measured blocking for up to **189 ms** — that
-reads as seconds-long stalls, and nothing in the render code can fix it. Wired to a dedicated
-router — or over Virtual Desktop's wired USB connection, currently in beta — the same build runs
-at 120 fps with only occasional dips or stutters. **If it stutters, suspect the link before
-anything else.**
-
 ## Reporting a bug
 
 [Open an issue](https://github.com/letsgosportsteam/singularity-vr-mod/issues) and attach the log
@@ -137,7 +129,7 @@ tried it.
 `d3d9.dll` is unsigned, so SmartScreen and some antivirus will flag it. Verify what you downloaded:
 
 ```
-200d78c0ade230bf555c1d22130777cd2383732d520ab22bdb34cfe8e9a45e23  SingularityVR-0.1.0-alpha.zip
+1d0efde1ff8f81ac9dcc821171b5e39831ddb2d6dfdfd1ef3b57a370c05702ad  SingularityVR-0.1.0-alpha.zip
 a827d9d4db0b7dcc301c2a61d9f5cfc05b108ee4a883f819cf4812650168a302  d3d9-0.1.0-alpha.pdb
 ```
 
