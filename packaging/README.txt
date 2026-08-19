@@ -54,6 +54,9 @@ That is the whole install. SingularityVR.ini ships pre-configured - the VR
 settings menu (section 4) changes it live and saves automatically, so you
 rarely need to touch it by hand.
 
+IN THE GAME'S VIDEO SETTINGS, UNCHECK EVERY OPTION. High Quality Decals in
+particular enables dynamic shadows, which are currently broken.
+
 SingularityVR.ini.example, in the repository, is a fully-documented reference
 of every setting the mod reads, in case you want to go further than the menu.
 

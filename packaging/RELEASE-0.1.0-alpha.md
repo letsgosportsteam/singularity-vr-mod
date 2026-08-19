@@ -33,6 +33,9 @@ SingularityVR.ini
 `SingularityVR.ini` ships pre-configured. The in-headset settings menu changes it live and saves
 automatically, so you rarely need to touch it by hand.
 
+**In the game's Video Settings, uncheck every option.** High Quality Decals in particular enables
+dynamic shadows, which are currently broken.
+
 Connect Virtual Desktop **first**, then launch `Singularity.exe` with no arguments. It starts in VR.
 
 **The first run will be at the wrong resolution — this is expected.** The mod must inject
