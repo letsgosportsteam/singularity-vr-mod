@@ -5,15 +5,6 @@ It is a `d3d9.dll` proxy. **No game files are modified**, and uninstalling is de
 
 ---
 
-**Updated 2026-08-19** (same tag, assets replaced): two fixes that were confirmed working on the
-dev machine the whole time but only ever saved to a local, unshipped config. If you downloaded
-before this note appeared, redownload.
-
-- Long popup/note text spanned the stereo seam unremapped, drawn once and large. Fixed.
-- The TMD's left arm and gauntlet mesh drew in full instead of trimmed. Fixed.
-
----
-
 ## Before you download
 
 **This build only supports Virtual Desktop with VDXR as your OpenXR runtime.** All testing has
