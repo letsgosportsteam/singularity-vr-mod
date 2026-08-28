@@ -7015,6 +7015,20 @@ PadButtonAction g_padButtons[] = {
     { "menu",       "Menu",           "/user/hand/left/input/menu/click",        "Menu",       XI_START,     XR_NULL_HANDLE, true,  false },
 };
 const int kPadButtonCount = (int)(sizeof(g_padButtons) / sizeof(g_padButtons[0]));
+
+// ---- ⭐ run 274: the buttons had NO instrument, and that is why the tester report stalled ----
+//
+// The per-second census has recorded the two triggers in detail since run 156 - raw, min, max,
+// inactive count, veto count, and the bytes the game actually received - because the trigger was
+// the suspect then. The nine BUTTONS have never been recorded at all. So the 2026-08-19 report
+// ("as soon as I touch any controller buttons it lags, fps down to 20, returns to normal when I
+// stop") could be narrowed to "input activity, not the stick, not the draw count" and no further:
+// a button stuck ON for minutes leaves no trace in the log beyond `packet advances/sec`, which is
+// polluted by any stick movement.
+//
+// Held-frame count per button per window. A button the player taps reads a handful of frames; a
+// button the runtime is holding down reads the whole window, which is the signature to look for.
+int g_btnHeldFrames[kPadButtonCount]{};
 // Run 214: which row is the melee/impulse button. Resolved once at ini load; -1 until then, and the
 // melee window simply never arms in that case rather than guessing at a row.
 int g_impulseBtnIdx = -1;
@@ -7143,6 +7157,91 @@ extern LONG  g_gunSignYaw, g_gunSignPitch, g_gunSignRoll, g_gunFollowPos;
 extern LONG  g_gunSignPosZ, g_gunAnchorFwd, g_gunAnchorRight, g_gunAnchorUp;
 extern volatile LONG g_gunSignCombo;
 extern float g_aimPoseSignX, g_aimPoseSignY;
+
+// ---- ⭐ run 274: a SECOND interaction profile, for Valve Index controllers ----
+//
+// Until now the mod suggested bindings for `/interaction_profiles/oculus/touch_controller` and
+// nothing else, so every non-Touch runtime got whatever its own compatibility remap produced. A
+// tester's log (Pimax Dream + Index controllers, 2026-08-19) showed exactly what that costs:
+//
+//     trigger touch gate ON: LEFT NO SENSOR (values pass through unchanged), RIGHT NO SENSOR
+//         - vetoed 0/120 and 0/120 frames          <- in ALL 289 windows of the session
+//
+// `grasp` survived the remap because it is bound to twelve surfaces and only needs one of them;
+// `trigtouch` is bound to exactly two paths on purpose and got neither. So the run-156 veto - the
+// fix for the original framerate tank - had silently switched itself off, permanently, about 50
+// seconds into every session on that hardware (kTrigGateGrace). A profile the runtime is only
+// emulating is not a profile you can rely on for a single-source sensor.
+//
+// ⚠️ The suggest call is ALL-OR-NOTHING per profile (run 172 lost 31 bindings to one bad path), so
+// each profile now gets its OWN call and its own log line. A profile that is rejected costs only
+// itself - Touch still stands and the runtime falls back to exactly today's behaviour, which is
+// what makes this safe to ship without being able to test it here.
+//
+// Paths verified against the Khronos spec source (specification/sources/chapters/semantic_paths.adoc,
+// "Valve Index Controller Profile"), not from memory, for the same reason.
+//
+// Index differs from Touch in four ways that matter:
+//   - a/click and b/click exist on BOTH hands; x and y do not exist at all.
+//   - there is no menu button.
+//   - there is no thumbrest.
+//   - squeeze has TWO components: `value` (capacitive/analog, rises as soon as you close your
+//     hand) and `force` (a force sensor that rests at zero even under a firm carrying grip).
+//
+// That last one is the interesting one. On Touch a single `squeeze/value` feeds two opposite
+// questions: grasp asks "is anyone holding this at all" and wants to be SENSITIVE, while the
+// use/impulse buttons ask "did they press it" and want to be DELIBERATE. Touch has one path so
+// they share it. On Index that sharing is a bug: tightening your hand to reach a face button
+// raises `squeeze/value`, the runtime thresholds it true, and X / RSHOULDER latch on for as long
+// as you are gripping - which is Use/reload and the impulse weapon held down continuously. Hence
+// `sensorRole`: grasp keeps `value`, the buttons move to `force`.
+//
+// Boolean-on-scalar is legal and specified: "If the path is to a scalar value, a threshold must be
+// applied ... the runtime should use hysteresis" (spec, input.adoc). Same rule carries the menu
+// button onto `trackpad/force`.
+//
+// Returns nullptr for a control this profile does not have, so it is SKIPPED rather than poisoning
+// the whole suggestion.
+static const char* IndexBindingPath(const char* p, bool sensorRole, char* buf, size_t cap) {
+    if (!p) return nullptr;
+    const char* hand;
+    if      (strncmp(p, "/user/hand/left/",  16) == 0) hand = "/user/hand/left";
+    else if (strncmp(p, "/user/hand/right/", 17) == 0) hand = "/user/hand/right";
+    else return p;                                   // unhanded path - nothing to translate
+    const char* comp = p + strlen(hand);             // "/input/..." or "/output/..."
+
+    // The face buttons are NOT a mirror here: Index carries a and b on both hands, so left/x and
+    // left/y simply become left/a and left/b. Composed with the run-170 left-handed mirror (which
+    // runs first, in Touch vocabulary) this yields a plain hand swap, which is what Index wants.
+    static const struct { const char* from; const char* to; } kMap[] = {
+        { "/input/x/click",    "/input/a/click"        },
+        { "/input/y/click",    "/input/b/click"        },
+        { "/input/x/touch",    "/input/a/touch"        },
+        { "/input/y/touch",    "/input/b/touch"        },
+        // No menu button on this profile. `system/click` is the closest match and the spec flags it
+        // "may not be available for application use" - SteamVR reserves it - so a firm press on the
+        // trackpad carries menu instead. It needs deliberate pressure, which suits a button whose
+        // long-press recentres.
+        { "/input/menu/click", "/input/trackpad/force" },
+    };
+    for (auto& m : kMap)
+        if (strcmp(comp, m.from) == 0) {
+            _snprintf_s(buf, cap, _TRUNCATE, "%s%s", hand, m.to);
+            return buf;
+        }
+
+    if (strcmp(comp, "/input/thumbrest/touch") == 0) return nullptr;   // no thumbrest on Index
+    if (!sensorRole && strcmp(comp, "/input/squeeze/value") == 0) {
+        _snprintf_s(buf, cap, _TRUNCATE, "%s/input/squeeze/force", hand);
+        return buf;
+    }
+    // trigger/value, trigger/touch, thumbstick (+click/touch), a/b click+touch, aim/pose and
+    // output/haptic are spelled identically on both profiles.
+    return p;
+}
+
+// Touch is the vocabulary the tables are written in, so its translation is the identity.
+static const char* TouchBindingPath(const char* p, bool, char*, size_t) { return p; }
 
 bool InitXRInput() {
     if (g_xrInstance == XR_NULL_HANDLE || g_xrSession == XR_NULL_HANDLE) return false;
@@ -7457,11 +7556,26 @@ bool InitXRInput() {
                        XR_ACTION_TYPE_BOOLEAN_INPUT, &g_padButtons[i].action);
     if (!ok) { Log("xrinput: xrCreateAction failed - controllers unavailable"); return false; }
 
-    // 4 fixed + one per button + 2 haptic outputs. Sized from the same constants that fill it, so
-    // adding a row to g_padButtons cannot silently overrun this.
-    // 4 fixed + one per button + 2 haptic outputs + 2 hand poses. Sized from the same constants
-    // that fill it, so adding a row to g_padButtons cannot silently overrun this.
-    XrActionSuggestedBinding binds[4 + kPadButtonCount + 2 + 2 + 12 + 2]{};
+    // ---- ⚠️ run 274: this was TWO SHORT, and had been since run 180 ----
+    //
+    // The size claimed to be "sized from the same constants that fill it", but it was written out
+    // by hand and the terms stopped matching the emission sites. Counting them: 4 fixed + 9 buttons
+    // + 2 haptic + 12 grasp + 2 trigtouch + 2 sticktouch + 2 hand poses = 33, into binds[31]. Every
+    // path is syntactically valid so xrStringToPath accepts all 33, which means the last two entries
+    // were written past the end of the array on EVERY successful startup. Run 180 added sticktouch's
+    // two sources and did not add its term here.
+    //
+    // Now spelled one term per emission site, in the order they run, and bounds-checked at the point
+    // of use so the next row that gets added fails loudly instead of scribbling on the stack.
+    static const uint32_t kMaxBinds = 4                  // fixed: move, turn, fire, altfire
+                                    + kPadButtonCount    // one per pad button
+                                    + 2                  // haptic outputs
+                                    + 12                 // grasp sources
+                                    + 2                  // trigtouch
+                                    + 2                  // sticktouch
+                                    + 2                  // hand poses
+                                    + 2;                 // per-profile extras (Index trackpad/touch)
+    XrActionSuggestedBinding binds[kMaxBinds]{};
     uint32_t nb = 0;
     // ---- ⭐ run 170: left-handed mode ----
     //
@@ -7521,38 +7635,72 @@ bool InitXRInput() {
         return buf;
     };
 
-    struct { XrAction a; const char* p; bool handed; } fixed[] = {
-        { g_actMove,    "/user/hand/left/input/thumbstick",     false },  // sticks never mirror
-        { g_actTurn,    "/user/hand/right/input/thumbstick",    false },
-        { g_actFire,    "/user/hand/right/input/trigger/value", true  },
-        { g_actAltFire, "/user/hand/left/input/trigger/value",  true  },
+    // ---- run 274: one pass per interaction profile ----
+    //
+    // Touch first, so that if anything here regresses it is the profile that has been working all
+    // along that gets suggested first, and the new one that is additional.
+    static const struct {
+        const char* path;
+        const char* (*map)(const char*, bool, char*, size_t);
+        const char* extraGrasp[2];   // profile-only grasp sources; nullptr entries are skipped
+    } kProfiles[] = {
+        { "/interaction_profiles/oculus/touch_controller", TouchBindingPath, { nullptr, nullptr } },
+        { "/interaction_profiles/valve/index_controller",  IndexBindingPath,
+          // Index has a trackpad where Touch has a thumbrest. A thumb parked on it is exactly the
+          // "somebody is holding this" signal run 82 widened grasp to catch, so it belongs here for
+          // the same reason thumbrest/touch does on Touch.
+          { "/user/hand/left/input/trackpad/touch", "/user/hand/right/input/trackpad/touch" } },
     };
-    for (auto& f : fixed) {
-        char mb[64];
-        XrPath p;
-        const char* path = f.handed ? mirrorHand(f.p, mb, sizeof(mb)) : f.p;
-        if (XrPathOf(path, &p)) { binds[nb].action = f.a; binds[nb].binding = p; ++nb; }
-    }
-    for (int i = 0; i < kPadButtonCount; ++i) {
-        char mb[64];
-        XrPath p;
-        const char* path = mirrorHand(g_padButtons[i].path, mb, sizeof(mb));
-        // Printed only in left-handed mode, and only because the suggest call is ALL-OR-NOTHING:
-        // when it fails there is no way to tell which of 31 paths was the bad one, which is exactly
-        // the position run 172 was in. Thirteen lines once at startup is worth not being there again.
-        if (g_leftHanded) Log("  mirrored binding: %-40s -> %s", g_padButtons[i].path, path);
-        if (XrPathOf(path, &p)) {
-            binds[nb].action = g_padButtons[i].action; binds[nb].binding = p; ++nb;
-        }
-    }
-    if (g_actHaptic != XR_NULL_HANDLE) {
-        const char* hp[2] = { "/user/hand/left/output/haptic", "/user/hand/right/output/haptic" };
-        for (int i = 0; i < 2; ++i) {
+
+    int profilesAccepted = 0;
+    for (auto& prof : kProfiles) {
+        nb = 0;
+        bool overflow = false;
+        // Every binding goes through here: mirror in Touch vocabulary first (run 170), translate to
+        // this profile second, then bounds-check. `sensorRole` picks `squeeze/value` over
+        // `squeeze/force` for the two actions that are asking about contact rather than intent.
+        auto add = [&](XrAction act, const char* canonical, bool handed, bool sensorRole) {
+            if (act == XR_NULL_HANDLE || !canonical) return;
+            char mb[64], pb[64];
+            const char* path = handed ? mirrorHand(canonical, mb, sizeof(mb)) : canonical;
+            path = prof.map(path, sensorRole, pb, sizeof(pb));
+            if (!path) return;                       // not present on this profile - skip it
             XrPath p;
-            if (XrPathOf(hp[i], &p)) { binds[nb].action = g_actHaptic; binds[nb].binding = p; ++nb; }
+            if (!XrPathOf(path, &p)) return;
+            if (nb >= kMaxBinds) { overflow = true; return; }
+            binds[nb].action = act; binds[nb].binding = p; ++nb;
+        };
+
+        struct { XrAction a; const char* p; bool handed; } fixed[] = {
+            { g_actMove,    "/user/hand/left/input/thumbstick",     false },  // sticks never mirror
+            { g_actTurn,    "/user/hand/right/input/thumbstick",    false },
+            { g_actFire,    "/user/hand/right/input/trigger/value", true  },
+            { g_actAltFire, "/user/hand/left/input/trigger/value",  true  },
+        };
+        for (auto& f : fixed) add(f.a, f.p, f.handed, false);
+
+        for (int i = 0; i < kPadButtonCount; ++i) {
+            // Printed only in left-handed mode, and only because the suggest call is ALL-OR-NOTHING:
+            // when it fails there is no way to tell which of the paths was the bad one, which is
+            // exactly the position run 172 was in. A dozen lines once at startup is worth not being
+            // there again.
+            //
+            // run 274: prints the FINAL path for this profile, not the Touch-space intermediate.
+            // On Index the mirror and the translation compose - left/x/click mirrors to
+            // right/a/click and then stays put - so printing the middle step would describe a path
+            // that is never suggested.
+            if (g_leftHanded) {
+                char mb[64], pb[64];
+                const char* f = prof.map(mirrorHand(g_padButtons[i].path, mb, sizeof(mb)),
+                                         false, pb, sizeof(pb));
+                Log("  mirrored binding [%s]: %-40s -> %s", strrchr(prof.path, '/') + 1,
+                    g_padButtons[i].path, f ? f : "(not on this profile)");
+            }
+            add(g_padButtons[i].action, g_padButtons[i].path, true, false);
         }
-    }
-    if (g_actGrasp != XR_NULL_HANDLE) {
+        const char* hp[2] = { "/user/hand/left/output/haptic", "/user/hand/right/output/haptic" };
+        for (int i = 0; i < 2; ++i) add(g_actHaptic, hp[i], false, false);
+
         // ⚠️ Run 82: thumbrest + trigger alone was TOO NARROW. The log caught it outright -
         // "right on desk (2346 um/frame)" is a controller being waved about while the sensors
         // insist nobody is touching it. A thumb parked on the STICK is not on the thumbrest, and
@@ -7562,6 +7710,10 @@ bool InitXRInput() {
         // Every capacitive surface on the controller now feeds the same boolean, so any finger
         // anywhere counts. Being generous is the right bias: a false "held" costs nothing, and a
         // false "put down" unplugs the pad mid-fight.
+        //
+        // ⚠️ These pass sensorRole=true, which is what keeps grasp on `squeeze/value` when the
+        // buttons move to `squeeze/force` on Index. Grasp is asking about CONTACT; the buttons are
+        // asking about INTENT. Sharing one path is what makes a firm grip read as a held button.
         const char* gp[12] = { "/user/hand/left/input/thumbrest/touch",
                                "/user/hand/right/input/thumbrest/touch",
                                "/user/hand/left/input/trigger/touch",
@@ -7574,56 +7726,61 @@ bool InitXRInput() {
                                "/user/hand/right/input/b/touch",
                                "/user/hand/left/input/squeeze/value",
                                "/user/hand/right/input/squeeze/value" };
-        for (int i = 0; i < 12; ++i) {
-            XrPath p;
-            if (XrPathOf(gp[i], &p)) { binds[nb].action = g_actGrasp; binds[nb].binding = p; ++nb; }
-        }
-    }
-    if (g_actTrigTouch != XR_NULL_HANDLE) {
+        for (int i = 0; i < 12; ++i) add(g_actGrasp, gp[i], false, true);
+        for (auto& xg : prof.extraGrasp) add(g_actGrasp, xg, false, true);
+
         // Exactly two sources, and nothing else may be added here. The moment this accepts a second
         // surface it stops meaning "a finger is on the trigger" and becomes another copy of grasp.
+        //
+        // ⭐ run 274: on Index this now RESOLVES. It is the whole reason the profile was added -
+        // the run-156 veto was inert on that hardware because this action had no fallback.
         const char* tp[2] = { "/user/hand/left/input/trigger/touch",
                               "/user/hand/right/input/trigger/touch" };
-        for (int i = 0; i < 2; ++i) {
-            XrPath p;
-            if (XrPathOf(tp[i], &p)) { binds[nb].action = g_actTrigTouch; binds[nb].binding = p; ++nb; }
-        }
-    }
-    if (g_actStickTouch != XR_NULL_HANDLE) {
+        for (int i = 0; i < 2; ++i) add(g_actTrigTouch, tp[i], false, true);
+
         // Same rule as trigtouch above: exactly two sources. One question, one sensor, one hand.
         const char* sp[2] = { "/user/hand/left/input/thumbstick/touch",
                               "/user/hand/right/input/thumbstick/touch" };
-        for (int i = 0; i < 2; ++i) {
-            XrPath p;
-            if (XrPathOf(sp[i], &p)) { binds[nb].action = g_actStickTouch; binds[nb].binding = p; ++nb; }
-        }
-    }
-    if (g_actHandPose != XR_NULL_HANDLE) {
+        for (int i = 0; i < 2; ++i) add(g_actStickTouch, sp[i], false, true);
+
         // `aim`, not `grip`: aim is the runtime's own pointing ray for the controller, which is
         // what a weapon direction wants. grip is where the hand holds it, and using that would
         // mean re-deriving the pointing axis ourselves for no gain.
         const char* pp[2] = { "/user/hand/left/input/aim/pose", "/user/hand/right/input/aim/pose" };
-        for (int i = 0; i < 2; ++i) {
-            XrPath p;
-            if (XrPathOf(pp[i], &p)) { binds[nb].action = g_actHandPose; binds[nb].binding = p; ++nb; }
-        }
-    }
+        for (int i = 0; i < 2; ++i) add(g_actHandPose, pp[i], false, false);
 
-    XrPath profile;
-    if (!XrPathOf("/interaction_profiles/oculus/touch_controller", &profile)) {
-        Log("xrinput: Touch profile path failed"); return false;
+        if (overflow) {
+            // Cannot happen with the table as it stands - kMaxBinds is spelled one term per site.
+            // It is here so that the NEXT row added fails on this line instead of on the stack.
+            Log("xrinput: BUG - binding array overflowed at %u for %s. Raise kMaxBinds.",
+                kMaxBinds, prof.path);
+        }
+
+        XrPath profile;
+        if (!XrPathOf(prof.path, &profile)) {
+            Log("xrinput: profile path failed for %s", prof.path);
+            continue;
+        }
+        XrInteractionProfileSuggestedBinding sb{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+        sb.interactionProfile = profile;
+        sb.suggestedBindings = binds;
+        sb.countSuggestedBindings = nb;
+        XrResult sr = xrSuggestInteractionProfileBindings(g_xrInstance, &sb);
+        if (XR_FAILED(sr)) {
+            // ⚠️ This fails as a WHOLE if any single binding path is not valid for the profile - it
+            // is not a per-binding filter. So a typo in one path silently costs every control for
+            // that profile, which is why the count and the result are both logged rather than
+            // assumed. Since run 274 each profile is suggested separately, so one rejected profile
+            // costs only itself - the others still stand.
+            Log("xrinput: xrSuggestInteractionProfileBindings failed (%d) for %u bindings on %s"
+                " - one bad path rejects them all, but only for this profile", (int)sr, nb, prof.path);
+            continue;
+        }
+        ++profilesAccepted;
+        Log("xrinput: %u bindings suggested for %s", nb, prof.path);
     }
-    XrInteractionProfileSuggestedBinding sb{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
-    sb.interactionProfile = profile;
-    sb.suggestedBindings = binds;
-    sb.countSuggestedBindings = nb;
-    XrResult sr = xrSuggestInteractionProfileBindings(g_xrInstance, &sb);
-    if (XR_FAILED(sr)) {
-        // ⚠️ This fails as a WHOLE if any single binding path is not valid for the profile - it is
-        // not a per-binding filter. So a typo in one path silently costs every control, which is
-        // why the count and the result are both logged rather than assumed.
-        Log("xrinput: xrSuggestInteractionProfileBindings failed (%d) for %u bindings"
-            " - one bad path rejects them all", (int)sr, nb);
+    if (!profilesAccepted) {
+        Log("xrinput: no interaction profile was accepted - controllers unavailable");
         return false;
     }
 
@@ -7938,6 +8095,7 @@ void SyncXRInput(XrTime displayTime) {
     WORD panelMask = 0;
     for (int i = 0; i < kPadButtonCount; ++i) {
         const bool down = getBool(g_padButtons[i].action);
+        if (down) ++g_btnHeldFrames[i];
         if (g_padButtons[i].isMenu)  { menuHeld  = down; menuMask  = g_padButtons[i].mask; continue; }
         if (g_padButtons[i].isPanel) { panelHeld = down; panelMask = g_padButtons[i].mask; continue; }
         // ---- ⭐ run 214: the melee swing is invisible, for the run-198 reason ----
@@ -20392,6 +20550,37 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                         InterlockedCompareExchange(&g_killSleep, 0, 0) ? " [NEUTRALISED]" : "");
             }
 
+            // ---- ⭐ run 274: name the interaction profile the runtime actually chose ----
+            //
+            // The 2026-08-19 tester log carried no headset, runtime or controller identification
+            // anywhere in 27,000 lines, so "trigger touch gate: NO SENSOR" could be read but not
+            // explained without asking. One line fixes that for every future report.
+            //
+            // ⚠️ NOT the runs 178-179 experiment. That tried to use this call to DETECT the
+            // hand-tracking hand-over mid-session, and it cannot - the profile stays bound to the
+            // controller throughout. Identifying which profile is in force at startup is a
+            // different question, and the same runs showed it answers that one correctly. Nothing
+            // branches on this; it is a log line.
+            {
+                static char lastProf[2][XR_MAX_PATH_LENGTH]{};
+                for (int h = 0; h < 2; ++h) {
+                    XrInteractionProfileState ps{ XR_TYPE_INTERACTION_PROFILE_STATE };
+                    if (XR_FAILED(xrGetCurrentInteractionProfile(g_xrSession, g_handSubPath[h], &ps)))
+                        continue;
+                    char buf[XR_MAX_PATH_LENGTH] = "(none - runtime bound nothing)";
+                    if (ps.interactionProfile != XR_NULL_PATH) {
+                        uint32_t n = 0;
+                        if (XR_FAILED(xrPathToString(g_xrInstance, ps.interactionProfile,
+                                                     sizeof(buf), &n, buf)))
+                            strcpy_s(buf, "(path could not be resolved)");
+                    }
+                    if (strcmp(buf, lastProf[h]) != 0) {
+                        strcpy_s(lastProf[h], buf);
+                        Log("    interaction profile [%s hand]: %s", h ? "right" : "left", buf);
+                    }
+                }
+            }
+
             // Controller state, on the same line cadence as the frame budget, so a run where the
             // controllers were picked up and set down a few times shows the correlation directly
             // instead of depending on anyone remembering when they did it.
@@ -20444,6 +20633,23 @@ HRESULT STDMETHODCALLTYPE Hook_Present(IDirect3DDevice9* s, const RECT* a, const
                     g_triggerGate ? "ON" : "off (ini TriggerTouchGate=0)",
                     sensorState(0), sensorState(1),
                     g_trigVetoed[0], g_trigFrames, g_trigVetoed[1], g_trigFrames);
+                // run 274: buttons held, as frames-of-window per button. Silent when nothing was
+                // pressed, so it costs a line only when there is something to say. Read it as: a
+                // count near the window length is a button being HELD, not tapped - and a held
+                // `use` or `impulse` is Use/reload or the impulse weapon jammed on, which is the
+                // shape the framerate report describes.
+                {
+                    char btnLine[256]; int n = 0; bool any = false;
+                    for (int i = 0; i < kPadButtonCount; ++i) {
+                        if (!g_btnHeldFrames[i]) continue;
+                        any = true;
+                        n += _snprintf_s(btnLine + n, sizeof(btnLine) - n, _TRUNCATE, "%s%s %d",
+                                         n ? " | " : "", g_padButtons[i].name, g_btnHeldFrames[i]);
+                        if (n < 0 || n >= (int)sizeof(btnLine) - 1) break;
+                    }
+                    if (any) Log("    buttons held (frames of %d): %s", g_trigFrames, btnLine);
+                    memset(g_btnHeldFrames, 0, sizeof(g_btnHeldFrames));
+                }
                 // run 180: the turn stick had NO instrument at all while phantom snaps were being
                 // reported. Nothing is vetoed here - this is the measurement that decides whether a
                 // stick veto is justified. `over 0.7` with no thumb is the phantom signature.

@@ -53,7 +53,7 @@ dropped beside the game exe. No game files modified.
 | **True stereo**, real per-eye parallax | ✅ draw-call duplication; eyes align, depth correct |
 | **FOV / aspect / resolution** | ✅ **100% of the headset's pixels, automatic** |
 | **Performance** | ✅ **120 fps locked**, 4.35 ms idle per frame |
-| **Controller input** | ✅ **working** — full Touch mapping, menus, haptics, snap turn, off-hand movement |
+| **Controller input** | ✅ **working** — Touch and Valve Index mappings, menus, haptics, snap turn, off-hand movement |
 | **Aim decoupling** | ✅ **SOLVED via route 2** — the bullet follows the controller, the view never moves, and it costs NOTHING in culling or LOD. Aim mode 11 |
 | **Gun follows the controller** | ✅ **working** — 6-DOF, arms hidden, anchor tuned. APPS toggles it |
 | **Cutscene head tracking** | ✅ **working, automatic** — run 138. `SetCinematicMode` drives it; look around freely during a cutscene, normal turning restored on exit |
@@ -108,6 +108,49 @@ discount a perfect empirical correlation. **Matching a tested value costs nothin
    your own bug. `xrEndFrame` hid a **189 ms** stall in there for an entire day.
 3. **The cheap control first.** Rename `d3d9.dll` to `d3d9.dll.off` and run the game unmodded at the
    same resolution. One minute, and it settles "is this us at all" before any bisection starts.
+
+### ⚠️ SHIPPED, NOT YET FLOWN (run 274) — Valve Index bindings, and the trigger veto was dead on non-Touch hardware
+
+A tester's log (Pimax Dream + Index controllers) read `trigger touch gate ON: LEFT NO SENSOR
+(values pass through unchanged), RIGHT NO SENSOR — vetoed 0/120` in **every one of its 289
+windows**. The mod suggested bindings for `oculus/touch_controller` and nothing else, so every
+non-Touch runtime got its own compatibility remap. `grasp` survived that remap because it is bound
+to twelve surfaces; `trigtouch` is bound to exactly two on purpose and got neither. **The run-156
+veto — the fix for the original framerate tank — had been switching itself off about 50 seconds
+into every session on that hardware** (`kTrigGateGrace`), and the log line for it reads like a
+benign capability report rather than a disabled safety net.
+
+Shipped:
+
+- **`valve/index_controller` bindings**, suggested in their own call. The suggest call is
+  all-or-nothing *per profile*, so a rejected profile now costs only itself — Touch still stands
+  and the runtime falls back to exactly the old behaviour. Every path checked against the Khronos
+  spec source, not from memory; run 172 lost 31 bindings to one bad string.
+- **`use` and `impulse` move to `squeeze/force` on Index.** On Touch a single `squeeze/value` feeds
+  both `grasp` (wants to be sensitive — "is anyone holding this") and the two grip buttons (want to
+  be deliberate — "did they press it"). Index splits them. This is the **suspected cause of the
+  reported lag**: tightening your hand to reach a face button raises `squeeze/value`, the runtime
+  thresholds it true, and X / RSHOULDER latch on — Use/reload and the impulse weapon held down for
+  as long as you are gripping.
+- **`x`/`y` → `a`/`b`** (Index has a/b on both hands, no x/y), **menu → `trackpad/force`** (Index
+  has no menu button; `system/click` is reserved by SteamVR). The run-170 left-handed mirror runs
+  first in Touch vocabulary and composes with the translation to give a plain hand swap.
+- **The interaction profile is now named in the log**, per hand, on change. The tester log carried
+  no headset, runtime or controller identification in 27,000 lines. ⚠️ Not the runs 178–179
+  experiment — that tried to use this call to *detect* the hand-tracking hand-over and cannot.
+  Nothing branches on it.
+- **A per-button held-frame census.** The two triggers have had a detailed instrument since run
+  156; the nine buttons had none at all, which is why the lag report could be narrowed to "input
+  activity, not the stick, not the draw count" and no further.
+- **`binds[]` was two entries too short** and had been since run 180 — 33 emissions into `binds[31]`,
+  written past the end of the array on every successful startup. Now spelled one term per emission
+  site and bounds-checked.
+
+**What would fool this test:** the tester reporting "better" tells us nothing on its own, because
+two things changed. Read the log instead — `trigger touch gate` should now name a real sensor
+state, and `buttons held` should show `use`/`impulse` at low counts rather than whole windows. If
+the gate still says `NO SENSOR`, the Index profile was rejected and the `xrinput:` line at startup
+says so. **Nobody here can test this**; it is built, not flown.
 
 ### ⚠️ SHIPPED, NOT YET FLOWN (run 250) — the triangle window had the run-244 gate defect too
 
